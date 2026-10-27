@@ -6,6 +6,7 @@
 
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_cgraph;
 struct ggml_backend;
 struct ggml_backend_buffer;
 struct ggml_backend_sched;
@@ -44,6 +45,8 @@ public:
     uint64_t kv_bytes() const { return kv_bytes_; }
     bool on_gpu() const { return main_ != cpu_; }
     void device_memory(size_t& free, size_t& total) const;   // of the device holding the weights
+    bool flash_attn() const { return flash_attn_; }
+    const char* kv_type() const { return kv_f32_ ? "f32" : "f16"; }
 
     // Convenience: reset, then evaluate the whole sequence.
     std::vector<float> forward(const std::vector<int32_t>& ids, int n_threads) { reset(); return eval(ids, n_threads); }
@@ -52,6 +55,14 @@ public:
 
 private:
     OlmoeModel() = default;
+    struct Graph {
+        ggml_context* ctx = nullptr;
+        struct ggml_cgraph* gf = nullptr;
+        ggml_tensor *inp = nullptr, *pos = nullptr, *mask = nullptr, *logits = nullptr;
+        std::vector<ggml_tensor*> orders;        // router rankings per layer (when routing is wanted)
+    };
+    Graph build(int n_tok, int n_past, bool want_routing);
+    std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
     struct Layer {
         ggml_tensor *attn_norm, *wq, *wk, *wv, *wo, *q_norm, *k_norm;
         ggml_tensor *ffn_norm, *router, *up, *gate, *down;
@@ -72,6 +83,7 @@ private:
     int max_ctx_ = 0, n_past_ = 0;
     uint64_t weights_bytes_ = 0, kv_bytes_ = 0;
     void* dev_ = nullptr;                        // ggml_backend_dev_t of the main device
+    bool flash_attn_ = true, kv_f32_ = false;
 };
 
 }

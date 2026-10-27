@@ -23,7 +23,7 @@ add_library(tierlm_core src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/
 target_include_directories(tierlm_core PUBLIC src)
 target_link_libraries(tierlm_core PUBLIC ggml)
 
-foreach(tool inspect plan tok_test logits run)
+foreach(tool inspect plan tok_test logits run bench)
   string(REPLACE "_" "-" name ${tool})
   add_executable(tierlm-${name} tools/${tool}.cpp)
   target_link_libraries(tierlm-${name} PRIVATE tierlm_core)

@@ -169,6 +169,7 @@ int main(int argc, char** argv) {
             {"device", model->device_name()}, {"on_gpu", model->on_gpu()}, {"threads", a.threads},
             {"weights_bytes", model->weights_bytes()}, {"kv_bytes", model->kv_bytes()},
             {"device_free", free}, {"device_total", total},
+            {"kv_type", model->kv_type()}, {"flash_attn", model->flash_attn()},
         };
         res.set_content(dump(j), "application/json");
     });

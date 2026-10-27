@@ -68,16 +68,25 @@ def reference(ids):
     x = rms(x, W["output_norm.weight"])
     return x[-1] @ W["output.weight"].T
 
-worst = 0.0
-for mode in ([], ["--step"]):               # all at once, then one token per call through the KV cache
-    label = "one call " if not mode else "KV cache "
-    for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55]):
-        want = reference(np.array(ids))
-        run = subprocess.run([sys.argv[1], path, *mode, *map(str, ids)], capture_output=True, text=True)
-        if run.returncode != 0:
-            sys.exit(f"tierlm-logits failed: {run.stderr.strip()}")
-        got = np.array([float(v) for v in run.stdout.split()])
-        err = float(np.abs(got - want).max())
-        worst = max(worst, err)
-        print(f"{label}{len(ids):2d} tokens: max |diff| {err:.2e}  top token ours {got.argmax()} / reference {want.argmax()}")
-print("PASS" if worst < 1e-3 else "FAIL")
+# Two passes over the same cases:
+#   exact      KV cache in f32: the attention math must match the reference to ~1e-6
+#   f16 cache  the normal setting: rounding gives ~1e-3..1e-2 of the logit range, same top token
+# A real bug (wrong mask, rotation, routing...) shows up as large errors and a wrong top token.
+long_ids = list(np.random.default_rng(7).integers(0, V, 300))   # > 256: exercises batched prompts
+ok = True
+for name, env, tol in (("exact", {"TIERLM_KV_F32": "1"}, 1e-4), ("f16 cache", {}, 3e-2)):
+    worst, all_top = 0.0, True
+    for mode in ([], ["--step"]):           # all at once, then one token per call through the KV cache
+        for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55], long_ids):
+            want = reference(np.array(ids))
+            run = subprocess.run([sys.argv[1], path, *mode, *map(str, ids)], capture_output=True, text=True,
+                                 env={**os.environ, **env})
+            if run.returncode != 0:
+                sys.exit(f"tierlm-logits failed: {run.stderr.strip()}")
+            got = np.array([float(v) for v in run.stdout.split()])
+            worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
+            all_top &= bool(got.argmax() == want.argmax())
+    passed = worst < tol and all_top
+    ok &= passed
+    print(f"{name:9s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token always matches: {all_top}  ->  {'ok' if passed else 'FAIL'}")
+print("PASS" if ok else "FAIL")

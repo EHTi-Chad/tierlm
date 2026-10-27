@@ -4,7 +4,9 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -12,6 +14,7 @@
 namespace tierlm {
 
 static constexpr int kGraphSize = 16384;
+static constexpr int kBatch = 256;      // max tokens per graph
 
 OlmoeModel::~OlmoeModel() {
     if (sched_) ggml_backend_sched_free(sched_);
@@ -128,19 +131,25 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
         m->layers_.push_back(L);
     }
 
-    // ---- KV cache on the same device: f32 for now (exact); smaller types come later ----
+    // ---- KV cache on the same device, in f16: half the size and memory traffic of f32 ----
     const int hd = hp.n_embd / hp.n_head;
     m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
+    // TIERLM_KV_F32=1 keeps it in f32 (exact; used by the tests to check the attention math).
+    m->kv_f32_ = std::getenv("TIERLM_KV_F32") != nullptr;
+    const ggml_type kv_type = m->kv_f32_ ? GGML_TYPE_F32 : GGML_TYPE_F16;
     ggml_init_params kp{ (size_t)2 * hp.n_layer * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     m->kvctx_ = ggml_init(kp);
     for (auto& L : m->layers_) {
-        L.k_cache = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hd, hp.n_head_kv, m->max_ctx_);
-        L.v_cache = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hd, hp.n_head_kv, m->max_ctx_);
+        L.k_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
+        L.v_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
     }
     m->kvbuf_ = ggml_backend_alloc_ctx_tensors(m->kvctx_, m->main_);
     if (!m->kvbuf_) throw std::runtime_error("not enough device memory for the KV cache (try a smaller -c)");
     ggml_backend_buffer_clear(m->kvbuf_, 0);
     m->kv_bytes_ = ggml_backend_buffer_get_size(m->kvbuf_);
+
+    // Fused flash attention reads the cache once, with no copies. TIERLM_NO_FA=1 uses the plain version.
+    m->flash_attn_ = std::getenv("TIERLM_NO_FA") == nullptr;
 
     // ---- scheduler: runs each op on the device, falling back to the CPU where needed ----
     ggml_backend_t backends[2] = { m->main_, m->cpu_ };
@@ -148,6 +157,14 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     m->sched_ = ggml_backend_sched_new(backends, nullptr, n_backends, kGraphSize, false, false);
     if (!m->sched_) throw std::runtime_error("failed to create the scheduler");
     m->graph_mem_.resize(ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false));
+
+    // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
+    // of the context), so it is not re-planned on every token.
+    const int n_res = std::min(kBatch, m->max_ctx_);
+    Graph worst = m->build(n_res, m->max_ctx_ - n_res, true);
+    bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
+    ggml_free(worst.ctx);
+    if (!ok) throw std::runtime_error("failed to reserve compute memory");
     return m;
 }
 
@@ -156,27 +173,29 @@ void OlmoeModel::device_memory(size_t& free, size_t& total) const {
     if (dev_) ggml_backend_dev_memory((ggml_backend_dev_t)dev_, &free, &total);
 }
 
-std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing) {
+// Builds the compute graph for n_tok new tokens placed after n_past cached ones.
+// Only a description: the scheduler allocates its memory on the right device later.
+OlmoeModel::Graph OlmoeModel::build(int n_tok, int n_past, bool want_routing) {
     const OlmoeHparams& hp = hp_;
-    const int n_tok = (int)ids.size();
-    if (n_tok == 0) return {};
-    const int n_past = n_past_;
-    const int n_kv = n_past + n_tok;              // tokens visible to attention after this call
-    if (n_kv > max_ctx_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens)");
+    const int n_kv = n_past + n_tok;
     const int hd = hp.n_embd / hp.n_head;
 
-    // The graph is only a description here; the scheduler allocates its memory on the right device.
+    Graph g;
     ggml_init_params ip{ graph_mem_.size(), graph_mem_.data(), /*no_alloc=*/true };
-    ggml_context* c = ggml_init(ip);
+    ggml_context* c = g.ctx = ggml_init(ip);
+    g.gf = ggml_new_graph_custom(c, kGraphSize, false);
 
-    ggml_tensor* inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
-    ggml_set_input(inp);
-    ggml_tensor* pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
-    ggml_set_input(pos);
+    g.inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
+    ggml_set_input(g.inp);
+    g.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
+    ggml_set_input(g.pos);
+    if (flash_attn_) {                                                     // causal mask: 0 = visible, -inf = future
+        g.mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok);
+        ggml_set_input(g.mask);
+    }
+    const float scale = 1.0f / std::sqrt((float)hd);
 
-    ggml_cgraph* gf = ggml_new_graph_custom(c, kGraphSize, false);
-    std::vector<ggml_tensor*> orders;                                      // router rankings, read back if asked
-    ggml_tensor* x = ggml_get_rows(c, tok_embd_, inp);                     // [n_embd, n_tok]
+    ggml_tensor* x = ggml_get_rows(c, tok_embd_, g.inp);                   // [n_embd, n_tok]
     for (const Layer& L : layers_) {
         // ---- attention ----
         ggml_tensor* h = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.attn_norm);
@@ -188,27 +207,33 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
         q = ggml_reshape_3d(c, q, hd, hp.n_head, n_tok);
         k = ggml_reshape_3d(c, k, hd, hp.n_head_kv, n_tok);
         v = ggml_reshape_3d(c, v, hd, hp.n_head_kv, n_tok);
-        q = ggml_rope_ext(c, q, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-        k = ggml_rope_ext(c, k, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        q = ggml_rope_ext(c, q, g.pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        k = ggml_rope_ext(c, k, g.pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
-        // Write this call's keys/values into the cache at positions [n_past, n_kv). These copies are
+        // Write this batch's keys/values into the cache at positions [n_past, n_kv). These copies are
         // added to the graph first, so they run before the attention below reads the cache.
         const size_t knb1 = L.k_cache->nb[1], knb2 = L.k_cache->nb[2];
         const size_t vnb1 = L.v_cache->nb[1], vnb2 = L.v_cache->nb[2];
-        ggml_build_forward_expand(gf, ggml_cpy(c, k, ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_tok, knb1, knb2, (size_t)n_past * knb2)));
-        ggml_build_forward_expand(gf, ggml_cpy(c, v, ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_tok, vnb1, vnb2, (size_t)n_past * vnb2)));
+        ggml_build_forward_expand(g.gf, ggml_cpy(c, k, ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_tok, knb1, knb2, (size_t)n_past * knb2)));
+        ggml_build_forward_expand(g.gf, ggml_cpy(c, v, ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_tok, vnb1, vnb2, (size_t)n_past * vnb2)));
         ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_kv, knb1, knb2, 0);   // all tokens so far
         ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_kv, vnb1, vnb2, 0);
 
-        ggml_tensor* Q  = ggml_permute(c, q, 0, 2, 1, 3);                    // [hd, n_tok, n_head]
-        ggml_tensor* K  = ggml_permute(c, kall, 0, 2, 1, 3);                 // [hd, n_kv, n_head_kv]
-        ggml_tensor* kq = ggml_mul_mat(c, K, Q);                             // [n_kv, n_tok, n_head]
-        kq = ggml_scale(c, kq, 1.0f / std::sqrt((float)hd));
-        kq = ggml_diag_mask_inf(c, kq, n_past);                              // causal: no peeking ahead
-        kq = ggml_soft_max(c, kq);
-        ggml_tensor* V = ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3));   // [n_kv, hd, n_head_kv]
-        ggml_tensor* o = ggml_mul_mat(c, V, kq);                             // [hd, n_tok, n_head]
-        o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));                    // [hd, n_head, n_tok]
+        ggml_tensor* Q = ggml_permute(c, q, 0, 2, 1, 3);                     // [hd, n_tok, n_head]
+        ggml_tensor* K = ggml_permute(c, kall, 0, 2, 1, 3);                  // [hd, n_kv, n_head_kv]
+        ggml_tensor* o;
+        if (flash_attn_) {
+            ggml_tensor* V = ggml_permute(c, vall, 0, 2, 1, 3);              // [hd, n_kv, n_head_kv], no copy
+            o = ggml_flash_attn_ext(c, Q, K, V, g.mask, scale, 0.0f, 0.0f);  // [hd, n_head, n_tok]
+        } else {
+            ggml_tensor* kq = ggml_mul_mat(c, K, Q);                         // [n_kv, n_tok, n_head]
+            kq = ggml_scale(c, kq, scale);
+            kq = ggml_diag_mask_inf(c, kq, n_past);                          // causal: no peeking ahead
+            kq = ggml_soft_max(c, kq);
+            ggml_tensor* V = ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3));   // [n_kv, hd, n_head_kv]
+            o = ggml_mul_mat(c, V, kq);                                      // [hd, n_tok, n_head]
+            o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));                // [hd, n_head, n_tok]
+        }
         o = ggml_reshape_2d(c, o, hp.n_embd, n_tok);
         x = ggml_add(c, x, ggml_mul_mat(c, L.wo, o));
 
@@ -217,7 +242,7 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
         ggml_tensor* probs = ggml_soft_max(c, ggml_mul_mat(c, L.router, h)); // [n_expert, n_tok]
         ggml_tensor* order = ggml_argsort(c, probs, GGML_SORT_ORDER_DESC);  // [n_expert, n_tok] best first
         ggml_tensor* sel   = ggml_view_2d(c, order, hp.n_expert_used, n_tok, order->nb[1], 0);   // top n_used
-        if (routing) { ggml_set_output(order); orders.push_back(order); }
+        if (want_routing) { ggml_set_output(order); g.orders.push_back(order); }
         ggml_tensor* w     = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, hp.n_expert, n_tok), sel); // [1, n_used, n_tok]
         ggml_tensor* h3    = ggml_reshape_3d(c, h, hp.n_embd, 1, n_tok);
         ggml_tensor* up    = ggml_mul_mat_id(c, L.up, h3, sel);              // [n_ff, n_used, n_tok]
@@ -234,38 +259,67 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
     }
 
     x = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), out_norm_);
-    ggml_tensor* last   = ggml_view_2d(c, x, hp.n_embd, 1, x->nb[1], (size_t)(n_tok - 1) * x->nb[1]);
-    ggml_tensor* logits = ggml_mul_mat(c, output_, last);                    // [n_vocab, 1]
-    ggml_set_output(logits);
-    ggml_build_forward_expand(gf, logits);
+    ggml_tensor* last = ggml_view_2d(c, x, hp.n_embd, 1, x->nb[1], (size_t)(n_tok - 1) * x->nb[1]);
+    g.logits = ggml_mul_mat(c, output_, last);                             // [n_vocab, 1]
+    ggml_set_output(g.logits);
+    ggml_build_forward_expand(g.gf, g.logits);
+    return g;
+}
+
+// Long prompts are processed in batches of kBatch tokens, which bounds the memory a single graph needs.
+std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing) {
+    if (ids.empty()) return {};
+    if (n_past_ + (int)ids.size() > max_ctx_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens)");
+    if (routing) routing->clear();
+    std::vector<float> lg;
+    std::vector<int32_t> part;
+    for (size_t off = 0; off < ids.size(); off += kBatch) {
+        const size_t n = std::min<size_t>(kBatch, ids.size() - off);
+        lg = eval_batch(ids.data() + off, (int)n, n_threads, routing ? &part : nullptr);
+        if (routing) routing->insert(routing->end(), part.begin(), part.end());
+    }
+    return lg;
+}
+
+std::vector<float> OlmoeModel::eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing) {
+    const OlmoeHparams& hp = hp_;
+    const int n_past = n_past_, n_kv = n_past + n_tok;
+    Graph g = build(n_tok, n_past, routing != nullptr);
 
     ggml_backend_sched_reset(sched_);
-    if (!ggml_backend_sched_alloc_graph(sched_, gf)) { ggml_free(c); throw std::runtime_error("failed to allocate compute memory"); }
+    if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) { ggml_free(g.ctx); throw std::runtime_error("failed to allocate compute memory"); }
 
     std::vector<int32_t> positions(n_tok);
     for (int i = 0; i < n_tok; ++i) positions[i] = n_past + i;
-    ggml_backend_tensor_set(inp, ids.data(), 0, sizeof(int32_t) * n_tok);
-    ggml_backend_tensor_set(pos, positions.data(), 0, sizeof(int32_t) * n_tok);
+    ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
+    ggml_backend_tensor_set(g.pos, positions.data(), 0, sizeof(int32_t) * n_tok);
+    if (g.mask) {
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+        std::vector<ggml_fp16_t> mask((size_t)n_kv * n_tok);
+        for (int t = 0; t < n_tok; ++t)
+            for (int j = 0; j < n_kv; ++j) mask[(size_t)t * n_kv + j] = j <= n_past + t ? zero : ninf;
+        ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+    }
     ggml_backend_cpu_set_n_threads(cpu_, n_threads);
 
-    if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS) {
-        ggml_free(c);
+    if (ggml_backend_sched_graph_compute(sched_, g.gf) != GGML_STATUS_SUCCESS) {
+        ggml_free(g.ctx);
         throw std::runtime_error("graph compute failed");
     }
     std::vector<float> out(hp.n_vocab);
-    ggml_backend_tensor_get(logits, out.data(), 0, sizeof(float) * hp.n_vocab);
+    ggml_backend_tensor_get(g.logits, out.data(), 0, sizeof(float) * hp.n_vocab);
     if (routing) {
-        const int L = (int)orders.size(), K = hp.n_expert_used;
+        const int L = (int)g.orders.size(), K = hp.n_expert_used;
         routing->assign((size_t)n_tok * L * K, 0);
         std::vector<int32_t> buf((size_t)hp.n_expert * n_tok);
         for (int l = 0; l < L; ++l) {
-            ggml_backend_tensor_get(orders[l], buf.data(), 0, sizeof(int32_t) * buf.size());
+            ggml_backend_tensor_get(g.orders[l], buf.data(), 0, sizeof(int32_t) * buf.size());
             for (int t = 0; t < n_tok; ++t)
                 for (int k = 0; k < K; ++k)
                     (*routing)[((size_t)t * L + l) * K + k] = buf[(size_t)t * hp.n_expert + k];
         }
     }
-    ggml_free(c);
+    ggml_free(g.ctx);
     n_past_ = n_kv;
     return out;
 }
