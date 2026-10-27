@@ -9,7 +9,8 @@ set(TIERLM_VERSION "0.2.0-dev" CACHE STRING "Version shown in the app")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
-  add_compile_options(/utf-8)
+  # Read sources as UTF-8. Only for the C/C++ compiler: NVIDIA's nvcc needs it passed through as -Xcompiler.
+  add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>" "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
 endif()
 
 # Device backends (ggml). CPU is always built.
