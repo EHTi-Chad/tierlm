@@ -57,7 +57,22 @@ Long contexts get slower because every new token has to read the whole KV cache.
 values for all 16 attention heads (about 128 KB per token of context at f16), so a quantized KV cache is the
 next lever for it.
 
-## Quick start (Windows, Vulkan)
+## Try it (Windows)
+
+1. Download the latest `tierlm-<version>-windows-x64-vulkan.zip` from
+   [Releases](https://github.com/EHTi-Chad/tierlm/releases) and extract it.
+2. Download [`OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`](https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF/tree/main)
+   (4.2 GB) into its `models` folder.
+3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040.
+
+Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** · Problems: [docs/FAQ.md](docs/FAQ.md)
+
+### Supported models
+
+Only the **OLMoE** family for now: `OLMoE-1B-7B-0924-Instruct` (Q4_K_M tested; other quantizations should
+work). Other GGUF models are not supported yet and fail with "expected olmoe". Qwen3 MoE is next.
+
+## Build from source (Windows, Vulkan)
 
 Full instructions, including Linux/WSL and common pitfalls, are in [docs/BUILD.md](docs/BUILD.md).
 
@@ -70,12 +85,8 @@ build\tierlm-devices.exe
 build\tierlm-server.exe C:\models\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf --port 8040
 ```
 
-Then open http://127.0.0.1:8040. Run these from a Visual Studio "x64 Native Tools" / Developer Command
-Prompt with the Vulkan SDK installed.
-
-Get the model from Hugging Face, for example
-[bartowski/OLMoE-1B-7B-0924-Instruct-GGUF](https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF)
-(`OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`).
+Then open http://127.0.0.1:8040. Run these from a Visual Studio Developer Command Prompt with the Vulkan SDK
+installed.
 
 ## Tools
 
@@ -94,7 +105,9 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 
 ## Documentation
 
-- [docs/BUILD.md](docs/BUILD.md): building on Windows and Linux, GPU backends, troubleshooting
+- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): download, run, and use tierlm (no programming needed)
+- [docs/FAQ.md](docs/FAQ.md): questions and troubleshooting
+- [docs/BUILD.md](docs/BUILD.md): building on Windows and Linux, GPU backends, making a release
 - [docs/TOOLS.md](docs/TOOLS.md): every tool and option, environment variables, tests
 - [docs/API.md](docs/API.md): the server's HTTP API and event stream
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how tierlm works, and design decisions

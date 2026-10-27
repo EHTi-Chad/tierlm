@@ -9,6 +9,7 @@ CMake options.
 | `-DTIERLM_VULKAN=ON` | off | Vulkan backend: Intel Arc, AMD and NVIDIA GPUs (needs the Vulkan SDK) |
 | `-DTIERLM_CUDA=ON` | off | CUDA backend: NVIDIA GPUs (needs the CUDA toolkit) |
 | `-DCMAKE_BUILD_TYPE=Release` | Release | Optimised build. Debug builds are roughly 10× slower |
+| `-DTIERLM_PORTABLE=ON` | off | Binaries for distribution: AVX2 baseline instead of the build machine's CPU, static MSVC runtime |
 
 Get the source with the submodule:
 
@@ -120,6 +121,26 @@ cmake --build build
   [automount]
   options = "metadata,uid=1000,gid=1000,umask=022"
   ```
+
+---
+
+## Making a Windows release
+
+`scripts\package-windows.bat` builds a portable release and zips it: binaries tuned for any AVX2 CPU instead
+of the build machine (`-DTIERLM_PORTABLE=ON`), with the C runtime linked in so users don't need the Visual C++
+redistributable. From a Developer Command Prompt in the project folder:
+
+```bat
+scripts\package-windows.bat 0.1.0
+```
+
+It builds into `build-release`, then writes `dist\tierlm-0.1.0-windows-x64-vulkan.zip` (the tools, `web\`,
+`start-tierlm.bat`, an empty `models\` folder, the docs and all licences) plus a `.sha256` checksum. Publish
+both on a GitHub release, for example from WSL:
+
+```bash
+gh release create v0.1.0 /mnt/c/dev/tierlm/dist/tierlm-0.1.0-windows-x64-vulkan.zip* --title "tierlm 0.1.0" --notes "..."
+```
 
 ---
 
