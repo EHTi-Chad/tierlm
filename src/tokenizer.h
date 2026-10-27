@@ -17,6 +17,10 @@ public:
     std::vector<int32_t> encode(const std::string& text, bool parse_special = false) const;
     std::string decode(const std::vector<int32_t>& ids) const;
 
+    // Control tokens (like <|endoftext|> or <|user|>) mark structure, not text.
+    bool is_control(int32_t id) const { return id >= 0 && (size_t)id < token_type_.size() && token_type_[id] == 3; }
+    int32_t find(const std::string& token) const { auto it = token_to_id_.find(token); return it == token_to_id_.end() ? -1 : it->second; }
+
     int32_t bos() const { return bos_; }
     int32_t eos() const { return eos_; }
     size_t vocab_size() const { return id_to_token_.size(); }

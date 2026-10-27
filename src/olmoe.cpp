@@ -34,6 +34,7 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
         if (!dev) dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
         if (dev) {
+            m->dev_ = dev;
             m->main_ = ggml_backend_dev_init(dev, nullptr);
             if (!m->main_) throw std::runtime_error(std::string("failed to start ") + ggml_backend_dev_name(dev));
             m->device_name_ = std::string(ggml_backend_dev_name(dev)) + " (" + ggml_backend_dev_description(dev) + ")";
@@ -41,7 +42,10 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
             throw std::runtime_error("no GPU backend in this build (or no GPU found)");
         }
     }
-    if (m->main_ == m->cpu_) m->device_name_ = "CPU";
+    if (m->main_ == m->cpu_) {
+        m->device_name_ = "CPU";
+        m->dev_ = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
 
     // ---- read the header: tensor shapes/types only, no data yet ----
     gguf_init_params params{ /*no_alloc=*/true, /*ctx=*/&m->wctx_ };
@@ -79,6 +83,7 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     m->wbuf_ = ggml_backend_alloc_ctx_tensors(m->wctx_, m->main_);
     if (!m->wbuf_) { gguf_free(g); throw std::runtime_error("not enough device memory for the weights"); }
     ggml_backend_buffer_set_usage(m->wbuf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    m->weights_bytes_ = ggml_backend_buffer_get_size(m->wbuf_);
 
     std::ifstream file(path, std::ios::binary);
     if (!file) { gguf_free(g); throw std::runtime_error("cannot open " + path); }
@@ -135,6 +140,7 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     m->kvbuf_ = ggml_backend_alloc_ctx_tensors(m->kvctx_, m->main_);
     if (!m->kvbuf_) throw std::runtime_error("not enough device memory for the KV cache (try a smaller -c)");
     ggml_backend_buffer_clear(m->kvbuf_, 0);
+    m->kv_bytes_ = ggml_backend_buffer_get_size(m->kvbuf_);
 
     // ---- scheduler: runs each op on the device, falling back to the CPU where needed ----
     ggml_backend_t backends[2] = { m->main_, m->cpu_ };
@@ -145,7 +151,12 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     return m;
 }
 
-std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threads) {
+void OlmoeModel::device_memory(size_t& free, size_t& total) const {
+    free = total = 0;
+    if (dev_) ggml_backend_dev_memory((ggml_backend_dev_t)dev_, &free, &total);
+}
+
+std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing) {
     const OlmoeHparams& hp = hp_;
     const int n_tok = (int)ids.size();
     if (n_tok == 0) return {};
@@ -164,6 +175,7 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
     ggml_set_input(pos);
 
     ggml_cgraph* gf = ggml_new_graph_custom(c, kGraphSize, false);
+    std::vector<ggml_tensor*> orders;                                      // router rankings, read back if asked
     ggml_tensor* x = ggml_get_rows(c, tok_embd_, inp);                     // [n_embd, n_tok]
     for (const Layer& L : layers_) {
         // ---- attention ----
@@ -203,7 +215,9 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
         // ---- mixture of experts ----
         h = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.ffn_norm);
         ggml_tensor* probs = ggml_soft_max(c, ggml_mul_mat(c, L.router, h)); // [n_expert, n_tok]
-        ggml_tensor* sel   = ggml_argsort_top_k(c, probs, hp.n_expert_used); // [n_used, n_tok] expert ids
+        ggml_tensor* order = ggml_argsort(c, probs, GGML_SORT_ORDER_DESC);  // [n_expert, n_tok] best first
+        ggml_tensor* sel   = ggml_view_2d(c, order, hp.n_expert_used, n_tok, order->nb[1], 0);   // top n_used
+        if (routing) { ggml_set_output(order); orders.push_back(order); }
         ggml_tensor* w     = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, hp.n_expert, n_tok), sel); // [1, n_used, n_tok]
         ggml_tensor* h3    = ggml_reshape_3d(c, h, hp.n_embd, 1, n_tok);
         ggml_tensor* up    = ggml_mul_mat_id(c, L.up, h3, sel);              // [n_ff, n_used, n_tok]
@@ -240,6 +254,17 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
     }
     std::vector<float> out(hp.n_vocab);
     ggml_backend_tensor_get(logits, out.data(), 0, sizeof(float) * hp.n_vocab);
+    if (routing) {
+        const int L = (int)orders.size(), K = hp.n_expert_used;
+        routing->assign((size_t)n_tok * L * K, 0);
+        std::vector<int32_t> buf((size_t)hp.n_expert * n_tok);
+        for (int l = 0; l < L; ++l) {
+            ggml_backend_tensor_get(orders[l], buf.data(), 0, sizeof(int32_t) * buf.size());
+            for (int t = 0; t < n_tok; ++t)
+                for (int k = 0; k < K; ++k)
+                    (*routing)[((size_t)t * L + l) * K + k] = buf[(size_t)t * hp.n_expert + k];
+        }
+    }
     ggml_free(c);
     n_past_ = n_kv;
     return out;

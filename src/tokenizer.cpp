@@ -103,6 +103,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
 
     Tokenizer t;
     int64_t tk = gguf_find_key(g, "tokenizer.ggml.tokens");
+    if (tk < 0) { gguf_free(g); throw std::runtime_error("GGUF has no tokenizer vocabulary"); }
     const size_t nt = gguf_get_arr_n(g, tk);
     t.id_to_token_.resize(nt);
     for (size_t i = 0; i < nt; ++i) {
@@ -121,8 +122,8 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
     std::stable_sort(t.added_.begin(), t.added_.end(),
                      [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
 
-    int64_t rk = gguf_find_key(g, "tokenizer.ggml.merges");
-    const size_t nm = gguf_get_arr_n(g, rk);
+    int64_t rk = gguf_find_key(g, "tokenizer.ggml.merges");          // optional: a byte-only vocab has none
+    const size_t nm = rk < 0 ? 0 : gguf_get_arr_n(g, rk);
     for (size_t i = 0; i < nm; ++i) t.merge_rank_.emplace(gguf_get_arr_str(g, rk, i), (int32_t)i);
 
     auto u32 = [&](const char* k) -> int32_t {

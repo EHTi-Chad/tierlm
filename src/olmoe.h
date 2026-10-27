@@ -32,12 +32,18 @@ public:
     OlmoeModel& operator=(const OlmoeModel&) = delete;
 
     // Appends `ids` after the tokens already in the cache; returns logits for the last one.
-    // n_threads applies to whatever runs on the CPU.
-    std::vector<float> eval(const std::vector<int32_t>& ids, int n_threads);
+    // n_threads applies to whatever runs on the CPU. If `routing` is given, it receives the experts
+    // the router picked: n_tok x n_layer x n_expert_used ids, best first.
+    std::vector<float> eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing = nullptr);
     void reset() { n_past_ = 0; }                 // forget the conversation
+    void truncate(int n) { if (n < n_past_) n_past_ = n < 0 ? 0 : n; }   // keep only the first n tokens
     int n_past() const { return n_past_; }
     int max_ctx() const { return max_ctx_; }
     const std::string& device_name() const { return device_name_; }
+    uint64_t weights_bytes() const { return weights_bytes_; }
+    uint64_t kv_bytes() const { return kv_bytes_; }
+    bool on_gpu() const { return main_ != cpu_; }
+    void device_memory(size_t& free, size_t& total) const;   // of the device holding the weights
 
     // Convenience: reset, then evaluate the whole sequence.
     std::vector<float> forward(const std::vector<int32_t>& ids, int n_threads) { reset(); return eval(ids, n_threads); }
@@ -64,6 +70,8 @@ private:
     std::vector<Layer> layers_;
     std::string device_name_;
     int max_ctx_ = 0, n_past_ = 0;
+    uint64_t weights_bytes_ = 0, kv_bytes_ = 0;
+    void* dev_ = nullptr;                        // ggml_backend_dev_t of the main device
 };
 
 }
