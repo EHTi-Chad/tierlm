@@ -257,6 +257,21 @@
             <div class="help" id="exphelp">How many experts each layer uses per token. Fewer is faster but lower quality.</div>
           </div>
           <div>
+            <label for="topk">Top-k: <span id="topkv"></span></label>
+            <input id="topk" type="range" min="0" max="200" step="1" value="40">
+            <div class="help">Only consider the k most likely next words. 0 = no limit.</div>
+          </div>
+          <div>
+            <label for="topp">Top-p: <span id="toppv"></span></label>
+            <input id="topp" type="range" min="0.05" max="1" step="0.01" value="0.9">
+            <div class="help">Only consider the most likely words that add up to this share of the probability.</div>
+          </div>
+          <div>
+            <label for="minp">Min-p: <span id="minpv"></span></label>
+            <input id="minp" type="range" min="0" max="0.5" step="0.01" value="0.05">
+            <div class="help">Drop words less than this fraction as likely as the top choice. Cuts nonsense at higher temperatures.</div>
+          </div>
+          <div>
             <label for="seed">Seed</label>
             <input id="seed" type="number" value="-1" min="-1" step="1">
             <div class="help">-1 is random. Any other number makes replies repeatable at the same settings.</div>
@@ -300,6 +315,7 @@
       <textarea id="input" rows="2" placeholder="Message the model… (Enter to send, Shift+Enter for a new line)"></textarea>
       <div class="row">
         <label class="small">Temperature <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.7"> <span id="tempv">0.70</span></label>
+        <label class="small" title="Makes words used in the last 64 tokens less likely, so the model doesn't loop. 1.00 = off.">Repeat penalty <input id="rpen" type="range" min="1" max="1.5" step="0.01" value="1.1"> <span id="rpenv">1.10</span></label>
         <label class="small">Max tokens <input id="maxtok" type="range" min="32" max="1024" step="32" value="512"> <span id="maxv">512</span></label>
         <span class="grow"></span>
         <button class="ghost" id="newchat">New chat</button>
@@ -463,7 +479,8 @@ async function send(text) {
   try {
     const res = await fetch("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
-      body: JSON.stringify({ messages: history, temperature: +$("temp").value, top_p: 0.9, max_tokens: +$("maxtok").value }),
+      body: JSON.stringify({ messages: history, temperature: +$("temp").value, max_tokens: +$("maxtok").value,
+        top_p: +$("topp").value, top_k: +$("topk").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value }),
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
     const reader = res.body.getReader(), dec = new TextDecoder();
@@ -694,6 +711,9 @@ function applySaved() {
   $("exphelp").textContent = E ? `How many of the ${E} experts each layer uses per token (this model was trained with ${K}). Fewer is faster but lower quality.`
                                : "Only for mixture-of-experts models.";
   $("seed").value = s.seed ?? -1;
+  $("topk").value = s.top_k ?? 40; $("topp").value = s.top_p ?? 0.9; $("minp").value = s.min_p ?? 0.05;
+  if (s.repeat_penalty) $("rpen").value = s.repeat_penalty;
+  for (const id of ["topk", "topp", "minp", "rpen"]) $(id).oninput();
   $("forcecpu").checked = s.device === "cpu";
   $("setnote").textContent = selModel ? (md.saved && md.saved[selModel.id] ? "Using your saved settings for this model" : "Settings are remembered per model") : "";
 }
@@ -839,6 +859,10 @@ for (const id of ["ctxsel", "forcecpu"]) $(id).onchange = renderSetup;
 $("kvsel").onchange = () => { buildCtx($("ctxsel").value); renderSetup(); };
 $("thr").oninput = () => $("thrv").textContent = $("thr").value;
 $("experts").oninput = () => $("expv").textContent = $("experts").value;
+$("topk").oninput = () => $("topkv").textContent = +$("topk").value || "off";
+$("topp").oninput = () => $("toppv").textContent = (+$("topp").value).toFixed(2);
+$("minp").oninput = () => $("minpv").textContent = (+$("minp").value).toFixed(2);
+$("rpen").oninput = () => $("rpenv").textContent = (+$("rpen").value).toFixed(2);
 $("setupbtn").onclick = () => { if (!busy) showSetup(); };
 $("backbtn").onclick = () => showApp();
 $("loadbtn").onclick = async () => {
@@ -849,7 +873,8 @@ $("loadbtn").onclick = async () => {
   const exp = +$("experts").value;
   const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
-                 experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value };
+                 experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
+                 top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
   if ($("forcecpu").checked) body.device = "cpu";
   try {
     const r = await fetch("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

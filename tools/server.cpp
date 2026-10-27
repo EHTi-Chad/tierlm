@@ -14,7 +14,8 @@
 //   POST /api/load     {"model": "sub/file.gguf", "device": "auto|cpu|<device>", "ctx": 4096, "threads": 4,
 //                       "flash_attn": true, "kv_type": "f16|f32", "batch": 256, "experts_used": 0, "seed": -1}
 //   POST /api/unload   frees the model
-//   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "max_tokens":512}
+//   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "top_k":40,
+//                     "min_p":0.05, "repeat_penalty":1.1, "repeat_last_n":64, "max_tokens":512}
 //                     streams Server-Sent Events: one "prompt" event, a "token" event per token
 //                     (with the experts picked in every layer), then "done"
 //   POST /api/reset   clears the KV cache
@@ -94,27 +95,46 @@ std::string format_chat(const json& messages) {
     return s + "<|assistant|>\n";
 }
 
-// Temperature + nucleus (top-p) sampling. temperature <= 0 means always take the most likely token.
-int32_t sample(const std::vector<float>& lg, float temperature, float top_p, std::mt19937& rng) {
+// Sampling settings, as in LM Studio / llama.cpp.
+struct Sampling {
+    float temperature = 0.7f, top_p = 0.9f, min_p = 0.05f, repeat_penalty = 1.1f;
+    int top_k = 40, repeat_last_n = 64;
+};
+
+// Repetition penalty, then temperature with top-k, top-p (nucleus) and min-p filtering.
+// temperature <= 0 means always take the most likely token (after the penalty).
+int32_t sample(std::vector<float> lg, const Sampling& s, const std::vector<int32_t>& recent, std::mt19937& rng) {
+    if (s.repeat_penalty > 0.0f && s.repeat_penalty != 1.0f) {
+        // Make tokens used in the last repeat_last_n positions less likely (each token once).
+        std::vector<int32_t> seen;
+        const size_t n = std::min<size_t>(recent.size(), (size_t)std::max(0, s.repeat_last_n));
+        for (size_t i = recent.size() - n; i < recent.size(); ++i) {
+            const int32_t t = recent[i];
+            if (t < 0 || (size_t)t >= lg.size() || std::find(seen.begin(), seen.end(), t) != seen.end()) continue;
+            seen.push_back(t);
+            lg[t] = lg[t] > 0 ? lg[t] / s.repeat_penalty : lg[t] * s.repeat_penalty;
+        }
+    }
     const int32_t best = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
-    if (temperature <= 0.0f) return best;
+    if (s.temperature <= 0.0f) return best;
     const float mx = lg[best];
     std::vector<std::pair<float, int32_t>> p(lg.size());
-    double total = 0;
-    for (size_t i = 0; i < lg.size(); ++i) {
-        float w = std::exp((lg[i] - mx) / temperature);
-        p[i] = {w, (int32_t)i};
-        total += w;
-    }
-    const size_t keep = std::min<size_t>(256, p.size());     // the nucleus is always inside the top few hundred
+    for (size_t i = 0; i < lg.size(); ++i) p[i] = {std::exp((lg[i] - mx) / s.temperature), (int32_t)i};
+    size_t keep = s.top_k > 0 ? std::min<size_t>((size_t)s.top_k, p.size()) : std::min<size_t>(1024, p.size());
     std::partial_sort(p.begin(), p.begin() + keep, p.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    p.resize(keep);
+    // min-p: drop tokens less than min_p times as likely as the best one (p[0].first is 1 after scaling).
+    if (s.min_p > 0.0f) while (p.size() > 1 && p.back().first < s.min_p * p[0].first) p.pop_back();
+    double total = 0;
+    for (auto& x : p) total += x.first;
     double cum = 0;
     size_t n = 0;
-    while (n < keep && cum < top_p * total) cum += p[n++].first;
+    while (n < p.size() && cum < s.top_p * total) cum += p[n++].first;
+    if (n == 0) n = 1, cum = p[0].first;
     std::uniform_real_distribution<double> u(0.0, cum);
     double r = u(rng);
     for (size_t i = 0; i < n; ++i) { r -= p[i].first; if (r <= 0) return p[i].second; }
-    return p[n ? n - 1 : 0].second;
+    return p[n - 1].second;
 }
 
 // Length of the longest prefix of s that does not end inside a multi-byte UTF-8 character.
@@ -582,8 +602,13 @@ int main(int argc, char** argv) {
         res.set_chunked_content_provider("text/event-stream", [&, body, lock](size_t, httplib::DataSink& sink) {
             auto send = [&](const json& j) { std::string s = "data: " + dump(j) + "\n\n"; return sink.write(s.data(), s.size()); };
             try {
-                const float temperature = body.value("temperature", 0.7f);
-                const float top_p = body.value("top_p", 0.9f);
+                Sampling sp;
+                sp.temperature = body.value("temperature", sp.temperature);
+                sp.top_p = body.value("top_p", sp.top_p);
+                sp.top_k = body.value("top_k", sp.top_k);
+                sp.min_p = body.value("min_p", sp.min_p);
+                sp.repeat_penalty = body.value("repeat_penalty", sp.repeat_penalty);
+                sp.repeat_last_n = body.value("repeat_last_n", sp.repeat_last_n);
                 const int max_tokens = body.value("max_tokens", 512);
                 if (eng.seed >= 0) eng.rng.seed((uint32_t)eng.seed);    // same seed, same reply
                 auto& model = eng.model; auto& tok = eng.tok; auto& cached = eng.cached;
@@ -617,7 +642,14 @@ int main(int argc, char** argv) {
                 std::string stop = "length";
                 auto g0 = Clock::now();
                 for (int i = 0; i < max_tokens; ++i) {
-                    int32_t id = sample(lg, temperature, top_p, eng.rng);
+                    // Recent tokens for the repetition penalty, leaving out control tokens such as the
+                    // end-of-reply marker: penalising those would stop the model from finishing.
+                    std::vector<int32_t> recent;
+                    for (size_t j = cached.size(); j > 0 && (int)recent.size() < sp.repeat_last_n; --j) {
+                        const int32_t t = cached[j - 1];
+                        if (t != tok.eos() && !tok.is_control(t)) recent.push_back(t);
+                    }
+                    int32_t id = sample(lg, sp, recent, eng.rng);
                     if (id == tok.eos() || tok.is_control(id)) { stop = "end"; break; }
                     if (model->n_past() + 1 >= model->max_ctx()) { stop = "context"; break; }
                     out.push_back(id);
