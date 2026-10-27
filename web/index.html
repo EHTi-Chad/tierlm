@@ -155,6 +155,8 @@
   .menu .mi input { accent-color: var(--accent); margin-right: 6px; }
   .menu hr { border: 0; border-top: 1px solid var(--line); margin: 5px 4px; }
   .menu .sub { font-size: 11.5px; color: var(--faint); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
+  .folderrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+  .folderrow code { background: var(--panel-2); color: var(--ink); padding: 3px 8px; border-radius: 6px; font-size: 12.5px; word-break: break-all; }
   .pathform { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   .pathform input { flex: 1; min-width: 220px; font: inherit; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
   #patherr { color: var(--danger); }
@@ -192,7 +194,6 @@
     <div class="head">
       <h2>2 · GGUF models</h2>
       <div class="menuwrap">
-        <span class="caption" id="modelfolder"></span>
         <button class="tiny ghost dots" id="mbtn" title="Models folder and downloads" aria-haspopup="true">⋯</button>
         <div class="menu" id="mmenu" hidden>
           <button id="m-pick">Choose models folder…</button>
@@ -206,6 +207,7 @@
       </div>
     </div>
     <div class="body">
+      <div class="folderrow"><span>Looking in</span><code id="folderpath"></code><button class="tiny" id="chgfolder">Change folder…</button></div>
       <div class="pathform" id="pathform" hidden>
         <input id="pathin" type="text" placeholder="e.g. D:\AI\models or C:\Users\you\.lmstudio\models" spellcheck="false">
         <button class="primary tiny" id="pathok">Use folder</button>
@@ -661,7 +663,7 @@ async function loadSetup() {
     md = m; models = m.models; defCtx = m.default_ctx || 4096;
     if (dv.version) $("ver").textContent = "v" + dv.version;
   } catch (e) { $("loadmsg").textContent = "Could not reach the tierlm server."; $("loadmsg").className = "err"; return; }
-  $("modelfolder").textContent = md.folder; $("modelfolder").title = md.folder;
+  $("folderpath").textContent = md.folder + (md.recursive ? "  (and subfolders)" : "");
   $("m-rec").checked = md.recursive;
   const sg = $("m-suggest"); sg.innerHTML = "";
   for (const f of md.suggestions || []) {
@@ -682,9 +684,9 @@ async function loadSetup() {
 function applySaved() {
   const s = (selModel && md.saved && md.saved[selModel.id]) || {};
   $("thr").value = s.threads || defThreads; $("thrv").textContent = $("thr").value;
+  $("kvsel").value = s.kv_type || "f16";
   buildCtx(s.ctx || defCtx);
   $("fa").checked = s.flash_attn !== false;
-  $("kvsel").value = s.kv_type || "f16";
   $("batchsel").value = String(s.batch || 256);
   const E = (selModel && selModel.experts) || 0, K = (selModel && selModel.experts_used) || 0;
   $("experts").disabled = !E; $("experts").max = Math.max(1, E);
@@ -695,11 +697,19 @@ function applySaved() {
   $("forcecpu").checked = s.device === "cpu";
   $("setnote").textContent = selModel ? (md.saved && md.saved[selModel.id] ? "Using your saved settings for this model" : "Settings are remembered per model") : "";
 }
+// Context choices go up to the model's own limit (read from the file), with the memory each one needs.
 function buildCtx(want) {
   const max = selModel && selModel.ctx_train ? selModel.ctx_train : 4096;
-  const opts = [1024, 2048, 4096, 8192, 16384, 32768].filter(v => v <= Math.max(max, 1024));
+  const opts = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576].filter(v => v <= max);
+  if (!opts.includes(max)) opts.push(max);
+  const kvpt = (selModel && selModel.kv_bytes_per_token || 0) * ($("kvsel").value === "f32" ? 2 : 1);
   const sel = $("ctxsel"); sel.innerHTML = "";
-  for (const v of opts) { const o = document.createElement("option"); o.value = v; o.textContent = v.toLocaleString() + " tokens"; sel.appendChild(o); }
+  for (const v of opts) {
+    const o = document.createElement("option"); o.value = v;
+    const k = v >= 1024 && v % 1024 === 0 ? (v / 1024) + "K" : v.toLocaleString();
+    o.textContent = k + " tokens" + (kvpt ? " · " + fmtGiB(kvpt * v) : "") + (v === max ? " (model max)" : "");
+    sel.appendChild(o);
+  }
   sel.value = opts.includes(+want) ? want : opts.filter(v => v <= 4096).at(-1) || opts[0];
 }
 function renderWarnings() {
@@ -787,8 +797,8 @@ function renderSetup() {
       `(${fmtGiB(selModel.bytes)} model + ${fmtGiB((selModel.kv_bytes_per_token || 0) * ctx * (kv32 ? 2 : 1))} for ${ctx.toLocaleString()} tokens of context).` +
       (p.dev.free < p.need ? " That's more than is free, so loading may fail; try a shorter context or close other programs." : ""));
   }
-  $("ctxhelp").textContent = "How much conversation the model can remember. " +
-    (selModel && selModel.kv_bytes_per_token ? `Each 1,000 tokens uses about ${fmtGiB(selModel.kv_bytes_per_token * 1000 * ($("kvsel").value === "f32" ? 2 : 1))}.` : "Longer uses more memory.");
+  $("ctxhelp").textContent = "How much conversation the model can remember, up to what this model was trained for (" +
+    (selModel && selModel.ctx_train ? selModel.ctx_train.toLocaleString() + " tokens" : "unknown") + "). Longer uses more memory, shown next to each size.";
   $("loadbtn").disabled = !selModel || !p.dev;
 }
 // ⋯ menu
@@ -814,6 +824,7 @@ $("m-pick").onclick = async () => {
     if (!j.cancelled && j.folder) await setFolder(j.folder);
   } catch (e) { $("loadmsg").className = "err"; $("loadmsg").textContent = "Could not change folder: " + e.message; }
 };
+$("chgfolder").onclick = () => $("m-pick").click();
 $("m-type").onclick = () => { closeMenu(); showPathForm(); };
 $("m-rec").onchange = async () => { try { await setFolder(undefined, $("m-rec").checked); } catch (e) {} };
 $("m-rescan").onclick = () => { closeMenu(); loadSetup(); };
@@ -824,7 +835,8 @@ $("pathok").onclick = async () => {
 };
 $("pathin").onkeydown = e => { if (e.key === "Enter") $("pathok").click(); if (e.key === "Escape") $("pathcancel").click(); };
 $("rescanhw").onclick = e => { e.preventDefault(); loadSetup(); };
-for (const id of ["ctxsel", "kvsel", "forcecpu"]) $(id).onchange = renderSetup;
+for (const id of ["ctxsel", "forcecpu"]) $(id).onchange = renderSetup;
+$("kvsel").onchange = () => { buildCtx($("ctxsel").value); renderSetup(); };
 $("thr").oninput = () => $("thrv").textContent = $("thr").value;
 $("experts").oninput = () => $("expv").textContent = $("experts").value;
 $("setupbtn").onclick = () => { if (!busy) showSetup(); };
