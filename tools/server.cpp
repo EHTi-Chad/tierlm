@@ -19,7 +19,7 @@
 //                     streams Server-Sent Events: one "prompt" event, a "token" event per token
 //                     (with the experts picked in every layer), then "done"
 //   POST /api/reset   clears the KV cache
-#include "olmoe.h"
+#include "model.h"
 #include "tokenizer.h"
 #include "gguf.h"
 #include "ggml-backend.h"
@@ -83,16 +83,74 @@ std::string gguf_string(const std::string& path, const char* key) {
     return v;
 }
 
-// OLMoE-Instruct (Tulu) chat format. Control tokens are matched when encoding with parse_special.
-std::string format_chat(const json& messages) {
-    std::string s = "<|endoftext|>";
-    for (const auto& m : messages) {
-        const std::string role = m.value("role", ""), content = m.value("content", "");
-        if (role == "system")         s += "<|system|>\n" + content + "\n";
-        else if (role == "user")      s += "<|user|>\n" + content + "\n";
-        else if (role == "assistant") s += "<|assistant|>\n" + content + "<|endoftext|>\n";
+// Chat formats. Each model family wraps a conversation in its own markers; the GGUF's chat template (and
+// failing that, its vocabulary) says which one. Control tokens are matched when encoding with parse_special.
+enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Plain };
+
+const char* chat_fmt_name(ChatFmt f) {
+    switch (f) {
+        case ChatFmt::Tulu: return "tulu"; case ChatFmt::ChatML: return "chatml";
+        case ChatFmt::Llama3: return "llama3"; case ChatFmt::Mistral: return "mistral"; default: return "plain";
     }
-    return s + "<|assistant|>\n";
+}
+
+ChatFmt detect_chat(const Tokenizer& tok) {
+    const std::string& t = tok.chat_template();
+    auto has = [&](const char* s) { return t.find(s) != std::string::npos; };
+    if (has("<|im_start|>")) return ChatFmt::ChatML;
+    if (has("<|start_header_id|>")) return ChatFmt::Llama3;
+    if (has("<|user|>")) return ChatFmt::Tulu;
+    if (has("[INST]")) return ChatFmt::Mistral;
+    if (tok.find("<|im_start|>") >= 0) return ChatFmt::ChatML;
+    if (tok.find("<|start_header_id|>") >= 0) return ChatFmt::Llama3;
+    if (tok.find("<|user|>") >= 0) return ChatFmt::Tulu;
+    if (tok.find("[INST]") >= 0 || tok.spm()) return ChatFmt::Mistral;
+    return ChatFmt::Plain;
+}
+
+std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok) {
+    std::string s;
+    switch (f) {
+    case ChatFmt::Tulu: {                                 // OLMoE-Instruct / Tulu, and Zephyr (TinyLlama)
+        const bool zephyr = tok.find("<|endoftext|>") < 0;      // Zephyr ends every turn with </s>
+        const std::string end = zephyr ? "</s>" : "<|endoftext|>";
+        s = zephyr ? (tok.bos() >= 0 ? "<s>" : "") : "<|endoftext|>";
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", ""), c = m.value("content", "");
+            if (role == "system")         s += "<|system|>\n" + c + (zephyr ? end : "") + "\n";
+            else if (role == "user")      s += "<|user|>\n" + c + (zephyr ? end : "") + "\n";
+            else if (role == "assistant") s += "<|assistant|>\n" + c + end + "\n";
+        }
+        return s + "<|assistant|>\n";
+    }
+    case ChatFmt::ChatML:                                 // Qwen, and many others
+        for (const auto& m : messages)
+            s += "<|im_start|>" + m.value("role", std::string("user")) + "\n" + m.value("content", std::string()) + "<|im_end|>\n";
+        return s + "<|im_start|>assistant\n";
+    case ChatFmt::Llama3:
+        s = "<|begin_of_text|>";
+        for (const auto& m : messages)
+            s += "<|start_header_id|>" + m.value("role", std::string("user")) + "<|end_header_id|>\n\n" + m.value("content", std::string()) + "<|eot_id|>";
+        return s + "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    case ChatFmt::Mistral: {                              // Llama 2 / Mistral: [INST] ... [/INST]
+        const std::string bos = tok.bos() >= 0 ? "<s>" : "", eos = "</s>";
+        std::string sys;
+        s = bos;
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", ""), c = m.value("content", "");
+            if (role == "system") sys += c + "\n\n";
+            else if (role == "user") { s += "[INST] " + sys + c + " [/INST]"; sys.clear(); }
+            else if (role == "assistant") s += " " + c + eos;
+        }
+        return s;
+    }
+    default:
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", "");
+            s += (role == "assistant" ? "Assistant: " : role == "system" ? "System: " : "User: ") + m.value("content", std::string()) + "\n";
+        }
+        return s + "Assistant:";
+    }
 }
 
 // Sampling settings, as in LM Studio / llama.cpp.
@@ -264,8 +322,9 @@ std::string pick_folder_windows(const std::string& start, bool& cancelled) {
 
 // The loaded model and everything that belongs to it.
 struct Engine {
-    std::unique_ptr<OlmoeModel> model;
+    std::unique_ptr<Model> model;
     Tokenizer tok;
+    ChatFmt chat = ChatFmt::Plain;
     std::vector<int32_t> cached;      // the tokens currently in the KV cache
     std::string path, name;
     int threads = 1, seed = -1;
@@ -299,8 +358,16 @@ json describe_model(const std::string& path) {
     j["experts_used"] = u32(arch + ".expert_used_count");
     j["ctx_train"] = u32(arch + ".context_length");
     // KV cache cost per token of context, at f16: K and V for every layer.
-    if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * layers * (kv_heads ? kv_heads : heads) * (embd / heads) * 2;
-    if (arch == "olmoe") j["supported"] = true;
+    const int64_t head_dim = u32(arch + ".attention.key_length") ? u32(arch + ".attention.key_length") : (heads ? embd / heads : 0);
+    if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * layers * (kv_heads ? kv_heads : heads) * head_dim * 2;
+    const std::string tk = str("tokenizer.ggml.model");
+    if (arch_supported(arch) && (tk == "gpt2" || tk == "llama")) j["supported"] = true;
+    else if (arch_supported(arch)) j["reason"] = "the " + (tk.empty() ? std::string("unknown") : tk) + " tokenizer is not supported yet";
+    else if (arch == "clip") {
+        // A vision projector (mmproj file): the "eyes" of a vision model, not a model that runs on its own.
+        j["kind"] = "mmproj";
+        j["reason"] = "Vision add-on (mmproj) for a model in the same folder, not a standalone model";
+    }
     else j["reason"] = "the " + (arch.empty() ? std::string("unknown") : arch) + " architecture is not supported yet";
     gguf_free(g);
     return j;
@@ -350,14 +417,16 @@ int main(int argc, char** argv) {
         eng.cached.clear();
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
-        eng.model = OlmoeModel::load(path, opt);
+        eng.model = Model::load(path, opt);
+        eng.chat = detect_chat(eng.tok);
         eng.path = path;
         eng.name = gguf_string(path, "general.name");
         eng.threads = threads > 0 ? threads : a.threads;
         eng.seed = seed;
         if (seed >= 0) eng.rng.seed((uint32_t)seed);
         eng.load_s = since(t0);
-        std::fprintf(stderr, "loaded %s on %s in %.1fs\n", path.c_str(), eng.model->device_name().c_str(), eng.load_s);
+        std::fprintf(stderr, "loaded %s (%s, %s chat format) on %s in %.1fs\n", path.c_str(), eng.model->arch().c_str(),
+                     chat_fmt_name(eng.chat), eng.model->device_name().c_str(), eng.load_s);
     };
     if (!a.model.empty()) {
         LoadOptions o; o.max_ctx = a.ctx; o.device = a.device;
@@ -388,7 +457,8 @@ int main(int argc, char** argv) {
         eng.model->device_memory(free, total);
         json j = {
             {"loaded", true}, {"path", eng.path},
-            {"name", eng.name.empty() ? "OLMoE" : eng.name}, {"arch", "olmoe"},
+            {"name", eng.name.empty() ? fs::u8path(eng.path).stem().u8string() : eng.name}, {"arch", eng.model->arch()},
+            {"chat_format", chat_fmt_name(eng.chat)}, {"moe", hp.is_moe()},
             {"layers", hp.n_layer}, {"experts", hp.n_expert}, {"experts_used", hp.n_expert_used},
             {"vocab", hp.n_vocab}, {"ctx", eng.model->max_ctx()}, {"n_past", eng.model->n_past()},
             {"device", eng.model->device_name()}, {"on_gpu", eng.model->on_gpu()}, {"threads", eng.threads},
@@ -615,7 +685,7 @@ int main(int argc, char** argv) {
                 const auto& hp = model->hparams();
                 const int L = hp.n_layer, E = hp.n_expert, K = hp.n_expert_used;
 
-                std::vector<int32_t> toks = tok.encode(format_chat(body["messages"]), true);
+                std::vector<int32_t> toks = tok.encode(format_chat(body["messages"], eng.chat, tok), true);
                 if ((int)toks.size() + 1 >= model->max_ctx()) throw std::runtime_error("conversation is longer than the context window; start a new chat");
 
                 // Reuse whatever part of the KV cache still matches this conversation.
@@ -647,10 +717,10 @@ int main(int argc, char** argv) {
                     std::vector<int32_t> recent;
                     for (size_t j = cached.size(); j > 0 && (int)recent.size() < sp.repeat_last_n; --j) {
                         const int32_t t = cached[j - 1];
-                        if (t != tok.eos() && !tok.is_control(t)) recent.push_back(t);
+                        if (t != tok.eos() && t != tok.eot() && !tok.is_control(t)) recent.push_back(t);
                     }
                     int32_t id = sample(lg, sp, recent, eng.rng);
-                    if (id == tok.eos() || tok.is_control(id)) { stop = "end"; break; }
+                    if (id == tok.eos() || id == tok.eot() || tok.is_control(id)) { stop = "end"; break; }
                     if (model->n_past() + 1 >= model->max_ctx()) { stop = "context"; break; }
                     out.push_back(id);
                     std::string text = tok.decode(out);

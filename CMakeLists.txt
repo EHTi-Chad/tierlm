@@ -33,7 +33,7 @@ set(GGML_VULKAN ${TIERLM_VULKAN} CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/ggml)
 
-add_library(tierlm_core src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/olmoe.cpp)
+add_library(tierlm_core src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/model.cpp)
 target_include_directories(tierlm_core PUBLIC src)
 target_link_libraries(tierlm_core PUBLIC ggml)
 

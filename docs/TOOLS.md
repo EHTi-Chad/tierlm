@@ -112,7 +112,7 @@ template...).
 | Tool | Used by |
 |---|---|
 | `tierlm-tok-test model.gguf tests/tok_cases.txt` | Tokenizer test: compares token IDs with Hugging Face's, and checks decoding round-trips |
-| `tierlm-logits model.gguf [--step] id ...` | Prints last-position logits for token IDs; `--step` feeds one token per call through the KV cache. Used by `tests/tiny_olmoe.py` |
+| `tierlm-logits model.gguf [--step] id ...` | Prints last-position logits for token IDs; `--step` feeds one token per call through the KV cache. Used by `tests/tiny_models.py` |
 
 See [BUILD.md](BUILD.md#running-the-tests).
 

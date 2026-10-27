@@ -33,8 +33,9 @@ tierlm/
 ├── src/           tierlm's engine
 │   ├── model_map     reads a GGUF header: every tensor's size, type, offset, layer, role
 │   ├── planner       splits experts into units, assigns VRAM / RAM / SSD within a budget (dry run)
-│   ├── tokenizer     byte-level BPE (GPT-2 family), added tokens, Unicode tables
-│   └── olmoe         OLMoE compute graph, KV cache, flash attention, batching, device placement
+│   ├── tokenizer     byte-level BPE (GPT-2, Llama 3, Qwen splitting) and SentencePiece, added tokens
+│   └── model         one compute graph for every supported architecture, KV cache, flash attention,
+│                     batching, device placement
 ├── tools/         command-line tools and the web server
 ├── web/           the web page and dashboard (plain HTML/JS, no build step)
 ├── tests/         reference tests (Python, testing only)
@@ -71,6 +72,22 @@ attention kernels, and backends for CPU, Vulkan and CUDA. Everything that decide
 Then the chosen token is fed back in, and the loop repeats. Thanks to the KV cache, each new step processes
 only that one token.
 
+The steps above use OLMoE as the example. Other families are variations on the same design, described by a
+handful of switches in `Hparams` (src/model.h), so one graph builder runs them all:
+
+| Switch | Llama 2/3, Mistral | Mixtral | Qwen2 | Qwen3 | Qwen3 MoE | OLMoE |
+|---|---|---|---|---|---|---|
+| Feed-forward | dense | experts | dense | dense | experts | experts |
+| RoPE layout | adjacent pairs | adjacent pairs | halves (NeoX) | halves | halves | halves |
+| QK-norm | none | none | none | per head | per head | full width |
+| Q/K/V biases | no | no | yes | no | no | no |
+| Expert weights renormalised | | yes | | | yes | no |
+| Tokenizer | Llama 3 BPE / SentencePiece | SentencePiece | Qwen BPE | Qwen BPE | Qwen BPE | GPT-2 BPE |
+
+Grouped-query attention (fewer key/value heads than query heads), a head size independent of the model
+width (Qwen3), tied input/output embeddings and Llama 3.1's RoPE frequency factors are handled for all of
+them. The chat format (Tulu, ChatML, Llama 3, `[INST]`) is read from the model's own chat template.
+
 ## Memory and devices
 
 - **Weights** are read from the GGUF file into a buffer on the chosen device (`ggml_backend_alloc_ctx_tensors`
@@ -95,7 +112,8 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 |---|---|---|
 | Tokenizer | Hugging Face's OLMoE tokenizer, 14 tricky strings | All exact; all decode back byte-for-byte |
 | Pre-tokenizer | The reference split regex, ~3,000 random and edge-case strings | 0 mismatches |
-| Model graph | Plain NumPy OLMoE on a tiny random model (`tests/tiny_olmoe.py`) | ~3e-6 relative with an f32 cache, including flash attention, the KV cache and 300-token batched prompts |
+| Model graph | Plain NumPy reference of each architecture on tiny random models (`tests/tiny_models.py`: Llama, Llama 3 with RoPE factors, Mixtral, Qwen2, Qwen3, Qwen3 MoE, OLMoE) | ~2e-6 relative with an f32 cache, including flash attention, grouped-query attention, the KV cache and 300-token batched prompts |
+| Tokenizers without models | Small tokenizers trained with Hugging Face `tokenizers` and `sentencepiece` (`tests/trained_tokenizers.py`) | Exact token IDs for GPT-2, Llama 3 and Qwen2 splitting and SentencePiece |
 | Real model | "The capital of France is" | " Paris" at 62–64% on CPU and GPU |
 
 ## Design decisions so far
@@ -111,9 +129,9 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 
 ## What's next
 
-1. **A pluggable architecture layer and a second model family, Qwen3 MoE** (e.g. Qwen3-30B-A3B: 48 layers,
-   128 experts, 8 active, grouped-query attention with 4 KV heads per layer versus OLMoE's 16). At about
-   18.6 GB in Q4 it is larger than the Arc's 16 GB, which makes it the first real test of tiering.
+1. **Real-model testing of the new families**, then more families: the Qwen3.5 hybrid (Gated DeltaNet
+   linear attention), Gemma, Phi, DeepSeek, gpt-oss. Qwen3-30B-A3B (48 layers, 128 experts, 8 active, about
+   18.6 GB in Q4) is larger than the Arc's 16 GB, which makes it the first real test of tiering.
 2. **Tier loader.** Place each expert unit in VRAM, RAM or SSD per the planner: VRAM experts in a device
    buffer, RAM experts in host memory (computed on the CPU or copied to the GPU on demand), SSD experts
    read with direct I/O when routed to.

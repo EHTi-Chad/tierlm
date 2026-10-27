@@ -1,4 +1,4 @@
-#include "olmoe.h"
+#include "model.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -6,7 +6,9 @@
 #include "gguf.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -14,9 +16,16 @@
 
 namespace tierlm {
 
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe" };
+bool arch_supported(const std::string& arch) {
+    for (const char* a : kArchs) if (arch == a) return true;
+    return false;
+}
+std::vector<std::string> supported_archs() { return std::vector<std::string>(std::begin(kArchs), std::end(kArchs)); }
+
 static constexpr int kGraphSize = 16384;
 
-OlmoeModel::~OlmoeModel() {
+Model::~Model() {
     if (sched_) ggml_backend_sched_free(sched_);
     if (kvbuf_) ggml_backend_buffer_free(kvbuf_);
     if (wbuf_) ggml_backend_buffer_free(wbuf_);
@@ -26,8 +35,8 @@ OlmoeModel::~OlmoeModel() {
     if (cpu_) ggml_backend_free(cpu_);
 }
 
-std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, const LoadOptions& opt) {
-    std::unique_ptr<OlmoeModel> m(new OlmoeModel());
+std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& opt) {
+    std::unique_ptr<Model> m(new Model());
     const std::string& device = opt.device;
     const int max_ctx = opt.max_ctx;
     m->batch_ = opt.batch > 0 ? std::min(opt.batch, 2048) : 256;
@@ -87,22 +96,46 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, const Load
     };
 
     const std::string arch = str("general.architecture");
-    if (arch != "olmoe") { gguf_free(g); throw std::runtime_error("expected olmoe, got " + arch); }
-    OlmoeHparams& hp = m->hp_;
+    if (!arch_supported(arch)) { gguf_free(g); throw std::runtime_error("the " + arch + " architecture is not supported yet"); }
+    Hparams& hp = m->hp_;
+    hp.arch          = arch;
     hp.n_layer       = u32(arch + ".block_count", true);
     hp.n_embd        = u32(arch + ".embedding_length", true);
     hp.n_head        = u32(arch + ".attention.head_count", true);
     hp.n_head_kv     = u32(arch + ".attention.head_count_kv", false);
-    hp.n_ff          = u32(arch + ".feed_forward_length", true);
-    hp.n_expert      = u32(arch + ".expert_count", true);
-    hp.n_expert_used = u32(arch + ".expert_used_count", true);
+    hp.head_dim      = u32(arch + ".attention.key_length", false);
+    hp.n_rot         = u32(arch + ".rope.dimension_count", false);
+    hp.n_ff          = u32(arch + ".feed_forward_length", false);
+    hp.n_ff_exp      = u32(arch + ".expert_feed_forward_length", false);
+    hp.n_expert      = u32(arch + ".expert_count", false);
+    hp.n_expert_used = u32(arch + ".expert_used_count", false);
     hp.n_ctx         = u32(arch + ".context_length", false);
     hp.rope_base     = f32(arch + ".rope.freq_base", 10000.0f);
     hp.rms_eps       = f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     if (hp.n_head_kv == 0) hp.n_head_kv = hp.n_head;
+    if (hp.head_dim == 0) hp.head_dim = hp.n_embd / hp.n_head;
+    if (hp.n_rot == 0) hp.n_rot = hp.head_dim;
     if (hp.n_ctx == 0) hp.n_ctx = 4096;
+    if (hp.n_expert > 0 && hp.n_ff_exp == 0) hp.n_ff_exp = hp.n_ff;
+    if (hp.n_expert > 0 && hp.n_expert_used == 0) { gguf_free(g); throw std::runtime_error("missing key " + arch + ".expert_used_count"); }
+    {   // RoPE scaling: "linear" stretches positions; Llama 3.1-style factors come as a rope_freqs tensor instead
+        const std::string type = str((arch + ".rope.scaling.type").c_str());
+        const float factor = f32(arch + ".rope.scaling.factor", 1.0f);
+        if (type == "linear" && factor > 0) hp.rope_scale = 1.0f / factor;
+        else if (!type.empty() && type != "none" && factor > 1.0f)
+            std::fprintf(stderr, "warning: rope scaling '%s' is not supported yet; contexts beyond the original length will degrade\n", type.c_str());
+    }
+    // The variations
+    hp.rope_neox     = arch != "llama";
+    hp.qk_norm       = arch == "olmoe" ? Hparams::kFull : (arch == "qwen3" || arch == "qwen3moe") ? Hparams::kPerHead : Hparams::kNone;
+    hp.qkv_bias      = arch == "qwen2";
+    hp.expert_renorm = arch == "qwen3moe" || arch == "llama";   // Mixtral and Qwen3-MoE renormalise; OLMoE doesn't
+    if (arch == "qwen3moe") {
+        int64_t id = gguf_find_key(g, (arch + ".expert_weights_norm").c_str());
+        if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL) hp.expert_renorm = gguf_get_val_bool(g, id);
+    }
     m->n_expert_used_file_ = hp.n_expert_used;
-    if (opt.experts_used > 0) hp.n_expert_used = std::min(opt.experts_used, hp.n_expert);
+    if (opt.experts_used > 0 && hp.n_expert > 0) hp.n_expert_used = std::min(opt.experts_used, hp.n_expert);
 
     // ---- allocate every weight on the device, then stream the data in from the file ----
     m->wbuf_ = ggml_backend_alloc_ctx_tensors(m->wctx_, m->main_);
@@ -129,10 +162,11 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, const Load
         if (!t && required) throw std::runtime_error("missing tensor " + name);
         return t;
     };
-    m->tok_embd_ = T("token_embd.weight");
-    m->out_norm_ = T("output_norm.weight");
-    m->output_   = T("output.weight", false);
-    if (!m->output_) m->output_ = m->tok_embd_;   // tied embeddings
+    m->tok_embd_   = T("token_embd.weight");
+    m->out_norm_   = T("output_norm.weight");
+    m->output_     = T("output.weight", false);
+    m->rope_freqs_ = T("rope_freqs.weight", false);   // Llama 3.1+ long-context frequency factors
+    if (!m->output_) m->output_ = m->tok_embd_;      // tied embeddings
     hp.n_vocab = (int)m->tok_embd_->ne[1];
 
     for (int i = 0; i < hp.n_layer; ++i) {
@@ -143,18 +177,30 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, const Load
         L.wk        = T(b + "attn_k.weight");
         L.wv        = T(b + "attn_v.weight");
         L.wo        = T(b + "attn_output.weight");
-        L.q_norm    = T(b + "attn_q_norm.weight");
-        L.k_norm    = T(b + "attn_k_norm.weight");
+        L.bq        = T(b + "attn_q.bias", hp.qkv_bias);
+        L.bk        = T(b + "attn_k.bias", hp.qkv_bias);
+        L.bv        = T(b + "attn_v.bias", hp.qkv_bias);
+        if (hp.qk_norm != Hparams::kNone) {
+            L.q_norm = T(b + "attn_q_norm.weight");
+            L.k_norm = T(b + "attn_k_norm.weight");
+        }
         L.ffn_norm  = T(b + "ffn_norm.weight");
-        L.router    = T(b + "ffn_gate_inp.weight");
-        L.gate      = T(b + "ffn_gate_exps.weight");
-        L.up        = T(b + "ffn_up_exps.weight");
-        L.down      = T(b + "ffn_down_exps.weight");
+        if (hp.is_moe()) {
+            L.router = T(b + "ffn_gate_inp.weight");
+            L.gate_x = T(b + "ffn_gate_exps.weight", false);
+            if (!L.gate_x) throw std::runtime_error("this file stores experts as separate tensors (an old Mixtral GGUF); re-download a newer conversion");
+            L.up_x   = T(b + "ffn_up_exps.weight");
+            L.down_x = T(b + "ffn_down_exps.weight");
+        } else {
+            L.gate = T(b + "ffn_gate.weight");
+            L.up   = T(b + "ffn_up.weight");
+            L.down = T(b + "ffn_down.weight");
+        }
         m->layers_.push_back(L);
     }
 
     // ---- KV cache on the same device, in f16: half the size and memory traffic of f32 ----
-    const int hd = hp.n_embd / hp.n_head;
+    const int hd = hp.head_dim;
     m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
     // TIERLM_KV_F32=1 keeps it in f32 (exact; used by the tests to check the attention math).
     m->kv_f32_ = opt.kv_f32 >= 0 ? opt.kv_f32 == 1 : std::getenv("TIERLM_KV_F32") != nullptr;
@@ -190,21 +236,21 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, const Load
     return m;
 }
 
-bool OlmoeModel::integrated_gpu() const {
+bool Model::integrated_gpu() const {
     return dev_ && ggml_backend_dev_type((ggml_backend_dev_t)dev_) == GGML_BACKEND_DEVICE_TYPE_IGPU;
 }
 
-void OlmoeModel::device_memory(size_t& free, size_t& total) const {
+void Model::device_memory(size_t& free, size_t& total) const {
     free = total = 0;
     if (dev_) ggml_backend_dev_memory((ggml_backend_dev_t)dev_, &free, &total);
 }
 
 // Builds the compute graph for n_tok new tokens placed after n_past cached ones.
 // Only a description: the scheduler allocates its memory on the right device later.
-OlmoeModel::Graph OlmoeModel::build(int n_tok, int n_past, bool want_routing) {
-    const OlmoeHparams& hp = hp_;
+Model::Graph Model::build(int n_tok, int n_past, bool want_routing) {
+    const Hparams& hp = hp_;
     const int n_kv = n_past + n_tok;
-    const int hd = hp.n_embd / hp.n_head;
+    const int hd = hp.head_dim;
 
     Graph g;
     ggml_init_params ip{ graph_mem_.size(), graph_mem_.data(), /*no_alloc=*/true };
@@ -225,16 +271,24 @@ OlmoeModel::Graph OlmoeModel::build(int n_tok, int n_past, bool want_routing) {
     for (const Layer& L : layers_) {
         // ---- attention ----
         ggml_tensor* h = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.attn_norm);
-        ggml_tensor* q = ggml_mul_mat(c, L.wq, h);
+        ggml_tensor* q = ggml_mul_mat(c, L.wq, h);                            // [n_head*hd, n_tok]
         ggml_tensor* k = ggml_mul_mat(c, L.wk, h);
         ggml_tensor* v = ggml_mul_mat(c, L.wv, h);
-        q = ggml_mul(c, ggml_rms_norm(c, q, hp.rms_eps), L.q_norm);          // OLMoE: QK-norm over the full width
-        k = ggml_mul(c, ggml_rms_norm(c, k, hp.rms_eps), L.k_norm);
+        if (L.bq) { q = ggml_add(c, q, L.bq); k = ggml_add(c, k, L.bk); v = ggml_add(c, v, L.bv); }
+        if (hp.qk_norm == Hparams::kFull) {                                  // OLMoE: over the full width
+            q = ggml_mul(c, ggml_rms_norm(c, q, hp.rms_eps), L.q_norm);
+            k = ggml_mul(c, ggml_rms_norm(c, k, hp.rms_eps), L.k_norm);
+        }
         q = ggml_reshape_3d(c, q, hd, hp.n_head, n_tok);
         k = ggml_reshape_3d(c, k, hd, hp.n_head_kv, n_tok);
         v = ggml_reshape_3d(c, v, hd, hp.n_head_kv, n_tok);
-        q = ggml_rope_ext(c, q, g.pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-        k = ggml_rope_ext(c, k, g.pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        if (hp.qk_norm == Hparams::kPerHead) {                               // Qwen3: per head
+            q = ggml_mul(c, ggml_rms_norm(c, q, hp.rms_eps), L.q_norm);
+            k = ggml_mul(c, ggml_rms_norm(c, k, hp.rms_eps), L.k_norm);
+        }
+        const int mode = hp.rope_neox ? GGML_ROPE_TYPE_NEOX : 0;
+        q = ggml_rope_ext(c, q, g.pos, rope_freqs_, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
+        k = ggml_rope_ext(c, k, g.pos, rope_freqs_, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
 
         // Write this batch's keys/values into the cache at positions [n_past, n_kv). These copies are
         // added to the graph first, so they run before the attention below reads the cache.
@@ -260,21 +314,32 @@ OlmoeModel::Graph OlmoeModel::build(int n_tok, int n_past, bool want_routing) {
             o = ggml_mul_mat(c, V, kq);                                      // [hd, n_tok, n_head]
             o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));                // [hd, n_head, n_tok]
         }
-        o = ggml_reshape_2d(c, o, hp.n_embd, n_tok);
+        o = ggml_reshape_2d(c, o, hd * hp.n_head, n_tok);
         x = ggml_add(c, x, ggml_mul_mat(c, L.wo, o));
 
-        // ---- mixture of experts ----
         h = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.ffn_norm);
+        if (!hp.is_moe()) {
+            // ---- dense SwiGLU feed-forward ----
+            ggml_tensor* act = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, L.gate, h)), ggml_mul_mat(c, L.up, h));
+            x = ggml_add(c, x, ggml_mul_mat(c, L.down, act));
+            continue;
+        }
+        // ---- mixture of experts ----
         ggml_tensor* probs = ggml_soft_max(c, ggml_mul_mat(c, L.router, h)); // [n_expert, n_tok]
         ggml_tensor* order = ggml_argsort(c, probs, GGML_SORT_ORDER_DESC);  // [n_expert, n_tok] best first
         ggml_tensor* sel   = ggml_view_2d(c, order, hp.n_expert_used, n_tok, order->nb[1], 0);   // top n_used
         if (want_routing) { ggml_set_output(order); g.orders.push_back(order); }
         ggml_tensor* w     = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, hp.n_expert, n_tok), sel); // [1, n_used, n_tok]
+        if (hp.expert_renorm) {                                             // chosen weights sum to 1
+            ggml_tensor* w2 = ggml_reshape_2d(c, w, hp.n_expert_used, n_tok);
+            w2 = ggml_div(c, w2, ggml_sum_rows(c, w2));
+            w = ggml_reshape_3d(c, w2, 1, hp.n_expert_used, n_tok);
+        }
         ggml_tensor* h3    = ggml_reshape_3d(c, h, hp.n_embd, 1, n_tok);
-        ggml_tensor* up    = ggml_mul_mat_id(c, L.up, h3, sel);              // [n_ff, n_used, n_tok]
-        ggml_tensor* gate  = ggml_mul_mat_id(c, L.gate, h3, sel);
+        ggml_tensor* up    = ggml_mul_mat_id(c, L.up_x, h3, sel);            // [n_ff_exp, n_used, n_tok]
+        ggml_tensor* gate  = ggml_mul_mat_id(c, L.gate_x, h3, sel);
         ggml_tensor* act   = ggml_mul(c, ggml_silu(c, gate), up);
-        ggml_tensor* down  = ggml_mul_mat_id(c, L.down, act, sel);           // [n_embd, n_used, n_tok]
+        ggml_tensor* down  = ggml_mul_mat_id(c, L.down_x, act, sel);         // [n_embd, n_used, n_tok]
         down = ggml_mul(c, down, w);                                         // weight each expert's output
         ggml_tensor* moe = nullptr;
         for (int e = 0; e < hp.n_expert_used; ++e) {
@@ -293,7 +358,7 @@ OlmoeModel::Graph OlmoeModel::build(int n_tok, int n_past, bool want_routing) {
 }
 
 // Long prompts are processed in batches of batch_ tokens, which bounds the memory a single graph needs.
-std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing) {
+std::vector<float> Model::eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing) {
     if (ids.empty()) return {};
     if (n_past_ + (int)ids.size() > max_ctx_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens)");
     if (routing) routing->clear();
@@ -307,8 +372,8 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
     return lg;
 }
 
-std::vector<float> OlmoeModel::eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing) {
-    const OlmoeHparams& hp = hp_;
+std::vector<float> Model::eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing) {
+    const Hparams& hp = hp_;
     const int n_past = n_past_, n_kv = n_past + n_tok;
     Graph g = build(n_tok, n_past, routing != nullptr);
 

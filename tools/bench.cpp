@@ -1,7 +1,7 @@
 // tierlm-bench: generation speed at different context lengths.
 //   tierlm-bench model.gguf [-d auto|cpu|gpu] [-t threads] [contexts...]     e.g. tierlm-bench m.gguf 64 512 1024 2048
 // For each context length: fill the cache with that many tokens, then time 32 single-token steps.
-#include "olmoe.h"
+#include "model.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
     if (ctxs.empty()) ctxs = {64, 512, 1024, 2048};
     const int steps = 32;
     try {
-        auto m = OlmoeModel::load(argv[1], *std::max_element(ctxs.begin(), ctxs.end()) + steps + 8, device);
+        auto m = Model::load(argv[1], *std::max_element(ctxs.begin(), ctxs.end()) + steps + 8, device);
         std::printf("device: %s | KV cache %s | flash attention %s | %d CPU threads\n",
                     m->device_name().c_str(), m->kv_type(), m->flash_attn() ? "on" : "off", threads);
         m->eval(std::vector<int32_t>(16, 1), threads);   // warm-up (first use compiles GPU pipelines)

@@ -1,5 +1,5 @@
 // tierlm-run: tokenize a prompt, run OLMoE, and generate text greedily.
-#include "olmoe.h"
+#include "model.h"
 #include "tokenizer.h"
 #include <algorithm>
 #include <chrono>
@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
     try {
         auto t0 = Clock::now();
         Tokenizer tok = Tokenizer::from_gguf(argv[1]);
-        auto model = OlmoeModel::load(argv[1], n_ctx, device);
+        auto model = Model::load(argv[1], n_ctx, device);
         const auto& hp = model->hparams();
         std::fprintf(stderr, "device: %s\nloaded in %.1fs | %d layers, %d experts (%d active), vocab %d, ctx %d, %d CPU threads\n",
                      model->device_name().c_str(), since(t0), hp.n_layer, hp.n_expert, hp.n_expert_used, hp.n_vocab, model->max_ctx(), n_threads);

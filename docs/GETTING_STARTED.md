@@ -2,8 +2,8 @@
 
 This guide gets you from nothing to chatting with a model in your browser. No programming needed.
 
-tierlm is an early-stage project: it currently runs **one model family (OLMoE)**. See
-[Supported models](#supported-models) before downloading anything.
+tierlm is an early-stage project: it runs the most common model families (Llama, Mistral, Qwen, OLMoE) but not
+yet everything on Hugging Face. See [Supported models](#supported-models) before downloading anything.
 
 ## What you need
 
@@ -91,14 +91,23 @@ Close the black tierlm window, or press **Ctrl+C** in it.
 
 ## Supported models
 
-| Model | File | Status |
-|---|---|---|
-| OLMoE-1B-7B-0924-Instruct | `OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf` | Tested |
-| OLMoE-1B-7B-0924-Instruct, other quantizations | e.g. `Q5_K_M`, `Q6_K`, `Q8_0` | Should work, not yet tested |
-| OLMoE-1B-7B-0924 (base, not instruct) | | Runs, but isn't tuned for chat |
-| Anything else (Llama, Qwen, Mistral, DeepSeek, ...) | | **Not supported yet.** tierlm will say "expected olmoe" |
+tierlm reads the architecture from the file. The setup screen marks each model as supported or says why not.
 
-Qwen3 MoE models are next on the [roadmap](../README.md#roadmap).
+| Family | GGUF architecture | Examples | Status |
+|---|---|---|---|
+| OLMoE | `olmoe` | OLMoE-1B-7B-0924-Instruct | Tested on real hardware |
+| Qwen3 | `qwen3` | Qwen3-0.6B ... Qwen3-32B | New: model math verified, real-model test pending |
+| Qwen3 MoE | `qwen3moe` | Qwen3-30B-A3B, Qwen3-235B-A22B | New: model math verified, real-model test pending |
+| Qwen2 / 2.5 | `qwen2` | Qwen2.5-7B-Instruct, Qwen2.5-Coder | New: model math verified, real-model test pending |
+| Llama 3 / 3.1 / 3.2 / 3.3 | `llama` | Llama-3.2-3B-Instruct, Llama-3.1-8B-Instruct | New: model math verified, real-model test pending |
+| Llama 2, Mistral 7B, Mixtral, TinyLlama | `llama` | Mistral-7B-Instruct, Mixtral-8x7B | New: model math verified, real-model test pending |
+| Qwen3.5 / 3.6 hybrid | `qwen35` | Qwen3.8-27B | Not yet (planned) |
+| Gemma, Phi, DeepSeek, GLM, gpt-oss, ... | various | | Not yet |
+
+A `mmproj-*.gguf` file next to a model is its **vision add-on** (for reading images). tierlm lists it but
+doesn't use it yet.
+
+The OLMoE file used in this guide is the safe choice to start with.
 
 ## Options
 

@@ -365,7 +365,12 @@
       </div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" id="densecard" hidden>
+      <div class="head"><h2>Model type</h2></div>
+      <div class="body"><div class="note" id="densenote" style="margin:0"></div></div>
+    </div>
+
+    <div class="card wide" id="mapcard">
       <div class="head">
         <h2>Expert activity map</h2>
         <div class="row">
@@ -385,7 +390,7 @@
       </div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" id="hitcard">
       <div class="head"><h2>Hot-expert cache preview</h2></div>
       <div class="body">
         <div class="row">
@@ -416,25 +421,29 @@ async function loadInfo() {
   if (info.version) $("ver").textContent = "v" + info.version;
   if (!info.loaded) { info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "setup"; showSetup(); return; }
   showApp();
-  L = info.layers; E = info.experts; K = info.experts_used;
+  L = info.layers; E = info.experts || 0; K = info.experts_used || 0;
   counts = new Float64Array(L * E); flash = new Float64Array(L * E);
-  $("slots").max = E; $("slots").value = Math.max(1, Math.round(E / 4));
+  $("slots").max = Math.max(1, E); $("slots").value = Math.max(1, Math.round(E / 4));
+  const moe = E > 0;
+  $("mapcard").hidden = !moe; $("hitcard").hidden = !moe; $("densecard").hidden = moe;
+  $("densenote").textContent = moe ? "" : `${info.name} is a dense model: every token uses all of its ${L} layers, so there are no experts to map. ` +
+    "For dense models, tiering will place whole layers in VRAM, RAM or SSD instead of individual experts.";
   $("devname").textContent = info.device;
   $("devdot").classList.toggle("on", info.on_gpu);
   $("modelname").textContent = info.name;
-  $("arch").textContent = info.arch.toUpperCase() + ", vocab " + info.vocab.toLocaleString();
-  $("lx").textContent = L + " × " + E + " = " + (L * E).toLocaleString();
-  $("active").textContent = K + " of " + E + " experts per layer";
+  $("arch").textContent = info.arch.toUpperCase() + ", vocab " + info.vocab.toLocaleString() + (info.chat_format ? ", " + info.chat_format + " chat" : "");
+  $("lx").textContent = E ? L + " × " + E + " = " + (L * E).toLocaleString() : L + " layers (dense)";
+  $("active").textContent = E ? K + " of " + E + " experts per layer" : "all weights, every token";
   $("ctxof").textContent = "/ " + info.ctx.toLocaleString() + " tokens";
   setContext(info.n_past);
   const w = info.weights_bytes, kv = info.kv_bytes;
   if (info.on_gpu) {
     $("t-vram").textContent = fmtGiB(w + kv);
-    $("t-vram-sub").textContent = "all " + (L * E).toLocaleString() + " experts + KV cache";
+    $("t-vram-sub").textContent = (E ? "all " + (L * E).toLocaleString() + " experts" : "all " + L + " layers") + " + KV cache";
     $("t-ram").textContent = "0 GiB"; $("t-ram-sub").textContent = "spill-over tier (not needed yet)";
   } else {
     $("t-vram").textContent = "0 GiB"; $("t-vram-sub").textContent = "no GPU in use";
-    $("t-ram").textContent = fmtGiB(w + kv); $("t-ram-sub").textContent = "all experts + KV cache";
+    $("t-ram").textContent = fmtGiB(w + kv); $("t-ram-sub").textContent = (E ? "all experts" : "all layers") + " + KV cache";
   }
   const used = info.device_total - info.device_free;
   $("devmem").textContent = info.device + ": " + fmtGiB(used) + " used of " + fmtGiB(info.device_total) +
@@ -556,6 +565,7 @@ function hexToRgb(h) { h = h.replace("#", ""); return [0, 2, 4].map(i => parseIn
 let last = performance.now();
 function draw(now) {
   const dt = (now - last) / 1000; last = now;
+  if (!E || !L) { requestAnimationFrame(draw); return; }
   const W = map.width, H = map.height, cw = W / E, ch = H / L, gap = Math.max(1, Math.round(Math.min(cw, ch) * 0.12));
   mctx.clearRect(0, 0, W, H);
   let mx = 0; for (let i = 0; i < counts.length; i++) mx = Math.max(mx, counts[i]);
@@ -611,6 +621,7 @@ map.addEventListener("mouseleave", () => $("tip").style.display = "none");
 
 // ---------- hot-cache preview ----------
 function updateHits() {
+  if (!E) return;
   const k = Math.min(+$("slots").value, E);
   $("slotsv").textContent = k;
   let hits = 0, all = 0;
@@ -714,7 +725,7 @@ function applySaved() {
   $("topk").value = s.top_k ?? 40; $("topp").value = s.top_p ?? 0.9; $("minp").value = s.min_p ?? 0.05;
   if (s.repeat_penalty) $("rpen").value = s.repeat_penalty;
   for (const id of ["topk", "topp", "minp", "rpen"]) $(id).oninput();
-  $("forcecpu").checked = s.device === "cpu";
+  $("forcecpu").checked = !!s.force_cpu;
   $("setnote").textContent = selModel ? (md.saved && md.saved[selModel.id] ? "Using your saved settings for this model" : "Settings are remembered per model") : "";
 }
 // Context choices go up to the model's own limit (read from the file), with the memory each one needs.
@@ -800,9 +811,11 @@ function renderSetup() {
     const add = tagger(lab.querySelector(".tags"));
     if (m.supported) {
       add("Supported", "good");
-      if (m.experts) add(m.experts_used + " of " + m.experts + " experts per token");
+      if (m.experts) add(m.experts_used + " of " + m.experts + " experts per token"); else add("Dense");
+      if (m.arch) add(m.arch);
       if (m.layers) add(m.layers + " layers");
-    } else add(m.reason || "Not supported", "bad");
+    } else if (m.kind === "mmproj") add("Vision add-on (mmproj): used together with its model, not on its own", "warn");
+    else add(m.reason || "Not supported", "bad");
     if (m.supported) lab.onclick = e => { e.preventDefault(); if (selModel && selModel.id === m.id) return; selModel = m; applySaved(); renderSetup(); };
     ml.appendChild(lab);
   }
@@ -874,7 +887,7 @@ $("loadbtn").onclick = async () => {
   const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
+                 force_cpu: $("forcecpu").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
   if ($("forcecpu").checked) body.device = "cpu";
   try {
     const r = await fetch("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

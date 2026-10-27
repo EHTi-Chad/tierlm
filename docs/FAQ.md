@@ -8,8 +8,9 @@ NVIDIA GeForce), replies are typically 1.5 to 2 times faster. The pill at the to
 device is in use.
 
 **Can I use a different model?**
-Not yet. tierlm currently understands one model family, OLMoE. Other GGUF files fail with "expected olmoe".
-Qwen3 MoE support is next. See [Supported models](GETTING_STARTED.md#supported-models).
+Yes, for the common families: Llama (2, 3.x), Mistral and Mixtral, Qwen2/2.5, Qwen3 and Qwen3 MoE, and OLMoE.
+More families are being added. The setup screen says which of your files are supported, and why the others
+aren't. See [Supported models](GETTING_STARTED.md#supported-models).
 
 **Does anything leave my computer?**
 No. The model runs entirely on your machine, and the web page talks only to `127.0.0.1` (your own computer).
@@ -25,8 +26,13 @@ efficient, but very long chats still slow down. Click **New chat** to start fres
 on the dashboard shows the effect.
 
 **Is the model always right?**
-No. OLMoE-1B-7B is a small model (about 1 billion active parameters). It's good for experiments and simple
-questions, but it makes mistakes and can state wrong things confidently.
+No. Small models such as OLMoE-1B-7B (about 1 billion active parameters) are good for experiments and simple
+questions, but they make mistakes and can invent things confidently, such as code libraries that don't exist.
+Bigger models are much more reliable.
+
+**Replies repeat themselves or go on forever**
+Raise **Repeat penalty** (next to Temperature) a little, for example to 1.15. Very small models loop more
+easily, especially on vague prompts.
 
 ## Problems
 
@@ -39,7 +45,9 @@ Put a supported `.gguf` file in the `models` folder next to `start-tierlm.bat` (
 folder), or use the **⋯** menu to choose the folder where your models already are, then click **Rescan**. See [Getting started](GETTING_STARTED.md#step-2-download-the-model).
 
 **My model shows as "not supported yet"**
-tierlm only runs OLMoE models so far. The label says which architecture the file is.
+The label says which architecture (or tokenizer) the file uses that tierlm doesn't support yet, for example
+`qwen35` or `gemma3`. A file labelled **Vision add-on (mmproj)** isn't a model on its own: it's the image part of
+the model next to it.
 
 **How does tierlm choose between my GPU and CPU?**
 Automatically. It uses a dedicated GPU if the model fits in its memory, then integrated graphics, then the CPU

@@ -153,16 +153,23 @@ for testing and is not part of the engine.
 python3 -m venv ~/tierlm-oracle
 ~/tierlm-oracle/bin/pip install tokenizers huggingface_hub gguf numpy
 
-# Model math (no real model needed: builds a tiny random OLMoE)
-~/tierlm-oracle/bin/python tests/tiny_olmoe.py build/tierlm-logits
+# Model math for every architecture (no real model needed: builds tiny random models)
+~/tierlm-oracle/bin/python tests/tiny_models.py build/tierlm-logits
 
-# Tokenizer (needs the real OLMoE GGUF; reference IDs are already in tests/tok_cases.txt)
+# Tokenizers, without any model: trains small BPE and SentencePiece tokenizers and compares
+~/tierlm-oracle/bin/pip install sentencepiece
+~/tierlm-oracle/bin/python tests/trained_tokenizers.py build/tierlm-tok-test
+
+# Tokenizers of real models against their official Hugging Face tokenizers
+~/tierlm-oracle/bin/python tests/check_real_models.py build/tierlm-tok-test ~/models/Qwen3-0.6B-Q8_0.gguf=Qwen/Qwen3-0.6B
+
+# OLMoE tokenizer (reference IDs are already in tests/tok_cases.txt)
 ./build/tierlm-tok-test ~/models/OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf tests/tok_cases.txt
 ```
 
-`tiny_olmoe.py` runs two passes: with an exact f32 KV cache, results must match the NumPy reference to about
-1e-6; with the normal f16 cache, they must agree within rounding and pick the same top token. Both print
-`PASS` when everything is right.
+`tiny_models.py` runs two passes per architecture: with an exact f32 KV cache, results must match the NumPy
+reference to about 1e-6; with the normal f16 cache, they must agree within rounding and pick the same top
+token. Each test prints `PASS` when everything is right.
 
 To regenerate the tokenizer cases or the Unicode tables (only needed when changing them):
 

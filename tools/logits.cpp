@@ -1,7 +1,7 @@
 // Prints the last-position logits for a list of token ids. Used by the tests.
 //   tierlm-logits model.gguf id [id ...]          whole sequence in one call
 //   tierlm-logits model.gguf --step id [id ...]   first id alone, then one id per call (exercises the KV cache)
-#include "olmoe.h"
+#include "model.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
         bool step = !std::strcmp(argv[2], "--step");
         std::vector<int32_t> ids;
         for (int i = step ? 3 : 2; i < argc; ++i) ids.push_back(std::atoi(argv[i]));
-        auto m = OlmoeModel::load(argv[1], std::max<int>(512, (int)ids.size() + 8));
+        auto m = Model::load(argv[1], std::max<int>(512, (int)ids.size() + 8));
         const int nt = std::getenv("TIERLM_THREADS") ? std::atoi(std::getenv("TIERLM_THREADS")) : std::max(1, (int)std::thread::hardware_concurrency() / 2);
 
         std::vector<float> lg;
