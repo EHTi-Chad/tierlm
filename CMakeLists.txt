@@ -10,7 +10,7 @@ option(TIERLM_CUDA "Build ggml with CUDA" OFF)
 set(GGML_CUDA ${TIERLM_CUDA} CACHE BOOL "" FORCE)
 add_subdirectory(third_party/ggml)
 
-add_library(tierlm_core src/model_map.cpp src/planner.cpp src/tokenizer.cpp)
+add_library(tierlm_core src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/olmoe.cpp)
 target_include_directories(tierlm_core PUBLIC src)
 target_link_libraries(tierlm_core PUBLIC ggml)
 
@@ -25,3 +25,9 @@ target_link_libraries(tierlm-kv PRIVATE ggml)
 
 add_executable(tierlm-tok-test tools/tok_test.cpp)
 target_link_libraries(tierlm-tok-test PRIVATE tierlm_core)
+
+add_executable(tierlm-logits tools/logits.cpp)
+target_link_libraries(tierlm-logits PRIVATE tierlm_core)
+
+add_executable(tierlm-run tools/run.cpp)
+target_link_libraries(tierlm-run PRIVATE tierlm_core)
