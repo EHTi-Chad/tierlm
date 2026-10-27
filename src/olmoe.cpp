@@ -8,9 +8,12 @@
 
 namespace tierlm {
 
-OlmoeModel::~OlmoeModel() { if (wctx_) ggml_free(wctx_); }
+OlmoeModel::~OlmoeModel() {
+    if (kvctx_) ggml_free(kvctx_);
+    if (wctx_) ggml_free(wctx_);
+}
 
-std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path) {
+std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ctx) {
     std::unique_ptr<OlmoeModel> m(new OlmoeModel());
     gguf_init_params params{ /*no_alloc=*/false, /*ctx=*/&m->wctx_ };   // reads all weights into RAM
     gguf_context* g = gguf_init_from_file(path.c_str(), params);
@@ -72,19 +75,34 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path) {
         L.down      = T(b + "ffn_down_exps.weight");
         m->layers_.push_back(L);
     }
+
+    // KV cache: f32 for now (exact); smaller types come later.
+    const int hd = hp.n_embd / hp.n_head;
+    m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
+    const size_t kv_bytes = (size_t)2 * hp.n_layer * hd * hp.n_head_kv * m->max_ctx_ * sizeof(float);
+    ggml_init_params kp{ kv_bytes + (size_t)2 * hp.n_layer * ggml_tensor_overhead() + 4096, nullptr, false };
+    m->kvctx_ = ggml_init(kp);
+    if (!m->kvctx_) throw std::runtime_error("failed to allocate KV cache");
+    for (auto& L : m->layers_) {
+        L.k_cache = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hd, hp.n_head_kv, m->max_ctx_);
+        L.v_cache = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hd, hp.n_head_kv, m->max_ctx_);
+    }
     return m;
 }
 
-std::vector<float> OlmoeModel::forward(const std::vector<int32_t>& ids, int n_threads) const {
+std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threads) {
     const OlmoeHparams& hp = hp_;
     const int n_tok = (int)ids.size();
     if (n_tok == 0) return {};
+    const int n_past = n_past_;
+    const int n_kv = n_past + n_tok;              // tokens visible to attention after this call
+    if (n_kv > max_ctx_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens)");
     const int hd = hp.n_embd / hp.n_head;
 
     // Scratch memory for activations, sized generously for this sequence length.
     const size_t per_layer = (size_t)n_tok * ((size_t)hp.n_embd * 4 * 24 + (size_t)hp.n_expert * 4 * 4 +
                                               (size_t)hp.n_expert_used * hp.n_ff * 4 * 4 +
-                                              (size_t)hp.n_head * n_tok * 4 * 4);
+                                              (size_t)hp.n_head * n_kv * 4 * 4);
     const size_t mem = (size_t)256 * 1024 * 1024 + per_layer * hp.n_layer + (size_t)hp.n_vocab * 4 * 2;
     ggml_init_params ip{ mem, nullptr, false };
     ggml_context* c = ggml_init(ip);
@@ -93,8 +111,9 @@ std::vector<float> OlmoeModel::forward(const std::vector<int32_t>& ids, int n_th
     ggml_tensor* inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
     std::memcpy(inp->data, ids.data(), sizeof(int32_t) * n_tok);
     ggml_tensor* pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
-    for (int i = 0; i < n_tok; ++i) ((int32_t*)pos->data)[i] = i;
+    for (int i = 0; i < n_tok; ++i) ((int32_t*)pos->data)[i] = n_past + i;
 
+    ggml_cgraph* gf = ggml_new_graph_custom(c, 16384, false);
     ggml_tensor* x = ggml_get_rows(c, tok_embd_, inp);                     // [n_embd, n_tok]
     for (const Layer& L : layers_) {
         // ---- attention ----
@@ -110,13 +129,22 @@ std::vector<float> OlmoeModel::forward(const std::vector<int32_t>& ids, int n_th
         q = ggml_rope_ext(c, q, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         k = ggml_rope_ext(c, k, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
+        // Write this call's keys/values into the cache at positions [n_past, n_kv). These copies are
+        // added to the graph first, so they run before the attention below reads the cache.
+        const size_t knb1 = L.k_cache->nb[1], knb2 = L.k_cache->nb[2];
+        const size_t vnb1 = L.v_cache->nb[1], vnb2 = L.v_cache->nb[2];
+        ggml_build_forward_expand(gf, ggml_cpy(c, k, ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_tok, knb1, knb2, (size_t)n_past * knb2)));
+        ggml_build_forward_expand(gf, ggml_cpy(c, v, ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_tok, vnb1, vnb2, (size_t)n_past * vnb2)));
+        ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_kv, knb1, knb2, 0);   // all tokens so far
+        ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_kv, vnb1, vnb2, 0);
+
         ggml_tensor* Q  = ggml_permute(c, q, 0, 2, 1, 3);                    // [hd, n_tok, n_head]
-        ggml_tensor* K  = ggml_permute(c, k, 0, 2, 1, 3);
-        ggml_tensor* kq = ggml_mul_mat(c, K, Q);                             // [n_tok(k), n_tok(q), n_head]
+        ggml_tensor* K  = ggml_permute(c, kall, 0, 2, 1, 3);                 // [hd, n_kv, n_head_kv]
+        ggml_tensor* kq = ggml_mul_mat(c, K, Q);                             // [n_kv, n_tok, n_head]
         kq = ggml_scale(c, kq, 1.0f / std::sqrt((float)hd));
-        kq = ggml_diag_mask_inf(c, kq, 0);                                   // causal: no peeking ahead
+        kq = ggml_diag_mask_inf(c, kq, n_past);                              // causal: no peeking ahead
         kq = ggml_soft_max(c, kq);
-        ggml_tensor* V = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));      // [n_tok, hd, n_head]
+        ggml_tensor* V = ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3));   // [n_kv, hd, n_head_kv]
         ggml_tensor* o = ggml_mul_mat(c, V, kq);                             // [hd, n_tok, n_head]
         o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));                    // [hd, n_head, n_tok]
         o = ggml_reshape_2d(c, o, hp.n_embd, n_tok);
@@ -145,7 +173,6 @@ std::vector<float> OlmoeModel::forward(const std::vector<int32_t>& ids, int n_th
     ggml_tensor* last   = ggml_view_2d(c, x, hp.n_embd, 1, x->nb[1], (size_t)(n_tok - 1) * x->nb[1]);
     ggml_tensor* logits = ggml_mul_mat(c, output_, last);                    // [n_vocab, 1]
 
-    ggml_cgraph* gf = ggml_new_graph_custom(c, 16384, false);
     ggml_build_forward_expand(gf, logits);
     if (ggml_graph_compute_with_ctx(c, gf, n_threads) != GGML_STATUS_SUCCESS) {
         ggml_free(c);
@@ -153,6 +180,7 @@ std::vector<float> OlmoeModel::forward(const std::vector<int32_t>& ids, int n_th
     }
     std::vector<float> out((const float*)logits->data, (const float*)logits->data + hp.n_vocab);
     ggml_free(c);
+    n_past_ = n_kv;
     return out;
 }
 

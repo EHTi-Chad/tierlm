@@ -69,13 +69,15 @@ def reference(ids):
     return x[-1] @ W["output.weight"].T
 
 worst = 0.0
-for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55]):
-    want = reference(np.array(ids))
-    run = subprocess.run([sys.argv[1], path, *map(str, ids)], capture_output=True, text=True)
-    if run.returncode != 0:
-        sys.exit(f"tierlm-logits failed: {run.stderr.strip()}")
-    got = np.array([float(v) for v in run.stdout.split()])
-    err = float(np.abs(got - want).max())
-    worst = max(worst, err)
-    print(f"{len(ids):2d} tokens: max |diff| {err:.2e}  top token ours {got.argmax()} / reference {want.argmax()}")
+for mode in ([], ["--step"]):               # all at once, then one token per call through the KV cache
+    label = "one call " if not mode else "KV cache "
+    for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55]):
+        want = reference(np.array(ids))
+        run = subprocess.run([sys.argv[1], path, *mode, *map(str, ids)], capture_output=True, text=True)
+        if run.returncode != 0:
+            sys.exit(f"tierlm-logits failed: {run.stderr.strip()}")
+        got = np.array([float(v) for v in run.stdout.split()])
+        err = float(np.abs(got - want).max())
+        worst = max(worst, err)
+        print(f"{label}{len(ids):2d} tokens: max |diff| {err:.2e}  top token ours {got.argmax()} / reference {want.argmax()}")
 print("PASS" if worst < 1e-3 else "FAIL")
