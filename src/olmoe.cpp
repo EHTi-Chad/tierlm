@@ -1,21 +1,50 @@
 #include "olmoe.h"
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 
 namespace tierlm {
 
+static constexpr int kGraphSize = 16384;
+
 OlmoeModel::~OlmoeModel() {
+    if (sched_) ggml_backend_sched_free(sched_);
+    if (kvbuf_) ggml_backend_buffer_free(kvbuf_);
+    if (wbuf_) ggml_backend_buffer_free(wbuf_);
     if (kvctx_) ggml_free(kvctx_);
     if (wctx_) ggml_free(wctx_);
+    if (main_ && main_ != cpu_) ggml_backend_free(main_);
+    if (cpu_) ggml_backend_free(cpu_);
 }
 
-std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ctx) {
+std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ctx, const std::string& device) {
     std::unique_ptr<OlmoeModel> m(new OlmoeModel());
-    gguf_init_params params{ /*no_alloc=*/false, /*ctx=*/&m->wctx_ };   // reads all weights into RAM
+
+    // ---- pick the device ----
+    m->cpu_ = ggml_backend_cpu_init();
+    if (!m->cpu_) throw std::runtime_error("failed to start the CPU backend");
+    m->main_ = m->cpu_;
+    if (device != "cpu") {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+        if (dev) {
+            m->main_ = ggml_backend_dev_init(dev, nullptr);
+            if (!m->main_) throw std::runtime_error(std::string("failed to start ") + ggml_backend_dev_name(dev));
+            m->device_name_ = std::string(ggml_backend_dev_name(dev)) + " (" + ggml_backend_dev_description(dev) + ")";
+        } else if (device == "gpu") {
+            throw std::runtime_error("no GPU backend in this build (or no GPU found)");
+        }
+    }
+    if (m->main_ == m->cpu_) m->device_name_ = "CPU";
+
+    // ---- read the header: tensor shapes/types only, no data yet ----
+    gguf_init_params params{ /*no_alloc=*/true, /*ctx=*/&m->wctx_ };
     gguf_context* g = gguf_init_from_file(path.c_str(), params);
     if (!g) throw std::runtime_error("failed to load GGUF: " + path);
 
@@ -45,7 +74,25 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     hp.rms_eps       = f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     if (hp.n_head_kv == 0) hp.n_head_kv = hp.n_head;
     if (hp.n_ctx == 0) hp.n_ctx = 4096;
-    gguf_free(g);   // tensor data stays in wctx_
+
+    // ---- allocate every weight on the device, then stream the data in from the file ----
+    m->wbuf_ = ggml_backend_alloc_ctx_tensors(m->wctx_, m->main_);
+    if (!m->wbuf_) { gguf_free(g); throw std::runtime_error("not enough device memory for the weights"); }
+    ggml_backend_buffer_set_usage(m->wbuf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { gguf_free(g); throw std::runtime_error("cannot open " + path); }
+    const size_t data_off = gguf_get_data_offset(g);
+    std::vector<char> chunk;
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) {
+        ggml_tensor* t = ggml_get_tensor(m->wctx_, gguf_get_tensor_name(g, i));
+        const size_t n = ggml_nbytes(t);
+        chunk.resize(n);
+        file.seekg((std::streamoff)(data_off + gguf_get_tensor_offset(g, i)));
+        if (!file.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + path); }
+        ggml_backend_tensor_set(t, chunk.data(), 0, n);
+    }
+    gguf_free(g);
 
     auto T = [&](const std::string& name, bool required = true) -> ggml_tensor* {
         ggml_tensor* t = ggml_get_tensor(m->wctx_, name.c_str());
@@ -76,17 +123,25 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
         m->layers_.push_back(L);
     }
 
-    // KV cache: f32 for now (exact); smaller types come later.
+    // ---- KV cache on the same device: f32 for now (exact); smaller types come later ----
     const int hd = hp.n_embd / hp.n_head;
     m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
-    const size_t kv_bytes = (size_t)2 * hp.n_layer * hd * hp.n_head_kv * m->max_ctx_ * sizeof(float);
-    ggml_init_params kp{ kv_bytes + (size_t)2 * hp.n_layer * ggml_tensor_overhead() + 4096, nullptr, false };
+    ggml_init_params kp{ (size_t)2 * hp.n_layer * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     m->kvctx_ = ggml_init(kp);
-    if (!m->kvctx_) throw std::runtime_error("failed to allocate KV cache");
     for (auto& L : m->layers_) {
         L.k_cache = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hd, hp.n_head_kv, m->max_ctx_);
         L.v_cache = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hd, hp.n_head_kv, m->max_ctx_);
     }
+    m->kvbuf_ = ggml_backend_alloc_ctx_tensors(m->kvctx_, m->main_);
+    if (!m->kvbuf_) throw std::runtime_error("not enough device memory for the KV cache (try a smaller -c)");
+    ggml_backend_buffer_clear(m->kvbuf_, 0);
+
+    // ---- scheduler: runs each op on the device, falling back to the CPU where needed ----
+    ggml_backend_t backends[2] = { m->main_, m->cpu_ };
+    const int n_backends = m->main_ == m->cpu_ ? 1 : 2;
+    m->sched_ = ggml_backend_sched_new(backends, nullptr, n_backends, kGraphSize, false, false);
+    if (!m->sched_) throw std::runtime_error("failed to create the scheduler");
+    m->graph_mem_.resize(ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false));
     return m;
 }
 
@@ -99,21 +154,16 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
     if (n_kv > max_ctx_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens)");
     const int hd = hp.n_embd / hp.n_head;
 
-    // Scratch memory for activations, sized generously for this sequence length.
-    const size_t per_layer = (size_t)n_tok * ((size_t)hp.n_embd * 4 * 24 + (size_t)hp.n_expert * 4 * 4 +
-                                              (size_t)hp.n_expert_used * hp.n_ff * 4 * 4 +
-                                              (size_t)hp.n_head * n_kv * 4 * 4);
-    const size_t mem = (size_t)256 * 1024 * 1024 + per_layer * hp.n_layer + (size_t)hp.n_vocab * 4 * 2;
-    ggml_init_params ip{ mem, nullptr, false };
+    // The graph is only a description here; the scheduler allocates its memory on the right device.
+    ggml_init_params ip{ graph_mem_.size(), graph_mem_.data(), /*no_alloc=*/true };
     ggml_context* c = ggml_init(ip);
-    if (!c) throw std::runtime_error("failed to allocate compute memory");
 
     ggml_tensor* inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
-    std::memcpy(inp->data, ids.data(), sizeof(int32_t) * n_tok);
+    ggml_set_input(inp);
     ggml_tensor* pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
-    for (int i = 0; i < n_tok; ++i) ((int32_t*)pos->data)[i] = n_past + i;
+    ggml_set_input(pos);
 
-    ggml_cgraph* gf = ggml_new_graph_custom(c, 16384, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(c, kGraphSize, false);
     ggml_tensor* x = ggml_get_rows(c, tok_embd_, inp);                     // [n_embd, n_tok]
     for (const Layer& L : layers_) {
         // ---- attention ----
@@ -172,13 +222,24 @@ std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threa
     x = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), out_norm_);
     ggml_tensor* last   = ggml_view_2d(c, x, hp.n_embd, 1, x->nb[1], (size_t)(n_tok - 1) * x->nb[1]);
     ggml_tensor* logits = ggml_mul_mat(c, output_, last);                    // [n_vocab, 1]
-
+    ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
-    if (ggml_graph_compute_with_ctx(c, gf, n_threads) != GGML_STATUS_SUCCESS) {
+
+    ggml_backend_sched_reset(sched_);
+    if (!ggml_backend_sched_alloc_graph(sched_, gf)) { ggml_free(c); throw std::runtime_error("failed to allocate compute memory"); }
+
+    std::vector<int32_t> positions(n_tok);
+    for (int i = 0; i < n_tok; ++i) positions[i] = n_past + i;
+    ggml_backend_tensor_set(inp, ids.data(), 0, sizeof(int32_t) * n_tok);
+    ggml_backend_tensor_set(pos, positions.data(), 0, sizeof(int32_t) * n_tok);
+    ggml_backend_cpu_set_n_threads(cpu_, n_threads);
+
+    if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS) {
         ggml_free(c);
         throw std::runtime_error("graph compute failed");
     }
-    std::vector<float> out((const float*)logits->data, (const float*)logits->data + hp.n_vocab);
+    std::vector<float> out(hp.n_vocab);
+    ggml_backend_tensor_get(logits, out.data(), 0, sizeof(float) * hp.n_vocab);
     ggml_free(c);
     n_past_ = n_kv;
     return out;

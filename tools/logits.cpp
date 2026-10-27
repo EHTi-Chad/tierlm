@@ -2,6 +2,7 @@
 //   tierlm-logits model.gguf id [id ...]          whole sequence in one call
 //   tierlm-logits model.gguf --step id [id ...]   first id alone, then one id per call (exercises the KV cache)
 #include "olmoe.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,7 +17,7 @@ int main(int argc, char** argv) {
         bool step = !std::strcmp(argv[2], "--step");
         std::vector<int32_t> ids;
         for (int i = step ? 3 : 2; i < argc; ++i) ids.push_back(std::atoi(argv[i]));
-        const int nt = (int)std::thread::hardware_concurrency();
+        const int nt = std::getenv("TIERLM_THREADS") ? std::atoi(std::getenv("TIERLM_THREADS")) : std::max(1, (int)std::thread::hardware_concurrency() / 2);
 
         std::vector<float> lg;
         if (!step) lg = m->eval(ids, nt);

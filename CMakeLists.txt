@@ -5,29 +5,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
 
-option(TIERLM_CUDA "Build ggml with CUDA" OFF)
-set(GGML_CUDA ${TIERLM_CUDA} CACHE BOOL "" FORCE)
+# Device backends (ggml). CPU is always built.
+option(TIERLM_CUDA   "Build the CUDA backend (NVIDIA)"          OFF)
+option(TIERLM_VULKAN "Build the Vulkan backend (Intel/AMD/NVIDIA)" OFF)
+set(GGML_CUDA   ${TIERLM_CUDA}   CACHE BOOL "" FORCE)
+set(GGML_VULKAN ${TIERLM_VULKAN} CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/ggml)
 
 add_library(tierlm_core src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/olmoe.cpp)
 target_include_directories(tierlm_core PUBLIC src)
 target_link_libraries(tierlm_core PUBLIC ggml)
 
-add_executable(tierlm-inspect tools/inspect.cpp)
-target_link_libraries(tierlm-inspect PRIVATE tierlm_core)
-
-add_executable(tierlm-plan tools/plan.cpp)
-target_link_libraries(tierlm-plan PRIVATE tierlm_core)
+foreach(tool inspect plan tok_test logits run)
+  string(REPLACE "_" "-" name ${tool})
+  add_executable(tierlm-${name} tools/${tool}.cpp)
+  target_link_libraries(tierlm-${name} PRIVATE tierlm_core)
+endforeach()
 
 add_executable(tierlm-kv tools/kv.cpp)
 target_link_libraries(tierlm-kv PRIVATE ggml)
-
-add_executable(tierlm-tok-test tools/tok_test.cpp)
-target_link_libraries(tierlm-tok-test PRIVATE tierlm_core)
-
-add_executable(tierlm-logits tools/logits.cpp)
-target_link_libraries(tierlm-logits PRIVATE tierlm_core)
-
-add_executable(tierlm-run tools/run.cpp)
-target_link_libraries(tierlm-run PRIVATE tierlm_core)

@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+#include <string>
 #include <thread>
 
 using namespace tierlm;
@@ -16,22 +17,24 @@ static double since(Clock::time_point t) { return std::chrono::duration<double>(
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s model.gguf \"prompt\" [-n tokens] [-t threads] [-c context]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s model.gguf \"prompt\" [-n tokens] [-t threads] [-c context] [-d auto|cpu|gpu]\n", argv[0]);
         return 1;
     }
     int n_gen = 32, n_threads = std::max(1, (int)std::thread::hardware_concurrency() / 2), n_ctx = 2048;
+    std::string device = "auto";
     for (int i = 3; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "-n")) n_gen = std::atoi(argv[i + 1]);
         else if (!std::strcmp(argv[i], "-t")) n_threads = std::atoi(argv[i + 1]);
         else if (!std::strcmp(argv[i], "-c")) n_ctx = std::atoi(argv[i + 1]);
+        else if (!std::strcmp(argv[i], "-d")) device = argv[i + 1];
     }
     try {
         auto t0 = Clock::now();
         Tokenizer tok = Tokenizer::from_gguf(argv[1]);
-        auto model = OlmoeModel::load(argv[1], n_ctx);
+        auto model = OlmoeModel::load(argv[1], n_ctx, device);
         const auto& hp = model->hparams();
-        std::fprintf(stderr, "loaded in %.1fs | %d layers, %d experts (%d active), vocab %d, ctx %d, %d threads\n",
-                     since(t0), hp.n_layer, hp.n_expert, hp.n_expert_used, hp.n_vocab, model->max_ctx(), n_threads);
+        std::fprintf(stderr, "device: %s\nloaded in %.1fs | %d layers, %d experts (%d active), vocab %d, ctx %d, %d CPU threads\n",
+                     model->device_name().c_str(), since(t0), hp.n_layer, hp.n_expert, hp.n_expert_used, hp.n_vocab, model->max_ctx(), n_threads);
 
         // Prompt processing: the whole prompt in one call fills the KV cache.
         std::vector<int32_t> prompt = tok.encode(argv[2]);
