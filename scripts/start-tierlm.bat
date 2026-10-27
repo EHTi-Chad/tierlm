@@ -1,28 +1,18 @@
 @echo off
-rem tierlm launcher: starts the server with the first model found in the "models" folder
-rem and opens the web page. Close this window (or press Ctrl+C) to stop tierlm.
+rem tierlm launcher: starts the server and opens the web page, where you choose
+rem your hardware and model. Close this window (or press Ctrl+C) to stop tierlm.
+rem Optional: start-tierlm.bat <port>   (default 8040)
 setlocal
 cd /d "%~dp0"
-set "MODEL="
-for %%f in ("models\*.gguf") do if not defined MODEL set "MODEL=%%~ff"
-if not defined MODEL (
-  echo.
-  echo  No model found. Put a supported .gguf file in the "models" folder next to this file, for example:
-  echo    OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf
-  echo  Download it from:
-  echo    https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF
-  echo.
-  pause
-  exit /b 1
-)
 set "PORT=8040"
 if not "%~1"=="" set "PORT=%~1"
 echo.
-echo  Starting tierlm with: %MODEL%
-echo  The web page will open at http://127.0.0.1:%PORT% in a few seconds.
+echo  Starting tierlm...
+echo  Your browser will open http://127.0.0.1:%PORT% in a few seconds.
+echo  Choose your hardware and model there. Keep this window open while you use tierlm.
 echo.
-start "" /b cmd /c "ping -n 9 127.0.0.1 >nul & start http://127.0.0.1:%PORT%"
-tierlm-server.exe "%MODEL%" --port %PORT% --web web
+start "" /b cmd /c "ping -n 4 127.0.0.1 >nul & start http://127.0.0.1:%PORT%"
+tierlm-server.exe --models models --web web --port %PORT%
 echo.
-echo  tierlm has stopped.
+echo  tierlm has stopped. If it stopped straight away, the message above says why.
 pause

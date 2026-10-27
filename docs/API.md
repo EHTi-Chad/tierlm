@@ -6,7 +6,11 @@
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | The web page (`web/index.html`) |
-| GET | `/api/info` | Model, device and memory details |
+| GET | `/api/info` | Model, device and memory details (`{"loaded": false}` before a model is loaded) |
+| GET | `/api/devices` | GPUs and CPU the engine can use, with free memory |
+| GET | `/api/models` | `.gguf` files in the models folder, and whether each is supported |
+| POST | `/api/load` | Load a model on a device |
+| POST | `/api/unload` | Free the loaded model |
 | POST | `/api/chat` | Generate a reply, streamed as Server-Sent Events |
 | POST | `/api/reset` | Clear the KV cache |
 
@@ -25,6 +29,52 @@ Example (values depend on the model and machine):
   "kv_type": "f16", "flash_attn": true
 }
 ```
+
+While a reply is streaming or a model is loading, `/api/info` returns the last known details with
+`"busy": true` instead of waiting.
+
+## GET /api/devices
+
+```json
+{"devices": [
+   {"id": "Vulkan0", "description": "Intel(R) Arc(TM) 140V GPU (16GB)", "type": "igpu", "backend": "Vulkan",
+    "free": 17179869184, "total": 19219415040},
+   {"id": "CPU", "description": "Intel(R) Core(TM) Ultra 7 258V", "type": "cpu", "backend": "CPU",
+    "free": 11811160064, "total": 33822867456}],
+ "threads": 4, "hw_threads": 8}
+```
+
+`type` is `gpu` (dedicated), `igpu` (integrated, shares system memory) or `cpu`. Pass `id` as the `device`
+when loading.
+
+## GET /api/models
+
+```json
+{"folder": "C:\\tierlm\\models", "default_ctx": 4096, "current": "",
+ "models": [
+   {"file": "OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf", "name": "OLMoE 1B 7B 0924 Instruct", "arch": "olmoe",
+    "supported": true, "bytes": 4212186208, "layers": 16, "experts": 64, "experts_used": 8,
+    "ctx_train": 4096, "kv_bytes_per_token": 131072},
+   {"file": "Llama-3.2-1B-Q4_K_M.gguf", "arch": "llama", "supported": false,
+    "reason": "the llama architecture is not supported yet", "bytes": 807694464}]}
+```
+
+Only the file headers are read, so this is fast. `kv_bytes_per_token` is the KV cache cost per token of
+context (f16), useful for estimating memory: model bytes + `kv_bytes_per_token` × context.
+
+## POST /api/load
+
+```json
+{"model": "OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf", "device": "Vulkan0", "ctx": 4096, "threads": 4}
+```
+
+`model` is a file name inside the models folder (other paths are refused). `device` is an `id` from
+`/api/devices`, or `auto` / `cpu` / `gpu`. Any loaded model is freed first. Returns
+`{"ok": true, "device": "...", "load_s": 3.2}`, or an `error` with HTTP 400/500.
+
+## POST /api/unload
+
+Frees the model and its memory. Returns `{"ok": true}`.
 
 ## POST /api/chat
 
@@ -48,7 +98,8 @@ Request:
 - Whatever part of the conversation is already in the KV cache is reused, so follow-up messages only process
   the new text.
 
-Errors before streaming starts: `400` for a malformed body, `409` if a reply is already being generated.
+Errors before streaming starts: `400` for a malformed body, `409` if a reply is already being generated, a
+model is loading, or no model is loaded.
 
 ### Response stream
 

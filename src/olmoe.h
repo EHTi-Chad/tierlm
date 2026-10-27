@@ -24,7 +24,8 @@ struct OlmoeHparams {
 // the tier loader will later spread them across devices.
 class OlmoeModel {
 public:
-    // device: "auto" (a GPU if there is one, else the CPU), "cpu" or "gpu".
+    // device: "auto" (the biggest dedicated GPU, else an integrated one, else the CPU), "cpu", "gpu",
+    // or a specific ggml device name such as "Vulkan0" or "CUDA0".
     // max_ctx = 0 uses the model's own context length.
     static std::unique_ptr<OlmoeModel> load(const std::string& path, int max_ctx = 0,
                                             const std::string& device = "auto");   // throws on failure
@@ -44,6 +45,7 @@ public:
     uint64_t weights_bytes() const { return weights_bytes_; }
     uint64_t kv_bytes() const { return kv_bytes_; }
     bool on_gpu() const { return main_ != cpu_; }
+    bool integrated_gpu() const;                  // shares system memory (e.g. Intel Arc in a laptop)
     void device_memory(size_t& free, size_t& total) const;   // of the device holding the weights
     bool flash_attn() const { return flash_attn_; }
     const char* kv_type() const { return kv_f32_ ? "f32" : "f16"; }

@@ -34,6 +34,8 @@ independent engine built on the same principle.
 - **KV cache in f16** and **flash attention**, with prompts processed in batches.
 - **Runs on any ggml device**: CPU, Vulkan (Intel, AMD, NVIDIA) and CUDA builds, with automatic CPU fallback for
   any operation a device can't run.
+- **Setup screen**: detects every GPU (Intel, AMD, NVIDIA) and the CPU with free memory, lists the models in
+  the `models` folder, recommends the best device that fits, and lets you choose.
 - **Web interface**: streaming chat, plus a live dashboard with an expert activity map, speed vs. context,
   memory placement, and a "hot-expert cache" preview built from real routing data.
 - **Local HTTP API** with streaming replies (Server-Sent Events): see [docs/API.md](docs/API.md). OpenAI-compatible endpoints are on the roadmap.
@@ -63,7 +65,8 @@ next lever for it.
    [Releases](https://github.com/EHTi-Chad/tierlm/releases) and extract it.
 2. Download [`OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`](https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF/tree/main)
    (4.2 GB) into its `models` folder.
-3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040.
+3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040, where you pick your GPU (or
+   CPU) and the model, then chat.
 
 Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** · Problems: [docs/FAQ.md](docs/FAQ.md)
 
@@ -119,6 +122,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] OLMoE forward pass, KV cache, flash attention, f16 cache
 - [x] Device-independent backend (CPU, Vulkan, CUDA builds)
 - [x] Web chat + live dashboard
+- [x] Setup screen: choose hardware and model in the browser
 - [ ] **Second model family: Qwen3 MoE** (e.g. Qwen3-30B-A3B), and a pluggable architecture layer
 - [ ] **Tier loader**: actually place each expert in VRAM, RAM or SSD according to the plan
 - [ ] Routing statistics and a hot-expert cache that promotes busy experts to VRAM

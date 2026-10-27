@@ -18,15 +18,22 @@ Common options:
 Web chat and live dashboard, plus the HTTP API described in [API.md](API.md).
 
 ```
-tierlm-server model.gguf [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu] [-t N] [-c 4096] [--web web]
+tierlm-server [model.gguf] [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu|<device>] [-t N] [-c 4096]
+              [--web web] [--models models]
 ```
 
-- Open `http://127.0.0.1:<port>` in a browser. Run it from the project folder, or pass `--web <folder>` to
+- **Without a model**, the page opens a **setup screen**: it lists the GPUs and CPU with free memory, the
+  `.gguf` files in the `--models` folder (marking which are supported), recommends the fastest device that has
+  room, and lets you pick the context length and CPU threads. **Change setup** brings it back later.
+- **With a model**, it loads that model straight away (on the device given by `-d`) and opens the chat.
+- `-d <device>` takes a name from `tierlm-devices`, such as `Vulkan0` or `CUDA0`. `auto` picks the dedicated
+  GPU with the most memory, then an integrated GPU, then the CPU.
+- Open `http://127.0.0.1:<port>` in a browser. Run it from the tierlm folder, or pass `--web <folder>` to
   point at the folder holding `index.html`. The page is re-read on every load, so you can edit
   `web/index.html` and just refresh.
 - `--host 0.0.0.0` makes it reachable from other machines on your network. **There is no authentication**, so
   only do this on a network you trust.
-- One reply is generated at a time; a second request while one is running gets HTTP 409.
+- One reply (or model load) runs at a time; a second request meanwhile gets HTTP 409.
 - Conversations reuse the KV cache: when you send the next message, only the new part is processed.
 
 ### The dashboard

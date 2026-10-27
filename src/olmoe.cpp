@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 
@@ -34,8 +35,25 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     if (!m->cpu_) throw std::runtime_error("failed to start the CPU backend");
     m->main_ = m->cpu_;
     if (device != "cpu") {
-        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-        if (!dev) dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+        ggml_backend_dev_t dev = nullptr;
+        if (device == "auto" || device == "gpu") {
+            // Prefer a dedicated GPU (the one with the most memory), then an integrated one.
+            size_t best = 0;
+            for (enum ggml_backend_dev_type want : { GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU }) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(d) != want) continue;
+                    size_t free = 0, total = 0;
+                    ggml_backend_dev_memory(d, &free, &total);
+                    if (!dev || total > best) { dev = d; best = total; }
+                }
+                if (dev) break;
+            }
+        } else {
+            dev = ggml_backend_dev_by_name(device.c_str());   // a specific device, e.g. "Vulkan0" or "CUDA0"
+            if (!dev) throw std::runtime_error("unknown device '" + device + "' (tierlm-devices lists them)");
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = nullptr;
+        }
         if (dev) {
             m->dev_ = dev;
             m->main_ = ggml_backend_dev_init(dev, nullptr);
@@ -88,7 +106,7 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     ggml_backend_buffer_set_usage(m->wbuf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     m->weights_bytes_ = ggml_backend_buffer_get_size(m->wbuf_);
 
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(std::filesystem::u8path(path), std::ios::binary);   // UTF-8 path, also on Windows
     if (!file) { gguf_free(g); throw std::runtime_error("cannot open " + path); }
     const size_t data_off = gguf_get_data_offset(g);
     std::vector<char> chunk;
@@ -166,6 +184,10 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     ggml_free(worst.ctx);
     if (!ok) throw std::runtime_error("failed to reserve compute memory");
     return m;
+}
+
+bool OlmoeModel::integrated_gpu() const {
+    return dev_ && ggml_backend_dev_type((ggml_backend_dev_t)dev_) == GGML_BACKEND_DEVICE_TYPE_IGPU;
 }
 
 void OlmoeModel::device_memory(size_t& free, size_t& total) const {
