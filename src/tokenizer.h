@@ -16,7 +16,10 @@ public:
     // User-defined added tokens (e.g. whitespace runs) are always matched before BPE.
     // Control tokens like <|endoftext|> are matched only when parse_special is true.
     std::vector<int32_t> encode(const std::string& text, bool parse_special = false) const;
-    std::string decode(const std::vector<int32_t>& ids) const;
+    // strip_prefix: SentencePiece puts a space before the text it encodes; drop it when decoding a whole reply
+    // (true), keep it when the tokens continue earlier text (false).
+    std::string decode(const std::vector<int32_t>& ids, bool strip_prefix = true) const;
+    bool add_bos() const { return add_bos_; }                // whether raw prompts should start with bos()
 
     // Control tokens (like <|endoftext|> or <|user|>) mark structure, not text.
     bool is_control(int32_t id) const { return id >= 0 && (size_t)id < token_type_.size() && token_type_[id] == 3; }
@@ -40,7 +43,7 @@ private:
     int32_t bos_ = -1, eos_ = -1, eot_ = -1, unk_ = -1;
     enum class Kind { Bpe, Spm } kind_ = Kind::Bpe;
     enum class Pre { Gpt2, Llama3, Qwen2 } pre_ = Pre::Gpt2;   // how BPE text is split before merging
-    bool add_space_prefix_ = true;                              // SentencePiece: " " before the text
+    bool add_space_prefix_ = true, add_bos_ = false;                              // SentencePiece: " " before the text
     std::vector<float> score_;                                  // SentencePiece merge scores
     std::string chat_template_;
 

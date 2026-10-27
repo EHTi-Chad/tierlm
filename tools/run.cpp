@@ -1,4 +1,4 @@
-// tierlm-run: tokenize a prompt, run OLMoE, and generate text greedily.
+// tierlm-run: tokenize a prompt, run the model, and generate text greedily.
 #include "model.h"
 #include "tokenizer.h"
 #include <algorithm>
@@ -38,6 +38,7 @@ int main(int argc, char** argv) {
 
         // Prompt processing: the whole prompt in one call fills the KV cache.
         std::vector<int32_t> prompt = tok.encode(argv[2]);
+        if (tok.add_bos()) prompt.insert(prompt.begin(), tok.bos());   // Llama-family models expect a start marker
         auto p0 = Clock::now();
         std::vector<float> lg = model->eval(prompt, n_threads);
         const double prompt_s = since(p0);
@@ -51,7 +52,7 @@ int main(int argc, char** argv) {
         for (float v : lg) z += std::exp((double)v - lg[order[0]]);
         std::fprintf(stderr, "prompt: %zu tokens in %.2fs\ntop 5 next tokens:", prompt.size(), prompt_s);
         for (int k = 0; k < 5; ++k)
-            std::fprintf(stderr, "  \"%s\" %.1f%%", tok.decode({order[k]}).c_str(),
+            std::fprintf(stderr, "  \"%s\" %.1f%%", tok.decode({order[k]}, false).c_str(),
                          100.0 * std::exp((double)lg[order[k]] - lg[order[0]]) / z);
         std::fprintf(stderr, "\n\n");
         std::fflush(stderr);
@@ -65,9 +66,9 @@ int main(int argc, char** argv) {
         auto g0 = Clock::now();
         for (int step = 0; step < n_gen; ++step) {
             int32_t next = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
-            if (next == tok.eos()) break;
+            if (next == tok.eos() || next == tok.eot()) break;
             out.push_back(next);
-            std::string text = tok.decode(out);       // print only the new part; keeps multi-byte chars intact
+            std::string text = tok.decode(out, false);       // print only the new part; keeps multi-byte chars intact
             if (text.size() > shown.size()) { std::printf("%s", text.c_str() + shown.size()); std::fflush(stdout); shown = text; }
             if (step + 1 < n_gen) lg = model->eval({next}, n_threads);
         }

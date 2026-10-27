@@ -687,7 +687,10 @@ async function loadSetup() {
   $("loadmsg").textContent = ""; $("loadmsg").className = "";
   try {
     const [dv, m] = await Promise.all([fetch("/api/devices").then(r => r.json()), fetch("/api/models").then(r => r.json())]);
-    devices = dv.devices; warnings = dv.warnings || []; hwThreads = dv.hw_threads || 8; defThreads = dv.threads || 4;
+    // The same NVIDIA card can be reachable through CUDA and Vulkan: show it once, as its CUDA device.
+    devices = dv.devices.filter(d => !d.same_gpu_as);
+    for (const d of devices) d.alsoVulkan = dv.devices.some(x => x.same_gpu_as === d.id);
+    warnings = dv.warnings || []; hwThreads = dv.hw_threads || 8; defThreads = dv.threads || 4;
     md = m; models = m.models; defCtx = m.default_ctx || 4096;
     if (dv.version) $("ver").textContent = "v" + dv.version;
   } catch (e) { $("loadmsg").textContent = "Could not reach the tierlm server."; $("loadmsg").className = "err"; return; }
@@ -776,6 +779,7 @@ function renderSetup() {
     add(typeLabel[d.type] || d.type);
     if (p.dev && d.id === p.dev.id) add("Will be used", "good");
     if (d.type === "igpu") add("Shares system RAM", "warn");
+    if (d.alsoVulkan) add("CUDA (Vulkan also available)");
     dl.appendChild(el);
   }
   // placement bar

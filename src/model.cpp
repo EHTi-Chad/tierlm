@@ -49,14 +49,22 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         ggml_backend_dev_t dev = nullptr;
         if (device == "auto" || device == "gpu") {
             // Prefer a dedicated GPU (the one with the most memory), then an integrated one.
+            // The same NVIDIA card can appear twice (CUDA and Vulkan); CUDA wins when the memory is about equal.
             size_t best = 0;
+            auto is_cuda = [](ggml_backend_dev_t d) {
+                ggml_backend_reg_t r = ggml_backend_dev_backend_reg(d);
+                return r && std::string(ggml_backend_reg_name(r)) == "CUDA";
+            };
+            const size_t slack = (size_t)512 << 20;
             for (enum ggml_backend_dev_type want : { GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU }) {
                 for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                     ggml_backend_dev_t d = ggml_backend_dev_get(i);
                     if (ggml_backend_dev_type(d) != want) continue;
                     size_t free = 0, total = 0;
                     ggml_backend_dev_memory(d, &free, &total);
-                    if (!dev || total > best) { dev = d; best = total; }
+                    const bool better = !dev || total > best + slack ||
+                                        (total + slack >= best && is_cuda(d) && !is_cuda(dev));
+                    if (better) { dev = d; best = total; }
                 }
                 if (dev) break;
             }

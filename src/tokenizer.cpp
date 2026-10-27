@@ -231,6 +231,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
     t.eos_ = u32("tokenizer.ggml.eos_token_id");
     t.eot_ = u32("tokenizer.ggml.eot_token_id");
     t.unk_ = u32("tokenizer.ggml.unknown_token_id");
+    t.add_bos_ = bval("tokenizer.ggml.add_bos_token", t.kind_ == Kind::Spm) && t.bos_ >= 0;
     t.chat_template_ = sval("tokenizer.chat_template");
     gguf_free(g);
 
@@ -345,7 +346,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool parse_speci
     return ids;
 }
 
-std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
+std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool strip_prefix) const {
     std::string out;
     for (int32_t id : ids) {
         if (id < 0 || (size_t)id >= id_to_token_.size()) continue;
@@ -368,7 +369,7 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
         }
     }
     // SentencePiece adds a space before the text; take it back off, like Hugging Face's decoder does.
-    if (kind_ == Kind::Spm && add_space_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
+    if (strip_prefix && kind_ == Kind::Spm && add_space_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
     return out;
 }
 

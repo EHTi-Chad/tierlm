@@ -494,6 +494,13 @@ int main(int argc, char** argv) {
                             {"type", type}, {"backend", reg ? ggml_backend_reg_name(reg) : ""},
                             {"free", free}, {"total", total}});
         }
+        // One NVIDIA card shows up as both CUDA0 and Vulkan0: mark the Vulkan entry as the same GPU, so the
+        // page shows the card once (CUDA is the faster route on NVIDIA).
+        for (auto& d : list) {
+            if (d["backend"] != "Vulkan") continue;
+            for (const auto& c : list)
+                if (c["backend"] == "CUDA" && c["description"] == d["description"]) d["same_gpu_as"] = c["id"];
+        }
         json j = {{"devices", list}, {"threads", a.threads}, {"hw_threads", (int)std::thread::hardware_concurrency()},
                   {"warnings", hardware_warnings(have_gpu)}, {"version", TIERLM_VERSION}};
         res.set_content(dump(j), "application/json");
