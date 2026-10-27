@@ -25,9 +25,9 @@ for arg in sys.argv[2:]:
     path, repo = arg.rsplit("=", 1)
     tk = Tokenizer.from_file(hf_hub_download(repo, "tokenizer.json"))
     cf = os.path.join(tempfile.mkdtemp(), "cases.txt")
-    with open(cf, "w") as f:
+    with open(cf, "w", encoding="utf-8") as f:
         for c in CASES: f.write(c.encode().hex() + "\t" + " ".join(map(str, tk.encode(c, add_special_tokens=False).ids)) + "\n")
-    r = subprocess.run([tool, os.path.expanduser(path), cf], capture_output=True, text=True)
+    r = subprocess.run([tool, os.path.expanduser(path), cf], capture_output=True, text=True, encoding="utf-8", errors="replace")
     ok &= r.returncode == 0
     print(f"== {os.path.basename(path)} vs {repo}")
     print((r.stdout + r.stderr).strip())

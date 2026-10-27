@@ -41,9 +41,9 @@ def write_gguf(path, pre, tokens, types, merges=None, scores=None, model="gpt2",
 
 def run(tool, gguf_path, cases, ids):
     cf = gguf_path + ".cases.txt"
-    with open(cf, "w") as f:
+    with open(cf, "w", encoding="utf-8") as f:
         for t, i in zip(cases, ids): f.write(t.encode().hex() + "\t" + " ".join(map(str, i)) + "\n")
-    r = subprocess.run([tool, gguf_path, cf], capture_output=True, text=True)
+    r = subprocess.run([tool, gguf_path, cf], capture_output=True, text=True, encoding="utf-8", errors="replace")
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 tool = sys.argv[1]
@@ -102,5 +102,22 @@ ids = [sp.encode(c) for c in cases]
 good, out = run(tool, p, cases, ids)
 ok &= good
 print(f"SentencePiece : {out.splitlines()[-1] if out else ''}" + ("" if good else "\n" + out))
+
+# Same SentencePiece model stored the way Hugging Face conversions often do it: every score 0, and the merge
+# order in a merges list instead (built like Hugging Face's SentencePieceExtractor).
+vocab = {sp.id_to_piece(i): i for i in range(sp.get_piece_size())}
+merges = []
+for piece, pid in vocab.items():
+    if types[pid] != 1: continue
+    for k in range(1, len(piece)):
+        a, b = piece[:k], piece[k:]
+        if a in vocab and b in vocab: merges.append((pid, vocab[a], vocab[b], a + " " + b))
+merges.sort()
+p = os.path.join(tmp, "spm-merges.gguf")
+write_gguf(p, None, tokens, types, scores=[0.0] * len(tokens), merges=[m[3] for m in merges], model="llama",
+           bos=sp.bos_id(), eos=sp.eos_id())
+good, out = run(tool, p, cases, ids)
+ok &= good
+print(f"SentencePiece, merges list: {out.splitlines()[-1] if out else ''}" + ("" if good else "\n" + out))
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

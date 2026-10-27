@@ -214,11 +214,14 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         const float* sc = (const float*)gguf_get_arr_data(g, sk);
         t.score_.assign(sc, sc + nt);
     }
-    if (t.kind_ == Kind::Spm && t.score_.empty()) { gguf_free(g); throw std::runtime_error("SentencePiece vocabulary has no scores"); }
 
     int64_t rk = gguf_find_key(g, "tokenizer.ggml.merges");          // optional: a byte-only vocab has none
     const size_t nm = rk < 0 ? 0 : gguf_get_arr_n(g, rk);
     for (size_t i = 0; i < nm; ++i) t.merge_rank_.emplace(gguf_get_arr_str(g, rk, i), (int32_t)i);
+    if (t.kind_ == Kind::Spm && t.score_.empty() && t.merge_rank_.empty()) {
+        gguf_free(g);
+        throw std::runtime_error("SentencePiece vocabulary has neither scores nor merges");
+    }
 
     auto u32 = [&](const char* k) -> int32_t {
         int64_t id = gguf_find_key(g, k);
@@ -283,7 +286,14 @@ void Tokenizer::spm(const std::string& raw, std::vector<int32_t>& out, bool pref
     for (const auto& c : utf8_decode(s)) sym.push_back(s.substr(c.off, c.len));
     // score[i]: score of merging sym[i] and sym[i + 1] (-inf if that piece isn't in the vocabulary).
     // After a merge only the two neighbouring pairs change, so only they are looked up again.
+    // Merge priority: if the file has a merges list (Hugging Face conversions), its order decides, like
+    // Hugging Face's tokenizer; otherwise the score of the merged piece does, like SentencePiece. Some files
+    // store all scores as 0 and rely on the merges list.
     auto pair_score = [&](size_t i) -> float {
+        if (!merge_rank_.empty()) {
+            auto m = merge_rank_.find(sym[i] + " " + sym[i + 1]);
+            return m == merge_rank_.end() ? -INFINITY : -(float)m->second;
+        }
         auto it = token_to_id_.find(sym[i] + sym[i + 1]);
         return it == token_to_id_.end() ? -INFINITY : score_[it->second];
     };
