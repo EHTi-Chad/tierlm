@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
+# Default to an optimised build. This must come before project(), because with MSVC
+# CMake otherwise quietly picks Debug, which is ~10x slower.
+if(NOT DEFINED CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
+endif()
 project(tierlm C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
-endif()
 if(MSVC)
   add_compile_options(/utf-8)
 endif()
@@ -29,3 +31,6 @@ endforeach()
 
 add_executable(tierlm-kv tools/kv.cpp)
 target_link_libraries(tierlm-kv PRIVATE ggml)
+
+add_executable(tierlm-devices tools/devices.cpp)
+target_link_libraries(tierlm-devices PRIVATE ggml)
