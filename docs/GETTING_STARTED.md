@@ -29,7 +29,8 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
    on Hugging Face.
 2. Download **`OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`** (about 4.2 GB).
 3. Move it into the **`models`** folder inside your tierlm folder, for example
-   `C:\tierlm\models\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`.
+   `C:\tierlm\models\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`. If you already keep models somewhere else
+   (LM Studio's folder, say), leave it there: you can point tierlm at that folder in step 4.
 
 ## Step 3: Start it
 
@@ -42,22 +43,28 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
 5. If Windows Firewall asks about network access, you can click **Cancel**: tierlm only listens on your own
    computer.
 
-## Step 4: Choose your hardware and model
+## Step 4: Choose your model
 
 The setup screen shows:
 
-1. **Hardware**: every GPU tierlm found, plus the CPU, with free memory. tierlm marks one as
-   **Recommended** (the fastest one that has room for the model) and tells you whether the model fits on each.
-   Integrated graphics, such as Intel Arc in a laptop, are labelled **Shares system RAM**: they work well, but
-   use the computer's normal memory.
-2. **Model**: the `.gguf` files in your `models` folder. Supported ones can be selected; others say why they
-   can't be used yet.
+1. **Detected hardware**: every GPU tierlm found, plus the CPU, with free memory. You don't choose: tierlm
+   uses the GPU if the model fits there (a dedicated GPU first, then integrated graphics), otherwise the CPU,
+   and marks it **Will be used**. A bar shows where the model will go: GPU memory, RAM or SSD. Integrated
+   graphics, such as Intel Arc in a laptop, are labelled **Shares system RAM**: they work well, but use the
+   computer's normal memory.
+2. **GGUF models**: the `.gguf` files in your models folder and its subfolders. Supported ones can be
+   selected; others say why they can't be used yet. The **⋯** menu at the top right lets you:
+   - **Choose models folder…**: point tierlm at a folder where your models already are. If you use LM Studio,
+     tierlm offers its folder directly.
+   - **Include subfolders**: on by default.
+   - **Find GGUF models on Hugging Face**: opens Hugging Face in your browser.
 3. **Settings**: **context length** (how much of the conversation the model remembers; longer uses more
-   memory) and **CPU threads**.
+   memory) and **CPU threads**. **Advanced** has more: flash attention, KV cache precision, prompt batch size,
+   active experts per token, a seed for repeatable replies, and **Force CPU**.
 
 Click **Load and start chatting**. Loading takes a few seconds; the first time on a GPU it can take a little
-longer while the graphics driver prepares itself. tierlm remembers your choices for next time, and
-**Change setup** (top right) brings this screen back.
+longer while the graphics driver prepares itself. tierlm remembers the folder, and your settings for each
+model, in `tierlm-settings.json`. **Change setup** (top right) brings this screen back.
 
 ## Step 5: Chat
 
@@ -110,7 +117,7 @@ tierlm-server.exe models\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf --port 8040 -c 40
 | `--port N` | Web page / API port |
 | `-c N` | Context length in tokens (default 4096). Smaller uses less memory |
 | `-d auto\|cpu\|<device>` | Which device to use: `auto` picks the best GPU, `cpu` forces the CPU, or a name such as `Vulkan0` (`tierlm-devices.exe` lists them) |
-| `--models <folder>` | Where to look for models (default: `models`) |
+| `--models <folder>` | Where to look for models (default: the folder chosen on the setup screen, else `models`) |
 | `-t N` | CPU threads |
 
 Other tools in the folder: `tierlm-devices.exe` (shows which GPU tierlm can use), `tierlm-bench.exe` (speed

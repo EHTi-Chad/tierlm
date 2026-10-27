@@ -19,6 +19,16 @@ struct OlmoeHparams {
     float rope_base = 10000.0f, rms_eps = 1e-5f;
 };
 
+// Load-time options. -1 / 0 mean "use the default".
+struct LoadOptions {
+    int max_ctx = 0;                 // 0 = the model's own context length
+    std::string device = "auto";     // "auto", "cpu", "gpu", or a ggml device name ("Vulkan0", "CUDA0")
+    int flash_attn = -1;             // 1 on, 0 off, -1 default (on, unless TIERLM_NO_FA is set)
+    int kv_f32 = -1;                 // 1 f32 cache, 0 f16, -1 default (f16, unless TIERLM_KV_F32 is set)
+    int batch = 0;                   // tokens per graph when reading a prompt; 0 = 256
+    int experts_used = 0;            // override active experts per token (MoE); 0 = the model's value
+};
+
 // OLMoE forward pass through ggml's backend API, so it runs on any ggml device
 // (CPU, Vulkan, CUDA, ...). All weights and the KV cache live on one device for now;
 // the tier loader will later spread them across devices.
@@ -27,8 +37,10 @@ public:
     // device: "auto" (the biggest dedicated GPU, else an integrated one, else the CPU), "cpu", "gpu",
     // or a specific ggml device name such as "Vulkan0" or "CUDA0".
     // max_ctx = 0 uses the model's own context length.
-    static std::unique_ptr<OlmoeModel> load(const std::string& path, int max_ctx = 0,
-                                            const std::string& device = "auto");   // throws on failure
+    static std::unique_ptr<OlmoeModel> load(const std::string& path, const LoadOptions& opt);   // throws on failure
+    static std::unique_ptr<OlmoeModel> load(const std::string& path, int max_ctx = 0, const std::string& device = "auto") {
+        LoadOptions o; o.max_ctx = max_ctx; o.device = device; return load(path, o);
+    }
     ~OlmoeModel();
     OlmoeModel(const OlmoeModel&) = delete;
     OlmoeModel& operator=(const OlmoeModel&) = delete;
@@ -49,6 +61,8 @@ public:
     void device_memory(size_t& free, size_t& total) const;   // of the device holding the weights
     bool flash_attn() const { return flash_attn_; }
     const char* kv_type() const { return kv_f32_ ? "f32" : "f16"; }
+    int batch() const { return batch_; }
+    int experts_default() const { return n_expert_used_file_; }   // active experts the model was trained with
 
     // Convenience: reset, then evaluate the whole sequence.
     std::vector<float> forward(const std::vector<int32_t>& ids, int n_threads) { reset(); return eval(ids, n_threads); }
@@ -86,6 +100,7 @@ private:
     uint64_t weights_bytes_ = 0, kv_bytes_ = 0;
     void* dev_ = nullptr;                        // ggml_backend_dev_t of the main device
     bool flash_attn_ = true, kv_f32_ = false;
+    int batch_ = 256, n_expert_used_file_ = 0;
 };
 
 }

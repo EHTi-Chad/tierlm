@@ -36,15 +36,20 @@ can verify the zip against the `.sha256` file on the Releases page first.
 
 **The setup screen says "No models found"**
 Put a supported `.gguf` file in the `models` folder next to `start-tierlm.bat` (the screen shows the exact
-folder), then click **Rescan**. See [Getting started](GETTING_STARTED.md#step-2-download-the-model).
+folder), or use the **⋯** menu to choose the folder where your models already are, then click **Rescan**. See [Getting started](GETTING_STARTED.md#step-2-download-the-model).
 
 **My model shows as "not supported yet"**
 tierlm only runs OLMoE models so far. The label says which architecture the file is.
 
-**Which device should I pick?**
-The one marked **Recommended**: tierlm picks the fastest device with enough free memory. A dedicated GPU is
-fastest, then integrated graphics, then the CPU. If a laptop has both Intel and NVIDIA graphics, both are
-listed; the NVIDIA one is usually faster.
+**How does tierlm choose between my GPU and CPU?**
+Automatically. It uses a dedicated GPU if the model fits in its memory, then integrated graphics, then the CPU
+(the one marked **Will be used**). If a laptop has both Intel and NVIDIA graphics, the NVIDIA one is used. To
+run on the CPU anyway, open **Advanced** on the setup screen and tick **Force CPU**. Splitting a model that is
+too big for the GPU between GPU memory, RAM and SSD is the next big feature.
+
+**My models are already in another folder (LM Studio, say)**
+Click the **⋯** menu next to **GGUF models** and choose **Choose models folder…**, or the LM Studio entry if
+tierlm found one. Subfolders are searched too. tierlm remembers the folder.
 
 **The page shows a different app, or "Server unavailable / 404"**
 Another program is already using the port. Start tierlm on a different one, for example
@@ -52,7 +57,8 @@ Another program is already using the port. Start tierlm on a different one, for 
 reach tierlm and not something else listening on the same port.
 
 **My GPU isn't listed on the setup screen (or it says `device: CPU`)**
-Run `tierlm-devices.exe` from a command prompt in the tierlm folder. It lists the GPUs tierlm can see and,
+If the setup screen shows a yellow box about `VK_ICD_FILENAMES` or `VK_DRIVER_FILES`, follow it (details
+below). Otherwise, run `tierlm-devices.exe` from a command prompt in the tierlm folder. It lists the GPUs tierlm can see and,
 if Vulkan fails to start, the reason.
 
 - Update your graphics driver from Intel, AMD or NVIDIA.

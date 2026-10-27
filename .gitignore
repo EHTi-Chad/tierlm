@@ -2,3 +2,4 @@ build/
 build-*/
 dist/
 *.gguf
+tierlm-settings.json

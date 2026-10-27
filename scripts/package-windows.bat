@@ -9,7 +9,7 @@ set "NAME=tierlm-%VER%-windows-x64-vulkan"
 cd /d "%~dp0.."
 
 echo == Building (portable: AVX2 baseline, static runtime, Vulkan) ==
-cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON || exit /b 1
+cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON -DTIERLM_VERSION=%VER% || exit /b 1
 cmake --build build-release || exit /b 1
 
 echo == Collecting files ==

@@ -15,7 +15,6 @@
 namespace tierlm {
 
 static constexpr int kGraphSize = 16384;
-static constexpr int kBatch = 256;      // max tokens per graph
 
 OlmoeModel::~OlmoeModel() {
     if (sched_) ggml_backend_sched_free(sched_);
@@ -27,8 +26,11 @@ OlmoeModel::~OlmoeModel() {
     if (cpu_) ggml_backend_free(cpu_);
 }
 
-std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ctx, const std::string& device) {
+std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, const LoadOptions& opt) {
     std::unique_ptr<OlmoeModel> m(new OlmoeModel());
+    const std::string& device = opt.device;
+    const int max_ctx = opt.max_ctx;
+    m->batch_ = opt.batch > 0 ? std::min(opt.batch, 2048) : 256;
 
     // ---- pick the device ----
     m->cpu_ = ggml_backend_cpu_init();
@@ -99,6 +101,8 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     hp.rms_eps       = f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     if (hp.n_head_kv == 0) hp.n_head_kv = hp.n_head;
     if (hp.n_ctx == 0) hp.n_ctx = 4096;
+    m->n_expert_used_file_ = hp.n_expert_used;
+    if (opt.experts_used > 0) hp.n_expert_used = std::min(opt.experts_used, hp.n_expert);
 
     // ---- allocate every weight on the device, then stream the data in from the file ----
     m->wbuf_ = ggml_backend_alloc_ctx_tensors(m->wctx_, m->main_);
@@ -153,7 +157,7 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     const int hd = hp.n_embd / hp.n_head;
     m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
     // TIERLM_KV_F32=1 keeps it in f32 (exact; used by the tests to check the attention math).
-    m->kv_f32_ = std::getenv("TIERLM_KV_F32") != nullptr;
+    m->kv_f32_ = opt.kv_f32 >= 0 ? opt.kv_f32 == 1 : std::getenv("TIERLM_KV_F32") != nullptr;
     const ggml_type kv_type = m->kv_f32_ ? GGML_TYPE_F32 : GGML_TYPE_F16;
     ggml_init_params kp{ (size_t)2 * hp.n_layer * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     m->kvctx_ = ggml_init(kp);
@@ -167,7 +171,7 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
     m->kv_bytes_ = ggml_backend_buffer_get_size(m->kvbuf_);
 
     // Fused flash attention reads the cache once, with no copies. TIERLM_NO_FA=1 uses the plain version.
-    m->flash_attn_ = std::getenv("TIERLM_NO_FA") == nullptr;
+    m->flash_attn_ = opt.flash_attn >= 0 ? opt.flash_attn == 1 : std::getenv("TIERLM_NO_FA") == nullptr;
 
     // ---- scheduler: runs each op on the device, falling back to the CPU where needed ----
     ggml_backend_t backends[2] = { m->main_, m->cpu_ };
@@ -178,7 +182,7 @@ std::unique_ptr<OlmoeModel> OlmoeModel::load(const std::string& path, int max_ct
 
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
     // of the context), so it is not re-planned on every token.
-    const int n_res = std::min(kBatch, m->max_ctx_);
+    const int n_res = std::min(m->batch_, m->max_ctx_);
     Graph worst = m->build(n_res, m->max_ctx_ - n_res, true);
     bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
     ggml_free(worst.ctx);
@@ -288,15 +292,15 @@ OlmoeModel::Graph OlmoeModel::build(int n_tok, int n_past, bool want_routing) {
     return g;
 }
 
-// Long prompts are processed in batches of kBatch tokens, which bounds the memory a single graph needs.
+// Long prompts are processed in batches of batch_ tokens, which bounds the memory a single graph needs.
 std::vector<float> OlmoeModel::eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing) {
     if (ids.empty()) return {};
     if (n_past_ + (int)ids.size() > max_ctx_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens)");
     if (routing) routing->clear();
     std::vector<float> lg;
     std::vector<int32_t> part;
-    for (size_t off = 0; off < ids.size(); off += kBatch) {
-        const size_t n = std::min<size_t>(kBatch, ids.size() - off);
+    for (size_t off = 0; off < ids.size(); off += (size_t)batch_) {
+        const size_t n = std::min<size_t>((size_t)batch_, ids.size() - off);
         lg = eval_batch(ids.data() + off, (int)n, n_threads, routing ? &part : nullptr);
         if (routing) routing->insert(routing->end(), part.begin(), part.end());
     }

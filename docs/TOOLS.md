@@ -19,12 +19,16 @@ Web chat and live dashboard, plus the HTTP API described in [API.md](API.md).
 
 ```
 tierlm-server [model.gguf] [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu|<device>] [-t N] [-c 4096]
-              [--web web] [--models models]
+              [--web web] [--models models] [--settings tierlm-settings.json]
 ```
 
-- **Without a model**, the page opens a **setup screen**: it lists the GPUs and CPU with free memory, the
-  `.gguf` files in the `--models` folder (marking which are supported), recommends the fastest device that has
-  room, and lets you pick the context length and CPU threads. **Change setup** brings it back later.
+- **Without a model**, the page opens a **setup screen**: it shows the GPUs and CPU it found with free memory
+  and where the model will go (it picks the device itself: the best GPU the model fits on, else the CPU), the
+  `.gguf` files in the models folder and its subfolders (marking which are supported), and the load settings,
+  with more under **Advanced**. **Change setup** brings it back later.
+- The models folder chosen on the page, and the settings used for each model, are saved in the `--settings`
+  file. `--models` on the command line overrides the saved folder.
+- It warns on the page if `VK_ICD_FILENAMES` or `VK_DRIVER_FILES` is set, since these can hide the GPU.
 - **With a model**, it loads that model straight away (on the device given by `-d`) and opens the chat.
 - `-d <device>` takes a name from `tierlm-devices`, such as `Vulkan0` or `CUDA0`. `auto` picks the dedicated
   GPU with the most memory, then an integrated GPU, then the CPU.
@@ -68,8 +72,10 @@ tierlm-bench model.gguf [-d auto|cpu|gpu] [-t N] [contexts...]       # default c
 
 ## tierlm-devices
 
-Lists the backends compiled into this build, the devices ggml can use (with free memory), and the build type.
-If a GPU is missing, it prints the error from the GPU backend, which `tierlm-run` cannot show.
+Lists the backends compiled into this build, the devices ggml can use (with free memory), the version and the
+build type. If a GPU is missing, it prints the error from the GPU backend, which `tierlm-run` cannot show. It
+also warns if `VK_ICD_FILENAMES` or `VK_DRIVER_FILES` is set (and whether the file it names exists), since a
+stale one can hide the GPU or crash Vulkan while it starts.
 
 ## tierlm-inspect
 

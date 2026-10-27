@@ -34,8 +34,9 @@ independent engine built on the same principle.
 - **KV cache in f16** and **flash attention**, with prompts processed in batches.
 - **Runs on any ggml device**: CPU, Vulkan (Intel, AMD, NVIDIA) and CUDA builds, with automatic CPU fallback for
   any operation a device can't run.
-- **Setup screen**: detects every GPU (Intel, AMD, NVIDIA) and the CPU with free memory, lists the models in
-  the `models` folder, recommends the best device that fits, and lets you choose.
+- **Setup screen**: detects every GPU (Intel, AMD, NVIDIA) and the CPU with free memory and places the model
+  automatically (GPU first, then CPU), lists the GGUF models in any folder you point it at (including LM
+  Studio's), and remembers LM Studio-style load settings per model.
 - **Web interface**: streaming chat, plus a live dashboard with an expert activity map, speed vs. context,
   memory placement, and a "hot-expert cache" preview built from real routing data.
 - **Local HTTP API** with streaming replies (Server-Sent Events): see [docs/API.md](docs/API.md). OpenAI-compatible endpoints are on the roadmap.
@@ -122,9 +123,10 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] OLMoE forward pass, KV cache, flash attention, f16 cache
 - [x] Device-independent backend (CPU, Vulkan, CUDA builds)
 - [x] Web chat + live dashboard
-- [x] Setup screen: choose hardware and model in the browser
+- [x] Setup screen: automatic hardware placement, models folder, per-model settings
 - [ ] **Second model family: Qwen3 MoE** (e.g. Qwen3-30B-A3B), and a pluggable architecture layer
-- [ ] **Tier loader**: actually place each expert in VRAM, RAM or SSD according to the plan
+- [ ] **Tier loader**: actually place each expert in VRAM, RAM or SSD according to the plan, with VRAM/RAM budget settings
+- [ ] Search and download GGUF models from Hugging Face inside tierlm
 - [ ] Routing statistics and a hot-expert cache that promotes busy experts to VRAM
 - [ ] NVIDIA (CUDA) testing on an RTX 5090; AMD testing via Vulkan/ROCm
 - [ ] Quantized KV cache, speculative decoding, OpenAI-compatible endpoints

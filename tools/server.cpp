@@ -8,8 +8,11 @@
 //   GET  /             the web page (web/index.html, re-read on every load so it can be edited live)
 //   GET  /api/info     model, device and memory details ({"loaded": false} before a model is loaded)
 //   GET  /api/devices  GPUs and CPU the engine can use, with memory
-//   GET  /api/models   .gguf files in the models folder, and whether each is supported
-//   POST /api/load     {"model": "file.gguf", "device": "auto|cpu|Vulkan0|...", "ctx": 4096, "threads": 4}
+//   GET  /api/models   .gguf files in the models folder (and its subfolders), and whether each is supported
+//   POST /api/folder   {"folder": "D:\\models", "recursive": true}  sets the models folder (saved)
+//   POST /api/pick-folder  opens a folder picker on this computer (Windows; local requests only)
+//   POST /api/load     {"model": "sub/file.gguf", "device": "auto|cpu|<device>", "ctx": 4096, "threads": 4,
+//                       "flash_attn": true, "kv_type": "f16|f32", "batch": 256, "experts_used": 0, "seed": -1}
 //   POST /api/unload   frees the model
 //   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "max_tokens":512}
 //                     streams Server-Sent Events: one "prompt" event, a "token" event per token
@@ -37,6 +40,16 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <shobjidl.h>
+#endif
+
+#ifndef TIERLM_VERSION
+#define TIERLM_VERSION "dev"
+#endif
 
 using namespace tierlm;
 using json = nlohmann::json;
@@ -46,7 +59,8 @@ static double since(Clock::time_point t) { return std::chrono::duration<double>(
 namespace {
 
 struct Args {
-    std::string model, host = "127.0.0.1", device = "auto", web = "web", models = "models";
+    std::string model, host = "127.0.0.1", device = "auto", web = "web", models = "models", settings = "tierlm-settings.json";
+    bool models_given = false;
     int port = 8080, threads = std::max(1, (int)std::thread::hardware_concurrency() / 2), ctx = 4096;
 };
 
@@ -117,6 +131,116 @@ size_t utf8_complete(const std::string& s) {
 
 std::string dump(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
 
+namespace fs = std::filesystem;
+
+// Settings kept between runs (models folder, per-model load settings), in a small JSON file.
+json read_settings(const std::string& path) {
+    json j = json::parse(read_file(path), nullptr, false);
+    return j.is_object() ? j : json::object();
+}
+void write_settings(const std::string& path, const json& j) {
+    const std::string tmp = path + ".tmp";
+    { std::ofstream f(fs::u8path(tmp), std::ios::binary); if (!f) return; f << j.dump(2); }
+    std::error_code ec;
+    fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
+    if (ec) { fs::remove(fs::u8path(path), ec); fs::rename(fs::u8path(tmp), fs::u8path(path), ec); }
+}
+
+std::string env(const char* k) { const char* v = std::getenv(k); return v ? v : ""; }
+
+// Folders where other apps keep GGUF models, offered as one-click choices if they exist.
+std::vector<std::string> known_model_folders() {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    const std::string home = env("USERPROFILE");
+#else
+    const std::string home = env("HOME");
+#endif
+    if (home.empty()) return out;
+    for (const char* sub : { ".lmstudio/models", ".cache/lm-studio/models" }) {
+        std::error_code ec;
+        fs::path p = fs::u8path(home) / fs::u8path(sub);
+        if (fs::is_directory(p, ec)) out.push_back(p.make_preferred().u8string());
+    }
+    return out;
+}
+
+// Problems worth telling the user about before they wonder why their GPU is missing.
+json hardware_warnings(bool have_gpu) {
+    json w = json::array();
+    for (const char* var : { "VK_ICD_FILENAMES", "VK_DRIVER_FILES" }) {
+        const std::string v = env(var);
+        if (v.empty()) continue;
+        bool missing = false;
+#ifdef _WIN32
+        const char sep = ';';
+#else
+        const char sep = ':';
+#endif
+        std::stringstream ss(v);
+        for (std::string part; std::getline(ss, part, sep);) {
+            std::error_code ec;
+            if (!part.empty() && !fs::exists(fs::u8path(part), ec)) missing = true;
+        }
+        w.push_back({{"code", "vk_env"}, {"variable", var}, {"value", v}, {"missing", missing},
+                     {"message", std::string(var) + " is set" + (missing ? " and points at a driver file that no longer exists" : "") +
+                                 ". This forces Vulkan to use one specific driver and is usually left over from an old driver install. "
+                                 "It can hide your GPU." }});
+    }
+#ifdef GGML_USE_VULKAN
+    if (!have_gpu)
+        w.push_back({{"code", "no_gpu"}, {"message", "No GPU was found, so the CPU will be used. If this computer has a GPU, update its driver; "
+                                                     "tierlm-devices.exe shows more detail."}});
+#else
+    (void)have_gpu;
+#endif
+    return w;
+}
+
+#ifdef _WIN32
+// Opens the Windows folder picker on this computer. Runs on its own thread with its own COM apartment.
+std::string pick_folder_windows(const std::string& start, bool& cancelled) {
+    std::string result;
+    cancelled = true;
+    std::thread t([&] {
+        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) return;
+        // A tiny always-on-top owner window, so the picker opens in front of the browser.
+        HWND owner = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"STATIC", L"tierlm", WS_POPUP, 0, 0, 0, 0,
+                                     nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (owner) { ShowWindow(owner, SW_SHOW); SetForegroundWindow(owner); }
+        IFileOpenDialog* dlg = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+            DWORD flags = 0;
+            dlg->GetOptions(&flags);
+            dlg->SetOptions(flags | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+            dlg->SetTitle(L"Choose the folder that holds your GGUF models");
+            if (!start.empty()) {
+                std::wstring w = fs::u8path(start).wstring();
+                IShellItem* item = nullptr;
+                if (SUCCEEDED(SHCreateItemFromParsingName(w.c_str(), nullptr, IID_PPV_ARGS(&item)))) { dlg->SetFolder(item); item->Release(); }
+            }
+            if (SUCCEEDED(dlg->Show(owner))) {
+                IShellItem* item = nullptr;
+                if (SUCCEEDED(dlg->GetResult(&item))) {
+                    PWSTR p = nullptr;
+                    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
+                        result = fs::path(p).u8string();
+                        cancelled = false;
+                        CoTaskMemFree(p);
+                    }
+                    item->Release();
+                }
+            }
+            dlg->Release();
+        }
+        if (owner) DestroyWindow(owner);
+        CoUninitialize();
+    });
+    t.join();
+    return result;
+}
+#endif
+
 
 // The loaded model and everything that belongs to it.
 struct Engine {
@@ -124,7 +248,7 @@ struct Engine {
     Tokenizer tok;
     std::vector<int32_t> cached;      // the tokens currently in the KV cache
     std::string path, name;
-    int threads = 1;
+    int threads = 1, seed = -1;
     double load_s = 0;
     std::mt19937 rng{std::random_device{}()};
 };
@@ -175,9 +299,10 @@ int main(int argc, char** argv) {
         else if (k == "-t") a.threads = std::atoi(next().c_str());
         else if (k == "-c") a.ctx = std::atoi(next().c_str());
         else if (k == "--web") a.web = next();
-        else if (k == "--models") a.models = next();
+        else if (k == "--models") { a.models = next(); a.models_given = true; }
+        else if (k == "--settings") a.settings = next();
         else if (k == "-h" || k == "--help") {
-            std::fprintf(stderr, "usage: %s [model.gguf] [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu|<device>] [-t threads] [-c context] [--web dir] [--models dir]\n"
+            std::fprintf(stderr, "usage: %s [model.gguf] [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu|<device>] [-t threads] [-c context] [--web dir] [--models dir] [--settings file]\n"
                                  "Without a model, the web page opens a setup screen to choose the hardware and model.\n", argv[0]);
             return 0;
         }
@@ -188,22 +313,35 @@ int main(int argc, char** argv) {
     eng.threads = a.threads;
     std::mutex mu;                       // one load or generation at a time
 
-    auto load = [&](const std::string& path, const std::string& device, int ctx, int threads) {
+    // The models folder: --models if given, else the one saved last time, else "models".
+    json settings = read_settings(a.settings);
+    bool recursive = settings.value("recursive", true);
+    if (!a.models_given && settings.contains("models_folder") && settings["models_folder"].is_string()) {
+        std::error_code ec;
+        const std::string saved = settings["models_folder"];
+        if (fs::is_directory(fs::u8path(saved), ec)) a.models = saved;
+    }
+    std::fprintf(stderr, "tierlm %s\nmodels folder: %s\n", TIERLM_VERSION, a.models.c_str());
+
+    auto load = [&](const std::string& path, const LoadOptions& opt, int threads, int seed) {
         json info = describe_model(path);
         if (!info.value("supported", false)) throw std::runtime_error(info.value("reason", std::string("unsupported model")));
         eng.model.reset();               // free the old model (and its GPU memory) first
         eng.cached.clear();
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
-        eng.model = OlmoeModel::load(path, ctx, device);
+        eng.model = OlmoeModel::load(path, opt);
         eng.path = path;
         eng.name = gguf_string(path, "general.name");
         eng.threads = threads > 0 ? threads : a.threads;
+        eng.seed = seed;
+        if (seed >= 0) eng.rng.seed((uint32_t)seed);
         eng.load_s = since(t0);
         std::fprintf(stderr, "loaded %s on %s in %.1fs\n", path.c_str(), eng.model->device_name().c_str(), eng.load_s);
     };
     if (!a.model.empty()) {
-        try { load(a.model, a.device, a.ctx, a.threads); }
+        LoadOptions o; o.max_ctx = a.ctx; o.device = a.device;
+        try { load(a.model, o, a.threads, -1); }
         catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
     }
 
@@ -219,12 +357,12 @@ int main(int argc, char** argv) {
         res.set_content(page, "text/html; charset=utf-8");
     });
 
-    json last_info = {{"loaded", false}};
+    json last_info = {{"loaded", false}, {"version", TIERLM_VERSION}};
     svr.Get("/api/info", [&](const httplib::Request&, httplib::Response& res) {
         // While a reply is streaming or a model is loading, answer from the last snapshot instead of waiting.
         std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
         if (!lk.owns_lock()) { json j = last_info; j["busy"] = true; res.set_content(dump(j), "application/json"); return; }
-        if (!eng.model) { last_info = {{"loaded", false}}; res.set_content(dump(last_info), "application/json"); return; }
+        if (!eng.model) { last_info = {{"loaded", false}, {"version", TIERLM_VERSION}}; res.set_content(dump(last_info), "application/json"); return; }
         const auto& hp = eng.model->hparams();
         size_t free = 0, total = 0;
         eng.model->device_memory(free, total);
@@ -238,6 +376,8 @@ int main(int argc, char** argv) {
             {"weights_bytes", eng.model->weights_bytes()}, {"kv_bytes", eng.model->kv_bytes()},
             {"device_free", free}, {"device_total", total},
             {"kv_type", eng.model->kv_type()}, {"flash_attn", eng.model->flash_attn()}, {"load_s", eng.load_s},
+            {"batch", eng.model->batch()}, {"experts_default", eng.model->experts_default()}, {"seed", eng.seed},
+            {"version", TIERLM_VERSION},
         };
         last_info = j;
         res.set_content(dump(j), "application/json");
@@ -246,6 +386,7 @@ int main(int argc, char** argv) {
     // Hardware the engine can use, with memory, for the setup screen.
     svr.Get("/api/devices", [&](const httplib::Request&, httplib::Response& res) {
         json list = json::array();
+        bool have_gpu = false;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);
             size_t free = 0, total = 0;
@@ -257,26 +398,100 @@ int main(int argc, char** argv) {
                 case GGML_BACKEND_DEVICE_TYPE_IGPU: type = "igpu"; break;
                 default: break;
             }
+            if (std::strcmp(type, "gpu") == 0 || std::strcmp(type, "igpu") == 0) have_gpu = true;
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
             list.push_back({{"id", ggml_backend_dev_name(d)}, {"description", ggml_backend_dev_description(d)},
                             {"type", type}, {"backend", reg ? ggml_backend_reg_name(reg) : ""},
                             {"free", free}, {"total", total}});
         }
-        json j = {{"devices", list}, {"threads", a.threads}, {"hw_threads", (int)std::thread::hardware_concurrency()}};
+        json j = {{"devices", list}, {"threads", a.threads}, {"hw_threads", (int)std::thread::hardware_concurrency()},
+                  {"warnings", hardware_warnings(have_gpu)}, {"version", TIERLM_VERSION}};
         res.set_content(dump(j), "application/json");
     });
 
-    // Models in the models folder, read from their headers (fast: no weights are loaded).
+    // Models in the models folder (and, if enabled, its subfolders, as LM Studio stores them), read from
+    // their headers only (fast: no weights are loaded). "id" is the path relative to the folder.
     svr.Get("/api/models", [&](const httplib::Request&, httplib::Response& res) {
         json list = json::array();
         std::error_code ec;
-        for (const auto& f : std::filesystem::directory_iterator(std::filesystem::u8path(a.models), ec)) {
-            if (!f.is_regular_file() || f.path().extension() != ".gguf") continue;
-            list.push_back(describe_model(f.path().u8string()));
+        const fs::path base = fs::u8path(a.models);
+        auto add = [&](const fs::path& p) {
+            json m = describe_model(p.u8string());
+            m["id"] = p.lexically_relative(base).generic_u8string();
+            std::string sub = p.parent_path().lexically_relative(base).generic_u8string();
+            m["folder"] = sub == "." ? "" : sub;
+            list.push_back(m);
+        };
+        const bool exists = fs::is_directory(base, ec);
+        if (exists && recursive) {
+            auto it = fs::recursive_directory_iterator(base, fs::directory_options::skip_permission_denied, ec);
+            for (; !ec && it != fs::recursive_directory_iterator() && list.size() < 500; it.increment(ec)) {
+                if (it.depth() > 4) { it.disable_recursion_pending(); continue; }
+                std::error_code e2;
+                if (it->is_regular_file(e2) && it->path().extension() == ".gguf") add(it->path());
+            }
+        } else if (exists) {
+            for (const auto& f : fs::directory_iterator(base, ec))
+                if (f.is_regular_file() && f.path().extension() == ".gguf") add(f.path());
         }
-        json j = {{"folder", std::filesystem::absolute(std::filesystem::u8path(a.models), ec).u8string()}, {"models", list},
-                  {"default_ctx", a.ctx}, {"current", eng.path}};
+        json suggest = json::array();
+        for (const auto& f : known_model_folders()) {
+            std::error_code e2;
+            if (!fs::equivalent(fs::u8path(f), base, e2)) suggest.push_back({{"name", "LM Studio models"}, {"folder", f}});
+        }
+        json per_model = settings.value("models", json::object());
+        json j = {{"folder", fs::absolute(base, ec).make_preferred().u8string()}, {"exists", exists}, {"recursive", recursive},
+                  {"models", list}, {"default_ctx", a.ctx}, {"current", eng.path}, {"suggestions", suggest},
+                  {"saved", per_model}, {"last_model", settings.value("last_model", std::string())},
+#ifdef _WIN32
+                  {"can_pick", true},
+#else
+                  {"can_pick", false},
+#endif
+        };
         res.set_content(dump(j), "application/json");
+    });
+
+    // Change the models folder. Saved for next time.
+    svr.Post("/api/folder", [&](const httplib::Request& req, httplib::Response& res) {
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) { res.status = 400; res.set_content(dump({{"error", "bad request"}}), "application/json"); return; }
+        std::lock_guard<std::mutex> lk(mu);
+        if (body.contains("recursive")) recursive = body.value("recursive", true);
+        if (body.contains("folder")) {
+            std::string f = body.value("folder", std::string());
+            while (f.size() > 1 && (f.back() == ' ' || f.back() == '"')) f.pop_back();
+            while (!f.empty() && (f.front() == ' ' || f.front() == '"')) f.erase(0, 1);
+            std::error_code ec;
+            if (f.empty() || !fs::is_directory(fs::u8path(f), ec)) {
+                res.status = 400;
+                res.set_content(dump({{"error", "folder not found: " + f}}), "application/json");
+                return;
+            }
+            a.models = fs::absolute(fs::u8path(f), ec).make_preferred().u8string();
+            settings["models_folder"] = a.models;
+        }
+        settings["recursive"] = recursive;
+        write_settings(a.settings, settings);
+        res.set_content(dump({{"ok", true}, {"folder", a.models}, {"recursive", recursive}}), "application/json");
+    });
+
+    // Native folder picker. It opens on the computer running tierlm, so only answer local requests.
+    svr.Post("/api/pick-folder", [&](const httplib::Request& req, httplib::Response& res) {
+#ifdef _WIN32
+        if (req.remote_addr != "127.0.0.1" && req.remote_addr != "::1") {
+            res.status = 403;
+            res.set_content(dump({{"error", "the folder picker only works from the computer running tierlm"}}), "application/json");
+            return;
+        }
+        bool cancelled = true;
+        std::string f = pick_folder_windows(a.models, cancelled);
+        res.set_content(dump({{"cancelled", cancelled}, {"folder", f}}), "application/json");
+#else
+        (void)req;
+        res.status = 501;
+        res.set_content(dump({{"error", "type the folder path instead (the picker is Windows only)"}}), "application/json");
+#endif
     });
 
     svr.Post("/api/load", [&](const httplib::Request& req, httplib::Response& res) {
@@ -303,7 +518,22 @@ int main(int argc, char** argv) {
             return;
         }
         try {
-            load(file.u8string(), body.value("device", std::string("auto")), body.value("ctx", a.ctx), body.value("threads", a.threads));
+            LoadOptions o;
+            o.device = body.value("device", std::string("auto"));
+            o.max_ctx = body.value("ctx", a.ctx);
+            if (body.contains("flash_attn")) o.flash_attn = body.value("flash_attn", true) ? 1 : 0;
+            if (body.contains("kv_type")) o.kv_f32 = body.value("kv_type", std::string("f16")) == "f32" ? 1 : 0;
+            o.batch = body.value("batch", 0);
+            o.experts_used = body.value("experts_used", 0);
+            const int threads = body.value("threads", a.threads), seed = body.value("seed", -1);
+            load(file.u8string(), o, threads, seed);
+            // Remember these settings for this model, like LM Studio does.
+            const std::string id = body.value("model", std::string());
+            json saved = body;
+            saved.erase("model");
+            settings["models"][id] = saved;
+            settings["last_model"] = id;
+            write_settings(a.settings, settings);
             res.set_content(dump({{"ok", true}, {"device", eng.model->device_name()}, {"load_s", eng.load_s}}), "application/json");
         } catch (const std::exception& e) {
             eng.model.reset();
@@ -355,6 +585,7 @@ int main(int argc, char** argv) {
                 const float temperature = body.value("temperature", 0.7f);
                 const float top_p = body.value("top_p", 0.9f);
                 const int max_tokens = body.value("max_tokens", 512);
+                if (eng.seed >= 0) eng.rng.seed((uint32_t)eng.seed);    // same seed, same reply
                 auto& model = eng.model; auto& tok = eng.tok; auto& cached = eng.cached;
                 const auto& hp = model->hparams();
                 const int L = hp.n_layer, E = hp.n_expert, K = hp.n_expert_used;

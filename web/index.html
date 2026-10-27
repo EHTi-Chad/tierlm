@@ -129,11 +129,45 @@
   #loadmsg.err { color: var(--danger); }
   .empty-models { font-size: 13.5px; color: var(--muted); }
   .empty-models code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+  .ver { font-size: 11px; font-weight: 500; color: var(--faint); letter-spacing: 0; }
+  .hw { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+  .dev { border: 1.5px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .dev.use { border-color: var(--accent); background: var(--accent-soft); }
+  .dev .t { font-weight: 600; line-height: 1.35; }
+  .dev .d { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .place { margin-top: 14px; }
+  .place .lbl { font-size: 13px; margin-bottom: 6px; }
+  .stack { display: flex; height: 14px; border-radius: 5px; overflow: hidden; background: var(--panel-2); }
+  .stack > div { height: 100%; }
+  .stackleg { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .stackleg i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  .stackleg b { color: var(--ink); font-weight: 600; }
+  #warnings .warnbox { border: 1px solid rgba(224,160,67,.5); background: rgba(224,160,67,.12); border-radius: 10px; padding: 10px 12px; margin-bottom: 14px; font-size: 13px; }
+  #warnings .warnbox b { display: block; margin-bottom: 2px; }
+  #warnings code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; word-break: break-all; }
+  #warnings pre { background: var(--panel-2); padding: 6px 8px; border-radius: 6px; margin: 6px 0 0; font-size: 12px; overflow-x: auto; }
+  .menuwrap { position: relative; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .menuwrap .caption { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 52vw; margin: 0; }
+  .dots { font-size: 16px; line-height: 1; padding: 2px 9px; }
+  .menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; min-width: 290px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.14); padding: 6px; display: flex; flex-direction: column; }
+  .menu button, .menu a, .menu .mi { display: block; text-align: left; border: 0; background: transparent; padding: 7px 10px; border-radius: 6px; color: var(--ink); text-decoration: none; font-size: 13.5px; cursor: pointer; }
+  .menu button:hover, .menu a:hover, .menu .mi:hover { background: var(--panel-2); }
+  .menu .mi input { accent-color: var(--accent); margin-right: 6px; }
+  .menu hr { border: 0; border-top: 1px solid var(--line); margin: 5px 4px; }
+  .menu .sub { font-size: 11.5px; color: var(--faint); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
+  .pathform { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .pathform input { flex: 1; min-width: 220px; font: inherit; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  #patherr { color: var(--danger); }
+  details#adv { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+  details#adv summary { cursor: pointer; font-weight: 600; font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+  .settings label.chk { display: flex; align-items: center; gap: 7px; }
+  .settings label.chk input { accent-color: var(--accent); }
+  .settings input[type=number] { font: inherit; width: 120px; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">tier<span>lm</span></div>
+  <div class="logo">tier<span>lm</span> <span class="ver" id="ver"></span></div>
   <span class="pill"><span class="dot" id="devdot"></span><span id="devname">connecting…</span></span>
   <span class="pill" id="modelname">model</span>
   <span class="spacer"></span>
@@ -143,31 +177,94 @@
 
 <main id="setup" hidden>
   <h1>Set up tierlm</h1>
-  <p class="lead">Choose the hardware to run on and the model to load. You can change this any time.</p>
+  <p class="lead">tierlm finds your hardware and places the model for you: GPU first, then CPU; VRAM first, then RAM, then SSD.</p>
+  <div id="warnings"></div>
 
   <section class="card">
-    <div class="head"><h2>1 · Hardware</h2></div>
-    <div class="body"><div class="choices" id="devlist"></div></div>
+    <div class="head"><h2>1 · Detected hardware</h2><a href="#" class="caption" id="rescanhw">Rescan</a></div>
+    <div class="body">
+      <div class="hw" id="devlist"></div>
+      <div class="place" id="place"></div>
+    </div>
   </section>
 
   <section class="card">
-    <div class="head"><h2>2 · Model</h2><span class="caption" id="modelfolder"></span></div>
-    <div class="body"><div class="choices" id="modellist"></div></div>
+    <div class="head">
+      <h2>2 · GGUF models</h2>
+      <div class="menuwrap">
+        <span class="caption" id="modelfolder"></span>
+        <button class="tiny ghost dots" id="mbtn" title="Models folder and downloads" aria-haspopup="true">⋯</button>
+        <div class="menu" id="mmenu" hidden>
+          <button id="m-pick">Choose models folder…</button>
+          <button id="m-type">Type a folder path…</button>
+          <div id="m-suggest"></div>
+          <label class="mi"><input type="checkbox" id="m-rec"> Include subfolders</label>
+          <button id="m-rescan">Rescan folder</button>
+          <hr>
+          <a href="https://huggingface.co/models?library=gguf&amp;search=olmoe&amp;sort=trending" target="_blank" rel="noopener">Find GGUF models on Hugging Face ↗</a>
+        </div>
+      </div>
+    </div>
+    <div class="body">
+      <div class="pathform" id="pathform" hidden>
+        <input id="pathin" type="text" placeholder="e.g. D:\AI\models or C:\Users\you\.lmstudio\models" spellcheck="false">
+        <button class="primary tiny" id="pathok">Use folder</button>
+        <button class="ghost tiny" id="pathcancel">Cancel</button>
+        <span class="caption" id="patherr"></span>
+      </div>
+      <div class="choices" id="modellist"></div>
+      <div class="caption" style="margin-top:8px">tierlm reads models in the <b>.gguf</b> format, the same files LM Studio and other local apps use.</div>
+    </div>
   </section>
 
   <section class="card">
-    <div class="head"><h2>3 · Settings</h2></div>
-    <div class="body settings">
-      <div>
-        <label for="ctxsel">Context length</label>
-        <select id="ctxsel"></select>
-        <div class="help" id="ctxhelp">How much conversation the model can remember. Longer uses more memory.</div>
+    <div class="head"><h2>3 · Settings</h2><span class="caption" id="setnote"></span></div>
+    <div class="body">
+      <div class="settings">
+        <div>
+          <label for="ctxsel">Context length</label>
+          <select id="ctxsel"></select>
+          <div class="help" id="ctxhelp">How much conversation the model can remember. Longer uses more memory.</div>
+        </div>
+        <div>
+          <label for="thr">CPU threads: <span id="thrv"></span></label>
+          <input id="thr" type="range" min="1" max="8" step="1">
+          <div class="help">Used for any work that runs on the CPU. On laptops, fewer threads is often faster.</div>
+        </div>
       </div>
-      <div>
-        <label for="thr">CPU threads: <span id="thrv"></span></label>
-        <input id="thr" type="range" min="1" max="8" step="1">
-        <div class="help">Used for any work that runs on the CPU. On laptops, fewer threads is often faster.</div>
-      </div>
+      <details id="adv">
+        <summary>Advanced</summary>
+        <div class="settings">
+          <div>
+            <label class="chk"><input type="checkbox" id="fa" checked> Flash attention</label>
+            <div class="help">Faster attention that reads the context once. Turn off only to compare or troubleshoot.</div>
+          </div>
+          <div>
+            <label for="kvsel">KV cache precision</label>
+            <select id="kvsel"><option value="f16">f16 (half the memory)</option><option value="f32">f32 (exact, twice the memory)</option></select>
+            <div class="help">How the conversation memory is stored.</div>
+          </div>
+          <div>
+            <label for="batchsel">Prompt batch size</label>
+            <select id="batchsel"><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option></select>
+            <div class="help">Tokens read at once when processing a prompt. Bigger is faster for long prompts but needs more memory.</div>
+          </div>
+          <div>
+            <label for="experts">Active experts per token: <span id="expv"></span></label>
+            <input id="experts" type="range" min="1" max="64" step="1">
+            <div class="help" id="exphelp">How many experts each layer uses per token. Fewer is faster but lower quality.</div>
+          </div>
+          <div>
+            <label for="seed">Seed</label>
+            <input id="seed" type="number" value="-1" min="-1" step="1">
+            <div class="help">-1 is random. Any other number makes replies repeatable at the same settings.</div>
+          </div>
+          <div>
+            <label class="chk"><input type="checkbox" id="forcecpu"> Force CPU</label>
+            <div class="help">Ignore the GPU and run everything on the CPU. Useful for troubleshooting.</div>
+          </div>
+        </div>
+      </details>
     </div>
   </section>
 
@@ -287,7 +384,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const fmtGiB = b => b < 1073741824 ? Math.max(0.1, b / 1048576).toFixed(b < 10485760 ? 1 : 0) + " MiB" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 1 : 2) + " GiB";
+const fmtGiB = b => !b ? "0 GiB" : b < 1073741824 ? Math.max(0.1, b / 1048576).toFixed(b < 10485760 ? 1 : 0) + " MiB" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 1 : 2) + " GiB";
 let info = null, L = 16, E = 64, K = 8;
 let counts = new Float64Array(L * E), flash = new Float64Array(L * E), totalPicks = 0;
 let mapMode = "heat", history = [], busy = false, controller = null;
@@ -298,6 +395,7 @@ async function loadInfo() {
   try {
     info = await (await fetch("/api/info")).json();
   } catch (e) { $("devname").textContent = "server not reachable"; return; }
+  if (info.version) $("ver").textContent = "v" + info.version;
   if (!info.loaded) { info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "setup"; showSetup(); return; }
   showApp();
   L = info.layers; E = info.experts; K = info.experts_used;
@@ -324,7 +422,9 @@ async function loadInfo() {
   $("devmem").textContent = info.device + ": " + fmtGiB(used) + " used of " + fmtGiB(info.device_total) +
     " · weights " + fmtGiB(w) + ", KV cache " + fmtGiB(kv) +
     (info.device_type === "igpu" ? " · an integrated GPU shares system RAM, so its 'VRAM' is borrowed memory" : "") +
-    " · KV cache " + info.kv_type + ", flash attention " + (info.flash_attn ? "on" : "off") + " · tiering across devices comes next";
+    " · KV cache " + info.kv_type + ", flash attention " + (info.flash_attn ? "on" : "off") +
+    (info.experts_used !== info.experts_default ? " · " + info.experts_used + " active experts (model default " + info.experts_default + ")" : "") +
+    " · tiering across devices comes next";
   resizeCanvases();
 }
 function setContext(n) {
@@ -525,9 +625,7 @@ $("m-heat").onclick = () => { mapMode = "heat"; $("m-heat").classList.add("on");
 $("m-live").onclick = () => { mapMode = "live"; $("m-live").classList.add("on"); $("m-heat").classList.remove("on"); };
 $("m-reset").onclick = () => { counts.fill(0); totalPicks = 0; updateHits(); };
 // ---------- setup screen ----------
-let devices = [], models = [], hwThreads = 8, defThreads = 4, defCtx = 4096, selDev = null, selModel = null;
-const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
-                set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+let devices = [], models = [], warnings = [], hwThreads = 8, defThreads = 4, defCtx = 4096, selModel = null, md = {};
 const typeLabel = { gpu: "Dedicated GPU", igpu: "Integrated GPU", cpu: "CPU" };
 function showSetup() {
   $("app").hidden = true; $("setup").hidden = false; $("setupbtn").hidden = true;
@@ -535,122 +633,216 @@ function showSetup() {
   loadSetup();
 }
 function showApp() { $("setup").hidden = true; $("app").hidden = false; $("setupbtn").hidden = false; resizeCanvases(); }
-function needBytes(m, ctx) { return (m.bytes || 0) + (m.kv_bytes_per_token || 0) * ctx + 600 * 1048576; }
-function score(d) {   // which device to recommend when several fit
-  return (d.type === "gpu" ? 3 : d.type === "igpu" ? 2 : 1) * 10 + (d.backend === "CUDA" ? 1 : 0);
+function needBytes(m, ctx, kv32) { return (m.bytes || 0) + (m.kv_bytes_per_token || 0) * ctx * (kv32 ? 2 : 1) + 600 * 1048576; }
+// Same order as the engine's "auto": the dedicated GPU with the most memory, then an integrated GPU.
+function bestGpu() {
+  for (const t of ["gpu", "igpu"]) {
+    const c = devices.filter(d => d.type === t).sort((a, b) => b.total - a.total);
+    if (c.length) return c[0];
+  }
+  return null;
+}
+function cpuDev() { return devices.find(d => d.type === "cpu") || null; }
+// Where the model will go. Until the tier loader exists, the whole model goes on one device:
+// the best GPU if it fits there, otherwise the CPU (system RAM).
+function plan() {
+  const ctx = +$("ctxsel").value || defCtx, kv32 = $("kvsel").value === "f32";
+  const need = selModel ? needBytes(selModel, ctx, kv32) : 0;
+  const gpu = bestGpu(), cpu = cpuDev();
+  if ($("forcecpu").checked || !gpu) return { dev: cpu, need, why: $("forcecpu").checked ? "forced" : "nogpu" };
+  if (!selModel || gpu.free >= need) return { dev: gpu, need, why: "fits" };
+  return { dev: cpu, need, why: "toobig", gpu };
 }
 async function loadSetup() {
   $("loadmsg").textContent = ""; $("loadmsg").className = "";
   try {
-    const [dv, md] = await Promise.all([fetch("/api/devices").then(r => r.json()), fetch("/api/models").then(r => r.json())]);
-    devices = dv.devices; hwThreads = dv.hw_threads || 8; defThreads = dv.threads || 4;
-    models = md.models; defCtx = md.default_ctx || 4096;
-    $("modelfolder").textContent = md.folder;
+    const [dv, m] = await Promise.all([fetch("/api/devices").then(r => r.json()), fetch("/api/models").then(r => r.json())]);
+    devices = dv.devices; warnings = dv.warnings || []; hwThreads = dv.hw_threads || 8; defThreads = dv.threads || 4;
+    md = m; models = m.models; defCtx = m.default_ctx || 4096;
+    if (dv.version) $("ver").textContent = "v" + dv.version;
   } catch (e) { $("loadmsg").textContent = "Could not reach the tierlm server."; $("loadmsg").className = "err"; return; }
-  const supported = models.filter(m => m.supported).sort((a, b) => a.file.localeCompare(b.file));
-  const lastModel = store.get("tierlm.model"), lastDev = store.get("tierlm.device");
-  selModel = supported.find(m => m.file === lastModel) || supported[0] || null;
+  $("modelfolder").textContent = md.folder; $("modelfolder").title = md.folder;
+  $("m-rec").checked = md.recursive;
+  const sg = $("m-suggest"); sg.innerHTML = "";
+  for (const f of md.suggestions || []) {
+    const b = document.createElement("button");
+    b.innerHTML = `Use ${f.name} folder<span class="sub"></span>`; b.querySelector(".sub").textContent = f.folder;
+    b.onclick = () => { closeMenu(); setFolder(f.folder); };
+    sg.appendChild(b);
+  }
+  const supported = models.filter(m => m.supported);
+  const keep = selModel && supported.find(m => m.id === selModel.id);
+  selModel = keep || supported.find(m => m.id === md.last_model) || supported.sort((a, b) => a.id.localeCompare(b.id))[0] || null;
   $("thr").max = Math.max(1, hwThreads);
-  $("thr").value = +(store.get("tierlm.threads") || defThreads);
-  $("thrv").textContent = $("thr").value;
-  buildCtx(+(store.get("tierlm.ctx") || defCtx));
-  // Recommend the best device that fits the chosen model; keep the user's last choice if it still exists.
-  const rec = recommend();
-  selDev = devices.find(d => d.id === lastDev) || rec || devices[0] || null;
+  applySaved();
+  renderWarnings();
   renderSetup();
+}
+// Settings are remembered per model (by the server, in tierlm-settings.json).
+function applySaved() {
+  const s = (selModel && md.saved && md.saved[selModel.id]) || {};
+  $("thr").value = s.threads || defThreads; $("thrv").textContent = $("thr").value;
+  buildCtx(s.ctx || defCtx);
+  $("fa").checked = s.flash_attn !== false;
+  $("kvsel").value = s.kv_type || "f16";
+  $("batchsel").value = String(s.batch || 256);
+  const E = (selModel && selModel.experts) || 0, K = (selModel && selModel.experts_used) || 0;
+  $("experts").disabled = !E; $("experts").max = Math.max(1, E);
+  $("experts").value = s.experts_used || K || 1; $("expv").textContent = E ? $("experts").value : "n/a";
+  $("exphelp").textContent = E ? `How many of the ${E} experts each layer uses per token (this model was trained with ${K}). Fewer is faster but lower quality.`
+                               : "Only for mixture-of-experts models.";
+  $("seed").value = s.seed ?? -1;
+  $("forcecpu").checked = s.device === "cpu";
+  $("setnote").textContent = selModel ? (md.saved && md.saved[selModel.id] ? "Using your saved settings for this model" : "Settings are remembered per model") : "";
 }
 function buildCtx(want) {
   const max = selModel && selModel.ctx_train ? selModel.ctx_train : 4096;
   const opts = [1024, 2048, 4096, 8192, 16384, 32768].filter(v => v <= Math.max(max, 1024));
   const sel = $("ctxsel"); sel.innerHTML = "";
   for (const v of opts) { const o = document.createElement("option"); o.value = v; o.textContent = v.toLocaleString() + " tokens"; sel.appendChild(o); }
-  sel.value = opts.includes(want) ? want : opts.filter(v => v <= 4096).at(-1) || opts[0];
+  sel.value = opts.includes(+want) ? want : opts.filter(v => v <= 4096).at(-1) || opts[0];
 }
-function recommend() {
-  if (!selModel) return devices.find(d => d.type !== "cpu") || devices[0];
-  const ctx = +$("ctxsel").value || defCtx, need = needBytes(selModel, ctx);
-  const fits = devices.filter(d => d.free >= need).sort((a, b) => score(b) - score(a));
-  return fits[0] || devices.find(d => d.type === "cpu") || devices[0];
+function renderWarnings() {
+  const w = $("warnings"); w.innerHTML = "";
+  for (const x of warnings) {
+    const d = document.createElement("div"); d.className = "warnbox";
+    if (x.code === "vk_env") {
+      d.innerHTML = `<b>Your GPU may be hidden by an old driver setting</b><span class="m"></span>
+        <pre></pre><div style="margin-top:6px">Then sign out of Windows and back in, and restart tierlm.</div>`;
+      d.querySelector(".m").textContent = x.message + " Value: " + x.value + ". To remove it, run this in a command prompt:";
+      d.querySelector("pre").textContent = `reg delete HKCU\\Environment /v ${x.variable} /f`;
+    } else {
+      d.innerHTML = `<b>No GPU found</b><span class="m"></span>`; d.querySelector(".m").textContent = x.message;
+    }
+    w.appendChild(d);
+  }
 }
+function tagger(el) { return (t, c) => { const s = document.createElement("span"); s.className = "tag " + (c || ""); s.textContent = t; el.appendChild(s); }; }
 function renderSetup() {
   const ctx = +$("ctxsel").value || defCtx;
-  const need = selModel ? needBytes(selModel, ctx) : 0;
-  const rec = recommend();
-  // hardware
+  const p = plan();
+  // hardware (read-only)
   const dl = $("devlist"); dl.innerHTML = "";
-  for (const d of devices) {
-    const lab = document.createElement("label");
-    lab.className = "choice" + (selDev && d.id === selDev.id ? " sel" : "");
-    const fits = !selModel || d.free >= need;
-    lab.innerHTML = `<input type="radio" name="dev"><div class="t"></div><div class="d"></div><div class="tags"></div>`;
-    lab.querySelector("input").checked = selDev && d.id === selDev.id;
-    lab.querySelector(".t").textContent = d.type === "cpu" ? "CPU · " + d.description : d.description;
-    lab.querySelector(".d").textContent = (d.type === "cpu" ? "System memory" : d.backend + " · " + d.id) + " · " +
-      fmtGiB(d.free) + " free of " + fmtGiB(d.total);
-    const tags = lab.querySelector(".tags");
-    const add = (t, c) => { const s = document.createElement("span"); s.className = "tag " + (c || ""); s.textContent = t; tags.appendChild(s); };
+  const order = [...devices].sort((a, b) => ({ gpu: 0, igpu: 1, cpu: 2 }[a.type] ?? 3) - ({ gpu: 0, igpu: 1, cpu: 2 }[b.type] ?? 3));
+  for (const d of order) {
+    const el = document.createElement("div");
+    el.className = "dev" + (p.dev && d.id === p.dev.id ? " use" : "");
+    el.innerHTML = `<div class="t"></div><div class="d"></div><div class="tags"></div>`;
+    el.querySelector(".t").textContent = d.type === "cpu" ? "CPU · " + d.description : d.description;
+    el.querySelector(".d").textContent = (d.type === "cpu" ? "System RAM" : d.type === "igpu" ? d.backend + " · shared memory" : d.backend + " · VRAM") +
+      " · " + fmtGiB(d.free) + " free of " + fmtGiB(d.total);
+    const add = tagger(el.querySelector(".tags"));
     add(typeLabel[d.type] || d.type);
-    if (rec && d.id === rec.id) add("Recommended", "good");
-    if (selModel) fits ? add("Model fits", "good") : add("Not enough free memory", "bad");
+    if (p.dev && d.id === p.dev.id) add("Will be used", "good");
     if (d.type === "igpu") add("Shares system RAM", "warn");
-    lab.onclick = () => { selDev = d; renderSetup(); };
-    dl.appendChild(lab);
+    dl.appendChild(el);
+  }
+  // placement bar
+  const pl = $("place");
+  if (!selModel || !p.dev) { pl.innerHTML = ""; }
+  else {
+    const onGpu = p.dev.type !== "cpu";
+    const vram = onGpu ? p.need : 0, ram = onGpu ? 0 : p.need, total = Math.max(1, vram + ram);
+    pl.innerHTML = `<div class="lbl"></div><div class="stack"><div style="background:var(--vram);width:${100 * vram / total}%"></div><div style="background:var(--ram);width:${100 * ram / total}%"></div><div style="background:var(--ssd);width:0"></div></div>
+      <div class="stackleg"><span><i style="background:var(--vram)"></i>${p.dev.type === "igpu" ? "GPU memory (shared)" : "VRAM"} <b>${fmtGiB(vram)}</b></span><span><i style="background:var(--ram)"></i>RAM <b>${fmtGiB(ram)}</b></span><span><i style="background:var(--ssd)"></i>SSD <b>0 GiB</b></span></div>`;
+    const msg = { fits: `The whole model fits on ${p.dev.description}.`,
+                  toobig: `Too big for ${p.gpu && p.gpu.description} (${fmtGiB(p.gpu ? p.gpu.free : 0)} free), so it will run from system RAM on the CPU. Splitting it between GPU and RAM comes with the tier loader.`,
+                  forced: "Force CPU is on, so everything runs on the CPU.",
+                  nogpu: "No GPU found, so everything runs on the CPU." }[p.why];
+    pl.querySelector(".lbl").textContent = "Where this model will go: " + msg;
   }
   // models
   const ml = $("modellist"); ml.innerHTML = "";
-  if (!models.length) {
-    ml.innerHTML = `<div class="empty-models">No models found. Put a supported <code>.gguf</code> file in the folder shown above, then click
+  if (!md.exists) {
+    ml.innerHTML = `<div class="empty-models">The models folder doesn't exist. Use the <b>⋯</b> menu to choose another one.</div>`;
+  } else if (!models.length) {
+    ml.innerHTML = `<div class="empty-models">No <code>.gguf</code> files found in this folder${md.recursive ? " or its subfolders" : ""}. Put a model here, or use the <b>⋯</b> menu to pick the folder where your models already are, then
       <a href="#" id="rescan">Rescan</a>. Start with <a href="https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF/tree/main" target="_blank" rel="noopener">OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf</a> (4.2 GB).</div>`;
     $("rescan").onclick = e => { e.preventDefault(); loadSetup(); };
   }
-  for (const m of [...models].sort((a, b) => (b.supported - a.supported) || a.file.localeCompare(b.file))) {
+  for (const m of [...models].sort((a, b) => (b.supported - a.supported) || a.id.localeCompare(b.id))) {
     const lab = document.createElement("label");
-    lab.className = "choice" + (selModel && m.file === selModel.file ? " sel" : "") + (m.supported ? "" : " off");
+    lab.className = "choice" + (selModel && m.id === selModel.id ? " sel" : "") + (m.supported ? "" : " off");
     lab.innerHTML = `<input type="radio" name="model"><div class="t"></div><div class="d"></div><div class="tags"></div>`;
-    const inp = lab.querySelector("input"); inp.checked = selModel && m.file === selModel.file; inp.disabled = !m.supported;
+    const inp = lab.querySelector("input"); inp.checked = selModel && m.id === selModel.id; inp.disabled = !m.supported;
     lab.querySelector(".t").textContent = m.name || m.file;
-    lab.querySelector(".d").textContent = m.file + " · " + fmtGiB(m.bytes || 0);
-    const tags = lab.querySelector(".tags");
-    const add = (t, c) => { const s = document.createElement("span"); s.className = "tag " + (c || ""); s.textContent = t; tags.appendChild(s); };
+    lab.querySelector(".d").textContent = (m.folder ? m.folder + "/" : "") + m.file + " · " + fmtGiB(m.bytes || 0);
+    const add = tagger(lab.querySelector(".tags"));
     if (m.supported) {
       add("Supported", "good");
       if (m.experts) add(m.experts_used + " of " + m.experts + " experts per token");
       if (m.layers) add(m.layers + " layers");
     } else add(m.reason || "Not supported", "bad");
-    if (m.supported) lab.onclick = () => { selModel = m; buildCtx(+$("ctxsel").value); renderSetup(); };
+    if (m.supported) lab.onclick = e => { e.preventDefault(); if (selModel && selModel.id === m.id) return; selModel = m; applySaved(); renderSetup(); };
     ml.appendChild(lab);
   }
   // summary
   if (!selModel) {
-    $("rec").textContent = models.length ? "None of the models in the folder are supported yet." : "";
-  } else if (selDev) {
-    const fits = selDev.free >= need;
+    $("rec").textContent = models.length ? "None of the models in this folder are supported yet. tierlm runs OLMoE models so far." : "";
+  } else if (p.dev) {
+    const kv32 = $("kvsel").value === "f32";
     $("rec").innerHTML = "";
     const b = document.createElement("b"); b.textContent = selModel.name || selModel.file;
-    $("rec").append("Will load ", b, ` on ${selDev.type === "cpu" ? "the CPU" : selDev.description}, needing about ${fmtGiB(need)} ` +
-      `(${fmtGiB(selModel.bytes)} model + ${fmtGiB((selModel.kv_bytes_per_token || 0) * ctx)} for ${ctx.toLocaleString()} tokens of context). ` +
-      (fits ? "" : "That's more than this device has free, so loading may fail; try a shorter context or another device."));
+    $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description}, needing about ${fmtGiB(p.need)} ` +
+      `(${fmtGiB(selModel.bytes)} model + ${fmtGiB((selModel.kv_bytes_per_token || 0) * ctx * (kv32 ? 2 : 1))} for ${ctx.toLocaleString()} tokens of context).` +
+      (p.dev.free < p.need ? " That's more than is free, so loading may fail; try a shorter context or close other programs." : ""));
   }
   $("ctxhelp").textContent = "How much conversation the model can remember. " +
-    (selModel && selModel.kv_bytes_per_token ? `Each 1,000 tokens uses about ${fmtGiB(selModel.kv_bytes_per_token * 1000)}.` : "Longer uses more memory.");
-  $("loadbtn").disabled = !selModel || !selDev;
+    (selModel && selModel.kv_bytes_per_token ? `Each 1,000 tokens uses about ${fmtGiB(selModel.kv_bytes_per_token * 1000 * ($("kvsel").value === "f32" ? 2 : 1))}.` : "Longer uses more memory.");
+  $("loadbtn").disabled = !selModel || !p.dev;
 }
-$("ctxsel").onchange = renderSetup;
+// ⋯ menu
+function closeMenu() { $("mmenu").hidden = true; }
+$("mbtn").onclick = e => { e.stopPropagation(); $("mmenu").hidden = !$("mmenu").hidden; };
+document.addEventListener("click", e => { if (!$("mmenu").hidden && !$("mmenu").contains(e.target)) closeMenu(); });
+async function setFolder(folder, recursive) {
+  const body = {}; if (folder !== undefined) body.folder = folder; if (recursive !== undefined) body.recursive = recursive;
+  const r = await fetch("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  selModel = null; await loadSetup();
+}
+function showPathForm() { $("pathform").hidden = false; $("pathin").value = md.folder || ""; $("patherr").textContent = ""; $("pathin").focus(); $("pathin").select(); }
+$("m-pick").onclick = async () => {
+  closeMenu();
+  if (!md.can_pick) { showPathForm(); return; }
+  $("loadmsg").className = ""; $("loadmsg").textContent = "A folder picker has opened on this computer (it may be behind this window)…";
+  try {
+    const j = await (await fetch("/api/pick-folder", { method: "POST" })).json();
+    $("loadmsg").textContent = "";
+    if (j.error) { showPathForm(); $("patherr").textContent = j.error; return; }
+    if (!j.cancelled && j.folder) await setFolder(j.folder);
+  } catch (e) { $("loadmsg").className = "err"; $("loadmsg").textContent = "Could not change folder: " + e.message; }
+};
+$("m-type").onclick = () => { closeMenu(); showPathForm(); };
+$("m-rec").onchange = async () => { try { await setFolder(undefined, $("m-rec").checked); } catch (e) {} };
+$("m-rescan").onclick = () => { closeMenu(); loadSetup(); };
+$("pathcancel").onclick = () => { $("pathform").hidden = true; };
+$("pathok").onclick = async () => {
+  try { await setFolder($("pathin").value.trim()); $("pathform").hidden = true; }
+  catch (e) { $("patherr").textContent = e.message; }
+};
+$("pathin").onkeydown = e => { if (e.key === "Enter") $("pathok").click(); if (e.key === "Escape") $("pathcancel").click(); };
+$("rescanhw").onclick = e => { e.preventDefault(); loadSetup(); };
+for (const id of ["ctxsel", "kvsel", "forcecpu"]) $(id).onchange = renderSetup;
 $("thr").oninput = () => $("thrv").textContent = $("thr").value;
+$("experts").oninput = () => $("expv").textContent = $("experts").value;
 $("setupbtn").onclick = () => { if (!busy) showSetup(); };
 $("backbtn").onclick = () => showApp();
 $("loadbtn").onclick = async () => {
-  if (!selModel || !selDev) return;
+  const p = plan();
+  if (!selModel || !p.dev) return;
   const btn = $("loadbtn"), msg = $("loadmsg");
   btn.disabled = true; msg.className = ""; msg.textContent = "Loading " + selModel.file + "… this takes a few seconds.";
-  const ctx = +$("ctxsel").value, threads = +$("thr").value;
+  const exp = +$("experts").value;
+  const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
+                 flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
+                 experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value };
+  if ($("forcecpu").checked) body.device = "cpu";
   try {
-    const r = await fetch("/api/load", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: selModel.file, device: selDev.id, ctx, threads }) });
+    const r = await fetch("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || r.statusText);
-    store.set("tierlm.model", selModel.file); store.set("tierlm.device", selDev.id);
-    store.set("tierlm.ctx", ctx); store.set("tierlm.threads", threads);
     history = []; $("messages").innerHTML = ""; speedPts = []; totalPicks = 0; tokCount = 0;
     msg.textContent = "";
     await loadInfo();
