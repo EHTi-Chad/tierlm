@@ -155,6 +155,8 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_THREADS=N` | CPU threads for `tierlm-logits` and `tierlm-bench` |
 | `TIERLM_PROFILE=1` | `tierlm-run`: per-token time breakdown and number of graph splits |
 | `TIERLM_DUMP_SCHED=1` | Debugging: prints each point where the work switches between CPU and GPU |
+| `TIERLM_CPU_OPS=MUL_MAT,...` | Debugging: runs the listed ggml operation types on the CPU, to find which GPU kernel differs |
+| `TIERLM_DEVICE=cpu` | `tierlm-logits` (tests): device to load the model on |
 | `GGML_VK_VISIBLE_DEVICES=0` | Choose which Vulkan GPU(s) ggml uses |
 | `VK_LOADER_DEBUG=error,warn` | Make the Vulkan loader explain driver problems |
 

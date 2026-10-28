@@ -24,7 +24,8 @@ CASES = ["Hello world", "Hello, world! How's it going?", "I'M HERE and you're TH
          "2026-10-27 at 16:30", "x=1;y=22;z=333;w=4444", "def f(x):\n    return x**2  # square\n",
          "Ça va? Être naïve, déjà vu.", "日本語のテキスト", "Привет мир", "emoji 😀🎉👍🏽!", "'quoted' and \"double\"",
          "a'b'c 's 't", "<|im_start|>user\nhi<|im_end|>", "", " ", "\n", "...!!!???", "URL: https://example.com/a?b=c&d=e",
-         "mixed123abc456", "ALLCAPS and lowercase And Title", "x  \n  y", "word\n", "über straße", "١٢٣ arabic digits"]
+         "mixed123abc456", "ALLCAPS and lowercase And Title", "x  \n  y", "word\n", "über straße", "١٢٣ arabic digits",
+         "cafe\u0301 nai\u0308ve", "हिन्दी भाषा", "ภาษาไทย ทดสอบ", "\u0301x .\u0301 a\u0301\u0301b"]
 
 def write_gguf(path, pre, tokens, types, merges=None, scores=None, model="gpt2", bos=None, eos=None):
     w = gguf.GGUFWriter(path, "llama")
@@ -56,6 +57,7 @@ PATTERNS = {
     "gpt-2":     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
     "llama-bpe": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
     "qwen2":     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    "qwen35":    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 }
 for pre, pat in PATTERNS.items():
     tk = Tokenizer(models.BPE())

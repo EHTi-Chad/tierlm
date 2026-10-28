@@ -18,7 +18,7 @@
 
 namespace tierlm {
 
-static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe" };
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35" };
 bool arch_supported(const std::string& arch) {
     for (const char* a : kArchs) if (arch == a) return true;
     return false;
@@ -176,6 +176,29 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         int64_t id = gguf_find_key(g, (arch + ".expert_weights_norm").c_str());
         if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL) hp.expert_renorm = gguf_get_val_bool(g, id);
     }
+    if (arch == "qwen35") {
+        hp.hybrid = true;
+        hp.qk_norm = Hparams::kPerHead;
+        // Multi-token-prediction draft blocks are stored after the real layers; they aren't run.
+        hp.n_layer  -= u32(arch + ".nextn_predict_layers", false);
+        hp.ssm_conv    = u32(arch + ".ssm.conv_kernel", true);
+        hp.ssm_state   = u32(arch + ".ssm.state_size", true);
+        hp.ssm_k_heads = u32(arch + ".ssm.group_count", true);
+        hp.ssm_v_heads = u32(arch + ".ssm.time_step_rank", true);
+        hp.recurrent.assign(hp.n_layer, false);
+        const int64_t rid = gguf_find_key(g, (arch + ".attention.recurrent_layers").c_str());
+        if (rid >= 0 && gguf_get_kv_type(g, rid) == GGUF_TYPE_ARRAY) {
+            const auto t = gguf_get_arr_type(g, rid);
+            const void* d = gguf_get_arr_data(g, rid);
+            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, rid); ++i)
+                hp.recurrent[i] = t == GGUF_TYPE_INT32 || t == GGUF_TYPE_UINT32 ? ((const int32_t*)d)[i] != 0 : ((const int8_t*)d)[i] != 0;
+        } else {
+            int interval = u32(arch + ".full_attention_interval", false);
+            if (interval <= 0) interval = 4;
+            for (int i = 0; i < hp.n_layer; ++i) hp.recurrent[i] = (i + 1) % interval != 0;
+        }
+        if (hp.ssm_v_heads % hp.ssm_k_heads != 0) { gguf_free(g); throw std::runtime_error("unexpected linear attention head counts"); }
+    }
     m->n_expert_used_file_ = hp.n_expert_used;
     if (opt.experts_used > 0 && hp.n_expert > 0) hp.n_expert_used = std::min(opt.experts_used, hp.n_expert);
 
@@ -186,7 +209,14 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
     // TIERLM_KV_F32=1 keeps the cache in f32 (exact; used by the tests to check the attention math).
     m->kv_f32_ = opt.kv_f32 >= 0 ? opt.kv_f32 == 1 : std::getenv("TIERLM_KV_F32") != nullptr;
-    const size_t kv_need = (size_t)2 * hp.n_layer * hp.head_dim * hp.n_head_kv * (size_t)m->max_ctx_ * (m->kv_f32_ ? 4 : 2);
+    // Conversation memory per layer: a KV cache for attention layers, a small fixed-size state for DeltaNet layers.
+    auto layer_mem = [&](int il) -> size_t {
+        if (hp.is_recurrent(il))
+            return ((size_t)(hp.ssm_conv - 1) * hp.ssm_conv_dim() + (size_t)hp.ssm_state * hp.ssm_state * hp.ssm_v_heads) * 4;
+        return (size_t)2 * hp.head_dim * hp.n_head_kv * (size_t)m->max_ctx_ * (m->kv_f32_ ? 4 : 2);
+    };
+    size_t kv_need = 0;
+    for (int il = 0; il < hp.n_layer; ++il) kv_need += layer_mem(il);
     const bool tied = ggml_get_tensor(m->wctx_, "output.weight") == nullptr;
     ggml_backend_buffer_type_t gpu_buft = m->main_ != m->cpu_ ? ggml_backend_get_default_buffer_type(m->main_) : nullptr;
     ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
@@ -204,7 +234,6 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     std::vector<Group> groups;
     const bool by_layer = opt.split_mode != "experts";
     m->place_.mode = by_layer ? "layers" : "experts";
-    const size_t kv_layer = kv_need / std::max(1, hp.n_layer);
     auto find_group = [&](int prio, int layer) -> Group& {
         for (auto& gr : groups) if (gr.prio == prio && gr.layer == layer) return gr;
         groups.push_back({prio, layer, {}, 0});
@@ -218,6 +247,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         else if (name == "output.weight") { prio = 1; layer = hp.n_layer; own = true; }
         else if (name.compare(0, 4, "blk.") == 0) {
             layer = std::atoi(name.c_str() + 4);
+            if (layer >= hp.n_layer) continue;                           // draft (MTP) blocks: not loaded
             const std::string rest = name.substr(name.find('.', 4) + 1);
             if (by_layer) prio = 2;                                      // the whole layer moves together
             else if (rest.find("_exps") != std::string::npos) prio = 4;
@@ -244,7 +274,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             std::fill(kv_gpu.begin(), kv_gpu.end(), fit);
             kv_decided = true;
         }
-        size_t need = gr.bytes + (by_layer && gr.prio == 2 ? kv_layer : 0);
+        size_t need = gr.bytes + (by_layer && gr.prio == 2 && gr.layer >= 0 && gr.layer < hp.n_layer ? layer_mem(gr.layer) : 0);
         bool gpu = gpu_buft && gr.prio < 9 && need <= budget && !(gr.prio == 2 && layers_full);
         if (gr.prio == 2 && !gpu) layers_full = true;                    // keep the VRAM layers contiguous
         if (gpu) budget -= need;
@@ -279,7 +309,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 ggml_tensor* t = ggml_get_tensor(m->wctx_, (b + n).c_str());
                 return t && std::find(on_gpu.begin(), on_gpu.end(), t) != on_gpu.end();
             };
-            m->place_.attn_gpu += in_vram("attn_q.weight");
+            m->place_.attn_gpu += in_vram("attn_norm.weight");
             m->place_.ffn_gpu += hp.n_expert > 0 ? in_vram("ffn_up_exps.weight") : in_vram("ffn_up.weight");
         }
     }
@@ -292,6 +322,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     }
     std::vector<char> chunk;
     for (const Source& s : sources) {
+        if (!s.t->buffer) continue;                                    // not loaded (draft blocks)
         const size_t n = ggml_nbytes(s.t);
         chunk.resize(n);
         auto& f = files[s.part];
@@ -317,18 +348,31 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         const std::string b = "blk." + std::to_string(i) + ".";
         Layer L;
         L.attn_norm = T(b + "attn_norm.weight");
-        L.wq        = T(b + "attn_q.weight");
-        L.wk        = T(b + "attn_k.weight");
-        L.wv        = T(b + "attn_v.weight");
-        L.wo        = T(b + "attn_output.weight");
-        L.bq        = T(b + "attn_q.bias", hp.qkv_bias);
-        L.bk        = T(b + "attn_k.bias", hp.qkv_bias);
-        L.bv        = T(b + "attn_v.bias", hp.qkv_bias);
-        if (hp.qk_norm != Hparams::kNone) {
-            L.q_norm = T(b + "attn_q_norm.weight");
-            L.k_norm = T(b + "attn_k_norm.weight");
+        L.recurrent = hp.is_recurrent(i);
+        if (L.recurrent) {                                            // Gated DeltaNet layer
+            L.wqkv       = T(b + "attn_qkv.weight");
+            L.wgate      = T(b + "attn_gate.weight");
+            L.ssm_conv1d = T(b + "ssm_conv1d.weight");
+            L.ssm_dt     = T(b + "ssm_dt.bias");
+            L.ssm_a      = T(b + "ssm_a");
+            L.ssm_beta   = T(b + "ssm_beta.weight");
+            L.ssm_alpha  = T(b + "ssm_alpha.weight");
+            L.ssm_norm   = T(b + "ssm_norm.weight");
+            L.ssm_out    = T(b + "ssm_out.weight");
+        } else {
+            L.wq        = T(b + "attn_q.weight");
+            L.wk        = T(b + "attn_k.weight");
+            L.wv        = T(b + "attn_v.weight");
+            L.wo        = T(b + "attn_output.weight");
+            L.bq        = T(b + "attn_q.bias", hp.qkv_bias);
+            L.bk        = T(b + "attn_k.bias", hp.qkv_bias);
+            L.bv        = T(b + "attn_v.bias", hp.qkv_bias);
+            if (hp.qk_norm != Hparams::kNone) {
+                L.q_norm = T(b + "attn_q_norm.weight");
+                L.k_norm = T(b + "attn_k_norm.weight");
+            }
         }
-        L.ffn_norm  = T(b + "ffn_norm.weight");
+        L.ffn_norm  = T(b + (hp.hybrid ? "post_attention_norm.weight" : "ffn_norm.weight"));
         if (hp.is_moe()) {
             L.router = T(b + "ffn_gate_inp.weight");
             L.gate_x = T(b + "ffn_gate_exps.weight", false);
@@ -351,9 +395,16 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     std::vector<ggml_tensor*> kv_on_gpu_t, kv_on_cpu_t;
     for (int i = 0; i < hp.n_layer; ++i) {
         auto& L = m->layers_[i];
+        auto& dst = (gpu_buft && m->layer_kv_gpu_[i]) ? kv_on_gpu_t : kv_on_cpu_t;
+        if (L.recurrent) {                                            // DeltaNet: fixed-size state, always f32
+            L.conv_state  = ggml_new_tensor_2d(m->kvctx_, GGML_TYPE_F32, hp.ssm_conv - 1, hp.ssm_conv_dim());
+            L.ssm_state_t = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hp.ssm_state, hp.ssm_state, hp.ssm_v_heads);
+            dst.push_back(L.conv_state);
+            dst.push_back(L.ssm_state_t);
+            continue;
+        }
         L.k_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
         L.v_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
-        auto& dst = (gpu_buft && m->layer_kv_gpu_[i]) ? kv_on_gpu_t : kv_on_cpu_t;
         dst.push_back(L.k_cache);
         dst.push_back(L.v_cache);
     }
@@ -397,10 +448,31 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
 // GPU<->CPU hand-offs, which on Windows cost more than the GPU saves. So in a layer split, every op of a RAM
 // layer is pinned to the CPU, and the work changes device once per token.
 void Model::pin_cpu_layers(const Graph& g) {
+    // Debugging: TIERLM_CPU_OPS=SSM_CONV,GATED_DELTA_NET,... runs those op types on the CPU, to find which
+    // GPU kernel disagrees with the reference.
+    if (const char* ops = std::getenv("TIERLM_CPU_OPS"); ops && main_ != cpu_) {
+        const std::string list = std::string(",") + ops + ",";
+        for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) {
+            ggml_tensor* t = ggml_graph_node(g.gf, i);
+            if (list.find(std::string(",") + ggml_op_name(t->op) + ",") != std::string::npos)
+                ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
+        }
+    }
     if (!pin_layers_) return;
     for (const auto& [t, layer] : g.owner)
         if (layer >= 0 && layer < (int)layer_kv_gpu_.size() && !layer_kv_gpu_[layer])
             ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
+}
+
+void Model::reset() {
+    n_past_ = 0;
+    if (hp_.hybrid) for (auto* b : kvbufs_) ggml_backend_buffer_clear(b, 0);   // clear the running memory
+}
+
+void Model::truncate(int n) {
+    if (n >= n_past_) return;
+    if (hp_.hybrid) { reset(); return; }                        // the running memory can't be rewound
+    n_past_ = n < 0 ? 0 : n;
 }
 
 bool Model::integrated_gpu() const {
@@ -448,7 +520,46 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing) {
         const Layer& L = layers_[li];
         // ---- attention ----
         ggml_tensor* h = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.attn_norm);
-        ggml_tensor* q = ggml_mul_mat(c, L.wq, h);                            // [n_head*hd, n_tok]
+        if (L.recurrent) {
+            // ---- Gated DeltaNet (linear attention with a running memory) ----
+            const int S = hp.ssm_state, Hk = hp.ssm_k_heads, Hv = hp.ssm_v_heads, CD = hp.ssm_conv_dim(), KC = hp.ssm_conv;
+            ggml_tensor* qkv  = ggml_mul_mat(c, L.wqkv, h);                     // [CD, n_tok]
+            ggml_tensor* z    = ggml_mul_mat(c, L.wgate, h);                    // [S*Hv, n_tok]
+            ggml_tensor* beta = ggml_sigmoid(c, ggml_mul_mat(c, L.ssm_beta, h)); // how strongly to write, per head
+            beta = ggml_reshape_4d(c, beta, 1, Hv, n_tok, 1);
+            // log of the memory's decay: -exp(A_log) * softplus(alpha + dt_bias)  (ssm_a holds -exp(A_log))
+            ggml_tensor* dec = ggml_mul(c, ggml_softplus(c, ggml_add(c, ggml_mul_mat(c, L.ssm_alpha, h), L.ssm_dt)), L.ssm_a);
+            dec = ggml_reshape_4d(c, dec, 1, Hv, n_tok, 1);
+            // Causal convolution over the last KC inputs: [the KC-1 saved from before | this batch]
+            ggml_tensor* cs  = ggml_reshape_3d(c, L.conv_state, KC - 1, CD, 1);
+            ggml_tensor* cin = ggml_concat(c, cs, ggml_transpose(c, ggml_reshape_3d(c, qkv, CD, n_tok, 1)), 0);
+            ggml_build_forward_expand(g.gf, ggml_cpy(c, ggml_view_3d(c, cin, KC - 1, CD, 1, cin->nb[1], cin->nb[2],
+                                                                     (size_t)n_tok * ggml_element_size(cin)), cs));
+            ggml_tensor* co = ggml_silu(c, ggml_ssm_conv(c, cin, L.ssm_conv1d)); // [CD, n_tok, 1]
+            const size_t es = ggml_element_size(co), rs = co->nb[1];
+            ggml_tensor* qh = ggml_view_4d(c, co, S, Hk, n_tok, 1, S * es, rs, rs * n_tok, 0);
+            ggml_tensor* kh = ggml_view_4d(c, co, S, Hk, n_tok, 1, S * es, rs, rs * n_tok, (size_t)S * Hk * es);
+            ggml_tensor* vh = ggml_view_4d(c, co, S, Hv, n_tok, 1, S * es, rs, rs * n_tok, (size_t)2 * S * Hk * es);
+            // l2-normalise q and k: x / sqrt(sum(x^2) + eps), written with rms_norm so every backend has it
+            auto l2 = [&](ggml_tensor* t) { return ggml_scale(c, ggml_rms_norm(c, t, hp.rms_eps / S), 1.0f / std::sqrt((float)S)); };
+            qh = l2(qh);
+            kh = l2(kh);
+            ggml_tensor* st  = ggml_reshape_4d(c, L.ssm_state_t, S, S, Hv, 1);
+            ggml_tensor* res = ggml_gated_delta_net(c, qh, kh, vh, dec, beta, st, 1);   // outputs, then the new memory
+            ggml_tensor* out = ggml_view_4d(c, res, S, Hv, n_tok, 1, (size_t)S * 4, (size_t)S * Hv * 4, (size_t)S * Hv * n_tok * 4, 0);
+            ggml_tensor* ns  = ggml_view_1d(c, res, (int64_t)S * S * Hv, (size_t)S * Hv * n_tok * 4);
+            ggml_build_forward_expand(g.gf, ggml_cpy(c, ns, ggml_view_1d(c, L.ssm_state_t, (int64_t)S * S * Hv, 0)));
+            // Gated norm: rms_norm(out) * w * silu(z), then back to the model width
+            ggml_tensor* on = ggml_mul(c, ggml_mul(c, ggml_rms_norm(c, out, hp.rms_eps), L.ssm_norm),
+                                       ggml_silu(c, ggml_reshape_4d(c, z, S, Hv, n_tok, 1)));
+            on = ggml_reshape_2d(c, on, (int64_t)S * Hv, n_tok);
+            x = ggml_add(c, x, ggml_mul_mat(c, L.ssm_out, on));
+        } else {
+        // Qwen3.5's attention layers project each head's query together with an output gate: [q | gate]
+        ggml_tensor* qg = hp.hybrid ? ggml_mul_mat(c, L.wq, h) : nullptr;    // [2*hd*n_head, n_tok]
+        ggml_tensor* q = qg ? ggml_view_3d(c, qg, hd, hp.n_head, n_tok, 2 * hd * ggml_element_size(qg),
+                                           2 * hd * hp.n_head * ggml_element_size(qg), 0)
+                            : ggml_mul_mat(c, L.wq, h);                       // [n_head*hd, n_tok]
         ggml_tensor* k = ggml_mul_mat(c, L.wk, h);
         ggml_tensor* v = ggml_mul_mat(c, L.wv, h);
         if (L.bq) { q = ggml_add(c, q, L.bq); k = ggml_add(c, k, L.bk); v = ggml_add(c, v, L.bv); }
@@ -456,7 +567,7 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing) {
             q = ggml_mul(c, ggml_rms_norm(c, q, hp.rms_eps), L.q_norm);
             k = ggml_mul(c, ggml_rms_norm(c, k, hp.rms_eps), L.k_norm);
         }
-        q = ggml_reshape_3d(c, q, hd, hp.n_head, n_tok);
+        if (!qg) q = ggml_reshape_3d(c, q, hd, hp.n_head, n_tok);
         k = ggml_reshape_3d(c, k, hd, hp.n_head_kv, n_tok);
         v = ggml_reshape_3d(c, v, hd, hp.n_head_kv, n_tok);
         if (hp.qk_norm == Hparams::kPerHead) {                               // Qwen3: per head
@@ -492,7 +603,14 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing) {
             o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));                // [hd, n_head, n_tok]
         }
         o = ggml_reshape_2d(c, o, hd * hp.n_head, n_tok);
+        if (qg) {                                                            // output gate (Qwen3.5)
+            ggml_tensor* gate = ggml_cont_2d(c, ggml_view_3d(c, qg, hd, hp.n_head, n_tok, 2 * hd * ggml_element_size(qg),
+                                                             2 * hd * hp.n_head * ggml_element_size(qg), hd * ggml_element_size(qg)),
+                                             hd * hp.n_head, n_tok);
+            o = ggml_mul(c, o, ggml_sigmoid(c, gate));
+        }
         x = ggml_add(c, x, ggml_mul_mat(c, L.wo, o));
+        }
 
         h = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.ffn_norm);
         if (!hp.is_moe()) {

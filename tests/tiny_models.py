@@ -128,6 +128,19 @@ names = sys.argv[2:] or list(CASES)
 # With TIERLM_RPC set (a tierlm-rpc-server standing in for a GPU), every case also runs split between the
 # device and RAM at several VRAM budgets (fractions of the model size), and must give the same results.
 SPLITS = [(mode, f) for mode in ("layers", "experts") for f in (0.0, 0.15, 0.4, 0.7, 2.0)] if os.environ.get("TIERLM_RPC") else [None]
+
+# Two passes:
+#   exact   on the CPU with an f32 KV cache: the math itself, which must match the reference to ~1e-5.
+#           (With a stand-in RPC GPU for split tests, on that device: it computes exactly too.)
+#   normal  the usual settings on the default device (a GPU if there is one): f16 KV cache, and GPU kernels that
+#           round (flash attention in f16, TF32 tensor cores for small batches on RTX 30-series and newer), so
+#           differences up to a few % of the logit range are expected; the top token must still match. Real bugs
+#           show up as errors of 100% or more.
+def PASSES(extra):
+    exact_env = {"TIERLM_KV_F32": "1", **extra}
+    if not os.environ.get("TIERLM_RPC") and "TIERLM_DEVICE" not in os.environ:
+        exact_env["TIERLM_DEVICE"] = "cpu"
+    return (("exact", exact_env, 1e-4), ("normal", dict(extra), 6e-2))
 long_ids = list(np.random.default_rng(7).integers(0, V, 300))   # > 256: exercises batched prompts
 ok = True
 for idx, name in enumerate(names):
@@ -136,7 +149,7 @@ for idx, name in enumerate(names):
     size = os.path.getsize(path)
     for frac in SPLITS:
       split_env = {} if frac is None else {"TIERLM_SPLIT": frac[0], "TIERLM_VRAM_BYTES": str(int(size * frac[1]))}
-      for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", **split_env}, 1e-4), ("f16 cache", split_env, 3e-2)):
+      for label, env, tol in PASSES(split_env):
         worst, all_top = 0.0, True
         placement = ""
         for mode in ([], ["--step"]):
@@ -164,7 +177,7 @@ if not os.environ.get("TIERLM_RPC"):
         for ids in ([5], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55]):
             want = reference(arch, s, W, L, np.array(ids))
             run = subprocess.run([sys.argv[1], path, *map(str, ids)], capture_output=True, text=True,
-                                 env={**os.environ, "TIERLM_KV_F32": "1"})
+                                 env={**os.environ, "TIERLM_KV_F32": "1", **({} if "TIERLM_DEVICE" in os.environ else {"TIERLM_DEVICE": "cpu"})})
             if run.returncode != 0:
                 sys.exit(f"{name} (3 files): tierlm-logits failed: {run.stderr.strip()}")
             got = np.array([float(v) for v in run.stdout.split()])

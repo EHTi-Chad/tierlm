@@ -156,6 +156,9 @@ python3 -m venv ~/tierlm-oracle
 # Model math for every architecture (no real model needed: builds tiny random models)
 ~/tierlm-oracle/bin/python tests/tiny_models.py build/tierlm-logits
 
+# The hybrid Qwen3.5 / 3.8 architecture (Gated DeltaNet), against a NumPy version of Hugging Face's model
+~/tierlm-oracle/bin/python tests/tiny_qwen35.py build/tierlm-logits
+
 # Tokenizers, without any model: trains small BPE and SentencePiece tokenizers and compares
 ~/tierlm-oracle/bin/pip install sentencepiece
 ~/tierlm-oracle/bin/python tests/trained_tokenizers.py build/tierlm-tok-test
@@ -176,9 +179,14 @@ cmake -S . -B build-rpc -G Ninja -DGGML_RPC=ON && cmake --build build-rpc
 TIERLM_RPC=127.0.0.1:50052 ~/tierlm-oracle/bin/python tests/tiny_models.py build-rpc/tierlm-logits
 ```
 
-`tiny_models.py` runs two passes per architecture: with an exact f32 KV cache, results must match the NumPy
-reference to about 1e-6; with the normal f16 cache, they must agree within rounding and pick the same top
-token. Each test prints `PASS` when everything is right.
+`tiny_models.py` and `tiny_qwen35.py` run two passes per architecture: **exact**, on the CPU with an f32 KV cache,
+must match the NumPy reference to about 1e-5; **normal**, with the usual settings on the default device (your GPU
+if you have one), must agree within GPU rounding (up to a few %, from the f16 KV cache, f16 flash attention, and the
+TF32 tensor-core matrix multiplies CUDA uses for small batches on RTX 30-series and newer) and pick the same top
+token. Real bugs show up as errors of 100% or more. Each test prints `PASS` when everything is right.
+
+`scripts\diag-qwen35.bat` and `scripts\diag-qwen35b.bat` show how a GPU difference was tracked down: they move one
+operation type at a time to the CPU (`TIERLM_CPU_OPS`) and show which one changes the result.
 
 To regenerate the tokenizer cases or the Unicode tables (only needed when changing them):
 

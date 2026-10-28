@@ -27,6 +27,7 @@ bool in(const uni::Range (&t)[N], uint32_t cp) {
 bool is_letter(uint32_t c) { return in(uni::kLetter, c); }
 bool is_number(uint32_t c) { return in(uni::kNumber, c); }
 bool is_space(uint32_t c)  { return in(uni::kSpace, c); }
+bool is_mark(uint32_t c)   { return in(uni::kMark, c); }
 bool is_other(uint32_t c)  { return !is_letter(c) && !is_number(c) && !is_space(c); }
 
 struct Cp { uint32_t cp; size_t off, len; };   // code point + its byte span in the input
@@ -96,13 +97,17 @@ std::vector<std::pair<size_t, size_t>> pretokenize_gpt2(const std::string& s) {
 
 // Llama 3 split pattern (Qwen2 is the same with single digits instead of groups of up to three), hand-compiled:
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
-std::vector<std::pair<size_t, size_t>> pretokenize_llama3(const std::string& s, int max_digits) {
+// Qwen3.5 (marks = true) also counts combining marks \p{M} as part of words:
+//   ...|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|...
+std::vector<std::pair<size_t, size_t>> pretokenize_llama3(const std::string& s, int max_digits, bool marks = false) {
     const auto cps = utf8_decode(s);
     const size_t n = cps.size();
     std::vector<std::pair<size_t, size_t>> out;
     auto C = [&](size_t k) { return cps[k].cp; };
     auto lower = [](uint32_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
     auto nl = [](uint32_t c) { return c == '\r' || c == '\n'; };
+    auto word = [&](uint32_t c) { return is_letter(c) || (marks && is_mark(c)); };
+    auto other = [&](uint32_t c) { return is_other(c) && !(marks && is_mark(c)); };
     auto emit = [&](size_t a, size_t b) {
         size_t off = cps[a].off, end = cps[b - 1].off + cps[b - 1].len;
         out.push_back({off, end - off});
@@ -118,10 +123,10 @@ std::vector<std::pair<size_t, size_t>> pretokenize_llama3(const std::string& s, 
         // 2. letters, with at most one leading non-letter, non-digit, non-newline character
         {
             size_t j = i;
-            if (!is_letter(C(i)) && !is_number(C(i)) && !nl(C(i)) && i + 1 < n && is_letter(C(i + 1))) j = i + 1;
-            if (is_letter(C(j))) {
+            if (!is_letter(C(i)) && !is_number(C(i)) && !nl(C(i)) && i + 1 < n && word(C(i + 1))) j = i + 1;
+            if (word(C(j))) {
                 size_t k = j + 1;
-                while (k < n && is_letter(C(k))) ++k;
+                while (k < n && word(C(k))) ++k;
                 emit(i, k); i = k; continue;
             }
         }
@@ -133,10 +138,10 @@ std::vector<std::pair<size_t, size_t>> pretokenize_llama3(const std::string& s, 
         }
         // 4. optional space, a run of punctuation/symbols, then any newlines
         {
-            size_t j = (C(i) == ' ' && i + 1 < n && is_other(C(i + 1))) ? i + 1 : i;
-            if (is_other(C(j))) {
+            size_t j = (C(i) == ' ' && i + 1 < n && other(C(i + 1))) ? i + 1 : i;
+            if (other(C(j))) {
                 size_t k = j + 1;
-                while (k < n && is_other(C(k))) ++k;
+                while (k < n && other(C(k))) ++k;
                 while (k < n && nl(C(k))) ++k;
                 emit(i, k); i = k; continue;
             }
@@ -176,6 +181,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         const std::string pre = sval("tokenizer.ggml.pre");
         if (pre == "llama-bpe" || pre == "llama3" || pre == "smaug-bpe" || pre == "dbrx") t.pre_ = Pre::Llama3;
         else if (pre == "qwen2" || pre == "deepseek-r1-qwen" || pre == "megrez") t.pre_ = Pre::Qwen2;
+        else if (pre == "qwen35") t.pre_ = Pre::Qwen35;
         else if (pre.empty() || pre == "default" || pre == "gpt-2" || pre == "olmo" || pre == "gpt2") t.pre_ = Pre::Gpt2;
         else {
             // Unknown splitter: most recent BPE models use the Llama 3 pattern or something close to it.
@@ -273,7 +279,8 @@ void Tokenizer::bpe(const std::string& chunk, std::vector<int32_t>& out) const {
 
 void Tokenizer::encode_plain(const std::string& text, std::vector<int32_t>& out, bool first) const {
     if (kind_ == Kind::Spm) { spm(text, out, first); return; }
-    const auto parts = pre_ == Pre::Gpt2 ? pretokenize_gpt2(text) : pretokenize_llama3(text, pre_ == Pre::Qwen2 ? 1 : 3);
+    const auto parts = pre_ == Pre::Gpt2 ? pretokenize_gpt2(text)
+                     : pretokenize_llama3(text, pre_ == Pre::Llama3 ? 3 : 1, pre_ == Pre::Qwen35);
     for (const auto& [off, len] : parts) bpe(text.substr(off, len), out);
 }
 

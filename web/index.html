@@ -839,7 +839,7 @@ function renderSetup() {
     if (m.parts > 1) add(m.parts + " files");
     if (m.supported) {
       add("Supported", "good");
-      if (m.experts) add(m.experts_used + " of " + m.experts + " experts per token"); else add("Dense");
+      if (m.experts) add(m.experts_used + " of " + m.experts + " experts per token"); else add(m.hybrid ? "Hybrid (linear attention)" : "Dense");
       if (m.arch) add(m.arch);
       if (m.layers) add(m.layers + " layers");
     } else if (m.kind === "mmproj") add("Vision add-on (mmproj): used together with its model, not on its own", "warn");

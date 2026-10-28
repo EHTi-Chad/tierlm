@@ -369,7 +369,7 @@ json describe_model(const std::string& path) {
     const std::string arch = str("general.architecture");
     j["arch"] = arch;
     j["name"] = str("general.name");
-    const int64_t layers = u32(arch + ".block_count"), embd = u32(arch + ".embedding_length");
+    const int64_t layers = u32(arch + ".block_count") - u32(arch + ".nextn_predict_layers"), embd = u32(arch + ".embedding_length");
     const int64_t heads = u32(arch + ".attention.head_count"), kv_heads = u32(arch + ".attention.head_count_kv");
     j["layers"] = layers;
     j["experts"] = u32(arch + ".expert_count");
@@ -377,7 +377,14 @@ json describe_model(const std::string& path) {
     j["ctx_train"] = u32(arch + ".context_length");
     // KV cache cost per token of context, at f16: K and V for every layer.
     const int64_t head_dim = u32(arch + ".attention.key_length") ? u32(arch + ".attention.key_length") : (heads ? embd / heads : 0);
-    if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * layers * (kv_heads ? kv_heads : heads) * head_dim * 2;
+    // Only attention layers keep a KV cache; in hybrid models (qwen35) that's one layer in every few.
+    int64_t kv_layers = layers;
+    if (arch == "qwen35") {
+        const int64_t interval = u32(arch + ".full_attention_interval") ? u32(arch + ".full_attention_interval") : 4;
+        kv_layers = layers / interval;
+        j["hybrid"] = true;
+    }
+    if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * kv_layers * (kv_heads ? kv_heads : heads) * head_dim * 2;
     const std::string tk = str("tokenizer.ggml.model");
     if (arch_supported(arch) && (tk == "gpt2" || tk == "llama")) j["supported"] = true;
     else if (arch_supported(arch)) j["reason"] = "the " + (tk.empty() ? std::string("unknown") : tk) + " tokenizer is not supported yet";
@@ -728,6 +735,7 @@ int main(int argc, char** argv) {
                 while (common < cached.size() && common < toks.size() && cached[common] == toks[common]) ++common;
                 if (common == toks.size()) common = toks.size() - 1;      // must evaluate at least one token
                 model->truncate((int)common);
+                common = (size_t)model->n_past();     // hybrid models start over rather than rewind
                 cached.resize(common);
 
                 std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;

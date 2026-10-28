@@ -8,7 +8,8 @@ NVIDIA GeForce), replies are typically 1.5 to 2 times faster. The pill at the to
 device is in use.
 
 **Can I use a different model?**
-Yes, for the common families: Llama (2, 3.x), Mistral and Mixtral, Qwen2/2.5, Qwen3 and Qwen3 MoE, and OLMoE.
+Yes, for the common families: Llama (2, 3.x), Mistral and Mixtral, Qwen2/2.5, Qwen3 and Qwen3 MoE, the Qwen3.5 /
+3.6 / 3.8 dense models (such as Qwen3.8-27B), and OLMoE.
 More families are being added. The setup screen says which of your files are supported, and why the others
 aren't. See [Supported models](GETTING_STARTED.md#supported-models).
 
@@ -29,6 +30,11 @@ on the dashboard shows the effect.
 No. Small models such as OLMoE-1B-7B (about 1 billion active parameters) are good for experiments and simple
 questions, but they make mistakes and can invent things confidently, such as code libraries that don't exist.
 Bigger models are much more reliable.
+
+**Qwen3.5 / 3.8: why does editing an earlier message take longer?**
+These are hybrid models: most layers keep a fixed-size running memory instead of a KV cache. That's why long
+conversations are cheap for them, but the memory can't be rewound. Adding a message continues where the
+conversation was; editing or regenerating an earlier message means reading the conversation again from the start.
 
 **Replies repeat themselves or go on forever**
 Raise **Repeat penalty** (next to Temperature) a little, for example to 1.15. Very small models loop more

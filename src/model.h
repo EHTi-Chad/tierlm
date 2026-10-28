@@ -20,6 +20,9 @@ namespace tierlm {
 //   qwen3     Qwen3 dense: per-head QK-norm, head size not tied to the model width
 //   qwen3moe  Qwen3 MoE (e.g. Qwen3-30B-A3B)
 //   olmoe     OLMoE: QK-norm over the full width, expert weights not renormalised
+//   qwen35    Qwen3.5 / 3.6 / 3.8 dense: a hybrid. Three of every four layers use Gated DeltaNet linear
+//             attention (a fixed-size running memory instead of a KV cache); the rest use gated full
+//             attention with partial RoPE.
 bool arch_supported(const std::string& arch);
 std::vector<std::string> supported_archs();
 
@@ -37,6 +40,14 @@ struct Hparams {
     bool expert_renorm = false;       // renormalise the chosen experts' weights to sum to 1
     bool expert_softmax_first = true; // softmax over all experts, then pick (vs pick then softmax: same order)
     bool is_moe() const { return n_expert > 0; }
+    // Hybrid (qwen35): Gated DeltaNet layers
+    bool hybrid = false;
+    std::vector<bool> recurrent;      // per layer: linear attention (true) or full attention (false)
+    int ssm_conv = 0;                 // causal convolution width (4)
+    int ssm_state = 0;                // head size of the linear attention (128)
+    int ssm_k_heads = 0, ssm_v_heads = 0;
+    bool is_recurrent(int il) const { return hybrid && il < (int)recurrent.size() && recurrent[il]; }
+    int ssm_conv_dim() const { return 2 * ssm_k_heads * ssm_state + ssm_v_heads * ssm_state; }
 };
 using OlmoeHparams = Hparams;
 
@@ -94,8 +105,10 @@ public:
     // n_threads applies to whatever runs on the CPU. If `routing` is given (MoE models), it receives the
     // experts the router picked: n_tok x n_layer x n_expert_used ids, best first.
     std::vector<float> eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing = nullptr);
-    void reset() { n_past_ = 0; }                 // forget the conversation
-    void truncate(int n) { if (n < n_past_) n_past_ = n < 0 ? 0 : n; }   // keep only the first n tokens
+    void reset();                                 // forget the conversation
+    // Keep only the first n tokens. Hybrid models can't rewind their running memory, so for them anything
+    // short of the whole conversation means starting over (n_past() tells the caller where it stands).
+    void truncate(int n);
     int n_past() const { return n_past_; }
     int max_ctx() const { return max_ctx_; }
     const std::string& device_name() const { return device_name_; }
@@ -137,6 +150,12 @@ private:
         ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;          // dense FFN
         ggml_tensor *router = nullptr, *gate_x = nullptr, *up_x = nullptr, *down_x = nullptr;   // experts
         ggml_tensor *k_cache = nullptr, *v_cache = nullptr;   // [head_dim, n_head_kv, max_ctx]
+        // Hybrid models: Gated DeltaNet layer
+        bool recurrent = false;
+        ggml_tensor *wqkv = nullptr, *wgate = nullptr, *ssm_conv1d = nullptr, *ssm_dt = nullptr, *ssm_a = nullptr;
+        ggml_tensor *ssm_beta = nullptr, *ssm_alpha = nullptr, *ssm_norm = nullptr, *ssm_out = nullptr;
+        ggml_tensor *conv_state = nullptr;       // [ssm_conv - 1, conv_dim]: the last few inputs
+        ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
     };
     Hparams hp_;
     ggml_backend* main_ = nullptr;               // device holding weights + cache

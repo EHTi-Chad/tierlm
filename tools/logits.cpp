@@ -29,6 +29,7 @@ int main(int argc, char** argv) {
         o.max_ctx = std::max<int>(512, (int)ids.size() + 8);
         if (const char* v = std::getenv("TIERLM_VRAM_MB")) o.vram_budget_mb = std::atoi(v);
         if (const char* v = std::getenv("TIERLM_SPLIT")) o.split_mode = v;
+        if (const char* v = std::getenv("TIERLM_DEVICE")) o.device = v;      // e.g. cpu, CUDA0, Vulkan0
         auto m = Model::load(argv[1], o);
         if (std::getenv("TIERLM_SHOW_PLACEMENT")) {
             const auto& p = m->placement();

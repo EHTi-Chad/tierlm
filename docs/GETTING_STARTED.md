@@ -2,8 +2,8 @@
 
 This guide gets you from nothing to chatting with a model in your browser. No programming needed.
 
-tierlm is an early-stage project: it runs the most common model families (Llama, Mistral, Qwen, OLMoE) but not
-yet everything on Hugging Face. See [Supported models](#supported-models) before downloading anything.
+tierlm is an early-stage project: it runs the most common model families (Llama, Mistral, Qwen up to Qwen3.8,
+OLMoE) but not yet everything on Hugging Face. See [Supported models](#supported-models) before downloading anything.
 
 ## What you need
 
@@ -105,7 +105,8 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Qwen2 / 2.5 | `qwen2` | Qwen2.5-7B-Instruct, Qwen2.5-Coder | New: model math verified, real-model test pending |
 | Llama 3 / 3.1 / 3.2 / 3.3 | `llama` | Llama-3.2-3B-Instruct, Llama-3.1-8B-Instruct | New: model math verified, real-model test pending |
 | Llama 2, Mistral 7B, Mixtral, TinyLlama | `llama` | Mistral-7B-Instruct, Mixtral-8x7B | New: model math verified, real-model test pending |
-| Qwen3.5 / 3.6 hybrid | `qwen35` | Qwen3.8-27B | Not yet (planned) |
+| Qwen3.5 / 3.6 / 3.8 dense (hybrid) | `qwen35` | Qwen3.8-27B, Qwen3.5-9B | New: model math verified, real-model test pending |
+| Qwen3.5 / 3.6 MoE | `qwen35moe` | Qwen3.5-35B-A3B | Not yet |
 | Gemma, Phi, DeepSeek, GLM, gpt-oss, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision add-on** (for reading images). tierlm lists it but

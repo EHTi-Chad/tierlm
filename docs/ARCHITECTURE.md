@@ -88,6 +88,15 @@ Grouped-query attention (fewer key/value heads than query heads), a head size in
 width (Qwen3), tied input/output embeddings and Llama 3.1's RoPE frequency factors are handled for all of
 them. The chat format (Tulu, ChatML, Llama 3, `[INST]`) is read from the model's own chat template.
 
+**Hybrid models (Qwen3.5 / 3.6 / 3.8, GGUF arch `qwen35`).** Three of every four layers replace attention with
+**Gated DeltaNet**: a short causal convolution over the last four inputs, then a per-head running memory (a
+128×128 matrix) that decays and is updated a little with every token (ggml's `gated_delta_net` op), followed by a
+gated RMSNorm. Only every fourth layer uses full attention, with an output gate, per-head QK-norm and RoPE on the
+first quarter of each head. Only those layers need a KV cache, so long conversations cost a quarter of the memory;
+the running memories are small, fixed-size, and live with their layer on the GPU or in RAM. They can't be rewound,
+so editing an earlier message recomputes the conversation. Draft (multi-token prediction) blocks in the file are
+skipped and never loaded.
+
 ## Memory and devices
 
 - **Weights** are read from the GGUF file into a buffer on the chosen device (`ggml_backend_alloc_ctx_tensors`
@@ -113,6 +122,7 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 | Tokenizer | Hugging Face's OLMoE tokenizer, 14 tricky strings | All exact; all decode back byte-for-byte |
 | Pre-tokenizer | The reference split regex, ~3,000 random and edge-case strings | 0 mismatches |
 | Model graph | Plain NumPy reference of each architecture on tiny random models (`tests/tiny_models.py`: Llama, Llama 3 with RoPE factors, Mixtral, Qwen2, Qwen3, Qwen3 MoE, OLMoE) | ~2e-6 relative with an f32 cache, including flash attention, grouped-query attention, the KV cache and 300-token batched prompts |
+| Hybrid Qwen3.5 | Plain NumPy implementation of Hugging Face's Qwen3_5 forward pass on a tiny random model written the way the converter writes it (`tests/tiny_qwen35.py`), also split between GPU and RAM | ~1e-5 relative with an f32 cache; deliberately wrong file conventions fail |
 | Tokenizers without models | Small tokenizers trained with Hugging Face `tokenizers` and `sentencepiece` (`tests/trained_tokenizers.py`) | Exact token IDs for GPT-2, Llama 3 and Qwen2 splitting and SentencePiece |
 | Real model | "The capital of France is" | " Paris" at 62–64% on CPU and GPU |
 

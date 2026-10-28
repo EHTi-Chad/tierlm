@@ -42,7 +42,7 @@ private:
     std::unordered_map<std::string, uint8_t> uni_to_byte_;
     int32_t bos_ = -1, eos_ = -1, eot_ = -1, unk_ = -1;
     enum class Kind { Bpe, Spm } kind_ = Kind::Bpe;
-    enum class Pre { Gpt2, Llama3, Qwen2 } pre_ = Pre::Gpt2;   // how BPE text is split before merging
+    enum class Pre { Gpt2, Llama3, Qwen2, Qwen35 } pre_ = Pre::Gpt2;   // how BPE text is split before merging
     bool add_space_prefix_ = true, add_bos_ = false;                              // SentencePiece: " " before the text
     std::vector<float> score_;                                  // SentencePiece merge scores
     std::string chat_template_;
