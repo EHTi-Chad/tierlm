@@ -8,7 +8,7 @@ the project, making the design calls, and testing and debugging it on real hardw
 memory planner, server and dashboard are all tierlm's own. It does not use llama.cpp.
 
 It runs the common model families (**Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8
-dense, OLMoE**) on the
+dense and MoE, OLMoE**) on the
 CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA. **Models bigger than the GPU's memory
 are split between VRAM and RAM automatically**: on a laptop RTX 3070 (8 GB), the 14.7 GB Qwen3-30B-A3B runs at
 about **27 tokens/second**, 40% faster than on the CPU alone. A web page lets you pick a model and chat, with a
@@ -104,8 +104,9 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | Llama 2 / Mistral 7B / TinyLlama (SentencePiece) | TinyLlama-1.1B-Chat |
 | Mixtral, Qwen2/2.5 | model math verified, real weights not yet tested |
 | Qwen3.5 / 3.6 / 3.8 dense (`qwen35`, hybrid Gated DeltaNet) | model math verified, real weights not yet tested |
+| Qwen3.5 / 3.6 MoE (`qwen35moe`, e.g. Qwen3.6-35B-A3B) | model math verified, real weights not yet tested |
 
-Not yet: Qwen3.5 MoE (`qwen35moe`), Gemma, Phi, DeepSeek, gpt-oss and others. The setup screen says which
+Not yet: Qwen3-Next / Qwen3-Coder-Next (`qwen3next`), Gemma, Phi, DeepSeek, gpt-oss and others. The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
 
 ## Build from source (Windows)
@@ -159,7 +160,8 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Setup screen: automatic hardware placement, models folder, per-model settings
 - [x] Architecture layer: Llama 2/3, Mistral, Mixtral, Qwen2, Qwen3, Qwen3 MoE, OLMoE; Llama 3 / Qwen / SentencePiece tokenizers
 - [x] Qwen3.5 / 3.6 / 3.8 dense: hybrid Gated DeltaNet + gated attention, verified against a NumPy reference
-- [ ] Real-model testing of the new families; more families (Qwen3.5 MoE, Gemma, Phi, DeepSeek, gpt-oss)
+- [x] Qwen3.5 / 3.6 MoE: the same hybrid with routed experts and a gated shared expert
+- [ ] Real-model testing of the new families; more families (Qwen3-Next, Gemma, Phi, DeepSeek, gpt-oss)
 - [x] Tier loader, first version: models bigger than VRAM split between VRAM and RAM (whole layers or experts), VRAM limit setting
 - [ ] SSD tier (stream rarely used weights from disk) and a hot-expert cache in VRAM
 - [ ] Search and download GGUF models from Hugging Face inside tierlm

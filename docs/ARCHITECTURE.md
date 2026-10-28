@@ -88,14 +88,17 @@ Grouped-query attention (fewer key/value heads than query heads), a head size in
 width (Qwen3), tied input/output embeddings and Llama 3.1's RoPE frequency factors are handled for all of
 them. The chat format (Tulu, ChatML, Llama 3, `[INST]`) is read from the model's own chat template.
 
-**Hybrid models (Qwen3.5 / 3.6 / 3.8, GGUF arch `qwen35`).** Three of every four layers replace attention with
+**Hybrid models (Qwen3.5 / 3.6 / 3.8, GGUF archs `qwen35` and `qwen35moe`).** Three of every four layers replace attention with
 **Gated DeltaNet**: a short causal convolution over the last four inputs, then a per-head running memory (a
 128×128 matrix) that decays and is updated a little with every token (ggml's `gated_delta_net` op), followed by a
 gated RMSNorm. Only every fourth layer uses full attention, with an output gate, per-head QK-norm and RoPE on the
 first quarter of each head. Only those layers need a KV cache, so long conversations cost a quarter of the memory;
 the running memories are small, fixed-size, and live with their layer on the GPU or in RAM. They can't be rewound,
 so editing an earlier message recomputes the conversation. Draft (multi-token prediction) blocks in the file are
-skipped and never loaded.
+skipped and never loaded. The MoE versions (`qwen35moe`, e.g. Qwen3.6-35B-A3B) replace the feed-forward block
+with routed experts (softmax, top 8, renormalised) plus a **shared expert** that runs on every token, scaled by its
+own sigmoid gate; files that store each expert's gate and up weights as one tensor (`ffn_gate_up_exps`) are read
+as-is, with one matrix multiply for both halves.
 
 ## Memory and devices
 
@@ -139,8 +142,7 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 
 ## What's next
 
-1. **Real-model testing of the new families**, then more families: the Qwen3.5 hybrid (Gated DeltaNet
-   linear attention), Gemma, Phi, DeepSeek, gpt-oss. Qwen3-30B-A3B (48 layers, 128 experts, 8 active, about
+1. **Real-model testing of the new families**, then more families: Qwen3-Next (Qwen3-Coder-Next), Gemma, Phi, DeepSeek, gpt-oss. Qwen3-30B-A3B (48 layers, 128 experts, 8 active, about
    18.6 GB in Q4) is larger than the Arc's 16 GB, which makes it the first real test of tiering.
 2. **Tier loader, next steps.** VRAM/RAM splitting works (see [TOOLS.md](TOOLS.md#splitting-models-between-vram-and-ram));
    next are the SSD tier (rarely used experts read from disk when routed to) and finer-grained placement.

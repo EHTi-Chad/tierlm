@@ -377,9 +377,9 @@ json describe_model(const std::string& path) {
     j["ctx_train"] = u32(arch + ".context_length");
     // KV cache cost per token of context, at f16: K and V for every layer.
     const int64_t head_dim = u32(arch + ".attention.key_length") ? u32(arch + ".attention.key_length") : (heads ? embd / heads : 0);
-    // Only attention layers keep a KV cache; in hybrid models (qwen35) that's one layer in every few.
+    // Only attention layers keep a KV cache; in hybrid models (qwen35, qwen35moe) that's one layer in every few.
     int64_t kv_layers = layers;
-    if (arch == "qwen35") {
+    if (arch == "qwen35" || arch == "qwen35moe") {
         const int64_t interval = u32(arch + ".full_attention_interval") ? u32(arch + ".full_attention_interval") : 4;
         kv_layers = layers / interval;
         j["hybrid"] = true;

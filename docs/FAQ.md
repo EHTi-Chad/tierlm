@@ -9,7 +9,7 @@ device is in use.
 
 **Can I use a different model?**
 Yes, for the common families: Llama (2, 3.x), Mistral and Mixtral, Qwen2/2.5, Qwen3 and Qwen3 MoE, the Qwen3.5 /
-3.6 / 3.8 dense models (such as Qwen3.8-27B), and OLMoE.
+3.6 / 3.8 dense models (such as Qwen3.8-27B) and MoE models (such as Qwen3.6-35B-A3B), and OLMoE.
 More families are being added. The setup screen says which of your files are supported, and why the others
 aren't. See [Supported models](GETTING_STARTED.md#supported-models).
 

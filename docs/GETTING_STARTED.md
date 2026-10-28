@@ -106,7 +106,8 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Llama 3 / 3.1 / 3.2 / 3.3 | `llama` | Llama-3.2-3B-Instruct, Llama-3.1-8B-Instruct | New: model math verified, real-model test pending |
 | Llama 2, Mistral 7B, Mixtral, TinyLlama | `llama` | Mistral-7B-Instruct, Mixtral-8x7B | New: model math verified, real-model test pending |
 | Qwen3.5 / 3.6 / 3.8 dense (hybrid) | `qwen35` | Qwen3.8-27B, Qwen3.5-9B | New: model math verified, real-model test pending |
-| Qwen3.5 / 3.6 MoE | `qwen35moe` | Qwen3.5-35B-A3B | Not yet |
+| Qwen3.5 / 3.6 MoE (hybrid) | `qwen35moe` | Qwen3.6-35B-A3B, Qwen3.5-122B-A10B | New: model math verified, real-model test pending |
+| Qwen3-Next | `qwen3next` | Qwen3-Coder-Next-80B-A3B | Not yet |
 | Gemma, Phi, DeepSeek, GLM, gpt-oss, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision add-on** (for reading images). tierlm lists it but

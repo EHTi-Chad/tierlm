@@ -18,7 +18,7 @@
 
 namespace tierlm {
 
-static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35" };
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe" };
 bool arch_supported(const std::string& arch) {
     for (const char* a : kArchs) if (arch == a) return true;
     return false;
@@ -171,12 +171,13 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     hp.rope_neox     = arch != "llama";
     hp.qk_norm       = arch == "olmoe" ? Hparams::kFull : (arch == "qwen3" || arch == "qwen3moe") ? Hparams::kPerHead : Hparams::kNone;
     hp.qkv_bias      = arch == "qwen2";
-    hp.expert_renorm = arch == "qwen3moe" || arch == "llama";   // Mixtral and Qwen3-MoE renormalise; OLMoE doesn't
-    if (arch == "qwen3moe") {
+    hp.expert_renorm = arch == "qwen3moe" || arch == "qwen35moe" || arch == "llama";   // OLMoE doesn't renormalise
+    hp.expert_scale  = f32(arch + ".expert_weights_scale", 0.0f);
+    if (arch == "qwen3moe" || arch == "qwen35moe") {
         int64_t id = gguf_find_key(g, (arch + ".expert_weights_norm").c_str());
         if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL) hp.expert_renorm = gguf_get_val_bool(g, id);
     }
-    if (arch == "qwen35") {
+    if (arch == "qwen35" || arch == "qwen35moe") {
         hp.hybrid = true;
         hp.qk_norm = Hparams::kPerHead;
         // Multi-token-prediction draft blocks are stored after the real layers; they aren't run.
@@ -310,7 +311,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 return t && std::find(on_gpu.begin(), on_gpu.end(), t) != on_gpu.end();
             };
             m->place_.attn_gpu += in_vram("attn_norm.weight");
-            m->place_.ffn_gpu += hp.n_expert > 0 ? in_vram("ffn_up_exps.weight") : in_vram("ffn_up.weight");
+            m->place_.ffn_gpu += hp.n_expert > 0 ? (in_vram("ffn_down_exps.weight")) : in_vram("ffn_up.weight");
         }
     }
 
@@ -375,10 +376,20 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         L.ffn_norm  = T(b + (hp.hybrid ? "post_attention_norm.weight" : "ffn_norm.weight"));
         if (hp.is_moe()) {
             L.router = T(b + "ffn_gate_inp.weight");
-            L.gate_x = T(b + "ffn_gate_exps.weight", false);
-            if (!L.gate_x) throw std::runtime_error("this file stores experts as separate tensors (an old Mixtral GGUF); re-download a newer conversion");
-            L.up_x   = T(b + "ffn_up_exps.weight");
+            L.gate_up_x = T(b + "ffn_gate_up_exps.weight", false);      // gate and up stored together (newer files)
+            if (!L.gate_up_x) {
+                L.gate_x = T(b + "ffn_gate_exps.weight", false);
+                if (!L.gate_x) throw std::runtime_error("this file stores experts as separate tensors (an old Mixtral GGUF); re-download a newer conversion");
+                L.up_x   = T(b + "ffn_up_exps.weight");
+            }
             L.down_x = T(b + "ffn_down_exps.weight");
+            // Shared expert (Qwen3.5/3.6 MoE): runs on every token, scaled by its own sigmoid gate.
+            L.up_s = T(b + "ffn_up_shexp.weight", false);
+            if (L.up_s) {
+                L.gate_s     = T(b + "ffn_gate_shexp.weight");
+                L.down_s     = T(b + "ffn_down_shexp.weight");
+                L.gate_inp_s = T(b + "ffn_gate_inp_shexp.weight");
+            }
         } else {
             L.gate = T(b + "ffn_gate.weight");
             L.up   = T(b + "ffn_up.weight");
@@ -630,16 +641,32 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing) {
             w2 = ggml_div(c, w2, ggml_sum_rows(c, w2));
             w = ggml_reshape_3d(c, w2, 1, hp.n_expert_used, n_tok);
         }
+        if (hp.expert_scale != 0.0f && hp.expert_scale != 1.0f) w = ggml_scale(c, w, hp.expert_scale);
         ggml_tensor* h3    = ggml_reshape_3d(c, h, hp.n_embd, 1, n_tok);
-        ggml_tensor* up    = ggml_mul_mat_id(c, L.up_x, h3, sel);            // [n_ff_exp, n_used, n_tok]
-        ggml_tensor* gate  = ggml_mul_mat_id(c, L.gate_x, h3, sel);
-        ggml_tensor* act   = ggml_mul(c, ggml_silu(c, gate), up);
+        ggml_tensor *up, *gate;
+        if (L.gate_up_x) {                                                   // [2*n_ff_exp, n_used, n_tok]: gate, then up
+            ggml_tensor* gu = ggml_mul_mat_id(c, L.gate_up_x, h3, sel);
+            const int64_t f = gu->ne[0] / 2;
+            gate = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
+            up   = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], f * gu->nb[0]);
+        } else {
+            up   = ggml_mul_mat_id(c, L.up_x, h3, sel);                      // [n_ff_exp, n_used, n_tok]
+            gate = ggml_mul_mat_id(c, L.gate_x, h3, sel);
+        }
+        ggml_tensor* act   = L.gate_up_x ? ggml_swiglu_split(c, gate, up)   // works on the two halves in place
+                                     : ggml_mul(c, ggml_silu(c, gate), up);
         ggml_tensor* down  = ggml_mul_mat_id(c, L.down_x, act, sel);         // [n_embd, n_used, n_tok]
         down = ggml_mul(c, down, w);                                         // weight each expert's output
         ggml_tensor* moe = nullptr;
         for (int e = 0; e < hp.n_expert_used; ++e) {
             ggml_tensor* s = ggml_view_2d(c, down, hp.n_embd, n_tok, down->nb[2], e * down->nb[1]);
             moe = moe ? ggml_add(c, moe, s) : s;
+        }
+        if (L.up_s) {                                                        // shared expert
+            ggml_tensor* sh = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, L.gate_s, h)), ggml_mul_mat(c, L.up_s, h));
+            sh = ggml_mul_mat(c, L.down_s, sh);                              // [n_embd, n_tok]
+            ggml_tensor* sg = ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h));   // [1, n_tok]
+            moe = ggml_add(c, moe, ggml_mul(c, sh, sg));
         }
         x = ggml_add(c, x, moe);
     }

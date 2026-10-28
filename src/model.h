@@ -20,6 +20,7 @@ namespace tierlm {
 //   qwen3     Qwen3 dense: per-head QK-norm, head size not tied to the model width
 //   qwen3moe  Qwen3 MoE (e.g. Qwen3-30B-A3B)
 //   olmoe     OLMoE: QK-norm over the full width, expert weights not renormalised
+//   qwen35moe Qwen3.5 / 3.6 MoE (e.g. Qwen3.6-35B-A3B): the same hybrid, with experts plus a shared expert
 //   qwen35    Qwen3.5 / 3.6 / 3.8 dense: a hybrid. Three of every four layers use Gated DeltaNet linear
 //             attention (a fixed-size running memory instead of a KV cache); the rest use gated full
 //             attention with partial RoPE.
@@ -38,6 +39,7 @@ struct Hparams {
     enum QkNorm { kNone, kFull, kPerHead } qk_norm = kNone;
     bool qkv_bias = false;            // biases on Q/K/V projections
     bool expert_renorm = false;       // renormalise the chosen experts' weights to sum to 1
+    float expert_scale = 0.0f;        // multiply the chosen experts' weights by this (0 or 1 = leave as is)
     bool expert_softmax_first = true; // softmax over all experts, then pick (vs pick then softmax: same order)
     bool is_moe() const { return n_expert > 0; }
     // Hybrid (qwen35): Gated DeltaNet layers
@@ -149,6 +151,8 @@ private:
         ggml_tensor *ffn_norm = nullptr;
         ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;          // dense FFN
         ggml_tensor *router = nullptr, *gate_x = nullptr, *up_x = nullptr, *down_x = nullptr;   // experts
+        ggml_tensor *gate_up_x = nullptr;                                     // gate+up experts in one tensor
+        ggml_tensor *up_s = nullptr, *gate_s = nullptr, *down_s = nullptr, *gate_inp_s = nullptr;   // shared expert
         ggml_tensor *k_cache = nullptr, *v_cache = nullptr;   // [head_dim, n_head_kv, max_ctx]
         // Hybrid models: Gated DeltaNet layer
         bool recurrent = false;
