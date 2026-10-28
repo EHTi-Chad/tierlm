@@ -20,6 +20,13 @@
 //                     streams Server-Sent Events: one "prompt" event, a "token" event per token
 //                     (with the experts picked in every layer), then "done"
 //   POST /api/reset   clears the KV cache
+//   GET  /api/network  API and network settings, and the addresses other apps should use
+//   POST /api/network  {"allow_network": true, "api_key": "..."}  (this computer only; saved)
+//
+// OpenAI-compatible API, for apps such as Open WebUI, Continue or anything built on the OpenAI SDK
+// (base URL http://<this computer>:<port>/v1; see docs/API.md):
+//   GET  /v1/models            the loaded model and every supported model in the models folder
+//   POST /v1/chat/completions  chat, streamed or not; naming another model loads it first
 #include "model.h"
 #include "gguf_split.h"
 #include "tokenizer.h"
@@ -30,6 +37,7 @@
 
 #include <climits>
 #include <algorithm>
+#include <functional>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -67,7 +75,8 @@ namespace {
 
 struct Args {
     std::string model, host = "127.0.0.1", device = "auto", web = "web", models = "models", settings = "tierlm-settings.json";
-    bool models_given = false;
+    std::string api_key;
+    bool models_given = false, host_given = false, api_key_given = false;
     int port = 8080, threads = std::max(1, (int)std::thread::hardware_concurrency() / 2), ctx = 4096;
 };
 
@@ -399,6 +408,89 @@ json describe_model(const std::string& path) {
     return j;
 }
 
+// ---- OpenAI-compatible API helpers ----
+
+// OpenAI messages to plain {role, content} ones. Content may be a string, a list of parts
+// ([{"type": "text", "text": ...}], images are skipped: no vision yet) or null. "developer" is OpenAI's newer
+// name for "system"; tool results become user turns so the model still sees them.
+json normalize_messages(const json& in) {
+    json out = json::array();
+    for (const auto& m : in) {
+        if (!m.is_object()) continue;
+        std::string role = m.value("role", std::string("user")), text;
+        const json c = m.contains("content") ? m["content"] : json();
+        if (c.is_string()) text = c.get<std::string>();
+        else if (c.is_array())
+            for (const auto& part : c) {
+                if (part.is_string()) text += part.get<std::string>();
+                else if (part.is_object() && part.value("type", std::string()) == "text") text += part.value("text", std::string());
+            }
+        if (role == "developer") role = "system";
+        if (role == "tool" || role == "function") { role = "user"; text = "Tool result:\n" + text; }
+        if (role != "system" && role != "user" && role != "assistant") role = "user";
+        out.push_back({{"role", role}, {"content", text}});
+    }
+    return out;
+}
+
+void oai_error(httplib::Response& res, int status, const std::string& msg, const char* type = "invalid_request_error",
+               const char* code = nullptr) {
+    res.status = status;
+    json e = {{"message", msg}, {"type", type}, {"param", nullptr}, {"code", code ? json(code) : json(nullptr)}};
+    res.set_content(json({{"error", e}}).dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+}
+
+// A request from this computer: a loopback address, and not passed on by a tunnel or proxy (Cloudflare Tunnel,
+// ngrok and friends connect from localhost but add one of these headers), so it can't be someone outside.
+bool is_local(const httplib::Request& req) {
+    const std::string& a = req.remote_addr;
+    const bool loop = a == "127.0.0.1" || a == "::1" || a == "::ffff:127.0.0.1";
+    return loop && !req.has_header("X-Forwarded-For") && !req.has_header("Forwarded") &&
+           !req.has_header("Cf-Connecting-Ip") && !req.has_header("X-Real-Ip");
+}
+
+// Same length and content, without returning early (so timing doesn't reveal how much of a key matched).
+bool same_secret(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char d = 0;
+    for (size_t i = 0; i < a.size(); ++i) d |= (unsigned char)(a[i] ^ b[i]);
+    return d == 0;
+}
+
+std::string random_key() {
+    std::random_device rd;
+    static const char* hex = "0123456789abcdef";
+    std::string k = "tlm-";
+    for (int i = 0; i < 40; ++i) k += hex[rd() % 16];
+    return k;
+}
+
+// This computer's address on the local network, for showing other devices where to connect. Connecting a UDP
+// socket sends nothing; it only asks the system which interface it would use.
+std::string lan_address() {
+    std::string ip;
+#ifdef _WIN32
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    socket_t s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) return ip;
+    sockaddr_in dst{}; dst.sin_family = AF_INET; dst.sin_port = htons(53);
+    inet_pton(AF_INET, "10.255.255.255", &dst.sin_addr);
+    if (::connect(s, (sockaddr*)&dst, sizeof(dst)) == 0) {
+        sockaddr_in me{}; socklen_t n = sizeof(me);
+        if (::getsockname(s, (sockaddr*)&me, &n) == 0) {
+            char buf[INET_ADDRSTRLEN] = {};
+            if (inet_ntop(AF_INET, &me.sin_addr, buf, sizeof(buf)) && std::string(buf) != "0.0.0.0") ip = buf;
+        }
+    }
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
+    return ip;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -407,7 +499,8 @@ int main(int argc, char** argv) {
         std::string k = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (k == "--port") a.port = std::atoi(next().c_str());
-        else if (k == "--host") a.host = next();
+        else if (k == "--host") { a.host = next(); a.host_given = true; }
+        else if (k == "--api-key") { a.api_key = next(); a.api_key_given = true; }
         else if (k == "-d") a.device = next();
         else if (k == "-t") a.threads = std::atoi(next().c_str());
         else if (k == "-c") a.ctx = std::atoi(next().c_str());
@@ -415,7 +508,7 @@ int main(int argc, char** argv) {
         else if (k == "--models") { a.models = next(); a.models_given = true; }
         else if (k == "--settings") a.settings = next();
         else if (k == "-h" || k == "--help") {
-            std::fprintf(stderr, "usage: %s [model.gguf] [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu|<device>] [-t threads] [-c context] [--web dir] [--models dir] [--settings file]\n"
+            std::fprintf(stderr, "usage: %s [model.gguf] [--port 8080] [--host 127.0.0.1] [--api-key KEY] [-d auto|cpu|gpu|<device>] [-t threads] [-c context] [--web dir] [--models dir] [--settings file]\n"
                                  "Without a model, the web page opens a setup screen to choose the hardware and model.\n", argv[0]);
             return 0;
         }
@@ -457,6 +550,19 @@ int main(int argc, char** argv) {
         eng.load_s = since(t0);
         std::fprintf(stderr, "loaded %s (%s, %s chat format) on %s in %.1fs\n", path.c_str(), eng.model->arch().c_str(),
                      chat_fmt_name(eng.chat), eng.model->device_name().c_str(), eng.load_s);
+    };
+    // Load settings from a /api/load body (or the settings saved for a model).
+    auto load_options = [&](const json& body) {
+        LoadOptions o;
+        o.device = body.value("device", std::string("auto"));
+        o.max_ctx = body.value("ctx", a.ctx);
+        if (body.contains("flash_attn")) o.flash_attn = body.value("flash_attn", true) ? 1 : 0;
+        if (body.contains("kv_type")) o.kv_f32 = body.value("kv_type", std::string("f16")) == "f32" ? 1 : 0;
+        o.batch = body.value("batch", 0);
+        o.experts_used = body.value("experts_used", 0);
+        o.vram_budget_mb = body.value("vram_limit_mb", 0);
+        o.split_mode = body.value("split_mode", std::string("layers"));
+        return o;
     };
     if (!a.model.empty()) {
         LoadOptions o; o.max_ctx = a.ctx; o.device = a.device;
@@ -542,7 +648,8 @@ int main(int argc, char** argv) {
 
     // Models in the models folder (and, if enabled, its subfolders, as LM Studio stores them), read from
     // their headers only (fast: no weights are loaded). "id" is the path relative to the folder.
-    svr.Get("/api/models", [&](const httplib::Request&, httplib::Response& res) {
+    // Every .gguf in the models folder (subfolders too if enabled), described from its header.
+    auto scan_models = [&](bool& exists) {
         json list = json::array();
         std::error_code ec;
         const fs::path base = fs::u8path(a.models);
@@ -553,7 +660,7 @@ int main(int argc, char** argv) {
             m["folder"] = sub == "." ? "" : sub;
             list.push_back(m);
         };
-        const bool exists = fs::is_directory(base, ec);
+        exists = fs::is_directory(base, ec);
         if (exists && recursive) {
             auto it = fs::recursive_directory_iterator(base, fs::directory_options::skip_permission_denied, ec);
             for (; !ec && it != fs::recursive_directory_iterator() && list.size() < 500; it.increment(ec)) {
@@ -565,6 +672,13 @@ int main(int argc, char** argv) {
             for (const auto& f : fs::directory_iterator(base, ec))
                 if (f.is_regular_file() && f.path().extension() == ".gguf" && !gguf_is_later_part(f.path().filename().u8string())) add(f.path());
         }
+        return list;
+    };
+    svr.Get("/api/models", [&](const httplib::Request&, httplib::Response& res) {
+        bool exists = false;
+        json list = scan_models(exists);
+        std::error_code ec;
+        const fs::path base = fs::u8path(a.models);
         json suggest = json::array();
         for (const auto& f : known_model_folders()) {
             std::error_code e2;
@@ -649,15 +763,7 @@ int main(int argc, char** argv) {
             return;
         }
         try {
-            LoadOptions o;
-            o.device = body.value("device", std::string("auto"));
-            o.max_ctx = body.value("ctx", a.ctx);
-            if (body.contains("flash_attn")) o.flash_attn = body.value("flash_attn", true) ? 1 : 0;
-            if (body.contains("kv_type")) o.kv_f32 = body.value("kv_type", std::string("f16")) == "f32" ? 1 : 0;
-            o.batch = body.value("batch", 0);
-            o.experts_used = body.value("experts_used", 0);
-            o.vram_budget_mb = body.value("vram_limit_mb", 0);
-            o.split_mode = body.value("split_mode", std::string("layers"));
+            const LoadOptions o = load_options(body);
             const int threads = body.value("threads", a.threads), seed = body.value("seed", -1);
             load(file.u8string(), o, threads, seed);
             // Remember these settings for this model, like LM Studio does.
@@ -690,6 +796,92 @@ int main(int argc, char** argv) {
         eng.cached.clear();
         res.set_content("{\"ok\":true}", "application/json");
     });
+
+    // One reply, shared by the web page and the OpenAI-compatible API. The caller holds `mu`.
+    //   on_prompt  once, after the conversation has been read
+    //   on_token   for each piece of new text (with the experts each layer picked); return false to stop
+    // `stops` are strings that end the reply (OpenAI's "stop"); text that might be the start of one is held back.
+    struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0; double prompt_s = 0, gen_s = 0; std::string stop = "length", text; };
+    auto generate = [&](const json& messages, const Sampling& sp, int max_tokens, const std::vector<std::string>& stops,
+                        const std::function<void(const json&)>& on_prompt,
+                        const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token) {
+        Gen r;
+        if (max_tokens <= 0) max_tokens = INT_MAX;    // no limit: until the model finishes or the context is full
+        if (eng.seed >= 0) eng.rng.seed((uint32_t)eng.seed);    // same seed, same reply
+        auto& model = eng.model; auto& tok = eng.tok; auto& cached = eng.cached;
+        const auto& hp = model->hparams();
+        const int L = hp.n_layer, E = hp.n_expert, K = hp.n_expert_used;
+
+        std::vector<int32_t> toks = tok.encode(format_chat(messages, eng.chat, tok), true);
+        if ((int)toks.size() + 1 >= model->max_ctx()) throw std::runtime_error("conversation is longer than the context window; start a new chat");
+
+        // Reuse whatever part of the KV cache still matches this conversation.
+        size_t common = 0;
+        while (common < cached.size() && common < toks.size() && cached[common] == toks[common]) ++common;
+        if (common == toks.size()) common = toks.size() - 1;      // must evaluate at least one token
+        model->truncate((int)common);
+        common = (size_t)model->n_past();     // hybrid models start over rather than rewind
+        cached.resize(common);
+
+        std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;
+        auto p0 = Clock::now();
+        std::vector<float> lg = model->eval(suffix, eng.threads, &routing);
+        r.prompt_s = since(p0);
+        r.n_prompt = toks.size();
+        r.reused = common;
+        cached.insert(cached.end(), suffix.begin(), suffix.end());
+
+        std::vector<int> counts((size_t)L * E, 0);                // experts used while reading the prompt
+        if (K > 0) for (size_t i = 0; i < routing.size(); ++i) counts[((i / K) % L) * E + routing[i]]++;
+        if (on_prompt)
+            on_prompt({{"n_prompt", toks.size()}, {"n_new", suffix.size()}, {"reused", common}, {"prompt_s", r.prompt_s},
+                       {"prompt_tps", suffix.size() / std::max(r.prompt_s, 1e-9)}, {"counts", counts}, {"n_past", model->n_past()}});
+
+        std::vector<int32_t> out;
+        size_t shown = 0;
+        auto g0 = Clock::now();
+        auto emit = [&](const std::string& visible, size_t upto) {
+            if (upto <= shown) return true;
+            const std::string delta = visible.substr(shown, upto - shown);
+            shown = upto;
+            r.text += delta;
+            return on_token ? on_token(delta, out.size() / std::max(since(g0), 1e-9), routing) : true;
+        };
+        std::string visible;
+        for (int i = 0; i < max_tokens; ++i) {
+            // Recent tokens for the repetition penalty, leaving out control tokens such as the
+            // end-of-reply marker: penalising those would stop the model from finishing.
+            std::vector<int32_t> recent;
+            for (size_t j = cached.size(); j > 0 && (int)recent.size() < sp.repeat_last_n; --j) {
+                const int32_t t = cached[j - 1];
+                if (t != tok.eos() && t != tok.eot() && !tok.is_control(t)) recent.push_back(t);
+            }
+            int32_t id = sample(lg, sp, recent, eng.rng);
+            if (id == tok.eos() || id == tok.eot() || tok.is_control(id)) { r.stop = "end"; break; }
+            if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
+            out.push_back(id);
+            const std::string text = tok.decode(out);
+            visible = text.substr(0, utf8_complete(text));
+            // A stop string: end the reply just before it.
+            size_t cut = std::string::npos;
+            for (const auto& st : stops)
+                if (!st.empty()) { size_t p = visible.find(st, shown > st.size() ? shown - st.size() : 0); if (p < cut) cut = p; }
+            if (cut != std::string::npos) { emit(visible, std::max(cut, shown)); r.stop = "stop"; break; }
+            // Hold back text that could be the start of a stop string.
+            size_t hold = 0;
+            for (const auto& st : stops)
+                for (size_t k = st.empty() ? 0 : std::min(st.size() - 1, visible.size()); k > hold; --k)
+                    if (visible.compare(visible.size() - k, k, st, 0, k) == 0) { hold = k; break; }
+
+            lg = model->eval({id}, eng.threads, &routing);            // also tells us which experts it used
+            cached.push_back(id);
+            if (!emit(visible, visible.size() - hold)) { r.stop = "abort"; break; }
+        }
+        if (r.stop != "stop" && r.stop != "abort") emit(visible, visible.size());   // release held-back text
+        r.n_gen = out.size();
+        r.gen_s = since(g0);
+        return r;
+    };
 
     svr.Post("/api/chat", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
@@ -724,69 +916,19 @@ int main(int argc, char** argv) {
                 sp.repeat_last_n = body.value("repeat_last_n", sp.repeat_last_n);
                 // Longest reply in tokens; 0 or less (the default) means no limit: the reply ends when the model
                 // finishes or the context window is full. Thinking models (Qwen3.x) need thousands of tokens.
-                int max_tokens = body.value("max_tokens", -1);
-                if (max_tokens <= 0) max_tokens = INT_MAX;
-                if (eng.seed >= 0) eng.rng.seed((uint32_t)eng.seed);    // same seed, same reply
-                auto& model = eng.model; auto& tok = eng.tok; auto& cached = eng.cached;
-                const auto& hp = model->hparams();
-                const int L = hp.n_layer, E = hp.n_expert, K = hp.n_expert_used;
-
-                std::vector<int32_t> toks = tok.encode(format_chat(body["messages"], eng.chat, tok), true);
-                if ((int)toks.size() + 1 >= model->max_ctx()) throw std::runtime_error("conversation is longer than the context window; start a new chat");
-
-                // Reuse whatever part of the KV cache still matches this conversation.
-                size_t common = 0;
-                while (common < cached.size() && common < toks.size() && cached[common] == toks[common]) ++common;
-                if (common == toks.size()) common = toks.size() - 1;      // must evaluate at least one token
-                model->truncate((int)common);
-                common = (size_t)model->n_past();     // hybrid models start over rather than rewind
-                cached.resize(common);
-
-                std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;
-                auto p0 = Clock::now();
-                std::vector<float> lg = model->eval(suffix, eng.threads, &routing);
-                const double prompt_s = since(p0);
-                cached.insert(cached.end(), suffix.begin(), suffix.end());
-
-                std::vector<int> counts((size_t)L * E, 0);                // experts used while reading the prompt
-                for (size_t i = 0; i < routing.size(); ++i) counts[((i / K) % L) * E + routing[i]]++;
-                send({{"type", "prompt"}, {"n_prompt", toks.size()}, {"n_new", suffix.size()}, {"reused", common},
-                      {"prompt_s", prompt_s}, {"prompt_tps", suffix.size() / std::max(prompt_s, 1e-9)},
-                      {"counts", counts}, {"n_past", model->n_past()}});
-
-                std::vector<int32_t> out;
-                size_t shown = 0;
-                std::string stop = "length";
-                auto g0 = Clock::now();
-                for (int i = 0; i < max_tokens; ++i) {
-                    // Recent tokens for the repetition penalty, leaving out control tokens such as the
-                    // end-of-reply marker: penalising those would stop the model from finishing.
-                    std::vector<int32_t> recent;
-                    for (size_t j = cached.size(); j > 0 && (int)recent.size() < sp.repeat_last_n; --j) {
-                        const int32_t t = cached[j - 1];
-                        if (t != tok.eos() && t != tok.eot() && !tok.is_control(t)) recent.push_back(t);
-                    }
-                    int32_t id = sample(lg, sp, recent, eng.rng);
-                    if (id == tok.eos() || id == tok.eot() || tok.is_control(id)) { stop = "end"; break; }
-                    if (model->n_past() + 1 >= model->max_ctx()) { stop = "context"; break; }
-                    out.push_back(id);
-                    std::string text = tok.decode(out);
-                    size_t ok = utf8_complete(text);
-                    std::string delta = ok > shown ? text.substr(shown, ok - shown) : "";
-                    shown = std::max(shown, ok);
-
-                    lg = model->eval({id}, eng.threads, &routing);            // also tells us which experts it used
-                    cached.push_back(id);
-                    json picks = json::array();
-                    for (int l = 0; l < L; ++l)
-                        picks.push_back(std::vector<int32_t>(routing.begin() + (size_t)l * K, routing.begin() + (size_t)(l + 1) * K));
-                    const double el = since(g0);
-                    if (!send({{"type", "token"}, {"text", delta}, {"tps", (i + 1) / std::max(el, 1e-9)},
-                               {"n_past", model->n_past()}, {"routing", picks}})) { stop = "abort"; break; }
-                }
-                const double gen_s = since(g0);
-                send({{"type", "done"}, {"n_gen", out.size()}, {"gen_s", gen_s},
-                      {"gen_tps", out.size() / std::max(gen_s, 1e-9)}, {"stop", stop}, {"n_past", model->n_past()}});
+                const int max_tokens = body.value("max_tokens", -1);
+                const int L = eng.model->hparams().n_layer, K = eng.model->hparams().n_expert_used;
+                Gen g = generate(body["messages"], sp, max_tokens, {},
+                    [&](const json& p) { json j = p; j["type"] = "prompt"; send(j); },
+                    [&](const std::string& delta, double tps, const std::vector<int32_t>& routing) {
+                        json picks = json::array();
+                        if (K > 0 && routing.size() >= (size_t)L * K)
+                            for (int l = 0; l < L; ++l)
+                                picks.push_back(std::vector<int32_t>(routing.begin() + (size_t)l * K, routing.begin() + (size_t)(l + 1) * K));
+                        return send({{"type", "token"}, {"text", delta}, {"tps", tps}, {"n_past", eng.model->n_past()}, {"routing", picks}});
+                    });
+                send({{"type", "done"}, {"n_gen", g.n_gen}, {"gen_s", g.gen_s},
+                      {"gen_tps", g.n_gen / std::max(g.gen_s, 1e-9)}, {"stop", g.stop}, {"n_past", eng.model->n_past()}});
             } catch (const std::exception& e) {
                 send({{"type", "error"}, {"message", e.what()}});
             }
@@ -795,12 +937,227 @@ int main(int argc, char** argv) {
         });
     });
 
-    std::fprintf(stderr, "\n  tierlm is ready: open http://%s:%d in your browser\n  %s\n  (Ctrl+C to stop)\n\n",
-                 a.host == "0.0.0.0" ? "127.0.0.1" : a.host.c_str(), a.port,
-                 eng.model ? "" : "No model loaded yet: the page will show the setup screen.");
-    if (!svr.listen(a.host, a.port)) {
-        std::fprintf(stderr, "error: could not listen on %s:%d (is something else using that port? try --port 8041)\n", a.host.c_str(), a.port);
-        return 1;
+    // ---------------- OpenAI-compatible API ----------------
+    const long long started = (long long)std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    // The loaded model's id: its path inside the models folder, as /v1/models lists it.
+    auto loaded_id = [&]() -> std::string {
+        if (eng.path.empty()) return {};
+        std::error_code ec;
+        auto rel = fs::u8path(eng.path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec));
+        std::string r = rel.generic_u8string();
+        return r.empty() || r.compare(0, 2, "..") == 0 ? fs::u8path(eng.path).filename().u8string() : r;
+    };
+
+    svr.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
+        json data = json::array();
+        std::string cur;
+        {
+            std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
+            cur = lk.owns_lock() ? loaded_id() : last_info.value("path", std::string());
+            if (!lk.owns_lock() && !cur.empty()) cur = fs::u8path(cur).filename().u8string();
+        }
+        if (!cur.empty()) data.push_back({{"id", cur}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}});
+        bool exists = false;
+        for (const auto& m : scan_models(exists)) {
+            if (!m.value("supported", false) || m.value("id", std::string()) == cur) continue;
+            data.push_back({{"id", m["id"]}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", false}});
+        }
+        res.set_content(dump({{"object", "list"}, {"data", data}}), "application/json");
+    });
+
+    svr.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array())
+            return oai_error(res, 400, "expected a JSON body with a \"messages\" array");
+        if (body.value("n", 1) != 1) return oai_error(res, 400, "only n = 1 is supported");
+        // Wait for any reply (from the web page or another app) to finish: one at a time.
+        auto lock = std::make_shared<std::unique_lock<std::mutex>>(mu);
+        // The model asked for: the loaded one if the name matches it, or is unknown (many apps send a fixed
+        // name such as "gpt-4o"); a different model in the models folder is loaded first, with its saved settings.
+        const std::string want = body.value("model", std::string());
+        if (!want.empty() && want != loaded_id()) {
+            std::error_code ec;
+            const auto base = fs::weakly_canonical(fs::u8path(a.models), ec);
+            const auto file = fs::weakly_canonical(fs::u8path(a.models) / fs::u8path(want), ec);
+            const auto rel = file.lexically_relative(base);
+            const bool in_folder = !ec && !rel.empty() && rel.begin()->string() != ".." && fs::is_regular_file(file, ec) &&
+                                   file.extension() == ".gguf";
+            if (in_folder) {
+                try {
+                    json saved = settings.value("models", json::object()).value(rel.generic_u8string(), json::object());
+                    load(file.u8string(), load_options(saved), saved.value("threads", a.threads), saved.value("seed", -1));
+                    settings["last_model"] = rel.generic_u8string();
+                    write_settings(a.settings, settings);
+                } catch (const std::exception& e) {
+                    eng.model.reset(); eng.path.clear();
+                    return oai_error(res, 500, std::string("could not load ") + want + ": " + e.what(), "server_error");
+                }
+            }
+        }
+        if (!eng.model)
+            return oai_error(res, 400, "no model is loaded: load one in tierlm, or name one from /v1/models", "invalid_request_error", "model_not_found");
+
+        Sampling sp;
+        sp.temperature = body.value("temperature", sp.temperature);
+        sp.top_p = body.value("top_p", sp.top_p);
+        sp.top_k = body.value("top_k", sp.top_k);
+        sp.min_p = body.value("min_p", sp.min_p);
+        sp.repeat_penalty = body.value("repeat_penalty", 1.0f);   // off unless asked: it harms code, where repeats are normal
+        sp.repeat_last_n = body.value("repeat_last_n", sp.repeat_last_n);
+        int max_tokens = -1;
+        if (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()) max_tokens = body["max_completion_tokens"].get<int>();
+        else if (body.contains("max_tokens") && body["max_tokens"].is_number()) max_tokens = body["max_tokens"].get<int>();
+        std::vector<std::string> stops;
+        if (body.contains("stop")) {
+            if (body["stop"].is_string()) stops.push_back(body["stop"].get<std::string>());
+            else if (body["stop"].is_array()) for (const auto& x : body["stop"]) if (x.is_string()) stops.push_back(x.get<std::string>());
+        }
+        if (body.contains("seed") && body["seed"].is_number_integer()) eng.rng.seed((uint32_t)body["seed"].get<long long>());
+        const json messages = normalize_messages(body["messages"]);
+        const bool stream = body.value("stream", false);
+        const bool usage_in_stream = body.contains("stream_options") && body["stream_options"].is_object() &&
+                                     body["stream_options"].value("include_usage", false);
+        const std::string model_id = loaded_id();
+        const long long created = (long long)std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        static std::atomic<unsigned> counter{0};
+        const std::string id = "chatcmpl-tierlm-" + std::to_string(created) + "-" + std::to_string(++counter);
+        auto finish = [](const std::string& stop) { return stop == "length" || stop == "context" ? "length" : "stop"; };
+
+        if (!stream) {
+            try {
+                Gen g = generate(messages, sp, max_tokens, stops, nullptr, nullptr);
+                res.set_content(dump({{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", model_id},
+                    {"choices", json::array({{{"index", 0}, {"message", {{"role", "assistant"}, {"content", g.text}}},
+                                              {"logprobs", nullptr}, {"finish_reason", finish(g.stop)}}})},
+                    {"usage", {{"prompt_tokens", g.n_prompt}, {"completion_tokens", g.n_gen}, {"total_tokens", g.n_prompt + g.n_gen}}}}),
+                    "application/json");
+            } catch (const std::exception& e) {
+                oai_error(res, 500, e.what(), "server_error");
+            }
+            return;
+        }
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream", [&, messages, sp, max_tokens, stops, usage_in_stream, model_id, created, id, lock]
+                                                              (size_t, httplib::DataSink& sink) {
+            auto send = [&](const json& j) { std::string s = "data: " + dump(j) + "\n\n"; return sink.write(s.data(), s.size()); };
+            auto chunk = [&](const json& delta, const json& fin) {
+                return send({{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model_id},
+                             {"choices", json::array({{{"index", 0}, {"delta", delta}, {"logprobs", nullptr}, {"finish_reason", fin}}})}});
+            };
+            try {
+                chunk({{"role", "assistant"}, {"content", ""}}, nullptr);
+                Gen g = generate(messages, sp, max_tokens, stops, nullptr,
+                                 [&](const std::string& delta, double, const std::vector<int32_t>&) {
+                                     return delta.empty() ? true : chunk({{"content", delta}}, nullptr);
+                                 });
+                if (g.stop != "abort") {
+                    chunk(json::object(), finish(g.stop));
+                    if (usage_in_stream)
+                        send({{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model_id},
+                              {"choices", json::array()},
+                              {"usage", {{"prompt_tokens", g.n_prompt}, {"completion_tokens", g.n_gen}, {"total_tokens", g.n_prompt + g.n_gen}}}});
+                }
+            } catch (const std::exception& e) {
+                send({{"error", {{"message", e.what()}, {"type", "server_error"}}}});
+            }
+            const std::string done = "data: [DONE]\n\n";
+            sink.write(done.data(), done.size());
+            sink.done();
+            return true;
+        });
+    });
+
+    // ---------------- network access and API key ----------------
+    // By default tierlm only answers this computer. "Allow other devices" (saved in the settings) listens on the
+    // network too, for phones, other PCs, or Open WebUI in Docker. An API key, if set, is then required by
+    // everything that isn't plainly this computer, and by every /v1 request, so a tunnel (needed by Cursor)
+    // can't open tierlm to the internet. --host and --api-key on the command line override the saved values.
+    std::atomic<bool> allow_network{settings.value("allow_network", false)};
+    std::string api_key = a.api_key_given ? a.api_key : settings.value("api_key", std::string());
+    std::mutex net_mu;                   // guards api_key
+    std::atomic<bool> relisten{false};
+    auto bind_host = [&]() { return a.host_given ? a.host : (allow_network ? std::string("0.0.0.0") : std::string("127.0.0.1")); };
+
+    svr.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
+        const bool local = is_local(req);
+        if (!local && !allow_network && !a.host_given) {
+            oai_error(res, 403, "tierlm only accepts connections from this computer: turn on \"Allow other devices\" in tierlm's settings",
+                      "permission_error");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        std::string key;
+        { std::lock_guard<std::mutex> lk(net_mu); key = api_key; }
+        const bool is_api = req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 5, "/api/") == 0;
+        const bool needs_key = !key.empty() && is_api && (!local || req.path.compare(0, 4, "/v1/") == 0);
+        if (needs_key) {
+            std::string auth = req.get_header_value("Authorization");
+            std::string given = auth.compare(0, 7, "Bearer ") == 0 ? auth.substr(7) : req.get_header_value("X-Api-Key");
+            if (!same_secret(given, key)) {
+                res.set_header("WWW-Authenticate", "Bearer");
+                oai_error(res, 401, "missing or wrong API key (send it as \"Authorization: Bearer <key>\")",
+                          "authentication_error", "invalid_api_key");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    auto network_info = [&](bool show_key) {
+        std::string key;
+        { std::lock_guard<std::mutex> lk(net_mu); key = api_key; }
+        const std::string lan = lan_address();
+        json urls = json::array();
+        urls.push_back({{"label", "This computer"}, {"url", "http://127.0.0.1:" + std::to_string(a.port) + "/v1"}});
+        if (!lan.empty()) urls.push_back({{"label", "Other devices on your network"}, {"url", "http://" + lan + ":" + std::to_string(a.port) + "/v1"}});
+        json j = {{"allow_network", (bool)allow_network}, {"listening_on", bind_host()}, {"port", a.port}, {"lan_address", lan},
+                  {"api_key_set", !key.empty()}, {"urls", urls}, {"fixed_by_command_line", a.host_given || a.api_key_given}};
+        if (show_key) j["api_key"] = key;
+        return j;
+    };
+    svr.Get("/api/network", [&](const httplib::Request& req, httplib::Response& res) {
+        res.set_content(dump(network_info(is_local(req))), "application/json");   // the key itself only to this computer
+    });
+    // Change network access or the API key. Only from this computer: someone on the network mustn't be able to
+    // open it wider or change the key.
+    svr.Post("/api/network", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!is_local(req)) { oai_error(res, 403, "network settings can only be changed on the computer running tierlm", "permission_error"); return; }
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) { oai_error(res, 400, "bad request"); return; }
+        const std::string before = bind_host();
+        if (body.contains("allow_network")) { allow_network = body.value("allow_network", false); settings["allow_network"] = (bool)allow_network; }
+        if (body.contains("api_key") && !a.api_key_given) {
+            std::string k = body["api_key"].is_string() ? body["api_key"].get<std::string>() : std::string();
+            if (k == "generate") k = random_key();
+            { std::lock_guard<std::mutex> lk(net_mu); api_key = k; }
+            settings["api_key"] = k;
+        }
+        write_settings(a.settings, settings);
+        // Listen on the new address: stop the listener a moment after this reply is sent; main() starts it again.
+        if (bind_host() != before) {
+            relisten = true;
+            std::thread([&] { std::this_thread::sleep_for(std::chrono::milliseconds(300)); svr.stop(); }).detach();
+        }
+        res.set_content(dump(network_info(true)), "application/json");
+    });
+
+    std::fprintf(stderr, "\n  tierlm is ready: open http://127.0.0.1:%d in your browser\n  %s\n  OpenAI-compatible API: http://127.0.0.1:%d/v1\n  (Ctrl+C to stop)\n\n",
+                 a.port, eng.model ? "" : "No model loaded yet: the page will show the setup screen.", a.port);
+    for (;;) {
+        const std::string host = bind_host();
+        if (host != "127.0.0.1" && host != "localhost") {
+            const std::string lan = lan_address();
+            std::fprintf(stderr, "  Other devices can connect: http://%s:%d (API: http://%s:%d/v1)%s\n\n", lan.empty() ? host.c_str() : lan.c_str(), a.port,
+                         lan.empty() ? host.c_str() : lan.c_str(), a.port, api_key.empty() ? "  -- no API key set" : "");
+        }
+        relisten = false;
+        if (!svr.listen(host, a.port)) {
+            std::fprintf(stderr, "error: could not listen on %s:%d (is something else using that port? try --port 8041)\n", host.c_str(), a.port);
+            return 1;
+        }
+        if (!relisten) break;
+        std::fprintf(stderr, "  network setting changed: listening again\n");
     }
     return 0;
 }

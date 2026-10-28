@@ -1,7 +1,8 @@
 # Server API
 
-`tierlm-server` serves the web page and a small JSON API on the same port (default
-`http://127.0.0.1:8080`). There is no authentication; keep it on localhost or a trusted network.
+`tierlm-server` serves the web page, an OpenAI-compatible API and its own small JSON API on the same port
+(`http://127.0.0.1:8040` when started with `start-tierlm.bat`). Only this computer can connect unless you turn
+on **Allow other devices**; see [Other devices and API keys](#other-devices-and-api-keys).
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -15,8 +16,77 @@
 | POST | `/api/unload` | Free the loaded model |
 | POST | `/api/chat` | Generate a reply, streamed as Server-Sent Events |
 | POST | `/api/reset` | Clear the KV cache |
+| GET | `/api/network` | Network access, API key status, and the addresses apps should use |
+| POST | `/api/network` | Change network access or the API key (this computer only) |
+| GET | `/v1/models` | OpenAI-compatible: models |
+| POST | `/v1/chat/completions` | OpenAI-compatible: chat, streamed or not |
 
-## GET /api/info
+The first part of this page is the OpenAI-compatible API, for other apps. The rest documents tierlm's own
+`/api` endpoints, which the web page uses.
+
+## OpenAI-compatible API
+
+Apps that can talk to OpenAI can use tierlm instead: set the **base URL** to `http://127.0.0.1:8040/v1` (or
+this computer's network address, see below) and any API key, unless you've set one in tierlm. Tested with
+the official `openai` Python library; it follows the same format as LM Studio, Ollama and llama.cpp's server.
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8040/v1", api_key="not-needed")
+reply = client.chat.completions.create(
+    model="Qwen3.6-35B-A3B-Q8_0.gguf",          # or any name: the loaded model is used
+    messages=[{"role": "user", "content": "Explain RAID 6 in two sentences."}],
+    stream=True)
+for chunk in reply:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+### GET /v1/models
+
+The loaded model first (`"loaded": true`), then every supported model in the models folder. `id` is the
+model's path inside the folder, e.g. `lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q8_0.gguf`.
+
+### POST /v1/chat/completions
+
+| Field | Notes |
+|---|---|
+| `model` | An `id` from `/v1/models` loads that model first (with the settings last used for it in tierlm), which takes as long as loading it on the setup screen. Any other name, such as `gpt-4o`, uses the loaded model. |
+| `messages` | `system`, `developer` (same as system), `user`, `assistant`. Content can be a string or a list of text parts; images are skipped (no vision yet). `tool` messages are passed to the model as user text. |
+| `stream` | `true` streams `chat.completion.chunk` events, ending with `data: [DONE]`. `stream_options: {"include_usage": true}` adds a final chunk with token counts. |
+| `max_tokens`, `max_completion_tokens` | Longest reply. Left out: no limit (until the model finishes or the context is full). |
+| `temperature`, `top_p`, `seed`, `stop` | As in OpenAI. `stop` is a string or a list of strings; the reply ends just before one. |
+| `top_k`, `min_p`, `repeat_penalty` | Extras, as in LM Studio and llama.cpp. `repeat_penalty` is off (1.0) unless given, because it harms code. |
+
+The reply includes `usage` (`prompt_tokens`, `completion_tokens`). `finish_reason` is `stop` (the model
+finished, or a stop string), or `length` (`max_tokens`, or the context window is full).
+
+One reply is generated at a time. Requests from apps wait their turn; while one is running, the web page's
+own chat answers "busy". Requests share the model's memory of the conversation, so an app that resends a
+growing conversation only pays for the new part.
+
+Not yet: tool (function) calling, which coding agents such as Cursor's agent mode, Cline and Continue's agent
+mode need; `logprobs`; `n` > 1; embeddings; images.
+
+Errors use OpenAI's format: `{"error": {"message": "...", "type": "...", "code": ...}}`.
+
+### Other devices and API keys
+
+By default tierlm only answers this computer. In the web page, **Connect other apps** has:
+
+- **Allow other devices**: tierlm listens on your network too, and shows the address to use, such as
+  `http://192.168.1.20:8040/v1`. Needed for other PCs and phones, for Open WebUI running in Docker (Docker's
+  traffic doesn't count as this computer), and for tunnels. It takes effect at once.
+- **API key**: when set, every `/v1` request must send it (`Authorization: Bearer <key>`, which is what apps do
+  with the "API key" you give them), and so must everything else that doesn't come from this computer; the web
+  page asks for it once on other devices. Requests passed on by a tunnel or proxy (they carry headers such as
+  `X-Forwarded-For` or `Cf-Connecting-Ip`) never count as this computer.
+
+Both are saved in `tierlm-settings.json`. `--host 0.0.0.0` and `--api-key KEY` on the command line override
+them. Network settings can only be changed on the computer running tierlm.
+
+## tierlm's own API (`/api`)
+
+### GET /api/info
 
 Example (values depend on the model and machine):
 
@@ -36,7 +106,7 @@ Example (values depend on the model and machine):
 While a reply is streaming or a model is loading, `/api/info` returns the last known details with
 `"busy": true` instead of waiting.
 
-## GET /api/devices
+### GET /api/devices
 
 ```json
 {"devices": [
@@ -54,7 +124,7 @@ when loading.
 `VK_ICD_FILENAMES` or `VK_DRIVER_FILES` is set (these can hide the GPU; `missing` is true if the file they
 name doesn't exist), and `no_gpu` when a GPU build finds no GPU.
 
-## GET /api/models
+### GET /api/models
 
 ```json
 {"folder": "C:\\tierlm\\models", "exists": true, "recursive": true, "default_ctx": 4096, "current": "",
@@ -76,7 +146,7 @@ listed once, by its first part, with `"parts": N` and the total size of all part
 searched too (up to 4 levels, as LM Studio stores models as `publisher/model/file.gguf`). `suggestions` lists
 other model folders found on this computer. `saved` holds the settings last used for each model, by `id`.
 
-## POST /api/folder
+### POST /api/folder
 
 ```json
 {"folder": "D:\\AI\\models", "recursive": true}
@@ -85,13 +155,13 @@ other model folders found on this computer. `saved` holds the settings last used
 Either field can be left out. The choice is saved in `tierlm-settings.json` (in the folder tierlm runs from)
 and used next time, unless `--models` is given on the command line.
 
-## POST /api/pick-folder
+### POST /api/pick-folder
 
 Opens the Windows folder picker on the computer running tierlm and returns
 `{"cancelled": false, "folder": "D:\\AI\\models"}`; it doesn't change the folder by itself. Only answers
 requests from the same computer. Elsewhere it returns HTTP 501.
 
-## POST /api/load
+### POST /api/load
 
 ```json
 {"model": "OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf", "device": "auto", "ctx": 4096, "threads": 4,
@@ -114,11 +184,11 @@ requests from the same computer. Elsewhere it returns HTTP 501.
 Any loaded model is freed first. The settings are saved for this model. Returns
 `{"ok": true, "device": "...", "load_s": 3.2}`, or an `error` with HTTP 400/500.
 
-## POST /api/unload
+### POST /api/unload
 
 Frees the model and its memory. Returns `{"ok": true}`.
 
-## POST /api/chat
+### POST /api/chat
 
 Request:
 
@@ -135,7 +205,7 @@ Request:
 ```
 
 - `messages` is the whole conversation; roles are `system`, `user` and `assistant`. The server formats it
-  with the OLMoE-Instruct (Tulu) chat template.
+  with the model's own chat format (ChatML, Llama 3, Tulu, `[INST]`).
 - `temperature` 0 means greedy (always the most likely token). Defaults: 0.7, top_p 0.9, and no limit on `max_tokens` (0 or less, or leaving it out, means the reply runs until the model finishes or the context is full).
 - Whatever part of the conversation is already in the KV cache is reused, so follow-up messages only process
   the new text.
@@ -143,7 +213,7 @@ Request:
 Errors before streaming starts: `400` for a malformed body, `409` if a reply is already being generated, a
 model is loading, or no model is loaded.
 
-### Response stream
+#### Response stream
 
 The response is `text/event-stream`: lines of `data: {json}` separated by blank lines.
 
@@ -180,17 +250,33 @@ or `abort` (the client disconnected).
 
 If something goes wrong after streaming starts, the server sends `{"type": "error", "message": "..."}`.
 
-### Stopping a reply
+#### Stopping a reply
 
 Close the connection (for example, abort the `fetch`). The server notices on the next token and stops.
 
-### Example with curl
+#### Example with curl
 
 ```bash
 curl -N http://127.0.0.1:8040/api/chat -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":20}'
 ```
 
-## POST /api/reset
+### POST /api/reset
 
 Clears the KV cache. Returns `{"ok": true}`.
+
+### GET /api/network
+
+```json
+{"allow_network": false, "listening_on": "127.0.0.1", "port": 8040, "lan_address": "192.168.1.20",
+ "api_key_set": true, "api_key": "tlm-...", "fixed_by_command_line": false,
+ "urls": [{"label": "This computer", "url": "http://127.0.0.1:8040/v1"},
+          {"label": "Other devices on your network", "url": "http://192.168.1.20:8040/v1"}]}
+```
+
+`api_key` itself is only included for requests from this computer.
+
+### POST /api/network
+
+`{"allow_network": true}` and/or `{"api_key": "generate"}` (a new random key), `{"api_key": "my-key"}` or
+`{"api_key": ""}` (no key). Only accepted from this computer. Returns the same as `GET /api/network`.

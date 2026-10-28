@@ -77,6 +77,16 @@ NVIDIA GeForce RTX 20/30/40/50 cards (the fastest option on NVIDIA; NVIDIA's run
 need a current driver), and **Vulkan** on Intel Arc, AMD Radeon and older NVIDIA cards. Without a GPU it uses
 the CPU. On a PC without an NVIDIA card, the black window may say CUDA found no device; that's expected.
 
+**Can other apps use tierlm, like they use LM Studio or Ollama?**
+Yes: tierlm has an OpenAI-compatible API at `http://127.0.0.1:8040/v1`. Open WebUI, Continue, LibreChat and
+scripts using the OpenAI library work with it. See [Connect other apps](GETTING_STARTED.md#connect-other-apps).
+Coding agents that need tool calling (Cursor's agent mode, Cline) don't work yet.
+
+**Another computer, my phone or Open WebUI in Docker can't connect**
+Turn on **Allow other devices** in **Connect other apps** on the setup screen, and use the network address it
+shows (not 127.0.0.1). If Windows asked about the firewall and you clicked Cancel, allow `tierlm-server` in
+**Windows Security → Firewall & network protection → Allow an app through firewall**, for Private networks.
+
 **My models are already in another folder (LM Studio, say)**
 Click the **⋯** menu next to **GGUF models** and choose **Choose models folder…**, or the LM Studio entry if
 tierlm found one. Subfolders are searched too. tierlm remembers the folder.

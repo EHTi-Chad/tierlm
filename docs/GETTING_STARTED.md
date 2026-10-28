@@ -97,6 +97,44 @@ more varied. **Max reply** caps the length of each reply; the default, **No limi
 
 Close the black tierlm window, or press **Ctrl+C** in it.
 
+## Connect other apps
+
+tierlm speaks the same API as OpenAI, so apps made for OpenAI (or for LM Studio and Ollama) can use the model
+you've loaded. On the setup screen (**Change setup**, top right, from the chat), scroll to **Connect other
+apps**: it shows the address to give them, the **Allow other devices** switch, and the **API key**.
+
+- **Apps on this computer** use `http://127.0.0.1:8040/v1` as the base URL, and any text as the API key unless
+  you've set one.
+- **Other computers and phones** need **Allow other devices** on, then use the second address shown, such as
+  `http://192.168.1.20:8040/v1`. If Windows asks whether to let tierlm through the firewall, choose **Private
+  networks**. Set an API key, or anyone on your network can use your GPU.
+
+**Open WebUI.** In Open WebUI, open **Admin Panel → Settings → Connections**, add an **OpenAI API** connection with
+URL `http://host.docker.internal:8040/v1` if Open WebUI runs in Docker on this computer (turn on **Allow other
+devices**: Docker's traffic doesn't count as this computer), or tierlm's network address if it runs elsewhere,
+and the API key if you set one. tierlm's models appear in Open WebUI's model list; picking one that isn't loaded
+loads it.
+
+**Continue (VS Code / JetBrains).** Add a model to Continue's `config.yaml`:
+
+```yaml
+models:
+  - name: tierlm
+    provider: openai
+    model: any            # the model loaded in tierlm
+    apiBase: http://127.0.0.1:8040/v1
+    apiKey: none          # or your tierlm API key
+```
+
+**Cursor.** Cursor sends requests for custom models from its own servers, so it can't reach `127.0.0.1`: tierlm
+needs a public HTTPS address from a tunnel, such as Cloudflare's `cloudflared tunnel --url http://localhost:8040`.
+Turn on **Allow other devices** and **set an API key** first (anyone who finds the tunnel's address could
+otherwise use your GPU). In Cursor's **Settings → Models**, enter the API key, set **Override OpenAI Base URL**
+to the tunnel's address plus `/v1`, and add the model name. Chat works; Cursor's agent mode needs tool calling,
+which tierlm doesn't have yet.
+
+Details: [API.md](API.md#openai-compatible-api).
+
 ## Supported models
 
 tierlm reads the architecture from the file. The setup screen marks each model as supported or says why not.

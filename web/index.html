@@ -33,7 +33,9 @@
   #status { color: var(--muted); font-size: 12.5px; }
 
   main { display: grid; grid-template-columns: minmax(340px, 1fr) minmax(420px, 1.15fr); gap: 16px; padding: 16px; height: calc(100% - 53px); }
-  @media (max-width: 980px) { main { grid-template-columns: 1fr; height: auto; } #chat { height: 70vh; } }
+  /* Chat page: the conversation gets two thirds of the width, the dashboard one third. */
+  main#app { grid-template-columns: minmax(420px, 2fr) minmax(320px, 1fr); }
+  @media (max-width: 980px) { main, main#app { grid-template-columns: 1fr; height: auto; } #chat { height: 70vh; } }
 
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
   .card h2 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; color: var(--muted); }
@@ -70,7 +72,7 @@
   button.on { background: var(--accent-soft); border-color: var(--accent); }
 
   /* dashboard */
-  #dash { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-content: start; overflow-y: auto; min-height: 0; }
+  #dash { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; align-content: start; overflow-y: auto; min-height: 0; }
   #dash .wide { grid-column: 1 / -1; }
   .big { font-size: 34px; font-weight: 700; letter-spacing: -1px; line-height: 1.1; }
   .big small { font-size: 14px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-left: 4px; }
@@ -165,6 +167,15 @@
   .settings label.chk { display: flex; align-items: center; gap: 7px; }
   .settings label.chk input { accent-color: var(--accent); }
   .settings input[type=number] { font: inherit; width: 120px; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  /* API and network card */
+  .apirow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; font-size: 13px; }
+  .apirow .lbl { color: var(--muted); min-width: 190px; }
+  .apirow code { background: var(--panel-2); color: var(--ink); padding: 3px 8px; border-radius: 6px; font-size: 12.5px; word-break: break-all; }
+  #apikey { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; flex: 1; min-width: 220px; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  #netcard label.chk { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13.5px; }
+  #netcard label.chk input { accent-color: var(--accent); width: 16px; height: 16px; }
+  #netmsg { color: var(--muted); }
+  .warnline { color: var(--danger); font-size: 12.5px; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -305,6 +316,32 @@
       </div>
     </div>
   </section>
+
+  <section class="card" id="netcard">
+    <div class="head"><h2>Connect other apps</h2><span class="caption">OpenAI-compatible API</span></div>
+    <div class="body">
+      <div class="help" style="margin-bottom:8px">Apps that work with OpenAI (Open WebUI, Continue, LibreChat, scripts using the OpenAI library)
+        can use tierlm instead: give them the address below as the <b>base URL</b>. They use the model loaded here, or load another
+        one by name (the names are listed at <code>/v1/models</code>).</div>
+      <div id="urls"></div>
+      <div style="margin-top:12px">
+        <label class="chk"><input type="checkbox" id="allownet"> Allow other devices</label>
+        <div class="help">Let other computers, phones, or Open WebUI running in Docker reach tierlm over your network. Off: only
+          this computer can. Anyone on your network can use your GPU while this is on, so set an API key too. Windows may ask
+          whether to allow tierlm through the firewall: choose <b>Private networks</b>.</div>
+      </div>
+      <div class="apirow" style="margin-top:12px">
+        <span class="lbl">API key</span>
+        <input id="apikey" type="text" readonly placeholder="none: apps on this computer don't need one" spellcheck="false">
+        <button class="tiny" id="keygen">New key</button>
+        <button class="tiny" id="keycopy">Copy</button>
+        <button class="tiny ghost" id="keyclear">Remove</button>
+      </div>
+      <div class="help">When set, apps must send it as their API key, and the tierlm page asks for it on other devices. Needed if you
+        open tierlm to the internet through a tunnel (Cursor works that way).</div>
+      <div class="caption" id="netmsg"></div>
+    </div>
+  </section>
 </main>
 
 <main id="app" hidden>
@@ -416,6 +453,30 @@
 <div id="tip"></div>
 
 <script>
+// Every request to tierlm goes through api(): when tierlm has an API key and this page is opened from another
+// device, it asks for the key once, remembers it in this browser, and sends it with each request.
+let apiKeyMem = null;
+function storedKey() { if (apiKeyMem !== null) return apiKeyMem; try { return localStorage.getItem("tierlm.apikey") || ""; } catch (e) { return ""; } }
+async function api(url, opts = {}) {
+  const withKey = () => { const k = storedKey(); const o = { ...opts, headers: { ...(opts.headers || {}) } }; if (k) o.headers["Authorization"] = "Bearer " + k; return o; };
+  const sent = storedKey();
+  let r = await fetch(url, withKey());
+  if (r.status === 401) {
+    // Requests that fail together share one question; a key that changed meanwhile is simply tried.
+    if (storedKey() === sent) {
+      keyAsk = keyAsk || new Promise(res => setTimeout(() => {
+        const k = prompt("This tierlm needs its API key. You'll find it on the computer running tierlm, under Connect other apps.");
+        if (k) { apiKeyMem = k.trim(); try { localStorage.setItem("tierlm.apikey", apiKeyMem); } catch (e) {} }
+        keyAsk = null; res();
+      }, 0));
+      await keyAsk;
+    }
+    if (storedKey() !== sent) r = await fetch(url, withKey());
+  }
+  return r;
+}
+let keyAsk = null;
+
 const $ = id => document.getElementById(id);
 const fmtGiB = b => !b ? "0 GiB" : b < 1073741824 ? Math.max(0.1, b / 1048576).toFixed(b < 10485760 ? 1 : 0) + " MiB" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 1 : 2) + " GiB";
 let info = null, L = 16, E = 64, K = 8;
@@ -426,7 +487,7 @@ let speedPts = [], lastTokT = 0, ema = 0, tokCount = 0;   // speed vs. context
 // ---------- info ----------
 async function loadInfo() {
   try {
-    info = await (await fetch("/api/info")).json();
+    info = await (await api("/api/info")).json();
   } catch (e) { $("devname").textContent = "server not reachable"; return; }
   if (info.version) $("ver").textContent = "v" + info.version;
   if (!info.loaded) { info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "setup"; showSetup(); return; }
@@ -504,7 +565,7 @@ async function send(text) {
   controller = new AbortController();
   let reply = "", meta = "";
   try {
-    const res = await fetch("/api/chat", {
+    const res = await api("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
       body: JSON.stringify({ messages: history, temperature: +$("temp").value, max_tokens: maxTokens(),
         top_p: +$("topp").value, top_k: +$("topk").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value }),
@@ -672,7 +733,7 @@ $("newchat").onclick = async () => {
   if (busy) return;
   history = [];
   $("messages").innerHTML = "";
-  await fetch("/api/reset", { method: "POST" });
+  await api("/api/reset", { method: "POST" });
   setContext(0);
 };
 $("m-heat").onclick = () => { mapMode = "heat"; $("m-heat").classList.add("on"); $("m-live").classList.remove("on"); };
@@ -713,7 +774,7 @@ function plan() {
 async function loadSetup() {
   $("loadmsg").textContent = ""; $("loadmsg").className = "";
   try {
-    const [dv, m] = await Promise.all([fetch("/api/devices").then(r => r.json()), fetch("/api/models").then(r => r.json())]);
+    const [dv, m] = await Promise.all([api("/api/devices").then(r => r.json()), api("/api/models").then(r => r.json())]);
     // The same NVIDIA card can be reachable through CUDA and Vulkan: show it once, as its CUDA device.
     devices = dv.devices.filter(d => !d.same_gpu_as);
     for (const d of devices) d.alsoVulkan = dv.devices.some(x => x.same_gpu_as === d.id);
@@ -874,7 +935,7 @@ $("mbtn").onclick = e => { e.stopPropagation(); $("mmenu").hidden = !$("mmenu").
 document.addEventListener("click", e => { if (!$("mmenu").hidden && !$("mmenu").contains(e.target)) closeMenu(); });
 async function setFolder(folder, recursive) {
   const body = {}; if (folder !== undefined) body.folder = folder; if (recursive !== undefined) body.recursive = recursive;
-  const r = await fetch("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const r = await api("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   selModel = null; await loadSetup();
@@ -885,7 +946,7 @@ $("m-pick").onclick = async () => {
   if (!md.can_pick) { showPathForm(); return; }
   $("loadmsg").className = ""; $("loadmsg").textContent = "A folder picker has opened on this computer (it may be behind this window)…";
   try {
-    const j = await (await fetch("/api/pick-folder", { method: "POST" })).json();
+    const j = await (await api("/api/pick-folder", { method: "POST" })).json();
     $("loadmsg").textContent = "";
     if (j.error) { showPathForm(); $("patherr").textContent = j.error; return; }
     if (!j.cancelled && j.folder) await setFolder(j.folder);
@@ -925,7 +986,7 @@ $("loadbtn").onclick = async () => {
                  force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
   if ($("forcecpu").checked) body.device = "cpu";
   try {
-    const r = await fetch("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await api("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || r.statusText);
     history = []; $("messages").innerHTML = ""; speedPts = []; totalPicks = 0; tokCount = 0;
@@ -939,6 +1000,48 @@ $("loadbtn").onclick = async () => {
 };
 
 loadInfo().then(() => { if (info) updateHits(); });
+
+// ---- Connect other apps: addresses, the network switch and the API key ----
+async function loadNetwork() {
+  let n;
+  try { n = await (await api("/api/network")).json(); } catch (e) { return; }
+  const local = "api_key" in n;                       // the key and the controls only on the computer running tierlm
+  const urls = $("urls"); urls.innerHTML = "";
+  for (const u of n.urls) {
+    if (u.label !== "This computer" && !n.allow_network) continue;
+    const row = document.createElement("div"); row.className = "apirow";
+    const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = u.label;
+    const code = document.createElement("code"); code.textContent = u.url;
+    const b = document.createElement("button"); b.className = "tiny"; b.textContent = "Copy";
+    b.onclick = () => copyText(u.url, b);
+    row.append(lbl, code, b); urls.append(row);
+  }
+  $("allownet").checked = n.allow_network;
+  $("apikey").value = local ? (n.api_key || "") : (n.api_key_set ? "set (shown only on the computer running tierlm)" : "");
+  for (const id of ["allownet", "keygen", "keyclear"]) $(id).disabled = !local || n.fixed_by_command_line;
+  $("keycopy").disabled = !local || !n.api_key;
+  $("netmsg").innerHTML = !local ? "These settings can only be changed on the computer running tierlm."
+    : n.fixed_by_command_line ? "Set by --host / --api-key on the command line."
+    : n.allow_network && !n.api_key_set ? '<span class="warnline">Other devices can use tierlm without a key. Consider setting one.</span>' : "";
+}
+async function setNetwork(body, msg) {
+  $("netmsg").textContent = msg || "Saving…";
+  try {
+    const r = await api("/api/network", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) { $("netmsg").textContent = (await r.json()).error?.message || "Could not save"; return; }
+  } catch (e) { /* the listener restarts when the switch changes; the page reconnects below */ }
+  setTimeout(loadNetwork, 700);
+}
+function copyText(t, btn) {
+  const done = () => { const o = btn.textContent; btn.textContent = "Copied"; setTimeout(() => btn.textContent = o, 1200); };
+  if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(t).then(done, () => {});
+  else { const ta = document.createElement("textarea"); ta.value = t; document.body.append(ta); ta.select(); try { document.execCommand("copy"); done(); } catch (e) {} ta.remove(); }
+}
+$("allownet").onchange = () => setNetwork({ allow_network: $("allownet").checked }, $("allownet").checked ? "Opening tierlm to your network…" : "Closing tierlm to other devices…");
+$("keygen").onclick = () => { if (!$("apikey").value || confirm("Make a new API key? Apps using the old one will need the new key.")) setNetwork({ api_key: "generate" }); };
+$("keyclear").onclick = () => { if (confirm("Remove the API key? Apps won't need a key any more.")) setNetwork({ api_key: "" }); };
+$("keycopy").onclick = () => copyText($("apikey").value, $("keycopy"));
+loadNetwork();
 </script>
 </body>
 </html>

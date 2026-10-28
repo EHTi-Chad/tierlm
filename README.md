@@ -48,7 +48,9 @@ independent engine built on the same principle.
   Studio's), and remembers LM Studio-style load settings per model.
 - **Web interface**: streaming chat, plus a live dashboard with an expert activity map, speed vs. context,
   memory placement, and a "hot-expert cache" preview built from real routing data.
-- **Local HTTP API** with streaming replies (Server-Sent Events): see [docs/API.md](docs/API.md). OpenAI-compatible endpoints are on the roadmap.
+- **OpenAI-compatible API** (`/v1/models`, `/v1/chat/completions`, streamed or not): Open WebUI, Continue, LibreChat
+  and anything built on the OpenAI SDK can use tierlm. An **Allow other devices** switch and an optional API key
+  control who can connect. See [docs/API.md](docs/API.md) and [Connect other apps](docs/GETTING_STARTED.md#connect-other-apps).
 
 ## Benchmarks
 
@@ -198,8 +200,10 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [ ] SSD tier (stream rarely used weights from disk) and a hot-expert cache in VRAM
 - [ ] Search and download GGUF models from Hugging Face inside tierlm
 - [ ] Routing statistics and a hot-expert cache that promotes busy experts to VRAM
+- [x] OpenAI-compatible API, with an Allow other devices switch and optional API key
+- [ ] Tool (function) calling in the API, for coding agents (Cursor agent mode, Cline, Continue agent)
 - [ ] NVIDIA (CUDA) testing on an RTX 5090; AMD testing via Vulkan/ROCm
-- [ ] Quantized KV cache, speculative decoding, OpenAI-compatible endpoints
+- [ ] Quantized KV cache, speculative decoding
 
 ## Credits and licence
 
