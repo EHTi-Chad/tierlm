@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tierlm</title>
+<script>try { const t = localStorage.getItem("tierlm.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}</script>
 <style>
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --ink: #1d2230; --muted: #636a7a; --faint: #9aa0ad;
@@ -12,13 +13,20 @@
     --user: #1e3a5f; --user-ink: #ffffff; --danger: #b4472b;
     --radius: 10px; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
   }
+  /* Theme: Auto follows the system; Light and Dark (the switch in the top bar) override it. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #12151b; --panel: #1a1e26; --panel-2: #222733; --ink: #e6e8ee; --muted: #a0a6b4; --faint: #6c7383;
       --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35;
       --vram: #2bb39e; --ram: #e0a043; --ssd: #e07a5f; --kv: #a08cf5; --work: #7a8396; --other: #3c4250; --heat-lo: #232834; --flash: #6ff0dc;
       --user: #2f5d93; --user-ink: #ffffff; --danger: #e07a5f;
     }
+  }
+  :root[data-theme="dark"] {
+      --bg: #12151b; --panel: #1a1e26; --panel-2: #222733; --ink: #e6e8ee; --muted: #a0a6b4; --faint: #6c7383;
+      --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35;
+      --vram: #2bb39e; --ram: #e0a043; --ssd: #e07a5f; --kv: #a08cf5; --work: #7a8396; --other: #3c4250; --heat-lo: #232834; --flash: #6ff0dc;
+      --user: #2f5d93; --user-ink: #ffffff; --danger: #e07a5f;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
@@ -33,9 +41,98 @@
   #status { color: var(--muted); font-size: 12.5px; }
 
   main { display: grid; grid-template-columns: minmax(340px, 1fr) minmax(420px, 1.15fr); gap: 16px; padding: 16px; height: calc(100% - 53px); }
-  /* Chat page: the conversation gets two thirds of the width, the dashboard one third. */
-  main#app { grid-template-columns: minmax(420px, 2fr) minmax(320px, 1fr); }
-  @media (max-width: 980px) { main, main#app { grid-template-columns: 1fr; height: auto; } #chat { height: 70vh; } }
+  /* Chat page: icon rail and menu panel on the left, the conversation in the middle, a thin live view on the right. */
+  main#app { display: flex; gap: 0; padding: 0; }
+  #rail { width: 56px; flex: 0 0 56px; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 0; background: var(--panel); border-right: 1px solid var(--line); }
+  #rail .grow { flex: 1; }
+  .ricon { width: 42px; height: 42px; padding: 0; display: flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 10px; background: transparent; color: var(--muted); }
+  .ricon:hover { border-color: var(--line); color: var(--ink); }
+  .ricon.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .ricon svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .ricon svg .fillbg { fill: var(--panel); }
+  .ricon.on svg .fillbg { fill: var(--accent-soft); }
+  #panel { width: 330px; flex: 0 0 330px; background: var(--panel); border-right: 1px solid var(--line); overflow-y: auto; }
+  #app.collapsed #panel { display: none; }
+  .sec { border-bottom: 1px solid var(--line); }
+  .sechead { width: 100%; display: flex; align-items: baseline; gap: 10px; padding: 13px 16px; border: 0; border-radius: 0; background: transparent; font-weight: 600; font-size: 13.5px; text-align: left; }
+  .sechead:hover { background: var(--panel-2); }
+  .sechead small { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--muted); }
+  .sechead::after { content: "▾"; color: var(--faint); font-size: 12px; }
+  .sec.open .sechead::after { content: "▴"; }
+  .secbody { display: none; padding: 2px 16px 16px; font-size: 13px; }
+  .sec.open .secbody { display: block; }
+  .secbody .lrow { display: flex; justify-content: space-between; color: var(--muted); margin-top: 10px; }
+  .secbody .lrow b { color: var(--ink); font-weight: 600; }
+  .secbody input.full { width: 100%; }
+  .secbody textarea { width: 100%; margin-top: 4px; font: inherit; font-size: 13px; padding: 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); resize: vertical; }
+  .secbody select { font: inherit; padding: 5px 7px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  .lrow2 { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+  .lrow2 label.chk { display: flex; align-items: center; gap: 7px; flex: 1; }
+  .lrow2 input[type=checkbox], #netbody input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
+  .secbody .help { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .reloadnote { margin-top: 14px; padding: 10px 12px; border-radius: 8px; background: var(--panel-2); color: var(--muted); font-size: 12.5px; }
+  .reloadnote button { display: block; margin-top: 8px; }
+  .subhead { font-weight: 600; margin: 16px 0 6px; font-size: 12.5px; }
+  #console { margin: 8px 0 0; max-height: 52vh; overflow: auto; background: #0e1116; color: #d5d9e2; border-radius: 8px; padding: 10px; font: 11.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; }
+  #console .v { color: #8a91a1; }
+  #console .e { color: #ff9a7a; }
+  #console .s { color: #6ff0dc; }
+  #chatlist { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
+  .chatitem { display: flex; align-items: center; gap: 6px; border-radius: 8px; }
+  .chatitem.cur { background: var(--accent-soft); }
+  .chatitem button.open { flex: 1; text-align: left; border: 0; background: transparent; padding: 7px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chatitem button.del { border: 0; background: transparent; color: var(--faint); padding: 4px 8px; }
+  .chatitem small { color: var(--faint); }
+  .presets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .presets .pchip { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; }
+  .presets .pchip button { border: 0; background: transparent; padding: 4px 10px; font-size: 12.5px; }
+  .presets .pchip button.x { padding: 4px 8px 4px 0; color: var(--faint); }
+  .benchgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0 6px; }
+  .bstat { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .bstat .bl { font-size: 11.5px; color: var(--muted); }
+  .bstat .bv { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bstat .bv small { font-size: 12px; font-weight: 500; color: var(--muted); }
+  #chat { flex: 1 1 auto; min-width: 0; border-radius: 0; border-width: 0 1px 0 0; }
+  #dash { width: 300px; flex: 0 0 300px; display: flex; flex-direction: column; gap: 10px; padding: 10px; overflow-y: auto; }
+  #dash .card .body { padding: 10px 12px 12px; }
+  .ctitle { font-size: 11px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; color: var(--muted); }
+  .mid { font-size: 20px; font-weight: 700; letter-spacing: -.5px; margin-top: 2px; }
+  .mid small { font-size: 12.5px; font-weight: 500; color: var(--muted); margin-left: 4px; letter-spacing: 0; }
+  .mm { margin-top: 8px; font-size: 12px; }
+  .mm .mmh { display: flex; justify-content: space-between; color: var(--muted); }
+  .mm .mmh b { color: var(--ink); font-weight: 600; }
+  .mm .stack { height: 8px; margin-top: 3px; }
+  .maphead { display: flex; align-items: center; gap: 6px; }
+  .maphead .ctitle { flex: 1; }
+  .qbtn { width: 26px; height: 26px; padding: 0; border-radius: 50%; font-size: 12.5px; font-weight: 700; color: var(--muted); background: var(--panel-2); }
+  .maphelp { margin-top: 8px; padding: 9px 10px; border-radius: 8px; background: var(--accent-soft); font-size: 12px; line-height: 1.5; }
+  .maphelp p { margin: 0 0 6px; } .maphelp p:last-child { margin: 0; }
+  .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; vertical-align: -1px; }
+  .swatch.v { background: var(--vram); } .swatch.r { background: var(--ram); }
+  .maptools { margin: 8px 0 6px; gap: 6px; }
+  #map { height: 220px; }
+  #mapcard.bigmap { position: fixed; inset: 24px; z-index: 30; overflow: auto; box-shadow: 0 10px 40px rgba(0,0,0,.35); }
+  #mapcard.bigmap #map { height: calc(100vh - 230px); }
+  #mapcard .legend { gap: 10px; font-size: 11.5px; }
+  #mapcard .legend i { width: 16px; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  .themesw { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel-2); }
+  .themesw button { border: 0; border-radius: 999px; padding: 2px 10px; font-size: 12px; background: transparent; color: var(--muted); }
+  .themesw button.on { background: var(--panel); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.15); }
+  header { flex-wrap: wrap; row-gap: 8px; }
+  .settings select { max-width: 100%; }
+  @media (max-width: 600px) { #status { display: none; } .pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; } }
+  #loadprog { flex-basis: 100%; height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+  #loadprog > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  @media (max-width: 980px) {
+    main { grid-template-columns: 1fr; height: auto; }
+    main#app { flex-wrap: wrap; height: auto; }
+    #rail { width: 100%; flex: 1 1 100%; flex-direction: row; justify-content: flex-start; padding: 6px 10px; border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+    #rail .grow { display: none; }
+    #panel { width: 100%; flex: 1 1 100%; border-right: 0; }
+    #chat { flex: 1 1 100%; height: 70vh; border-width: 0 0 1px 0; }
+    #dash { width: 100%; flex: 1 1 100%; }
+  }
 
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
   .card h2 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; color: var(--muted); }
@@ -90,7 +187,7 @@
   .tier .val { font-size: 18px; font-weight: 700; margin-top: 2px; }
   .tier .sub { font-size: 11.5px; color: var(--muted); }
   .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
-  #map { height: 260px; cursor: crosshair; border-radius: 6px; }
+  #map { cursor: crosshair; border-radius: 6px; }
   .legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); margin-top: 8px; }
   .legend i { display: inline-block; width: 22px; height: 9px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
   #tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 6px; display: none; z-index: 10; white-space: nowrap; }
@@ -119,7 +216,8 @@
   .tag.good { background: var(--accent-soft); color: var(--accent); }
   .tag.warn { background: rgba(224,160,67,.18); color: #a86a0c; }
   .tag.bad { background: rgba(224,122,95,.16); color: var(--danger); }
-  @media (prefers-color-scheme: dark) { .tag.warn { color: #e8b25a; } }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .tag.warn { color: #e8b25a; } }
+  :root[data-theme="dark"] .tag.warn { color: #e8b25a; }
   .settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px 24px; }
   .settings label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px; }
   .settings .help { font-size: 12px; color: var(--muted); margin-top: 3px; }
@@ -129,6 +227,13 @@
   #loadrow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   #loadmsg { font-size: 13px; color: var(--muted); }
   #loadmsg.err { color: var(--danger); }
+  #tunebox { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 13px; }
+  #tunebox .tunehead { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  #tunestat { color: var(--muted); }
+  #tunelist { margin: 8px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 2px; }
+  #tunelist li b { font-variant-numeric: tabular-nums; }
+  #tunelist li.best { color: var(--accent); font-weight: 600; }
+  #tunedone { margin-top: 10px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .empty-models { font-size: 13.5px; color: var(--muted); }
   .empty-models code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
   .ver { font-size: 11px; font-weight: 500; color: var(--faint); letter-spacing: 0; }
@@ -192,6 +297,9 @@
   <span class="pill" id="modelname">model</span>
   <span class="spacer"></span>
   <span id="status">idle</span>
+  <div class="themesw" role="group" aria-label="Theme">
+    <button data-theme="auto" aria-pressed="true">Auto</button><button data-theme="light" aria-pressed="false">Light</button><button data-theme="dark" aria-pressed="false">Dark</button>
+  </div>
   <button class="tiny" id="setupbtn" hidden>Change setup</button>
 </header>
 
@@ -253,7 +361,7 @@
         </div>
         <div>
           <label class="chk"><input type="checkbox" id="specon"> Speculative decoding</label>
-          <select id="specn" title="Guesses per check"><option value="2">2 guesses per check</option><option value="3" selected>3 guesses per check</option><option value="4">4 guesses per check</option><option value="6">6 guesses per check</option></select>
+          <select id="specn" title="Guesses per check"><option value="1">1 guess per check</option><option value="2">2 guesses per check</option><option value="3" selected>3 guesses per check</option><option value="4">4 guesses per check</option><option value="6">6 guesses per check</option></select>
           <div class="help" id="spechelp">Faster replies with the same answers: the model's small built-in draft layer guesses the next few words, and
             the model checks them all in one pass. Helps most when the model doesn't fit in VRAM.</div>
         </div>
@@ -302,8 +410,8 @@
           </div>
           <div>
             <label for="splitsel">When the model doesn't fit in VRAM</label>
-            <select id="splitsel"><option value="layers">Split by whole layers (recommended)</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
-            <div class="help">Whole layers: the GPU and CPU hand over once per token. Experts in RAM: the GPU does all the attention, but hands over twice per layer; can be faster with very long conversations.</div>
+            <select id="splitsel"><option value="auto">Automatic (recommended)</option><option value="layers">Split by whole layers</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
+            <div class="help">Automatic uses experts in RAM for mixture-of-experts models and whole layers for the rest. Experts in RAM: the GPU does all the attention and the CPU only the few experts each word picks, much faster for MoE models (Qwen3.6-35B-A3B on a laptop: 17 against 9.9 tok/s). Whole layers: the GPU and CPU hand over once per word; best for dense models.</div>
           </div>
           <div>
             <label for="vramlim">VRAM limit (GiB)</label>
@@ -324,15 +432,22 @@
       <div id="rec"></div>
       <div id="loadrow">
         <button class="primary" id="loadbtn">Load and start chatting</button>
+        <button id="tunebtn" title="Loads the model and measures the settings that affect speed, then keeps the fastest">Find the fastest settings</button>
         <button class="ghost" id="backbtn" hidden>Back to chat</button>
         <span id="loadmsg"></span>
+        <div id="loadprog" hidden><div></div></div>
+      </div>
+      <div id="tunebox" hidden>
+        <div class="tunehead"><b id="tunetitle">Finding the fastest settings</b> <span id="tunestat"></span></div>
+        <ol id="tunelist"></ol>
+        <div id="tunedone" hidden></div>
       </div>
     </div>
   </section>
 
   <section class="card" id="netcard">
     <div class="head"><h2>Connect other apps</h2><span class="caption">OpenAI-compatible API</span></div>
-    <div class="body">
+    <div class="body" id="netbody">
       <div class="help" style="margin-bottom:8px">Apps that work with OpenAI (Open WebUI, Continue, LibreChat, scripts using the OpenAI library)
         can use tierlm instead: give them the address below as the <b>base URL</b>. They use the model loaded here, or load another
         one by name (the names are listed at <code>/v1/models</code>).</div>
@@ -358,11 +473,109 @@
 </main>
 
 <main id="app" hidden>
+  <nav id="rail" aria-label="Side menu">
+    <button class="ricon" data-sec="settings" aria-label="Settings" title="Settings"><svg aria-hidden="true" viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="9" cy="6" r="2.2" class="fillbg"/><circle cx="15" cy="12" r="2.2" class="fillbg"/><circle cx="7" cy="18" r="2.2" class="fillbg"/></svg></button>
+    <button class="ricon" data-sec="api" aria-label="API" title="API and other apps"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 7l-5 5 5 5"/><path d="M15 7l5 5-5 5"/></svg></button>
+    <button class="ricon" data-sec="console" aria-label="Console" title="Console"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><line x1="12" y1="15" x2="17" y2="15"/></svg></button>
+    <button class="ricon" data-sec="model" aria-label="Model info" title="Model info"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="5" rx="1.5"/><rect x="4" y="11" width="16" height="4" rx="1.5"/><rect x="4" y="17" width="16" height="3" rx="1.5"/></svg></button>
+    <button class="ricon" data-sec="chats" aria-label="Chats" title="Chats and presets"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></svg></button>
+    <button class="ricon" data-sec="bench" aria-label="Benchmark" title="Benchmark"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="16" y2="11"/></svg></button>
+    <span class="grow"></span>
+    <button class="ricon" id="railtoggle" aria-label="Collapse menu" title="Collapse menu"><svg aria-hidden="true" viewBox="0 0 24 24"><path id="railarrow" d="M15 6l-6 6 6 6"/></svg></button>
+  </nav>
+
+  <aside id="panel" aria-label="Menu">
+    <div class="sec" data-sec="settings">
+      <button class="sechead" aria-expanded="false"><span>Settings</span><small>sampling, speculation</small></button>
+      <div class="secbody">
+        <label class="lrow" for="temp">Temperature <b id="tempv">0.70</b></label>
+        <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.7" class="full">
+        <label class="lrow" for="rpen" title="Makes words used in the last 64 tokens less likely, so the model doesn't loop. 1.00 = off.">Repeat penalty <b id="rpenv">1.10</b></label>
+        <input id="rpen" type="range" min="1" max="1.5" step="0.01" value="1.1" class="full">
+        <label class="lrow" for="maxtok" title="Longest reply. Thinking models (Qwen3.x) can use thousands of tokens before they answer.">Max reply <b id="maxv">No limit</b></label>
+        <input id="maxtok" type="range" min="0" max="8" step="1" value="8" class="full">
+        <div id="lspecrow" class="lrow2">
+          <label class="chk"><input type="checkbox" id="lspec"> Speculative decoding</label>
+          <select id="lspecn" aria-label="Guesses per check"><option value="1">1 guess</option><option value="2">2 guesses</option><option value="3">3 guesses</option><option value="4">4 guesses</option><option value="6">6 guesses</option></select>
+        </div>
+        <div class="help" id="lspechelp"></div>
+        <label class="lrow" for="sysprompt">System prompt</label>
+        <textarea id="sysprompt" rows="3" placeholder="Optional: instructions the model follows in every reply"></textarea>
+        <div class="reloadnote">Context length, split mode, context memory and the model itself need a reload.
+          <button class="tiny" id="chgsetup2">Change model and load settings…</button></div>
+      </div>
+    </div>
+    <div class="sec" data-sec="api">
+      <button class="sechead" aria-expanded="false"><span>API</span><small>connect other apps</small></button>
+      <div class="secbody" id="apihome"></div>
+    </div>
+    <div class="sec" data-sec="console">
+      <button class="sechead" aria-expanded="false"><span>Console</span><small>what the engine is doing</small></button>
+      <div class="secbody">
+        <div class="row">
+          <button class="tiny on" id="c-info">Info</button>
+          <button class="tiny" id="c-verbose">Verbose</button>
+          <span class="grow"></span>
+          <button class="tiny" id="c-copy">Copy log</button>
+        </div>
+        <pre id="console" aria-live="polite"></pre>
+      </div>
+    </div>
+    <div class="sec" data-sec="model">
+      <button class="sechead" aria-expanded="false"><span>Model info</span><small>where it lives</small></button>
+      <div class="secbody">
+        <dl class="kv">
+          <dt>Model</dt><dd id="arch">–</dd>
+          <dt>Layers × experts</dt><dd id="lx">–</dd>
+          <dt>Active per token</dt><dd id="active">–</dd>
+        </dl>
+        <div class="tiers">
+          <div class="tier"><div class="name"><span class="sw" style="background:var(--vram)"></span>VRAM</div><div class="val" id="t-vram">–</div><div class="sub" id="t-vram-sub">–</div></div>
+          <div class="tier"><div class="name"><span class="sw" style="background:var(--ram)"></span>RAM</div><div class="val" id="t-ram">–</div><div class="sub" id="t-ram-sub">–</div></div>
+          <div class="tier"><div class="name"><span class="sw" style="background:var(--ssd)"></span>SSD</div><div class="val" id="t-ssd">0 GiB</div><div class="sub">coming soon</div></div>
+        </div>
+        <div class="note" id="devmem">–</div>
+        <div class="note" id="densenote" hidden></div>
+        <div id="hitcard">
+          <div class="subhead">Hot-expert cache preview</div>
+          <label class="small">If each layer kept only <input id="slots" type="range" min="0" max="64" step="1" value="16"> <b id="slotsv">16</b> experts in VRAM…</label>
+          <div class="hitrow"><span>Hottest ones</span><div class="bar"><div id="hit"></div></div><span class="num" id="hitv">–</span></div>
+          <div class="hitrow base"><span>Random pick</span><div class="bar"><div id="hitbase"></div></div><span class="num" id="hitbasev">–</span></div>
+          <div class="note" id="hitnote">…this is how often the router's choice would already be in fast memory, based on this session. Chat for a while to collect data.</div>
+        </div>
+      </div>
+    </div>
+    <div class="sec" data-sec="chats">
+      <button class="sechead" aria-expanded="false"><span>Chats</span><small id="chatcount"></small></button>
+      <div class="secbody">
+        <button class="tiny" id="newchat2">+ New chat</button>
+        <div id="chatlist"></div>
+        <div class="subhead">System prompt presets</div>
+        <div id="presets" class="presets"></div>
+        <button class="tiny ghost" id="savepreset">Save the current system prompt as a preset…</button>
+        <div class="help">Chats and presets are kept in this browser.</div>
+      </div>
+    </div>
+    <div class="sec" data-sec="bench">
+      <button class="sechead" aria-expanded="false"><span>Benchmark</span><small>speed with these settings</small></button>
+      <div class="secbody">
+        <div class="help">Reads a 512-token prompt and generates 64 tokens with the current settings. Takes a few seconds, longer for big models.</div>
+        <button class="primary" id="benchbtn">Run benchmark</button>
+        <div class="benchgrid">
+          <div class="bstat"><div class="bl">Prompt reading</div><div class="bv"><span id="b-prompt">–</span> <small>tok/s</small></div></div>
+          <div class="bstat"><div class="bl">Generation</div><div class="bv"><span id="b-gen">–</span> <small>tok/s</small></div></div>
+        </div>
+        <div class="help" id="benchline"></div>
+        <button class="tiny" id="benchcopy" hidden>Copy result</button>
+      </div>
+    </div>
+  </aside>
+
   <section class="card" id="chat">
     <div id="messages">
       <div class="empty" id="empty">
         <b>Chat with your own engine.</b><br>
-        Every reply runs through tierlm on this machine. Watch the expert map on the right light up as the router picks experts for each token.
+        Every reply runs through tierlm on this machine. Watch the expert map on the right as the router picks experts for each word.
         <div class="suggest">
           <button class="ghost" data-q="What is the capital of France, and why is it famous?">Capital of France</button>
           <button class="ghost" data-q="Explain what a mixture-of-experts language model is, in simple terms.">Explain MoE</button>
@@ -372,11 +585,10 @@
       </div>
     </div>
     <div id="composer">
+      <label for="input" class="sr">Message</label>
       <textarea id="input" rows="2" placeholder="Message the model… (Enter to send, Shift+Enter for a new line)"></textarea>
       <div class="row">
-        <label class="small">Temperature <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.7"> <span id="tempv">0.70</span></label>
-        <label class="small" title="Makes words used in the last 64 tokens less likely, so the model doesn't loop. 1.00 = off.">Repeat penalty <input id="rpen" type="range" min="1" max="1.5" step="0.01" value="1.1"> <span id="rpenv">1.10</span></label>
-        <label class="small" title="Longest reply. Thinking models (Qwen3.x) can use thousands of tokens before they answer.">Max reply <input id="maxtok" type="range" min="0" max="8" step="1" value="8"> <span id="maxv">No limit</span></label>
+        <span class="caption" id="sysbadge" hidden>System prompt on</span>
         <span class="grow"></span>
         <button class="ghost" id="newchat">New chat</button>
         <button id="stop" style="display:none">Stop</button>
@@ -385,13 +597,12 @@
     </div>
   </section>
 
-  <section id="dash">
+  <section id="dash" aria-label="Live view">
     <div class="card">
-      <div class="head"><h2>Generation speed</h2></div>
       <div class="body">
+        <div class="ctitle">Speed</div>
         <div class="big" id="tps">–<small>tok/s</small></div>
         <canvas id="spark"></canvas>
-        <div class="caption">Speed vs. context: each dot is one generated token. Left = short conversation, right = long. A flat band means long chats stay fast.</div>
         <dl class="kv">
           <dt>Prompt reading</dt><dd id="ptps">–</dd>
           <dt>Last reply</dt><dd id="lastreply">–</dd>
@@ -399,67 +610,48 @@
         </dl>
       </div>
     </div>
-
     <div class="card">
-      <div class="head"><h2>Context window</h2></div>
       <div class="body">
-        <div class="big" id="ctxbig">0<small id="ctxof">/ – tokens</small></div>
+        <div class="ctitle">Context</div>
+        <div class="mid" id="ctxbig">0<small id="ctxof">/ – tokens</small></div>
         <div class="bar"><div id="ctxbar"></div></div>
-        <dl class="kv">
-          <dt>Model</dt><dd id="arch">–</dd>
-          <dt>Layers × experts</dt><dd id="lx">–</dd>
-          <dt>Active per token</dt><dd id="active">–</dd>
-        </dl>
       </div>
     </div>
-
-    <div class="card wide">
-      <div class="head"><h2>Where the model lives</h2></div>
+    <div class="card">
       <div class="body">
-        <div class="tiers">
-          <div class="tier"><div class="name"><span class="sw" style="background:var(--vram)"></span>VRAM</div><div class="val" id="t-vram">–</div><div class="sub" id="t-vram-sub">–</div></div>
-          <div class="tier"><div class="name"><span class="sw" style="background:var(--ram)"></span>RAM</div><div class="val" id="t-ram">–</div><div class="sub" id="t-ram-sub">–</div></div>
-          <div class="tier"><div class="name"><span class="sw" style="background:var(--ssd)"></span>SSD</div><div class="val" id="t-ssd">0 GiB</div><div class="sub">streamed on demand</div></div>
-        </div>
-        <div class="note" id="devmem">–</div>
+        <div class="ctitle">Memory</div>
+        <div id="minimem"></div>
       </div>
     </div>
-
-    <div class="card wide" id="densecard" hidden>
-      <div class="head"><h2>Model type</h2></div>
-      <div class="body"><div class="note" id="densenote" style="margin:0"></div></div>
-    </div>
-
-    <div class="card wide" id="mapcard">
-      <div class="head">
-        <h2>Expert activity map</h2>
-        <div class="row">
-          <button class="tiny on" id="m-heat">Heat</button>
-          <button class="tiny" id="m-live">Live only</button>
+    <div class="card" id="mapcard">
+      <div class="body">
+        <div class="maphead">
+          <span class="ctitle">Which experts are working</span>
+          <button class="qbtn" id="maphelpbtn" aria-label="What is this map?" aria-expanded="false" title="What is this map?">?</button>
+          <button class="qbtn" id="mapbig" aria-label="Enlarge the map" title="Enlarge">⤢</button>
+        </div>
+        <div class="maphelp" id="maphelp" hidden>
+          <p>This model is a <b>mixture of experts</b>: each of its <span class="hL">–</span> layers has <span class="hE">–</span> small specialist networks, and for every word a router picks just <span class="hK">–</span> of them.</p>
+          <p>Each <b>row</b> is a layer (top = first). In <b>Sorted</b> view each row lists its experts busiest first; <b>Brighter</b> = picked more often this session, and a <b>flash</b> = picked for the word just written. Hover for details.</p>
+          <p>The strip on the left shows where each layer's experts live: <span class="swatch v"></span> VRAM (fast) or <span class="swatch r"></span> RAM. When a few experts do most of the work, keeping those in VRAM makes the model faster.</p>
+        </div>
+        <div class="row maptools">
+          <button class="tiny on" id="m-sorted">Sorted</button>
+          <button class="tiny" id="m-byid">By number</button>
+          <span class="grow"></span>
+          <button class="tiny" id="m-live" title="Show only the experts picked for the current word">Live only</button>
           <button class="tiny ghost" id="m-reset">Reset</button>
         </div>
-      </div>
-      <div class="body">
         <canvas id="map"></canvas>
         <div class="legend">
-          <span>Rows = layers (top = first), columns = experts</span>
-          <span><i style="background:linear-gradient(90deg,var(--heat-lo),#e0a043,#c2410c)"></i>used more often</span>
-          <span><i style="background:var(--flash)"></i>picked for the current token</span>
-          <span id="picks">0 expert picks recorded</span>
+          <span><i style="background:linear-gradient(90deg,var(--heat-lo),#e0a043,#c2410c)"></i>more often</span>
+          <span><i style="background:var(--flash)"></i>this word</span>
+          <span id="picks">0 picks</span>
         </div>
       </div>
     </div>
-
-    <div class="card wide" id="hitcard">
-      <div class="head"><h2>Hot-expert cache preview</h2></div>
-      <div class="body">
-        <div class="row">
-          <label class="small">If each layer could keep only <input id="slots" type="range" min="0" max="64" step="1" value="16"> <b id="slotsv">16</b> of its experts in VRAM…</label>
-        </div>
-        <div class="hitrow"><span>Hottest ones</span><div class="bar"><div id="hit"></div></div><span class="num" id="hitv">–</span></div>
-        <div class="hitrow base"><span>Random pick</span><div class="bar"><div id="hitbase"></div></div><span class="num" id="hitbasev">–</span></div>
-        <div class="note" id="hitnote">…this is how often the router's choice would already be in fast memory, based on the experts used in this session. The gap between the two bars is what a hot-expert cache buys. Chat for a while to collect data.</div>
-      </div>
+    <div class="card" id="densecard" hidden>
+      <div class="body"><div class="ctitle">Model type</div><div class="note" id="densenote2" style="margin:0"></div></div>
     </div>
   </section>
 </main>
@@ -470,6 +662,7 @@
 // device, it asks for the key once, remembers it in this browser, and sends it with each request.
 let apiKeyMem = null;
 function storedKey() { if (apiKeyMem !== null) return apiKeyMem; try { return localStorage.getItem("tierlm.apikey") || ""; } catch (e) { return ""; } }
+const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 async function api(url, opts = {}) {
   const withKey = () => { const k = storedKey(); const o = { ...opts, headers: { ...(opts.headers || {}) } }; if (k) o.headers["Authorization"] = "Bearer " + k; return o; };
   const sent = storedKey();
@@ -494,8 +687,8 @@ const $ = id => document.getElementById(id);
 const fmtGiB = b => !b ? "0 GiB" : b < 1073741824 ? Math.max(0.1, b / 1048576).toFixed(b < 10485760 ? 1 : 0) + " MiB" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 1 : 2) + " GiB";
 let info = null, L = 16, E = 64, K = 8;
 let counts = new Float64Array(L * E), flash = new Float64Array(L * E), totalPicks = 0;
-let mapMode = "heat", history = [], busy = false, controller = null;
-let speedPts = [], lastTokT = 0, ema = 0, tokCount = 0;   // speed vs. context
+let mapMode = "heat", mapSorted = true, ffnVram = [], history = [], busy = false, controller = null;
+let speedPts = [], tokTimes = [], tokCount = 0;   // speed vs. context
 
 // ---------- info ----------
 async function loadInfo() {
@@ -509,9 +702,16 @@ async function loadInfo() {
   counts = new Float64Array(L * E); flash = new Float64Array(L * E);
   $("slots").max = Math.max(1, E); $("slots").value = Math.max(1, Math.round(E / 4));
   const moe = E > 0;
-  $("mapcard").hidden = !moe; $("hitcard").hidden = !moe; $("densecard").hidden = moe;
-  $("densenote").textContent = moe ? "" : `${info.name} is a dense model: every token uses all of its ${L} layers, so there are no experts to map. ` +
+  $("mapcard").hidden = !moe; $("hitcard").hidden = !moe; $("densecard").hidden = moe; $("densenote").hidden = moe;
+  const dn = moe ? "" : `${info.name} is a dense model: every word uses all of its ${L} layers, so there are no experts to map. ` +
     "When it doesn't fit in VRAM, tierlm splits it by whole layers between VRAM and RAM.";
+  $("densenote").textContent = dn; $("densenote2").textContent = dn;
+  document.querySelectorAll(".hL").forEach(x => x.textContent = L);
+  document.querySelectorAll(".hE").forEach(x => x.textContent = E);
+  document.querySelectorAll(".hK").forEach(x => x.textContent = K);
+  ffnVram = info.ffn_vram || [];
+  renderMiniMem();
+  syncLiveSpec();
   $("devname").textContent = info.device;
   $("devdot").classList.toggle("on", info.on_gpu);
   $("modelname").textContent = info.name;
@@ -564,6 +764,7 @@ function addMsg(role, text) {
 function setBusy(b) {
   busy = b;
   $("send").disabled = b; $("stop").style.display = b ? "" : "none";
+  for (const id of ["benchbtn", "newchat", "newchat2"]) $(id).disabled = b;
   $("status").textContent = b ? "generating…" : "idle";
 }
 async function send(text) {
@@ -580,7 +781,7 @@ async function send(text) {
   try {
     const res = await api("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
-      body: JSON.stringify({ messages: history, temperature: +$("temp").value, max_tokens: maxTokens(),
+      body: JSON.stringify({ messages: withSystem(history), temperature: +$("temp").value, max_tokens: maxTokens(),
         top_p: +$("topp").value, top_k: +$("topk").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value }),
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
@@ -612,8 +813,9 @@ async function send(text) {
   }
   bubble.classList.remove("streaming");
   if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m); }
-  if (reply) history.push({ role: "assistant", content: reply });
+  if (reply) history.push({ role: "assistant", content: reply, meta });
   else if (!reply && history.at(-1)?.role === "user" && meta !== "stopped") history.pop();
+  saveChat();
   setBusy(false);
   controller = null;
 }
@@ -623,7 +825,7 @@ function onPrompt(ev) {
   $("ptps").textContent = ev.n_new + " new tokens at " + ev.prompt_tps.toFixed(0) + " tok/s";
   $("reused").textContent = ev.reused + " of " + ev.n_prompt + " tokens";
   setContext(ev.n_past);
-  lastTokT = performance.now(); ema = 0;
+  tokTimes = [performance.now()];
   updateHits();
 }
 function onToken(ev) {
@@ -631,10 +833,12 @@ function onToken(ev) {
     for (const e of ev.routing[l]) { counts[l * E + e] += 1; flash[l * E + e] = 1; }
   totalPicks += L * K;
   $("tps").firstChild.nodeValue = ev.tps.toFixed(1);
-  const now = performance.now(), inst = 1000 / Math.max(1, now - lastTokT);   // this token alone
-  lastTokT = now;
-  ema = ema ? ema * 0.8 + inst * 0.2 : inst;
-  if (++tokCount > 1) { speedPts.push([ev.n_past, ema]); if (speedPts.length > 6000) speedPts.shift(); }
+  // Speed over the last 16 tokens. With speculative decoding tokens arrive in bursts (a check yields 2-3 at once),
+  // so a per-token speed would jump between very fast and slow.
+  const now = performance.now();
+  tokTimes.push(now); if (tokTimes.length > 17) tokTimes.shift();
+  const rate = tokTimes.length > 1 ? 1000 * (tokTimes.length - 1) / Math.max(1, now - tokTimes[0]) : 0;
+  if (++tokCount > 1) { speedPts.push([ev.n_past, rate]); if (speedPts.length > 6000) speedPts.shift(); }
   setContext(ev.n_past);
   if (tokCount % 4 === 0) updateHits();
 }
@@ -663,24 +867,29 @@ let last = performance.now();
 function draw(now) {
   const dt = (now - last) / 1000; last = now;
   if (!E || !L) { requestAnimationFrame(draw); return; }
-  const W = map.width, H = map.height, cw = W / E, ch = H / L, gap = Math.max(1, Math.round(Math.min(cw, ch) * 0.12));
-  mctx.clearRect(0, 0, W, H);
+  const dpr = window.devicePixelRatio || 1, strip = 7 * dpr;     // left strip: where each layer's experts live
+  const W = map.width - strip, H = map.height, cw = W / E, ch = H / L, gap = Math.max(cw > 3 ? 1 : 0, Math.round(Math.min(cw, ch) * 0.12));
+  mctx.clearRect(0, 0, map.width, H);
   let mx = 0; for (let i = 0; i < counts.length; i++) mx = Math.max(mx, counts[i]);
-  const lo = css("--heat-lo"), fl = css("--flash");
-  for (let l = 0; l < L; l++) for (let e = 0; e < E; e++) {
-    const i = l * E + e, x = e * cw, y = l * ch;
-    mctx.fillStyle = mapMode === "heat" && mx > 0 && counts[i] > 0 ? heatColor(Math.log1p(counts[i]) / Math.log1p(mx)) : lo;
-    mctx.fillRect(x + gap / 2, y + gap / 2, cw - gap, ch - gap);
-    if (flash[i] > 0.02) {
-      mctx.globalAlpha = Math.min(1, flash[i]);
-      mctx.fillStyle = fl;
-      mctx.fillRect(x + gap / 2, y + gap / 2, cw - gap, ch - gap);
-      mctx.globalAlpha = 1;
-      flash[i] *= Math.exp(-dt * 5);
-    } else flash[i] = 0;
+  const lo = css("--heat-lo"), fl = css("--flash"), cv = css("--vram"), cr = css("--ram");
+  rowOrder = mapSorted ? sortedRows() : null;
+  for (let l = 0; l < L; l++) {
+    if (ffnVram.length === L) { mctx.fillStyle = ffnVram[l] ? cv : cr; mctx.fillRect(0, l * ch + gap / 2, strip - 2 * dpr, ch - gap); }
+    for (let pos = 0; pos < E; pos++) {
+      const e = rowOrder ? rowOrder[l][pos] : pos, i = l * E + e, x = strip + pos * cw, y = l * ch;
+      mctx.fillStyle = mapMode === "heat" && mx > 0 && counts[i] > 0 ? heatColor(Math.log1p(counts[i]) / Math.log1p(mx)) : lo;
+      mctx.fillRect(x + gap / 2, y + gap / 2, Math.max(1, cw - gap), Math.max(1, ch - gap));
+      if (flash[i] > 0.02) {
+        mctx.globalAlpha = Math.min(1, flash[i]);
+        mctx.fillStyle = fl;
+        mctx.fillRect(x + gap / 2, y + gap / 2, Math.max(1, cw - gap), Math.max(1, ch - gap));
+        mctx.globalAlpha = 1;
+        flash[i] *= Math.exp(-dt * 5);
+      } else flash[i] = 0;
+    }
   }
   drawSpeed();
-  $("picks").textContent = totalPicks.toLocaleString() + " expert picks recorded";
+  $("picks").textContent = totalPicks.toLocaleString() + " picks";
   requestAnimationFrame(draw);
 
 // speed vs. context scatter
@@ -704,14 +913,27 @@ function drawSpeed() {
 }
 requestAnimationFrame(draw);
 
+// Each row's experts, busiest first (the Sorted view): makes "a few experts do most of the work" visible.
+let rowOrder = null;
+function sortedRows() {
+  const out = [];
+  for (let l = 0; l < L; l++) {
+    const idx = Array.from({ length: E }, (_, e) => e);
+    idx.sort((a, b) => counts[l * E + b] - counts[l * E + a] || a - b);
+    out.push(idx);
+  }
+  return out;
+}
 map.addEventListener("mousemove", ev => {
-  const r = map.getBoundingClientRect();
-  const e = Math.floor((ev.clientX - r.left) / r.width * E), l = Math.floor((ev.clientY - r.top) / r.height * L);
-  if (e < 0 || e >= E || l < 0 || l >= L) return;
+  const r = map.getBoundingClientRect(), strip = 7;
+  const pos = Math.floor((ev.clientX - r.left - strip) / (r.width - strip) * E), l = Math.floor((ev.clientY - r.top) / r.height * L);
+  if (pos < 0 || pos >= E || l < 0 || l >= L) { $("tip").style.display = "none"; return; }
+  const e = rowOrder ? rowOrder[l][pos] : pos;
   let row = 0; for (let j = 0; j < E; j++) row += counts[l * E + j];
   const c = counts[l * E + e];
   const tip = $("tip");
-  tip.textContent = `Layer ${l} · expert ${e} · picked ${c.toLocaleString()}×` + (row ? ` (${(100 * c / row).toFixed(1)}% of this layer)` : "");
+  tip.textContent = `Layer ${l + 1} · expert #${e} · picked ${c.toLocaleString()}×` + (row ? ` (${(100 * c / row).toFixed(1)}% of this layer)` : "") +
+    (ffnVram.length === L ? (ffnVram[l] ? " · in VRAM" : " · in RAM") : "");
   tip.style.display = "block"; tip.style.left = ev.clientX + 12 + "px"; tip.style.top = ev.clientY + 12 + "px";
 });
 map.addEventListener("mouseleave", () => $("tip").style.display = "none");
@@ -747,29 +969,32 @@ $("maxtok").oninput = () => { showMaxTok(); try { localStorage.setItem("tierlm.m
 try { const sv = localStorage.getItem("tierlm.maxtok"); if (sv !== null && +sv >= 0 && +sv < MAXTOK_STEPS.length) $("maxtok").value = sv; } catch (e) {}
 showMaxTok();
 $("slots").oninput = updateHits;
-$("newchat").onclick = async () => {
-  if (busy) return;
-  history = [];
-  $("messages").innerHTML = "";
-  await api("/api/reset", { method: "POST" });
-  setContext(0);
-};
-$("m-heat").onclick = () => { mapMode = "heat"; $("m-heat").classList.add("on"); $("m-live").classList.remove("on"); };
-$("m-live").onclick = () => { mapMode = "live"; $("m-live").classList.add("on"); $("m-heat").classList.remove("on"); };
+$("newchat").onclick = $("newchat2").onclick = () => newChat();
+$("m-sorted").onclick = () => { mapSorted = true; $("m-sorted").classList.add("on"); $("m-byid").classList.remove("on"); };
+$("m-byid").onclick = () => { mapSorted = false; $("m-byid").classList.add("on"); $("m-sorted").classList.remove("on"); };
+$("m-live").onclick = () => { mapMode = mapMode === "live" ? "heat" : "live"; $("m-live").classList.toggle("on", mapMode === "live"); };
+$("maphelpbtn").onclick = () => { const h = $("maphelp"); h.hidden = !h.hidden; $("maphelpbtn").setAttribute("aria-expanded", String(!h.hidden)); try { localStorage.setItem("tierlm.maphelp", h.hidden ? "0" : "1"); } catch (e) {} };
+try { if (localStorage.getItem("tierlm.maphelp") !== "0") { $("maphelp").hidden = false; $("maphelpbtn").setAttribute("aria-expanded", "true"); } } catch (e) { $("maphelp").hidden = false; }
+$("mapbig").onclick = () => { $("mapcard").classList.toggle("bigmap"); resizeCanvases(); };
+document.addEventListener("keydown", e => { if (e.key === "Escape" && $("mapcard").classList.contains("bigmap")) { $("mapcard").classList.remove("bigmap"); resizeCanvases(); } });
 $("m-reset").onclick = () => { counts.fill(0); totalPicks = 0; updateHits(); };
 // ---------- setup screen ----------
 let devices = [], models = [], warnings = [], hwThreads = 8, defThreads = 4, defCtx = 4096, selModel = null, md = {};
 const typeLabel = { gpu: "Dedicated GPU", igpu: "Integrated GPU", cpu: "CPU" };
 function showSetup() {
+  $("netcard").appendChild($("netbody"));        // the API card lives in the side menu while chatting
   $("app").hidden = true; $("setup").hidden = false; $("setupbtn").hidden = true;
   $("backbtn").hidden = !info;
   loadSetup();
 }
-function showApp() { $("setup").hidden = true; $("app").hidden = false; $("setupbtn").hidden = false; resizeCanvases(); }
+function showApp() { $("apihome").appendChild($("netbody")); $("setup").hidden = true; $("app").hidden = false; $("setupbtn").hidden = false; resizeCanvases(); }
 let cpuFeatures = "";
 const WORK = 768 * 1048576;
 // KV cache size relative to 16-bit: q8_0 stores 32 values in 34 bytes, q4_0 in 18.
 const KV_FACTOR = { f16: 1, f32: 2, q8_0: 34 / 64, q4_0: 18 / 64 };
+// The split mode tierlm will use: Automatic means experts in RAM for mixture-of-experts models (the CPU then only
+// reads the few experts each token picks), whole layers for the rest.
+function splitMode() { const v = $("splitsel").value; return v !== "auto" ? v : (selModel && selModel.experts ? "experts" : "layers"); }
 function kvFactor() { return KV_FACTOR[$("kvsel").value] || 1; }   // working memory the engine keeps free on the GPU (as the tier loader does)
 // Memory the loaded model holds now. Loading another one frees it first, so it counts as free when planning.
 function heldNow(gpu) {
@@ -788,6 +1013,13 @@ function bestGpu() {
   return null;
 }
 function cpuDev() { return devices.find(d => d.type === "cpu") || null; }
+// The GPUs tierlm fills, in order: the best one, then other cards of the same kind (same engine: several NVIDIA
+// cards with CUDA, say), as the engine does. A card listed twice (CUDA and Vulkan) counts once.
+function gpuGroup(first) {
+  if (!first || first.type !== "gpu") return first ? [first] : [];
+  const fam = d => String(d.backend || "").split("[")[0];
+  return [first, ...devices.filter(d => d !== first && d.type === "gpu" && !d.same_gpu_as && fam(d) === fam(first))];
+}
 // Where the model will go, as the tier loader will place it: the model's weights and its context (KV cache),
 // in VRAM first and the rest in RAM. "layers" moves whole layers with their part of the context; "experts" puts
 // all of the context (and attention) in VRAM first, then as many experts as fit.
@@ -802,12 +1034,21 @@ function plan() {
   if ($("forcecpu").checked || !gpu)
     return { ...base, dev: cpu, wv: 0, kvv: 0, wr: W, kvr: KV, why: $("forcecpu").checked ? "forced" : "nogpu" };
   const lim = +$("vramlim").value > 0 ? +$("vramlim").value * 1073741824 : Infinity;
-  const room = Math.max(0, Math.min(gpu.free + held.vram, lim) - WORK);
+  const group = gpuGroup(gpu);
+  const rooms = group.map((g, i) => Math.max(0, Math.min(g.free + (i === 0 ? held.vram : 0), lim) - WORK));
+  const room = rooms.reduce((t, r) => t + r, 0);
   let wv, kvv;
   if (W + KV <= room) { wv = W; kvv = KV; }
-  else if ($("splitsel").value === "experts") { kvv = Math.min(KV, room); wv = Math.min(W, room - kvv); }
+  else if (splitMode() === "experts") { kvv = Math.min(KV, room); wv = Math.min(W, room - kvv); }
   else { const f = (W + KV) ? room / (W + KV) : 0; wv = W * f; kvv = KV * f; }
-  return { ...base, dev: gpu, wv, kvv, wr: W - wv, kvr: KV - kvv, room, why: !selModel || W + KV <= room ? "fits" : "split" };
+  // Per GPU: filled in order, each with its share of model and context.
+  let left = wv + kvv;
+  const gpus = group.map((g, i) => {
+    const take = Math.min(rooms[i], left); left -= take;
+    const f = wv + kvv > 0 ? take / (wv + kvv) : 0;
+    return { dev: g, wv: wv * f, kvv: kvv * f };
+  }).filter((x, i) => i === 0 || x.wv + x.kvv > 0);
+  return { ...base, dev: gpu, gpus, wv, kvv, wr: W - wv, kvr: KV - kvv, room, why: !selModel || W + KV <= room ? "fits" : "split" };
 }
 // One memory bar: the device's whole memory, with what tierlm would put there, what other programs use, and what's free.
 function memBar(title, sub, total, parts) {
@@ -868,11 +1109,13 @@ function applySaved() {
   for (const id of ["topk", "topp", "minp", "rpen"]) $(id).oninput();
   $("forcecpu").checked = !!s.force_cpu;
   $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb / 1024).toFixed(1) : 0;
-  $("splitsel").value = s.split_mode || "layers";
+  // Settings saved before "Automatic" existed (no settings_v) had whole layers as the default: treat as Automatic.
+  $("splitsel").value = (s.settings_v >= 2 || s.split_mode === "experts") && s.split_mode ? s.split_mode : "auto";
   const canSpec = !!(selModel && selModel.mtp);
   $("specon").disabled = !canSpec; $("specn").disabled = !canSpec;
   $("specon").checked = canSpec && s.speculative !== false;     // on by default when the model has a draft layer
-  $("specn").value = String(s.draft_max || 3);
+  // Each guess an MoE model checks pulls in its own experts from RAM, so 2 does best there; 3 for dense models.
+  $("specn").value = String(s.draft_max || (E ? 2 : 3));
   $("spechelp").textContent = canSpec
     ? "Faster replies with the same answers: the model's small built-in draft layer guesses the next few words, and the model checks them all in one pass. Helps most when the model doesn't fit in VRAM."
     : "Not available for this model: its file has no built-in draft layer (Qwen3.5, 3.6 and 3.8 files usually include one).";
@@ -917,14 +1160,14 @@ function renderSetup() {
   const order = [...devices].sort((a, b) => ({ gpu: 0, igpu: 1, cpu: 2 }[a.type] ?? 3) - ({ gpu: 0, igpu: 1, cpu: 2 }[b.type] ?? 3));
   for (const d of order) {
     const el = document.createElement("div");
-    el.className = "dev" + (p.dev && d.id === p.dev.id ? " use" : "");
+    el.className = "dev" + (p.dev && (d.id === p.dev.id || (p.gpus || []).some(x => x.dev === d)) ? " use" : "");
     el.innerHTML = `<div class="t"></div><div class="d"></div><div class="tags"></div>`;
     el.querySelector(".t").textContent = d.type === "cpu" ? "CPU · " + d.description : d.description;
     el.querySelector(".d").textContent = (d.type === "cpu" ? "System RAM" : d.type === "igpu" ? d.backend + " · shared memory" : d.backend + " · VRAM") +
       " · " + fmtGiB(d.free) + " free of " + fmtGiB(d.total);
     const add = tagger(el.querySelector(".tags"));
     add(typeLabel[d.type] || d.type);
-    if (p.dev && d.id === p.dev.id) add("Will be used", "good");
+    if (p.dev && (d.id === p.dev.id || (p.gpus || []).some(x => x.dev === d))) add("Will be used", "good");
     if (d.type === "igpu") add("Shares system RAM", "warn");
     if (d.alsoVulkan) add("CUDA (Vulkan also available)");
     if (d.type === "cpu" && cpuFeatures) {                      // the CPU engine tierlm picked for this processor
@@ -941,12 +1184,14 @@ function renderSetup() {
     const other = d => Math.max(0, d.total - d.free - (d === p.gpu ? p.held.vram : p.held.ram));
     let html = `<div class="lbl"></div>`;
     if (p.dev === p.gpu) {
-      const ig = p.gpu.type === "igpu";
-      html += memBar(ig ? "GPU memory (shared)" : "VRAM", p.gpu.description + " · " + fmtGiB(p.gpu.total), p.gpu.total, [
-        { v: p.wv, c: "var(--vram)", l: "Model", always: true },
-        { v: p.kvv, c: "var(--kv)", l: "Context (KV cache)", always: true },
-        { v: p.wv + p.kvv > 0 ? WORK : 0, c: "var(--work)", l: "Working memory" },
-        { v: other(p.gpu), c: "var(--other)", h: true, l: "Other programs" }]);
+      const ig = p.gpu.type === "igpu", many = p.gpus.length > 1;
+      p.gpus.forEach((x, i) => {
+        html += memBar(ig ? "GPU memory (shared)" : many ? "VRAM, GPU " + (i + 1) : "VRAM", x.dev.description + " · " + fmtGiB(x.dev.total), x.dev.total, [
+          { v: x.wv, c: "var(--vram)", l: "Model", always: true },
+          { v: x.kvv, c: "var(--kv)", l: "Context (KV cache)", always: true },
+          { v: x.wv + x.kvv > 0 ? WORK : 0, c: "var(--work)", l: "Working memory" },
+          { v: i === 0 ? other(x.dev) : Math.max(0, x.dev.total - x.dev.free), c: "var(--other)", h: true, l: "Other programs" }]);
+      });
     }
     if (p.wr + p.kvr > 0 && p.cpu) {
       html += memBar("System RAM", fmtGiB(p.cpu.total), p.cpu.total, [
@@ -959,9 +1204,10 @@ function renderSetup() {
       html += `<div class="memnote">Other programs are using <b>${fmtGiB(otherG)}</b> of VRAM (another tierlm window, LM Studio, a game?). Closing them gives tierlm more room; then click <b>Rescan</b>.</div>`;
     pl.innerHTML = html;
     const ram = p.wr + p.kvr;
-    const msg = { fits: `The whole model fits on ${p.dev.description}: ${fmtGiB(p.W)} of model plus ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context.`,
-                  split: `It doesn't all fit on ${p.dev.description}, so tierlm splits it: ` +
-                         ($("splitsel").value === "experts" ? "the context and as much of the model as fits go in VRAM, the rest of the model in RAM, computed by the CPU."
+    const onWhat = (p.gpus || []).length > 1 ? `your ${p.gpus.length} GPUs (${p.gpus.map(x => x.dev.description).join(" + ")})` : p.dev.description;
+    const msg = { fits: `The whole model fits on ${onWhat}: ${fmtGiB(p.W)} of model plus ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context.`,
+                  split: `It doesn't all fit on ${onWhat}, so tierlm splits it: ` +
+                         (splitMode() === "experts" ? "the context and as much of the model as fits go in VRAM, the rest of the model in RAM, computed by the CPU."
                                                             : "as many layers as fit (with their part of the context) go in VRAM, the rest in RAM, computed by the CPU.") +
                          " Expect speed between all-GPU and CPU-only." +
                          (ram > p.ramFree ? ` Warning: that needs more RAM than is free (${fmtGiB(p.ramFree)}); the SSD tier isn't built yet, so close other programs, pick a shorter context, or a smaller model.` : ""),
@@ -1011,7 +1257,7 @@ function renderSetup() {
   }
   $("ctxhelp").textContent = "How much conversation the model can remember, up to what this model was trained for (" +
     (selModel && selModel.ctx_train ? selModel.ctx_train.toLocaleString() + " tokens" : "unknown") + "). Longer uses more memory, shown next to each size.";
-  $("loadbtn").disabled = !selModel || !p.dev;
+  $("loadbtn").disabled = $("tunebtn").disabled = !selModel || !p.dev;
 }
 // ⋯ menu
 function closeMenu() { $("mmenu").hidden = true; }
@@ -1067,27 +1313,320 @@ $("loadbtn").onclick = async () => {
   const p = plan();
   if (!selModel || !p.dev) return;
   const btn = $("loadbtn"), msg = $("loadmsg");
-  btn.disabled = true; msg.className = ""; msg.textContent = "Loading " + selModel.file + "… this takes a few seconds.";
-  const exp = +$("experts").value;
-  const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
-                 flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
-                 speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value,
-                 experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
-  if ($("forcecpu").checked) body.device = "cpu";
+  btn.disabled = true; msg.className = ""; msg.textContent = "Loading " + selModel.file + "…";
+  watchProgress(true);
+  const body = loadBody(p);
   try {
     const r = await api("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || r.statusText);
-    history = []; $("messages").innerHTML = ""; speedPts = []; totalPicks = 0; tokCount = 0;
+    history = []; curChat = null; renderChats(); $("messages").innerHTML = ""; speedPts = []; totalPicks = 0; tokCount = 0;
     msg.textContent = "";
     await loadInfo();
     updateHits();
   } catch (e) {
     msg.className = "err"; msg.textContent = "Could not load: " + e.message;
   }
+  watchProgress(false);
   btn.disabled = false;
 };
+// The /api/load body for the settings on the setup screen.
+function loadBody(p) {
+  const exp = +$("experts").value;
+  const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : (p.gpus || []).length > 1 ? "gpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
+                 flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
+                 speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value,
+                 experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
+                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
+  if ($("forcecpu").checked) body.device = "cpu";
+  return body;
+}
+// Auto-tune: the server loads the model, measures the settings that affect speed (split mode, CPU threads,
+// speculative decoding) and keeps the fastest; results stream in as they're measured.
+$("tunebtn").onclick = async () => {
+  const p = plan();
+  if (!selModel || !p.dev) return;
+  const btns = [$("loadbtn"), $("tunebtn")], msg = $("loadmsg"), list = $("tunelist"), done = $("tunedone");
+  btns.forEach(b => b.disabled = true);
+  msg.className = ""; msg.textContent = "";
+  $("tunebox").hidden = false; $("tunetitle").textContent = "Finding the fastest settings"; list.innerHTML = ""; done.hidden = true; done.innerHTML = "";
+  $("tunestat").textContent = "Loading " + selModel.file + "… about a minute, longer for big models.";
+  const rows = [];
+  watchProgress(true);
+  try {
+    const r = await api("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(loadBody(p)) });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || r.statusText); }
+    const rd = r.body.getReader(), dec = new TextDecoder();
+    let buf = "", fin = null;
+    for (;;) {
+      const { value, done: end } = await rd.read();
+      if (end) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!line.startsWith("data:")) continue;
+        const ev = JSON.parse(line.slice(5));
+        if (ev.type === "status") $("tunestat").textContent = ev.text + "…";
+        else if (ev.type === "result") {
+          const li = document.createElement("li");
+          li.innerHTML = `${esc(ev.label)}: <b>${ev.tps.toFixed(1)}</b> tok/s`;
+          li.dataset.tps = ev.tps; list.appendChild(li); rows.push(li);
+        } else if (ev.type === "error") throw new Error(ev.message);
+        else if (ev.type === "done") fin = ev;
+      }
+    }
+    if (!fin) throw new Error("the measurement stopped early");
+    const st = fin.settings;
+    const parts = [];
+    if (st.split_mode === "experts") parts.push("experts in RAM"); else if (st.split_mode === "layers") parts.push("whole layers");
+    parts.push(st.threads + " CPU threads");
+    parts.push(st.speculative ? "speculative decoding, " + st.draft_max + (st.draft_max === 1 ? " guess" : " guesses") + " per check" : "no speculative decoding");
+    for (const li of rows) if (Math.abs(+li.dataset.tps - fin.tps) < 0.05) { li.classList.add("best"); break; }
+    $("tunestat").textContent = ""; $("tunetitle").textContent = "Fastest settings for this PC"; watchProgress(false);
+    done.hidden = false;
+    done.innerHTML = `<span>Fastest: <b>${fin.tps.toFixed(1)} tok/s</b> with ${esc(parts.join(", "))}. Saved for this model.</span>`;
+    const go = document.createElement("button"); go.className = "primary"; go.textContent = "Start chatting";
+    go.onclick = async () => { history = []; $("messages").innerHTML = ""; speedPts = []; totalPicks = 0; tokCount = 0; await loadInfo(); updateHits(); };
+    done.appendChild(go);
+    md.saved = md.saved || {}; md.saved[selModel.id] = st;
+    applySaved(); renderSetup();
+  } catch (e) {
+    $("tunestat").textContent = ""; watchProgress(false);
+    msg.className = "err"; msg.textContent = "Could not finish: " + e.message;
+  }
+  btns.forEach(b => b.disabled = false);
+};
+
+
+// ---------- side menu: icon rail and accordion panel ----------
+let openSec = "settings", railOpen = true;
+try { openSec = localStorage.getItem("tierlm.sec") ?? "settings"; railOpen = localStorage.getItem("tierlm.rail") !== "0"; } catch (e) {}
+function renderRail() {
+  $("app").classList.toggle("collapsed", !railOpen);
+  document.querySelectorAll(".sec").forEach(x => {
+    const on = x.dataset.sec === openSec;
+    x.classList.toggle("open", on);
+    x.querySelector(".sechead").setAttribute("aria-expanded", String(on));
+  });
+  document.querySelectorAll(".ricon[data-sec]").forEach(b => b.classList.toggle("on", railOpen && b.dataset.sec === openSec));
+  $("railarrow").setAttribute("d", railOpen ? "M15 6l-6 6 6 6" : "M9 6l6 6-6 6");
+  $("railtoggle").setAttribute("aria-label", railOpen ? "Collapse menu" : "Expand menu");
+  $("railtoggle").title = railOpen ? "Collapse menu" : "Expand menu";
+  try { localStorage.setItem("tierlm.sec", openSec); localStorage.setItem("tierlm.rail", railOpen ? "1" : "0"); } catch (e) {}
+  if (openSec === "console" && railOpen) pollLog();
+  setTimeout(resizeCanvases, 0);
+}
+document.querySelectorAll(".ricon[data-sec]").forEach(b => b.onclick = () => {
+  if (railOpen && openSec === b.dataset.sec) railOpen = false; else { railOpen = true; openSec = b.dataset.sec; }
+  renderRail();
+});
+document.querySelectorAll(".sechead").forEach(h => h.onclick = () => {
+  const sec = h.parentElement.dataset.sec;
+  openSec = openSec === sec ? "" : sec;
+  renderRail();
+});
+$("railtoggle").onclick = () => { railOpen = !railOpen; renderRail(); };
+$("chgsetup2").onclick = () => { if (!busy) showSetup(); };
+renderRail();
+
+// ---------- theme ----------
+function setTheme(t) {
+  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  document.querySelectorAll(".themesw button").forEach(b => { const on = b.dataset.theme === t; b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on)); });
+  try { localStorage.setItem("tierlm.theme", t); } catch (e) {}
+}
+document.querySelectorAll(".themesw button").forEach(b => b.onclick = () => setTheme(b.dataset.theme));
+{ let t = "auto"; try { t = localStorage.getItem("tierlm.theme") || "auto"; } catch (e) {} setTheme(t); }
+
+// ---------- memory at a glance (right side) ----------
+function renderMiniMem() {
+  if (!info) { $("minimem").innerHTML = ""; return; }
+  const L_ = info.layers || 1, kvG = (info.kv_bytes || 0) * (info.kv_gpu_layers || 0) / L_;
+  const vram = (info.vram_weights || 0) + kvG, ram = (info.ram_weights || 0) + (info.kv_bytes || 0) - kvG;
+  const row = (name, used, total, parts) => `<div class="mm"><div class="mmh"><span>${name}</span><b>${fmtGiB(used)}${total ? " / " + fmtGiB(total) : ""}</b></div>` +
+    `<div class="stack">${parts.map(([v, c]) => `<div style="width:${total ? Math.min(100, 100 * v / total) : 0}%;background:${c}"></div>`).join("")}</div></div>`;
+  let h = "";
+  if (info.on_gpu) {
+    const gp = info.gpus && info.gpus.length > 1 ? info.gpus : null;
+    if (gp) for (const g of gp) h += row("VRAM · " + esc(g.name), g.weights + g.kv, 0, []);
+    else h += row("VRAM", vram, info.device_total || vram, [[info.vram_weights || 0, "var(--vram)"], [kvG, "var(--kv)"]]);
+  }
+  if (!devices.length && !renderMiniMem.asked) {                 // opened straight into a chat: fetch the hardware once
+    renderMiniMem.asked = true;
+    api("/api/devices").then(r => r.json()).then(j => { devices = j.devices || []; renderMiniMem(); }).catch(() => {});
+  }
+  const ramTotal = (devices.find(d => d.type === "cpu") || {}).total || 0;
+  if (ram > 0) h += row("RAM", ram, ramTotal, [[info.ram_weights || 0, "var(--ram)"], [(info.kv_bytes || 0) - kvG, "var(--kv)"]]);
+  $("minimem").innerHTML = h || '<div class="note">–</div>';
+}
+
+// ---------- speculative decoding while chatting (when the draft layer is loaded) ----------
+function syncLiveSpec() {
+  if (!info) return;
+  const can = !!info.mtp_loaded;
+  $("lspecrow").hidden = !info.has_draft_block && !can;
+  $("lspec").disabled = $("lspecn").disabled = !can;
+  $("lspec").checked = !!info.speculative;
+  $("lspecn").value = String(info.draft_max || (info.experts ? 2 : 3));
+  $("lspechelp").textContent = can ? "Faster replies with the same answers. 2 guesses usually suit MoE models, 3 dense ones; the benchmark below shows which is faster here."
+    : info.has_draft_block ? "This model has a draft layer, but it was loaded without it: turn on Speculative decoding on the setup screen and load it again." : "";
+}
+async function setLiveSpec() {
+  const r = await api("/api/spec", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ speculative: $("lspec").checked, draft_max: +$("lspecn").value }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { addMsg("error", "⚠ " + (j.error || r.statusText)); }
+  await loadInfo();
+}
+$("lspec").onchange = setLiveSpec;
+$("lspecn").onchange = () => { if ($("lspec").checked) setLiveSpec(); };
+
+// ---------- console ----------
+let logNext = -1, logLines = [], logVerbose = false, logTimer = null;
+function renderLog() {
+  const el = $("console"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+  el.innerHTML = logLines.filter(l => logVerbose || !l.v).map(l => {
+    const cls = l.v ? "v" : /error|failed|could not|not enough/i.test(l.text) ? "e" : /^(loaded|reply:|benchmark:|autotune:.*tok\/s)/.test(l.text) ? "s" : "";
+    return `<div${cls ? ` class="${cls}"` : ""}>${esc(l.text) || "&nbsp;"}</div>`;
+  }).join("");
+  if (atEnd) el.scrollTop = el.scrollHeight;
+}
+async function pollLog() {
+  clearTimeout(logTimer);
+  try {
+    const j = await (await api("/api/log?after=" + logNext)).json();
+    if (j.lines.length) { logLines.push(...j.lines); if (logLines.length > 3000) logLines.splice(0, logLines.length - 3000); renderLog(); }
+    logNext = j.next - 1;
+  } catch (e) {}
+  if (!$("app").hidden && railOpen && openSec === "console") logTimer = setTimeout(pollLog, 1000);
+}
+$("c-info").onclick = () => { logVerbose = false; $("c-info").classList.add("on"); $("c-verbose").classList.remove("on"); renderLog(); };
+$("c-verbose").onclick = () => { logVerbose = true; $("c-verbose").classList.add("on"); $("c-info").classList.remove("on"); renderLog(); };
+$("c-copy").onclick = () => navigator.clipboard?.writeText(logLines.filter(l => logVerbose || !l.v).map(l => l.text).join("\n"));
+
+// ---------- chats and system prompt presets (kept in this browser) ----------
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+let chats = LS.get("tierlm.chats", []), curChat = null;
+function withSystem(h) {
+  const sp = $("sysprompt").value.trim();
+  const msgs = h.map(m => ({ role: m.role, content: m.content }));
+  return sp ? [{ role: "system", content: sp }, ...msgs] : msgs;
+}
+function saveChat() {
+  if (!history.length) return;
+  if (!curChat) { curChat = { id: Date.now().toString(36), created: Date.now() }; chats.unshift(curChat); }
+  curChat.messages = history;
+  curChat.title = curChat.title || (history.find(m => m.role === "user")?.content || "Chat").slice(0, 60);
+  curChat.updated = Date.now();
+  curChat.model = info ? info.name : "";
+  if (chats.length > 100) chats.length = 100;
+  LS.set("tierlm.chats", chats);
+  renderChats();
+}
+function ago(t) {
+  const m = Math.round((Date.now() - t) / 60000);
+  return m < 1 ? "now" : m < 60 ? m + " min" : m < 1440 ? Math.round(m / 60) + " h" : new Date(t).toLocaleDateString();
+}
+function renderChats() {
+  const el = $("chatlist"); el.innerHTML = "";
+  $("chatcount").textContent = chats.length ? chats.length + " saved" : "";
+  for (const c of chats) {
+    const row = document.createElement("div");
+    row.className = "chatitem" + (c === curChat ? " cur" : "");
+    const o = document.createElement("button"); o.className = "open";
+    o.innerHTML = `${esc(c.title)} <small>· ${ago(c.updated || c.created)}</small>`;
+    o.onclick = () => openChat(c);
+    const d = document.createElement("button"); d.className = "del"; d.textContent = "✕"; d.setAttribute("aria-label", "Delete chat " + c.title);
+    d.onclick = () => { chats = chats.filter(x => x !== c); if (curChat === c) curChat = null; LS.set("tierlm.chats", chats); renderChats(); };
+    row.append(o, d); el.appendChild(row);
+  }
+}
+function renderHistory() {
+  $("messages").innerHTML = "";
+  for (const m of history) {
+    const d = addMsg(m.role, m.content);
+    if (m.meta) { const s = document.createElement("span"); s.className = "meta"; s.textContent = m.meta; d.appendChild(s); }
+  }
+}
+async function openChat(c) {
+  if (busy) return;
+  curChat = c; history = (c.messages || []).map(m => ({ ...m }));
+  renderHistory(); renderChats();
+  // The engine reuses whatever start of the conversation is still in its cache, so switching back is quick.
+}
+async function newChat() {
+  if (busy) return;
+  history = []; curChat = null;
+  $("messages").innerHTML = "";
+  await api("/api/reset", { method: "POST" });
+  setContext(0); renderChats();
+}
+let presets = LS.get("tierlm.presets", [
+  { name: "Concise answers", text: "Answer briefly and directly. Use lists only when they help." },
+  { name: "Coding helper", text: "You are an expert programmer. Give complete, working code with short explanations." }]);
+function renderPresets() {
+  const el = $("presets"); el.innerHTML = "";
+  for (const p of presets) {
+    const chip = document.createElement("span"); chip.className = "pchip";
+    const b = document.createElement("button"); b.textContent = p.name; b.title = p.text;
+    b.onclick = () => { $("sysprompt").value = p.text; $("sysprompt").oninput(); };
+    const x = document.createElement("button"); x.className = "x"; x.textContent = "✕"; x.setAttribute("aria-label", "Remove preset " + p.name);
+    x.onclick = () => { presets = presets.filter(q => q !== p); LS.set("tierlm.presets", presets); renderPresets(); };
+    chip.append(b, x); el.appendChild(chip);
+  }
+}
+$("savepreset").onclick = () => {
+  const text = $("sysprompt").value.trim();
+  if (!text) { $("sysprompt").focus(); return; }
+  const name = prompt("Name for this preset:", text.slice(0, 24));
+  if (!name) return;
+  presets.push({ name: name.slice(0, 40), text }); LS.set("tierlm.presets", presets); renderPresets();
+};
+$("sysprompt").value = LS.get("tierlm.sysprompt", "");
+$("sysprompt").oninput = () => { LS.set("tierlm.sysprompt", $("sysprompt").value); $("sysbadge").hidden = !$("sysprompt").value.trim(); };
+$("sysprompt").oninput();
+renderChats(); renderPresets();
+
+// ---------- benchmark ----------
+$("benchbtn").onclick = async () => {
+  if (busy || !info) return;
+  setBusy(true); $("status").textContent = "benchmarking…";
+  $("b-prompt").textContent = $("b-gen").textContent = "…"; $("benchline").textContent = ""; $("benchcopy").hidden = true;
+  try {
+    const r = await api("/api/bench", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    $("b-prompt").textContent = j.prompt_tps.toFixed(1); $("b-gen").textContent = j.gen_tps.toFixed(1);
+    const line = `tierlm ${info.version} · ${info.name} · ${info.device} · ${info.ctx.toLocaleString()} context, ${info.kv_type} · ` +
+      `${!info.on_gpu ? "CPU only" : info.ram_weights > 0 ? (info.split_mode === "experts" ? "experts in RAM" : "whole layers in RAM") : "all in VRAM"} · ${j.threads} threads · ` +
+      `${j.speculative ? "speculative " + j.draft_max : "no speculation"} → prompt ${j.prompt_tps.toFixed(1)} tok/s, generation ${j.gen_tps.toFixed(1)} tok/s`;
+    $("benchline").textContent = line; $("benchcopy").hidden = false;
+    $("benchcopy").onclick = () => navigator.clipboard?.writeText(line);
+  } catch (e) { $("benchline").textContent = "Could not run: " + e.message; $("b-prompt").textContent = $("b-gen").textContent = "–"; }
+  setBusy(false);
+  setContext(0);
+};
+
+// ---------- loading progress (setup screen) ----------
+let progTimer = null;
+function watchProgress(on) {
+  clearTimeout(progTimer);
+  const bar = $("loadprog");
+  if (!on) { bar.hidden = true; bar.firstElementChild.style.width = "0"; return; }
+  bar.hidden = false;
+  const tick = async () => {
+    try {
+      const j = await (await fetch("/api/progress")).json();
+      if (j.loading) bar.firstElementChild.style.width = Math.round(100 * j.progress) + "%";
+    } catch (e) {}
+    progTimer = setTimeout(tick, 250);
+  };
+  tick();
+}
 
 loadInfo().then(() => { if (info) updateHits(); });
 

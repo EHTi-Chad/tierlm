@@ -113,7 +113,7 @@ next token. Unsloth publishes it as a separate `mtp-<model>.gguf`; tierlm loads 
 
 Each step (`src/speculate.cpp`):
 
-1. **Guess.** The draft layer runs up to `draft_max` times (default 3), feeding its own hidden state forward,
+1. **Guess.** The draft layer runs up to `draft_max` times (default 3 for dense models, 2 for MoE: each guess an MoE model checks brings in its own experts), feeding its own hidden state forward,
    which is cheap: one layer, usually in VRAM.
 2. **Check.** The model evaluates the chosen token and the guesses in **one pass** (`Model::eval_ex`), producing a
    prediction for every position. Its weights are read once for all of them.
@@ -167,6 +167,29 @@ limited by RAM speed either way. The embedding table, looked up by row rather th
   as an output and read back after the step. This is what feeds the dashboard's expert map, and it will feed
   the hot-expert cache.
 
+## Several GPUs
+
+With `device` `auto` or `gpu`, every GPU of the same kind as the best one (the same engine: CUDA, Vulkan...) becomes
+another VRAM tier, so one card that shows up under both CUDA and Vulkan isn't counted twice. Whole layers fill the
+first GPU from the last layer backwards, then the next GPU, then RAM, each layer's ops pinned to its device. With
+experts in RAM, each layer's attention, router and KV cache go on a GPU first (again filling one before the next),
+then the experts: on their layer's GPU if it has room, else another GPU, else RAM. The tests run every model split
+over two stand-in GPUs (ggml's RPC backend) and RAM at many memory sizes, and compare with the reference.
+
+## Auto-tune
+
+`/api/autotune` measures what only changes speed, one setting at a time in the order that matters most: the split
+mode (a reload each), then CPU threads, then speculative decoding with 1 to 4 guesses. Each measurement generates
+the same text greedily (end-of-reply tokens skipped, so every run is equally long) after a short warm-up, and runs
+for about 5 seconds. Threads and speculation only win by a clear margin (2-3%), so noise doesn't pick them.
+
+## CPU and GPU at the same time
+
+With today's placement there is little to overlap: in each layer the CPU's experts need the GPU's attention and
+router, and the GPU's next layer needs the experts' result. Overlap appears once a layer's experts are split between
+VRAM (the busy ones) and RAM, which is the hot-expert cache; ggml's scheduler also runs device splits one after
+another and waits at every hand-off, so it needs changes there too. Planned together.
+
 ## Verification
 
 There is no llama.cpp to compare against, so every piece is checked against an independent reference:
@@ -193,12 +216,13 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 
 ## What's next
 
-1. **Real-model testing of the new families**, then more families: Gemma, Phi, DeepSeek, gpt-oss. Qwen3-30B-A3B (48 layers, 128 experts, 8 active, about
-   18.6 GB in Q4) is larger than the Arc's 16 GB, which makes it the first real test of tiering.
-2. **Tier loader, next steps.** VRAM/RAM splitting works (see [TOOLS.md](TOOLS.md#splitting-models-between-vram-and-ram));
-   next are the SSD tier (rarely used experts read from disk when routed to) and finer-grained placement.
-3. **Hot-expert cache.** Use routing statistics (already captured) to keep the most-used experts in VRAM and
-   swap them as usage shifts.
-4. **NVIDIA (CUDA) on an RTX 5090** and AMD testing.
-5. Quantized KV cache, speculative decoding with draft heads, OpenAI-compatible endpoints, P-core thread
-   pinning.
+1. **Adaptive tiering: a hot-expert cache with learned placement.** Keep the experts the router actually picks most
+   in VRAM (the routing statistics are already collected), remember them per model between runs, and let the GPU
+   and CPU work on the same layer at once (its VRAM experts and its RAM experts).
+2. **SSD tier**: rarely used experts read from an NVMe drive when the router picks them, for models bigger than VRAM
+   and RAM together.
+3. **Usage-based precision** (rarely used experts stored at lower precision) and **expert-aware speculation** (guess
+   further ahead only while the guesses reuse experts that are already loaded).
+4. **More families and real-model tests**: Gemma 4, Phi, DeepSeek, gpt-oss; Qwen3-Coder-Next, Mixtral and Qwen2.5 on
+   real weights. Tool calling in the API.
+5. Prompt-lookup guessing for models without a draft layer, CUDA graphs, and the Zen 4 / AMX CPU engines on Windows.

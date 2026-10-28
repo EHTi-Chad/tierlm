@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -73,10 +74,16 @@ struct LoadOptions {
     //   "layers"   whole layers: the last ones (with their KV cache) in VRAM, the first ones in RAM.
     //              One GPU<->CPU hand-off per token; usually fastest, especially on Windows.
     //   "experts"  attention, router and KV cache of every layer in VRAM, then expert layers while they
-    //              fit. Two hand-offs per RAM layer per token; can win on long contexts.
-    std::string split_mode = "layers";
+    //              fit. Two hand-offs per RAM layer per token. Much faster for MoE models: on a laptop RTX 3070,
+    //              Qwen3.6-35B-A3B went from 9.9 to 17 tok/s.
+    //   "auto"     "experts" for mixture-of-experts models, "layers" for the rest (the default).
+    std::string split_mode = "auto";
     bool repack = true;              // store CPU-side weights in ggml's faster repacked layout where it has one
     bool mtp = false;                // also load the MTP draft block, for speculative decoding (if the file has one)
+    // With device "auto" or "gpu": also use the other GPUs of the same kind (several NVIDIA cards with CUDA, say)
+    // as further VRAM tiers, filled after the first one and before system RAM.
+    bool multi_gpu = true;
+    std::function<void(float)> progress;   // called while the weights are read, with the share done (0..1)
 };
 
 // Where the time goes, accumulated over every eval_batch call (for profiling).
@@ -96,6 +103,9 @@ struct Placement {
     int attn_gpu = 0;                            // layers whose attention weights are in VRAM
     int ffn_gpu = 0;                             // layers whose feed-forward / experts are in VRAM
     int repacked = 0;                            // CPU-side weight tensors stored in the repacked layout
+    struct Gpu { std::string name; uint64_t weights = 0, kv = 0; int layers = 0; };
+    std::vector<Gpu> gpus;                       // per GPU (more than one with several cards): what it holds
+    std::vector<bool> ffn_vram;                  // per layer: its feed-forward part (the experts, in MoE models) is in VRAM
     bool split() const { return gpu_weights > 0 && cpu_weights > 0; }
 };
 
@@ -203,7 +213,8 @@ private:
         ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
     };
     Hparams hp_;
-    ggml_backend* main_ = nullptr;               // device holding weights + cache
+    ggml_backend* main_ = nullptr;               // device holding weights + cache (the first GPU)
+    std::vector<ggml_backend*> gpus_;            // every GPU in use, main_ first
     ggml_backend* cpu_ = nullptr;                // fallback for ops the device can't run
     ggml_backend_sched* sched_ = nullptr;
     ggml_context* wctx_ = nullptr;               // weight tensor descriptors
@@ -217,6 +228,7 @@ private:
     std::vector<Layer> layers_;
     std::unique_ptr<Layer> mtp_;                 // the MTP draft block, when loaded
     std::vector<bool> layer_kv_gpu_;             // per layer: KV cache in VRAM
+    std::vector<int> layer_dev_;                 // per layer: the GPU (index into gpus_) holding its KV cache, or -1 for RAM
     bool pin_layers_ = false;                    // layer split: RAM layers must run entirely on the CPU
     std::string device_name_;
     int max_ctx_ = 0, n_past_ = 0;

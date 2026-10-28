@@ -22,8 +22,20 @@ model's weights produces more than one word: faster replies, with exactly the an
 It's greyed out when the model file has no draft layer. Some publishers (Unsloth) put it in a separate file named
 `mtp-<model>.gguf`: download that too and keep it in the same folder, and tierlm uses it automatically (the setup
 screen lists it as a **Draft add-on**). The chat shows "tokens per check" after each reply: above about 1.5 it's
-helping. **Guesses per check** defaults to 3, the fastest on our tests (on a laptop RTX 3070 with Qwen3.6-27B: 3.0 tok/s
-off, 3.9 with 2, 5.3 with 3, 4.1 with 4); try 2 or 4 for your model and PC.
+helping. **Guesses per check** defaults to 3 for dense models, the fastest on our tests (on a laptop RTX 3070 with Qwen3.6-27B: 3.0 tok/s
+off, 3.9 with 2, 5.3 with 3, 4.1 with 4); try 2 or 4 for your model and PC. For mixture-of-experts models the default is 2 (Qwen3.6-35B-A3B on the same laptop:
+22.3 tok/s with 2, 18.7 with 3), because each guess the model checks pulls in its own experts.
+
+**Does tierlm use two graphics cards?**
+Yes, when they're the same kind (two NVIDIA cards with CUDA, say): the model fills the first card, then the second,
+then system RAM. The setup screen shows a VRAM bar for each card. Different kinds (an NVIDIA and an AMD card) aren't
+combined yet: tierlm uses the bigger one.
+
+**What does "Find the fastest settings" do?**
+It loads the model and measures, on your PC, the settings that only change speed: how to split a model that doesn't
+fit in VRAM, how many CPU threads to use, and speculative decoding with 1 to 4 guesses per check. It keeps the fastest
+and saves it for that model. Answers are the same whichever settings win; only the speed differs. On a laptop RTX
+3070, picking the right split and guesses by hand took Qwen3.6-35B-A3B from 9.9 to 22.3 tokens/second.
 
 **Can I use a different model?**
 Yes, for the common families: Llama (2, 3.x), Mistral and Mixtral, Qwen2/2.5, Qwen3 and Qwen3 MoE, the Qwen3.5 /

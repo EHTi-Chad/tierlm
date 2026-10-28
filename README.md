@@ -1,6 +1,8 @@
 # tierlm
 
-**A local LLM inference engine for mixture-of-experts models, built to spread big models across VRAM, RAM and SSD.**
+**A performance-first local LLM engine: it puts every part of a model in the right memory. The parts used for every
+word go in VRAM, the rest in RAM (soon SSD), so big models run as fast as your PC allows, and your RAM, not your
+GPU, sets how big you can go.**
 
 tierlm is written from scratch in C++ by **Claude** (Anthropic's AI), with **Chad Jameson (EHTi)** directing
 the project, making the design calls, and testing and debugging it on real hardware. It uses
@@ -8,13 +10,13 @@ the project, making the design calls, and testing and debugging it on real hardw
 memory planner, server and dashboard are all tierlm's own. It does not use llama.cpp.
 
 It runs the common model families (**Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8
-dense and MoE, OLMoE**) on the
-CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA. **Models bigger than the GPU's memory
-are split between VRAM and RAM automatically**: on a laptop RTX 3070 (8 GB), the 14.7 GB Qwen3-30B-A3B runs at
-about **27 tokens/second**, 40% faster than on the CPU alone. A web page lets you pick a model and chat, with a
+dense and MoE, Qwen3-Next, OLMoE**) on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with
+CUDA. **Models bigger than the GPU's memory are split between VRAM and RAM automatically**: on a laptop RTX 3070
+(8 GB), the 17 GB Qwen3.6-35B-A3B runs at about **22 tokens/second**, and on an RTX 5090 the 46 GB Qwen3.6-35B-A3B
+Q8_0 runs at **36.6 tokens/second** with 128K of context. A web page lets you pick a model and chat, with a
 live dashboard showing speed, where the model lives, and the router picking experts.
 
-**New user? Read the [tierlm 0.3.0 guide (PDF)](docs/tierlm-0.3.0-guide.pdf)**: what tierlm is, step-by-step
+**New user? Read the [tierlm 0.4.0 guide (PDF)](docs/tierlm-0.4.0-guide.pdf)**: what tierlm is, step-by-step
 setup, every setting, how it works, and all test results, with diagrams.
 
 > **Status: early.** VRAM and RAM tiering works; the SSD tier and a hot-expert cache are next. Not every model
@@ -22,11 +24,45 @@ setup, every setting, how it works, and all test results, with diagrams.
 
 ## Why
 
-Mixture-of-experts models split each layer into many small "expert" networks and use only a few per token:
-OLMoE uses 8 of 64. Experts are over 90% of the file, and most are idle at any moment. So if an engine keeps
-the busiest experts in the fastest memory and the rest further away, a model much bigger than the GPU can
-still run quickly. That is the idea behind [Strata](https://github.com/Niko1221/Strata), and tierlm is an
-independent engine built on the same principle.
+Local AI apps are usually built around the graphics card: a model that fits in VRAM runs well, and anything bigger
+is cut wherever VRAM runs out. But not every part of a model is equal. Attention, the router and the context are
+used for every word; in a mixture-of-experts model, most experts sit idle most of the time. VRAM is fast but small,
+RAM is big but several times slower, and an SSD is bigger again. **Speed comes from putting the busiest parts in the
+fastest memory**, and that is what tierlm is built around (the tiering idea was inspired by
+[Strata](https://github.com/Niko1221/Strata)):
+
+| Memory | What tierlm puts there | Why |
+|---|---|---|
+| **VRAM** (GPU) | Attention, the router and the context (KV cache) of every layer, then as many experts or layers as fit | Used for every word, and the GPU reads its memory fastest |
+| **System RAM** (CPU) | The rest: experts of an MoE model, or whole layers of a dense one | Needed less often; the CPU works on them with the best instructions it has (AVX2, AVX-512) |
+| **SSD** (soon) | Rarely used experts, streamed on demand | For models bigger than VRAM and RAM together |
+
+It makes a large difference: the 17 GB Qwen3.6-35B-A3B on an 8 GB laptop GPU runs at 9.9 tok/s split by whole layers,
+17 tok/s with attention and context in VRAM and only the experts in RAM, and 22.3 tok/s with speculative decoding.
+
+How tierlm keeps it fast, at any size:
+
+- **Size is about memory.** Any model that fits in VRAM plus RAM runs (about 10 GB is needed for Windows, the
+  context and working memory). The SSD tier, coming soon, will stream rarely used experts and push past RAM.
+- **Each part goes where it's fastest.** For mixture-of-experts models, attention and the context stay on the GPU and
+  only the experts go to RAM, so the CPU reads just the few experts each token picks; dense models are split by whole
+  layers. tierlm picks the split itself.
+- **More than one token per read.** When part of a model is in RAM, speed is set by how fast RAM can be read.
+  Speculative decoding gets several tokens out of each read, and the CPU work uses the best instruction set the
+  processor has (AVX2, AVX-512).
+
+| Graphics card | System RAM | Largest model, roughly | For example |
+|---|---|---|---|
+| 8 GB | 32 GB | 30 GB | Qwen3.6-35B-A3B at 3 or 4 bits |
+| 8 GB | 64 GB | 60 GB | Qwen3.6-35B-A3B at 8 bits |
+| 16 GB | 64 GB | 70 GB | Qwen3-Coder-Next 80B-A3B at 4 to 5 bits |
+| 24 GB | 64 GB | 75 GB | Llama 3.3 70B at 6 bits |
+| 32 GB | 64 GB | 85 GB | Qwen3-Coder-Next 80B-A3B at 6 bits |
+| 24 GB | 128 GB | 140 GB | Qwen3.5-122B-A10B at 8 bits |
+
+Mixture-of-experts models (A3B, A10B...) stay fast with most of the model in RAM: Qwen3.6-35B-A3B (17 GB) runs at
+22 tok/s on an 8 GB laptop RTX 3070. Dense models are slower once they spill into RAM, which is where speculative
+decoding helps most.
 
 ## Features
 
@@ -38,8 +74,9 @@ independent engine built on the same principle.
 - **Own model graph for every supported family**: dense and mixture-of-experts, grouped-query attention, QK-norm,
   RoPE variants, verified against independent NumPy implementations, including when split between GPU and RAM.
 - **Split (multi-part) GGUFs**: models published as `-00001-of-0000N.gguf` files load as one model.
-- **Tier loader**: a model that doesn't fit in VRAM is split by whole layers (or with experts in RAM), with
-  each RAM layer pinned to the CPU so a token changes device only once.
+- **Tier loader**: a model that doesn't fit in VRAM is split automatically: mixture-of-experts models keep attention
+  and context in VRAM with the experts in RAM; dense models are split by whole layers,
+  with each RAM layer pinned to the CPU so a token changes device only once.
 - **KV cache in f16, 8-bit or 4-bit** and **flash attention**, with prompts processed in batches.
 - **Every x86 CPU generation**: release builds carry a CPU engine per generation (plain x86-64 up to AVX2, AVX-512 and
   AMX) and load the best one at start-up; common quantizations are rearranged for the CPU's wide instructions on load
@@ -49,8 +86,14 @@ independent engine built on the same principle.
 - **Setup screen**: detects every GPU (Intel, AMD, NVIDIA) and the CPU with free memory and places the model
   automatically (GPU first, then CPU), lists the GGUF models in any folder you point it at (including LM
   Studio's), and remembers LM Studio-style load settings per model.
-- **Web interface**: streaming chat, plus a live dashboard with an expert activity map, speed vs. context,
-  memory placement, and a "hot-expert cache" preview built from real routing data.
+- **Several GPUs**: with more than one card of the same kind (two NVIDIA cards with CUDA, say), the model fills the
+  first GPU, then the next, then RAM.
+- **Find the fastest settings**: one click loads the model and measures the settings that affect speed on this PC
+  (split mode, CPU threads, speculative decoding and how far ahead to guess), then keeps the fastest.
+- **Web interface**: streaming chat with a collapsible side menu (live settings and system prompt, API, a console
+  showing what the engine is doing, model info, saved chats and system-prompt presets, a one-click benchmark), a
+  thin live view (speed, context, memory and an explained expert map that shows which experts work and where they
+  live), and a light/dark/automatic theme.
 - **Speculative decoding** with the model's own built-in draft layer (MTP, in Qwen3.5 / 3.6 / 3.8 and Qwen3-Next
   files, or a separate `mtp-*.gguf` next to the model): the model checks several guessed tokens in one pass, so
   each read of its weights from RAM produces more than one token. Same answers, faster replies; most useful when the
@@ -89,6 +132,20 @@ memory, 23 of 64 layers in VRAM and the rest in RAM (CUDA):
 A dense model with most of its weights in RAM is limited by how fast RAM can be read; checking several guessed
 tokens per read makes it about 1.75× faster here, with the same answers. More guesses isn't always better: each extra
 guess is less likely to be kept but still has to be checked.
+
+**Mixture-of-experts on the same laptop.** Qwen3.6-35B-A3B MTP UD-Q3_K_XL (Unsloth, 17 GB), 16K context, 8-bit
+context memory (CUDA):
+
+| Split mode | Speculative decoding | Generation |
+|---|---|---|
+| Whole layers | off | 9.9 tok/s |
+| Whole layers | 3 guesses | 11.3 tok/s |
+| Experts in RAM | off | 17.0 tok/s |
+| Experts in RAM | 3 guesses | 18.7 tok/s |
+| **Experts in RAM (now automatic for MoE)** | **2 guesses (now the MoE default)** | **22.3 tok/s** |
+
+Keeping attention on the GPU and only the experts in RAM means the CPU reads just the 8 experts each token picks.
+Short guesses suit MoE models: every guess the model checks brings in its own experts from RAM.
 
 **Intel Arc 140V (integrated), Intel Core Ultra 7 258V:**
 
@@ -158,7 +215,7 @@ model is in RAM.
 3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040, where tierlm shows the
    hardware it found and the models in your folder (the **⋯** menu changes the folder). Pick a model and chat.
 
-Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or the [PDF guide](docs/tierlm-0.3.0-guide.pdf) · Problems: [docs/FAQ.md](docs/FAQ.md)
+Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or the [PDF guide](docs/tierlm-0.4.0-guide.pdf) · Problems: [docs/FAQ.md](docs/FAQ.md)
 
 ### Supported models
 
@@ -209,7 +266,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 
 ## Documentation
 
-- **[docs/tierlm-0.3.0-guide.pdf](docs/tierlm-0.3.0-guide.pdf)**: the full guide with diagrams and test results
+- **[docs/tierlm-0.4.0-guide.pdf](docs/tierlm-0.4.0-guide.pdf)**: the full guide with diagrams and test results
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): download, run, and use tierlm (no programming needed)
 - [docs/FAQ.md](docs/FAQ.md): questions and troubleshooting
 - [docs/BUILD.md](docs/BUILD.md): building on Windows and Linux, GPU backends, making a release
@@ -236,7 +293,10 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [ ] Routing statistics and a hot-expert cache that promotes busy experts to VRAM
 - [x] OpenAI-compatible API, with an Allow other devices switch and optional API key
 - [ ] Tool (function) calling in the API, for coding agents (Cursor agent mode, Cline, Continue agent)
-- [ ] NVIDIA (CUDA) testing on an RTX 5090; AMD testing via Vulkan/ROCm
+- [x] NVIDIA (CUDA) testing on an RTX 5090
+- [ ] AMD GPU testing via Vulkan/ROCm
+- [x] Several GPUs as VRAM tiers; auto-tuning of the speed settings; new chat layout with console, chats and benchmark
+- [ ] CPU and GPU working on the same layer at once (needs the hot-expert cache and changes to ggml's scheduler)
 - [x] Speculative decoding with the built-in MTP draft layer; 8-bit and 4-bit KV cache
 - [ ] Prompt-lookup drafting (free guesses for code and edits); activation sparsity for dense models
 

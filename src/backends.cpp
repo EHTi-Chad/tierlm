@@ -57,16 +57,24 @@ std::string cpu_features() {
     return out;
 }
 
-bool add_rpc_server(const char* endpoint) {
+bool add_rpc_server(const char* endpoints) {
     load_backends();
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
     if (!reg) return false;
     using add_fn = ggml_backend_reg_t (*)(const char*);
     auto fn = (add_fn)ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
     if (!fn) return false;
-    ggml_backend_reg_t r = fn(endpoint);
-    if (!r) return false;
-    ggml_backend_register(r);
+    const std::string all = endpoints;                     // host:port[,host:port...]: one stand-in GPU each
+    for (size_t q = 0; q < all.size(); ) {
+        size_t comma = all.find(',', q);
+        if (comma == std::string::npos) comma = all.size();
+        const std::string ep = all.substr(q, comma - q);
+        q = comma + 1;
+        if (ep.empty()) continue;
+        ggml_backend_reg_t r = fn(ep.c_str());
+        if (!r) return false;
+        ggml_backend_register(r);
+    }
     return true;
 }
 

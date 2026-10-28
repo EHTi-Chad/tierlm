@@ -27,15 +27,18 @@ public:
     // Like Model::eval for a whole conversation: toks is the full token list, of which the first m.n_past() are
     // already in the model's cache (the caller truncates the cache to the part that still matches). Evaluates the
     // rest, keeping the hidden states the draft block needs, and brings the draft block up to date.
-    // Returns the prediction after the last token.
-    std::vector<float> prompt(const std::vector<int32_t>& toks, int n_threads);
+    // Returns the prediction after the last token. `routing` (MoE models) receives the experts the router picked
+    // for every token evaluated, as Model::eval gives them.
+    std::vector<float> prompt(const std::vector<int32_t>& toks, int n_threads, std::vector<int32_t>* routing = nullptr);
 
     // One step after token x, which was just chosen and is not yet in the cache. sample(row, accepted) picks the
     // model's token from a row of logits, given the tokens accepted so far in this step (after x). stop(t) is true
     // for a token that ends the reply. Returns the tokens that follow x: the accepted guesses plus one more. Like x,
-    // the last one is not yet in the cache.
+    // the last one is not yet in the cache. `routing` (MoE models) receives the experts picked for the tokens that
+    // were kept (x and the accepted guesses), n_kept x n_layer x n_expert_used ids.
     using Sampler = std::function<int32_t(const float* logits, const std::vector<int32_t>& accepted)>;
-    std::vector<int32_t> step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop);
+    std::vector<int32_t> step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop,
+                              std::vector<int32_t>* routing = nullptr);
 
     // Testing: guesses come from this function instead of the draft block (pos = position of x).
     using DraftSource = std::function<std::vector<int32_t>(int pos, int32_t x, int n)>;

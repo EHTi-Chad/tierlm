@@ -13,7 +13,7 @@
 //   POST /api/pick-folder  opens a folder picker on this computer (Windows; local requests only)
 //   POST /api/load     {"model": "sub/file.gguf", "device": "auto|cpu|<device>", "ctx": 4096, "threads": 4,
 //                       "flash_attn": true, "kv_type": "f16|q8_0|q4_0|f32", "batch": 256, "experts_used": 0, "seed": -1,
-//                       "vram_limit_mb": 0, "split_mode": "layers|experts"}
+//                       "vram_limit_mb": 0, "split_mode": "auto|layers|experts"}
 //   POST /api/unload   frees the model
 //   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "top_k":40,
 //                     "min_p":0.05, "repeat_penalty":1.1, "repeat_last_n":64, "max_tokens":-1}
@@ -56,9 +56,14 @@
 #include <vector>
 
 #include "backends.h"
+#include <deque>
 #ifdef _WIN32
 #include <windows.h>
 #include <shobjidl.h>
+#include <io.h>
+#include <fcntl.h>
+#else
+#include <unistd.h>
 #endif
 
 #ifndef TIERLM_VERSION
@@ -337,7 +342,7 @@ std::string pick_folder_windows(const std::string& start, bool& cancelled) {
 // The loaded model and everything that belongs to it.
 struct Engine {
     std::unique_ptr<Speculator> spec;   // speculative decoding with the model's MTP draft block, when turned on
-    int draft_max = 3;                  // most tokens the draft block guesses per check
+    int draft_max = 0;                  // most tokens the draft block guesses per check (0: 2 for MoE models, 3 for dense)
     std::unique_ptr<Model> model;
     Tokenizer tok;
     ChatFmt chat = ChatFmt::Plain;
@@ -507,9 +512,65 @@ std::string lan_address() {
     return ip;
 }
 
+// Everything tierlm and ggml print (the black window's text) is also kept for the page's console: stderr is
+// redirected into a pipe, and a thread copies each line to the real stderr and into a ring of recent lines.
+struct LogRing {
+    std::mutex mu;
+    std::deque<std::pair<long long, std::string>> lines;   // (line number, text)
+    long long next = 0;
+    void add(std::string t) {
+        while (!t.empty() && (t.back() == '\r' || t.back() == '\n')) t.pop_back();
+        std::lock_guard<std::mutex> lk(mu);
+        lines.emplace_back(next++, std::move(t));
+        while (lines.size() > 3000) lines.pop_front();
+    }
+};
+LogRing g_log;
+
+void capture_stderr() {
+    int fds[2];
+    std::fflush(stderr);
+#ifdef _WIN32
+    if (_pipe(fds, 1 << 16, _O_BINARY) != 0) return;
+    const int orig = _dup(2);
+    if (orig < 0 || _dup2(fds[1], 2) != 0) return;
+    // Engines loaded later (the ggml DLLs, each with its own C runtime) pick up the pipe as their stderr too.
+    SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(fds[1]));
+    auto rd = [](int fd, char* b, unsigned n) { return _read(fd, b, n); };
+    auto wr = [](int fd, const char* b, unsigned n) { return _write(fd, b, n); };
+#else
+    if (pipe(fds) != 0) return;
+    const int orig = dup(2);
+    if (orig < 0 || dup2(fds[1], 2) < 0) return;
+    auto rd = [](int fd, char* b, unsigned n) { return (int)read(fd, b, n); };
+    auto wr = [](int fd, const char* b, unsigned n) { return (int)write(fd, b, n); };
+#endif
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::thread([fd = fds[0], orig, rd, wr] {
+        std::string part;
+        char buf[4096];
+        for (;;) {
+            const int n = rd(fd, buf, sizeof buf);
+            if (n <= 0) break;
+            wr(orig, buf, (unsigned)n);
+            part.append(buf, (size_t)n);
+            size_t p;
+            while ((p = part.find('\n')) != std::string::npos) { g_log.add(part.substr(0, p)); part.erase(0, p + 1); }
+        }
+    }).detach();
+}
+
+// Lines from ggml and the GPU drivers, shown in the console's Verbose view only.
+bool verbose_line(const std::string& t) {
+    static const char* pre[] = {"ggml_", "load_backend", "register_", "ggml-", "  Device", "found ", "Device ", "repack", "vk", "llama_"};
+    for (const char* p : pre) if (t.compare(0, std::strlen(p), p) == 0) return true;
+    return false;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    capture_stderr();
     Args a;
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
@@ -536,7 +597,9 @@ int main(int argc, char** argv) {
     if (const char* ep = std::getenv("TIERLM_RPC")) add_rpc_server(ep);
     Engine eng;
     eng.threads = a.threads;
-    std::mutex mu;                       // one load or generation at a time
+    std::timed_mutex mu;                 // one load or generation at a time (a new request waits up to 3 s for the last one to finish)
+    std::atomic<bool> loading{false};    // a model is being loaded (for the page's progress bar)
+    std::atomic<float> load_progress{0.0f};
 
     // The models folder: --models if given, else the one saved last time, else "models".
     json settings = read_settings(a.settings);
@@ -556,7 +619,15 @@ int main(int argc, char** argv) {
         eng.cached.clear();
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
-        eng.model = Model::load(path, opt);
+        LoadOptions o = opt;
+        o.progress = [&](float f) { load_progress = f; };
+        load_progress = 0.0f;
+        loading = true;
+        struct Done { std::atomic<bool>& b; ~Done() { b = false; } } done{loading};
+        eng.model = Model::load(path, o);
+        // Each guess an MoE model checks pulls in its own experts, so shorter guesses pay off there
+        // (Qwen3.6-35B-A3B: 22.3 tok/s with 2, 18.7 with 3); dense models do best with 3.
+        if (eng.draft_max <= 0) eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
         if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max);
         eng.chat = detect_chat(eng.tok);
         eng.path = path;
@@ -578,7 +649,7 @@ int main(int argc, char** argv) {
         o.batch = body.value("batch", 0);
         o.experts_used = body.value("experts_used", 0);
         o.vram_budget_mb = body.value("vram_limit_mb", 0);
-        o.split_mode = body.value("split_mode", std::string("layers"));
+        o.split_mode = body.value("split_mode", std::string("auto"));
         o.mtp = body.value("speculative", false);      // load the MTP draft block for speculative decoding
         return o;
     };
@@ -603,7 +674,7 @@ int main(int argc, char** argv) {
     json last_info = {{"loaded", false}, {"version", TIERLM_VERSION}};
     svr.Get("/api/info", [&](const httplib::Request&, httplib::Response& res) {
         // While a reply is streaming or a model is loading, answer from the last snapshot instead of waiting.
-        std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
+        std::unique_lock<std::timed_mutex> lk(mu, std::try_to_lock);
         if (!lk.owns_lock()) { json j = last_info; j["busy"] = true; res.set_content(dump(j), "application/json"); return; }
         if (!eng.model) { last_info = {{"loaded", false}, {"version", TIERLM_VERSION}}; res.set_content(dump(last_info), "application/json"); return; }
         const auto& hp = eng.model->hparams();
@@ -625,7 +696,10 @@ int main(int argc, char** argv) {
             {"kv_on_gpu", eng.model->placement().kv_on_gpu}, {"attn_gpu", eng.model->placement().attn_gpu},
             {"ffn_gpu", eng.model->placement().ffn_gpu}, {"kv_gpu_layers", eng.model->placement().kv_gpu_layers},
             {"split_mode", eng.model->placement().mode},
+            {"gpus", [&] { json g = json::array(); for (const auto& x : eng.model->placement().gpus)
+                               g.push_back({{"name", x.name}, {"weights", x.weights}, {"kv", x.kv}, {"layers", x.layers}}); return g; }()},
             {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"has_draft_block", hp.n_nextn > 0},
+            {"mtp_loaded", eng.model->has_mtp()}, {"ffn_vram", eng.model->placement().ffn_vram},
             {"version", TIERLM_VERSION},
         };
         last_info = j;
@@ -721,7 +795,7 @@ int main(int argc, char** argv) {
     svr.Post("/api/folder", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded()) { res.status = 400; res.set_content(dump({{"error", "bad request"}}), "application/json"); return; }
-        std::lock_guard<std::mutex> lk(mu);
+        std::lock_guard<std::timed_mutex> lk(mu);
         if (body.contains("recursive")) recursive = body.value("recursive", true);
         if (body.contains("folder")) {
             std::string f = body.value("folder", std::string());
@@ -759,6 +833,17 @@ int main(int argc, char** argv) {
 #endif
     });
 
+    // A model id from the page or the API, as a file inside the models folder (empty if it isn't one: only files
+    // inside the models folder can be loaded).
+    auto model_file = [&](const std::string& id) -> std::filesystem::path {
+        std::error_code ec;
+        const auto base = std::filesystem::weakly_canonical(std::filesystem::u8path(a.models), ec);
+        const auto file = std::filesystem::weakly_canonical(std::filesystem::u8path(a.models) / std::filesystem::u8path(id), ec);
+        auto rel = file.lexically_relative(base);
+        if (ec || rel.empty() || rel.begin()->string() == ".." || !std::filesystem::is_regular_file(file, ec)) return {};
+        return file;
+    };
+
     svr.Post("/api/load", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("model")) {
@@ -766,25 +851,21 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"expected {\\\"model\\\": \\\"...\\\"}\"}", "application/json");
             return;
         }
-        if (!mu.try_lock()) {
+        if (!mu.try_lock_for(std::chrono::seconds(3))) {
             res.status = 409;
             res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
             return;
         }
-        std::lock_guard<std::mutex> lk(mu, std::adopt_lock);
-        // Only files inside the models folder can be loaded.
-        std::error_code ec;
-        const auto base = std::filesystem::weakly_canonical(std::filesystem::u8path(a.models), ec);
-        const auto file = std::filesystem::weakly_canonical(std::filesystem::u8path(a.models) / std::filesystem::u8path(body.value("model", std::string())), ec);
-        auto rel = file.lexically_relative(base);
-        if (ec || rel.empty() || rel.begin()->string() == ".." || !std::filesystem::is_regular_file(file, ec)) {
+        std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
+        const auto file = model_file(body.value("model", std::string()));
+        if (file.empty()) {
             res.status = 400;
             res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json");
             return;
         }
         try {
             const LoadOptions o = load_options(body);
-            eng.draft_max = std::max(1, std::min(8, body.value("draft_max", 3)));
+            eng.draft_max = std::min(8, std::max(0, body.value("draft_max", 0)));
             const int threads = body.value("threads", a.threads), seed = body.value("seed", -1);
             load(file.u8string(), o, threads, seed);
             // Remember these settings for this model, like LM Studio does.
@@ -805,7 +886,7 @@ int main(int argc, char** argv) {
     });
 
     svr.Post("/api/unload", [&](const httplib::Request&, httplib::Response& res) {
-        std::lock_guard<std::mutex> lk(mu);
+        std::lock_guard<std::timed_mutex> lk(mu);
         eng.spec.reset();
         eng.model.reset();
         eng.cached.clear();
@@ -814,7 +895,7 @@ int main(int argc, char** argv) {
     });
 
     svr.Post("/api/reset", [&](const httplib::Request&, httplib::Response& res) {
-        std::lock_guard<std::mutex> lk(mu);
+        std::lock_guard<std::timed_mutex> lk(mu);
         if (eng.model) eng.model->reset();
         eng.cached.clear();
         res.set_content("{\"ok\":true}", "application/json");
@@ -850,9 +931,11 @@ int main(int argc, char** argv) {
         std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;
         auto p0 = Clock::now();
         std::vector<float> lg;
-        if (eng.spec) { lg = eng.spec->prompt(toks, eng.threads); eng.spec->reset_stats(); }   // also feeds the draft block
+        if (eng.spec) { lg = eng.spec->prompt(toks, eng.threads, &routing); eng.spec->reset_stats(); }   // also feeds the draft block
         else lg = model->eval(suffix, eng.threads, &routing);
         r.prompt_s = since(p0);
+        std::fprintf(stderr, "chat: %zu prompt tokens, %zu reused from the cache, %zu read at %.0f tok/s\n", toks.size(), (size_t)common,
+                     toks.size() - common, (toks.size() - common) / std::max(r.prompt_s, 1e-9));
         r.n_prompt = toks.size();
         r.reused = common;
         cached = toks;
@@ -913,7 +996,12 @@ int main(int argc, char** argv) {
             }
         } else {
             // Speculative decoding: each check yields one or more tokens, all chosen by the model itself.
-            routing.clear();
+            std::vector<int32_t> kept;                                    // experts picked for x and the accepted guesses
+            const size_t per_tok = (size_t)L * std::max(K, 0);
+            auto routing_of = [&](size_t j) {                             // the dashboard shows one token's picks at a time
+                if (per_tok == 0 || kept.size() < (j + 1) * per_tok) routing.clear();
+                else routing.assign(kept.begin() + j * per_tok, kept.begin() + (j + 1) * per_tok);
+            };
             int32_t cur = -1;                                             // the token being checked
             auto pick = [&](const float* row, const std::vector<int32_t>& acc) {
                 std::vector<int32_t> extra;
@@ -927,13 +1015,15 @@ int main(int argc, char** argv) {
                 if (is_end(x)) { r.stop = "end"; break; }
                 if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
                 cur = x;
-                const std::vector<int32_t> prod = eng.spec->step(x, eng.threads, pick, is_end);
+                const std::vector<int32_t> prod = eng.spec->step(x, eng.threads, pick, is_end, K > 0 ? &kept : nullptr);
                 cur = -1;
                 cached.push_back(x);                                      // x and the accepted guesses are now cached
                 cached.insert(cached.end(), prod.begin(), prod.end() - 1);
+                routing_of(0);
                 bool go = add(x);
                 for (size_t j = 0; go && j + 1 < prod.size(); ++j) {
                     if ((int)out.size() >= max_tokens) { r.stop = "length"; go = false; break; }
+                    routing_of(j + 1);
                     go = add(prod[j]);
                 }
                 if (!go) break;
@@ -945,6 +1035,11 @@ int main(int argc, char** argv) {
         if (r.stop != "stop" && r.stop != "abort") emit(visible, visible.size());   // release held-back text
         r.n_gen = out.size();
         r.gen_s = since(g0);
+        if (r.checks > 0)
+            std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s); speculative: %.1f tokens per check, %zu of %zu guesses kept\n", r.n_gen,
+                         r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str(), (double)r.n_gen / r.checks, r.accepted, r.drafted);
+        else
+            std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s)\n", r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str());
         return r;
     };
 
@@ -955,7 +1050,7 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"expected {\\\"messages\\\": [...]}\"}", "application/json");
             return;
         }
-        if (!mu.try_lock()) {
+        if (!mu.try_lock_for(std::chrono::seconds(3))) {
             res.status = 409;
             res.set_content("{\"error\":\"busy: a reply is being generated or a model is loading\"}", "application/json");
             return;
@@ -966,7 +1061,7 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"no model loaded: choose one on the setup screen\"}", "application/json");
             return;
         }
-        auto lock = std::make_shared<std::unique_lock<std::mutex>>(mu, std::adopt_lock);   // released when the stream ends
+        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>(mu, std::adopt_lock);   // released when the stream ends
         res.set_header("Cache-Control", "no-cache");
 
         res.set_chunked_content_provider("text/event-stream", [&, body, lock](size_t, httplib::DataSink& sink) {
@@ -1004,6 +1099,304 @@ int main(int argc, char** argv) {
         });
     });
 
+
+    // ---------------- Speed measurement (auto-tune and benchmark) ----------------
+    // The text every measurement generates after; long enough to be a realistic prompt.
+    const std::string text =
+        "Explain, step by step, how a computer's memory hierarchy works: registers, caches, main memory and "
+        "storage. For each level, describe how fast and how big it typically is, why the trade-off exists, "
+        "and give an everyday analogy. Then explain why programs that reuse nearby data run faster.";
+    auto is_end = [&](int32_t t) { return t == eng.tok.eos() || t == eng.tok.eot() || eng.tok.is_control(t); };
+    auto best_token = [&](const float* row) {
+        int32_t b = -1;
+        for (int32_t i = 0; i < eng.model->hparams().n_vocab; ++i)
+            if (!is_end(i) && (b < 0 || row[i] > row[b])) b = i;
+        return b;
+    };
+    // Generation speed (tokens/second) with the loaded model: n tokens after the prompt, timed after a
+    // short warm-up. draft = 0: no speculation; otherwise guesses per check.
+    const int warm = 4;
+    auto measure = [&](int n, int draft) -> double {
+        eng.model->reset();
+        eng.cached.clear();
+        const std::vector<int32_t> toks = eng.tok.encode(text);
+        n = std::max(4, std::min(n, eng.model->max_ctx() - (int)toks.size() - warm - draft - 8));
+        std::vector<float> lg;
+        std::unique_ptr<Speculator> sp;
+        if (draft > 0) { sp = std::make_unique<Speculator>(*eng.model, draft); lg = sp->prompt(toks, eng.threads); }
+        else lg = eng.model->eval(toks, eng.threads);
+        int32_t x = best_token(lg.data());
+        auto greedy = [&](const float* row, const std::vector<int32_t>&) { return best_token(row); };
+        int made = 0, from = -1;
+        Clock::time_point tw;
+        for (;;) {
+            if (from < 0 && made >= warm) { from = made; tw = Clock::now(); }
+            if (from >= 0 && made - from >= n) break;
+            if (sp) {
+                const std::vector<int32_t> prod = sp->step(x, eng.threads, greedy, [](int32_t) { return false; });
+                made += (int)prod.size();
+                x = prod.back();
+            } else {
+                lg = eng.model->eval({x}, eng.threads);
+                x = best_token(lg.data());
+                ++made;
+            }
+        }
+        const double tps = (made - from) / std::max(since(tw), 1e-9);
+        eng.model->reset();
+        eng.cached.clear();
+        return tps;
+    };
+    // Prompt reading speed (tokens/second): about n tokens of text read in one go, as a long prompt would be.
+    auto measure_prompt = [&](int n) -> double {
+        eng.model->reset();
+        eng.cached.clear();
+        std::vector<int32_t> toks;
+        const std::vector<int32_t> one = eng.tok.encode(text + " ");
+        n = std::min(n, eng.model->max_ctx() - 8);
+        while ((int)toks.size() < n) toks.insert(toks.end(), one.begin(), one.end());
+        toks.resize(n);
+        const auto t = Clock::now();
+        eng.model->eval(toks, eng.threads);
+        const double tps = n / std::max(since(t), 1e-9);
+        eng.model->reset();
+        return tps;
+    };
+
+    // ---------------- Auto-tune ----------------
+    // Finds the fastest settings for a model on this PC by measuring them: how to split it when it doesn't fit in
+    // VRAM, how many CPU threads to use, and whether (and how far ahead) to guess with speculative decoding. The
+    // settings that change the answers (context, context memory precision, sampling) are left as the body gives
+    // them. Streams {"type":"status"|"result"|"done"|"error"} events; the winner is saved for the model and stays
+    // loaded.
+    //
+    // Each measurement generates a fixed text greedily (end-of-reply tokens skipped, so every run is the same
+    // length) after a warm-up, and times only the generation. Searched one setting at a time, in the order that
+    // matters most: split mode (a reload each), then threads, then guesses per check.
+    svr.Post("/api/autotune", [&](const httplib::Request& req, httplib::Response& res) {
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("model")) {
+            res.status = 400;
+            res.set_content("{\"error\":\"expected {\\\"model\\\": \\\"...\\\"}\"}", "application/json");
+            return;
+        }
+        const auto file = model_file(body.value("model", std::string()));
+        if (file.empty()) {
+            res.status = 400;
+            res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json");
+            return;
+        }
+        if (!mu.try_lock_for(std::chrono::seconds(3))) {
+            res.status = 409;
+            res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
+            return;
+        }
+        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>(mu, std::adopt_lock);
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream", [&, body, file, lock](size_t, httplib::DataSink& sink) {
+            bool alive = true;
+            auto send = [&](const json& j) {
+                std::string s = "data: " + dump(j) + "\n\n";
+                if (alive && !sink.write(s.data(), s.size())) alive = false;
+                return alive;
+            };
+            auto status = [&](const std::string& t) { std::fprintf(stderr, "autotune: %s\n", t.c_str()); return send({{"type", "status"}, {"text", t}}); };
+            try {
+                const json info = describe_model(file.u8string());
+                if (!info.value("supported", false)) throw std::runtime_error(info.value("reason", std::string("unsupported model")));
+                const bool has_mtp = info.value("mtp", false);
+                const int hw = std::max(1, (int)std::thread::hardware_concurrency());
+                const int t0 = std::max(1, body.value("threads", a.threads));
+                const int seed = body.value("seed", -1);
+                LoadOptions base = load_options(body);
+                base.mtp = has_mtp;                          // the draft layer stays loaded so guesses can be tried
+
+                json results = json::array();
+                auto record = [&](const std::string& label, json setting, double tps) {
+                    setting["label"] = label;
+                    setting["tps"] = std::round(tps * 10) / 10;
+                    results.push_back(setting);
+                    std::fprintf(stderr, "autotune: %s: %.1f tok/s\n", label.c_str(), tps);
+                    return send({{"type", "result"}, {"label", label}, {"tps", setting["tps"]}});
+                };
+                int n_gen = 32;                               // set from the first measurement: about 5 s per run
+                auto size_runs = [&](double tps) { n_gen = std::max(12, std::min(96, (int)std::lround(tps * 5))); };
+
+                // ---- 1. split mode (when the model doesn't fit in VRAM) ----
+                std::string mode = "auto";
+                std::string loaded_mode;
+                auto load_mode = [&](const std::string& m) {
+                    LoadOptions o = base;
+                    o.split_mode = m;
+                    eng.draft_max = 0;
+                    load(file.u8string(), o, t0, seed);
+                    loaded_mode = m;
+                };
+                const char* mode_label[] = {"whole layers", "experts in RAM"};
+                if (!status("Loading the model")) throw std::runtime_error("cancelled");
+                load_mode("layers");
+                const Placement& pl = eng.model->placement();
+                const bool split = eng.model->on_gpu() && pl.split();
+                const bool cpu_work = split || !eng.model->on_gpu();
+                {
+                    double t = measure(8, 0);                // a first, short run to size the others
+                    size_runs(t);
+                }
+                double best = 0;
+                if (split) {
+                    const std::string modes[] = {"layers", "experts"};
+                    for (int i = 0; i < 2; ++i) {
+                        if (loaded_mode != modes[i]) {
+                            if (!status(std::string("Loading with ") + mode_label[i])) throw std::runtime_error("cancelled");
+                            load_mode(modes[i]);
+                        }
+                        if (!status(std::string("Measuring ") + mode_label[i])) throw std::runtime_error("cancelled");
+                        const double t = measure(n_gen, 0);
+                        if (!record(std::string("Split: ") + mode_label[i], {{"split_mode", modes[i]}}, t)) throw std::runtime_error("cancelled");
+                        if (t > best) { best = t; mode = modes[i]; }
+                    }
+                    if (loaded_mode != mode) {
+                        if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
+                        load_mode(mode);
+                    }
+                    size_runs(best);
+                } else {
+                    if (!status("Measuring")) throw std::runtime_error("cancelled");
+                    best = measure(n_gen, 0);
+                    record(std::string(eng.model->on_gpu() ? "All in VRAM" : "CPU only") + (cpu_work ? ", " + std::to_string(t0) + " CPU threads" : ""),
+                           json::object(), best);
+                    mode = "auto";
+                }
+
+                // ---- 2. CPU threads (when the CPU does part of the work) ----
+                int threads = t0;
+                if (cpu_work) {
+                    std::vector<int> cands = {t0, std::max(1, t0 * 3 / 4), std::min(hw, (t0 * 3 + 1) / 2)};
+                    std::sort(cands.begin(), cands.end());
+                    cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
+                    for (int c : cands) {
+                        if (c == t0) continue;               // measured above
+                        eng.threads = c;
+                        if (!status("Measuring " + std::to_string(c) + " CPU threads")) throw std::runtime_error("cancelled");
+                        const double t = measure(n_gen, 0);
+                        if (!record(std::to_string(c) + " CPU threads", {{"threads", c}}, t)) throw std::runtime_error("cancelled");
+                        if (t > best * 1.02) { best = t; threads = c; }   // a clear win only: the default is a safe choice
+                    }
+                    eng.threads = threads;
+                }
+
+                // ---- 3. speculative decoding (when the model has a draft layer) ----
+                int draft = 0;
+                if (has_mtp && eng.model->has_mtp()) {
+                    const double plain = best;
+                    for (int d = 1; d <= 4; ++d) {
+                        if (!status("Measuring speculative decoding, " + std::to_string(d) + (d == 1 ? " guess" : " guesses") + " per check"))
+                            throw std::runtime_error("cancelled");
+                        const double t = measure(n_gen, d);
+                        if (!record("Speculative decoding, " + std::to_string(d) + (d == 1 ? " guess" : " guesses"), {{"draft_max", d}}, t))
+                            throw std::runtime_error("cancelled");
+                        if (t > best) { best = t; draft = d; }
+                    }
+                    if (draft > 0 && best < plain * 1.03) draft = 0;    // not worth it for a sliver
+                    if (draft == 0) best = plain;
+                }
+
+                // ---- the winner: keep it loaded and remember it ----
+                eng.draft_max = draft > 0 ? draft : 0;
+                eng.spec.reset();
+                if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft);
+                else eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
+                eng.model->reset();
+                eng.cached.clear();
+                const std::string id = body.value("model", std::string());
+                json saved = body;
+                saved.erase("model");
+                saved["split_mode"] = split ? mode : body.value("split_mode", std::string("auto"));
+                saved["threads"] = threads;
+                saved["speculative"] = draft > 0;
+                if (draft > 0) saved["draft_max"] = draft;
+                saved["settings_v"] = 2;
+                saved["tuned"] = {{"tps", std::round(best * 10) / 10}, {"results", results}};
+                settings["models"][id] = saved;
+                settings["last_model"] = id;
+                write_settings(a.settings, settings);
+                send({{"type", "done"}, {"tps", std::round(best * 10) / 10}, {"settings", saved}, {"results", results}});
+            } catch (const std::exception& e) {
+                send({{"type", "error"}, {"message", e.what()}});
+            }
+            sink.done();
+            return true;
+        });
+    });
+
+
+    // ---------------- Benchmark: the loaded model's speed with its current settings ----------------
+    svr.Post("/api/bench", [&](const httplib::Request&, httplib::Response& res) {
+        if (!mu.try_lock_for(std::chrono::seconds(3))) {
+            res.status = 409;
+            res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
+            return;
+        }
+        std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
+        if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
+        try {
+            std::fprintf(stderr, "benchmark: reading 512 tokens, then generating 64\n");
+            const double p = measure_prompt(512);
+            const int draft = eng.spec ? eng.draft_max : 0;
+            measure(4, draft);                                  // warm-up
+            const double g = measure(64, draft);
+            eng.model->reset();
+            eng.cached.clear();
+            std::fprintf(stderr, "benchmark: prompt %.1f tok/s, generation %.1f tok/s\n", p, g);
+            res.set_content(dump({{"prompt_tps", std::round(p * 10) / 10}, {"gen_tps", std::round(g * 10) / 10},
+                                  {"speculative", draft > 0}, {"draft_max", draft}, {"threads", eng.threads}}), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(dump({{"error", e.what()}}), "application/json");
+        }
+    });
+
+    // ---------------- Speculative decoding on/off without reloading (when the draft layer is loaded) ----------------
+    svr.Post("/api/spec", [&](const httplib::Request& req, httplib::Response& res) {
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) { res.status = 400; res.set_content("{\"error\":\"bad request\"}", "application/json"); return; }
+        if (!mu.try_lock_for(std::chrono::seconds(3))) { res.status = 409; res.set_content("{\"error\":\"busy\"}", "application/json"); return; }
+        std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
+        if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
+        const bool on = body.value("speculative", eng.spec != nullptr);
+        const int d = std::min(8, std::max(1, body.value("draft_max", eng.draft_max > 0 ? eng.draft_max : 2)));
+        if (on && !eng.model->has_mtp()) {
+            res.status = 409;
+            res.set_content(dump({{"error", "this model was loaded without its draft layer: turn on Speculative decoding on the setup screen and load it again"}}), "application/json");
+            return;
+        }
+        eng.draft_max = d;
+        eng.spec.reset();
+        if (on) eng.spec = std::make_unique<Speculator>(*eng.model, d);
+        eng.cached.clear();                                     // the draft block's cache starts over with the next reply
+        eng.model->reset();
+        std::fprintf(stderr, "speculative decoding %s%s\n", on ? "on, " : "off", on ? (std::to_string(d) + (d == 1 ? " guess per check" : " guesses per check")).c_str() : "");
+        res.set_content(dump({{"ok", true}, {"speculative", on}, {"draft_max", d}}), "application/json");
+    });
+
+    // ---------------- Loading progress and the console (no lock: they answer while a model loads) ----------------
+    svr.Get("/api/progress", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_content(dump({{"loading", loading.load()}, {"progress", load_progress.load()}}), "application/json");
+    });
+    svr.Get("/api/log", [&](const httplib::Request& req, httplib::Response& res) {
+        long long after = -1;
+        if (req.has_param("after")) after = std::atoll(req.get_param_value("after").c_str());
+        json lines = json::array();
+        long long next = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_log.mu);
+            next = g_log.next;
+            for (const auto& [n, t] : g_log.lines)
+                if (n > after) lines.push_back({{"n", n}, {"text", t}, {"v", verbose_line(t)}});
+        }
+        res.set_content(dump({{"lines", lines}, {"next", next}}), "application/json");
+    });
+
     // ---------------- OpenAI-compatible API ----------------
     const long long started = (long long)std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1020,7 +1413,7 @@ int main(int argc, char** argv) {
         json data = json::array();
         std::string cur;
         {
-            std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
+            std::unique_lock<std::timed_mutex> lk(mu, std::try_to_lock);
             cur = lk.owns_lock() ? loaded_id() : last_info.value("path", std::string());
             if (!lk.owns_lock() && !cur.empty()) cur = fs::u8path(cur).filename().u8string();
         }
@@ -1039,7 +1432,7 @@ int main(int argc, char** argv) {
             return oai_error(res, 400, "expected a JSON body with a \"messages\" array");
         if (body.value("n", 1) != 1) return oai_error(res, 400, "only n = 1 is supported");
         // Wait for any reply (from the web page or another app) to finish: one at a time.
-        auto lock = std::make_shared<std::unique_lock<std::mutex>>(mu);
+        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>(mu);
         // The model asked for: the loaded one if the name matches it, or is unknown (many apps send a fixed
         // name such as "gpt-4o"); a different model in the models folder is loaded first, with its saved settings.
         const std::string want = body.value("model", std::string());
@@ -1053,7 +1446,7 @@ int main(int argc, char** argv) {
             if (in_folder) {
                 try {
                     json saved = settings.value("models", json::object()).value(rel.generic_u8string(), json::object());
-                    eng.draft_max = std::max(1, std::min(8, saved.value("draft_max", 3)));
+                    eng.draft_max = std::min(8, std::max(0, saved.value("draft_max", 0)));
                     load(file.u8string(), load_options(saved), saved.value("threads", a.threads), saved.value("seed", -1));
                     settings["last_model"] = rel.generic_u8string();
                     write_settings(a.settings, settings);

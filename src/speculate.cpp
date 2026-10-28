@@ -7,7 +7,8 @@ namespace tierlm {
 
 Speculator::Speculator(Model& m, int n_draft, float p_min) : m_(m), n_draft_(std::max(0, n_draft)), p_min_(p_min) {}
 
-std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_threads) {
+std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_threads, std::vector<int32_t>* routing) {
+    if (routing) routing->clear();
     const int E = m_.hparams().n_embd, end = (int)toks.size();
     if (end == 0) return {};
     const int n0 = m_.n_past();                       // tokens [0, n0) are in the cache and unchanged
@@ -22,7 +23,9 @@ std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_th
     std::vector<float> H, lg;                         // hidden states of positions [s, end)
     for (int off = s; off < end; off += m_.batch()) {
         const int k = std::min(m_.batch(), end - off);
-        Model::EvalOut r = m_.eval_ex(toks.data() + off, k, n_threads, 1, true, 1);
+        std::vector<int32_t> part;
+        Model::EvalOut r = m_.eval_ex(toks.data() + off, k, n_threads, 1, true, 1, routing ? &part : nullptr);
+        if (routing) routing->insert(routing->end(), part.begin(), part.end());
         H.insert(H.end(), r.hidden.begin(), r.hidden.end());
         lg = std::move(r.logits);
     }
@@ -49,7 +52,8 @@ std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_th
     return lg;
 }
 
-std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop) {
+std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop,
+                                      std::vector<int32_t>* routing) {
     const int P = m_.n_past(), E = m_.hparams().n_embd, V = m_.hparams().n_vocab;
     const int room = m_.max_ctx() - P - 1;            // positions left after x
     const int n_max = std::max(0, std::min(n_draft_, room));
@@ -81,7 +85,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     // ---- 2. check all guesses in one pass ----
     std::vector<int32_t> batch(1, x);
     batch.insert(batch.end(), drafts.begin(), drafts.end());
-    Model::EvalOut out = m_.eval_ex(batch.data(), k + 1, n_threads, k + 1, true, k > 0 ? k + 1 : 1);
+    Model::EvalOut out = m_.eval_ex(batch.data(), k + 1, n_threads, k + 1, true, k > 0 ? k + 1 : 1, routing);
 
     // ---- 3. keep the guesses the model agrees with, plus the model's own next token ----
     std::vector<int32_t> produced, accepted;
@@ -93,6 +97,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     }
     const int m = (int)accepted.size();
     m_.accept(1 + m);                                 // x and the m accepted guesses stay; the rest are undone
+    if (routing && !routing->empty()) routing->resize(routing->size() / (size_t)(k + 1) * (size_t)(1 + m));
 
     // ---- 4. bring the draft block up to date with what was kept ----
     if (m_.has_mtp()) {

@@ -20,7 +20,8 @@ void set_n_threads(ggml_backend* backend, int n_threads);   // for engines that 
 // The CPU engine in use and the instruction sets it uses, e.g. "AVX2 FMA F16C" or "AVX512 AVX512_VNNI ...".
 std::string cpu_features();
 
-// Testing: adds a tierlm-rpc-server at host:port as a device (a stand-in GPU). False if RPC isn't built.
-bool add_rpc_server(const char* endpoint);
+// Testing: adds a tierlm-rpc-server at host:port (or several, comma-separated) as devices (stand-in GPUs).
+// False if RPC isn't built.
+bool add_rpc_server(const char* endpoints);
 
 }

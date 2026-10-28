@@ -6,6 +6,7 @@
 #include "backends.h"
 #include "gguf.h"
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -34,7 +35,7 @@ Model::~Model() {
     for (auto* b : wbufs_) if (b) ggml_backend_buffer_free(b);
     if (kvctx_) ggml_free(kvctx_);
     if (wctx_) ggml_free(wctx_);
-    if (main_ && main_ != cpu_) ggml_backend_free(main_);
+    for (auto* b : gpus_) if (b && b != cpu_) ggml_backend_free(b);
     if (cpu_) ggml_backend_free(cpu_);
 }
 
@@ -112,7 +113,25 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             m->dev_ = dev;
             m->main_ = ggml_backend_dev_init(dev, nullptr);
             if (!m->main_) throw std::runtime_error(std::string("failed to start ") + ggml_backend_dev_name(dev));
+            m->gpus_.push_back(m->main_);
             m->device_name_ = std::string(ggml_backend_dev_name(dev)) + " (" + ggml_backend_dev_description(dev) + ")";
+            // More GPUs of the same kind (the same engine: CUDA, Vulkan...) become further VRAM tiers. Only the
+            // same engine, so one card that shows up under both CUDA and Vulkan isn't counted twice.
+            if (opt.multi_gpu && (device == "auto" || device == "gpu")) {
+                auto family = [](ggml_backend_dev_t d) {
+                    ggml_backend_reg_t r = ggml_backend_dev_backend_reg(d);
+                    std::string n = r ? ggml_backend_reg_name(r) : "";
+                    return n.substr(0, n.find('['));             // RPC registries are named RPC[host:port]
+                };
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                    if (d == dev || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU || family(d) != family(dev)) continue;
+                    ggml_backend* b = ggml_backend_dev_init(d, nullptr);
+                    if (!b) { std::fprintf(stderr, "note: could not start %s; not using it\n", ggml_backend_dev_name(d)); continue; }
+                    m->gpus_.push_back(b);
+                    m->device_name_ += std::string(" + ") + ggml_backend_dev_name(d) + " (" + ggml_backend_dev_description(d) + ")";
+                }
+            }
         } else if (device == "gpu") {
             throw std::runtime_error("no GPU backend in this build (or no GPU found)");
         }
@@ -303,21 +322,39 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     size_t kv_need = 0;
     for (int il = 0; il < nl_all; ++il) kv_need += layer_mem(il);
     const bool tied = ggml_get_tensor(m->wctx_, "output.weight") == nullptr;
-    ggml_backend_buffer_type_t gpu_buft = m->main_ != m->cpu_ ? ggml_backend_get_default_buffer_type(m->main_) : nullptr;
+    const int G = (int)m->gpus_.size();                  // GPUs in use (0: CPU only)
+    ggml_backend_buffer_type_t gpu_buft = G ? ggml_backend_get_default_buffer_type(m->main_) : nullptr;
     ggml_backend_buffer_type_t cpu_buft = cpu_buffer_type();
-    size_t budget = 0;
-    if (gpu_buft) {
-        size_t free = 0, total = 0;
-        ggml_backend_dev_memory((ggml_backend_dev_t)m->dev_, &free, &total);
-        size_t avail = free;
-        if (opt.vram_budget_mb > 0) avail = std::min(avail, (size_t)opt.vram_budget_mb << 20);
-        const size_t reserve = (size_t)768 << 20;        // compute scratch memory and driver overhead
-        budget = avail > reserve ? avail - reserve : 0;
-        if (const char* b = std::getenv("TIERLM_VRAM_BYTES")) budget = (size_t)std::strtoull(b, nullptr, 10);   // tests only
+    std::vector<ggml_backend_buffer_type_t> bufts(G);
+    std::vector<size_t> budgets(G, 0);                     // VRAM each GPU can give to weights and the KV cache
+    {
+        std::vector<size_t> forced;                        // tests: TIERLM_VRAM_BYTES=n[,n...] per GPU
+        if (const char* e = std::getenv("TIERLM_VRAM_BYTES")) {
+            std::string v = e;
+            for (size_t q = 0; q <= v.size(); ) {
+                size_t comma = v.find(',', q);
+                if (comma == std::string::npos) comma = v.size();
+                forced.push_back((size_t)std::strtoull(v.substr(q, comma - q).c_str(), nullptr, 10));
+                q = comma + 1;
+            }
+        }
+        for (int d = 0; d < G; ++d) {
+            bufts[d] = ggml_backend_get_default_buffer_type(m->gpus_[d]);
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(m->gpus_[d]), &free, &total);
+            size_t avail = free;
+            if (opt.vram_budget_mb > 0) avail = std::min(avail, (size_t)opt.vram_budget_mb << 20);
+            const size_t reserve = (size_t)768 << 20;      // compute scratch memory and driver overhead
+            budgets[d] = avail > reserve ? avail - reserve : 0;
+            if (!forced.empty()) budgets[d] = forced[std::min((size_t)d, forced.size() - 1)];
+        }
     }
+    size_t budget = G ? budgets[0] : 0;
     struct Group { int prio, layer; std::vector<ggml_tensor*> t; size_t bytes = 0; };
     std::vector<Group> groups;
-    const bool by_layer = opt.split_mode != "experts";
+    // "auto": mixture-of-experts models keep attention (and DeltaNet) on the GPU with the experts in RAM, since
+    // the CPU then only reads the few experts each token picks; dense models move whole layers.
+    const bool by_layer = opt.split_mode == "auto" ? !hp.is_moe() : opt.split_mode != "experts";
     m->place_.mode = by_layer ? "layers" : "experts";
     auto find_group = [&](int prio, int layer) -> Group& {
         for (auto& gr : groups) if (gr.prio == prio && gr.layer == layer) return gr;
@@ -351,28 +388,74 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     });
     std::vector<ggml_tensor*> on_gpu, on_cpu;
     std::vector<bool> kv_gpu(nl_all, false);
-    bool kv_decided = false, layers_full = false;
-    for (const Group& gr : groups) {
-        if (!by_layer && gr.prio >= 3 && !kv_decided) {                  // the KV cache goes before the FFNs
-            const bool fit = gpu_buft && kv_need <= budget;
-            if (fit) budget -= kv_need;
-            std::fill(kv_gpu.begin(), kv_gpu.end(), fit);
-            kv_decided = true;
+    std::vector<std::vector<ggml_tensor*>> on_dev(G);       // per GPU
+    std::vector<int> ldev(nl_all, -1);                      // per layer: the GPU holding its KV cache, or -1
+    if (G <= 1) {
+        bool kv_decided = false, layers_full = false;
+        for (const Group& gr : groups) {
+            if (!by_layer && gr.prio >= 3 && !kv_decided) {                  // the KV cache goes before the FFNs
+                const bool fit = gpu_buft && kv_need <= budget;
+                if (fit) budget -= kv_need;
+                std::fill(kv_gpu.begin(), kv_gpu.end(), fit);
+                kv_decided = true;
+            }
+            size_t need = gr.bytes + (by_layer && gr.prio == 2 && gr.layer >= 0 && gr.layer < nl_all ? layer_mem(gr.layer) : 0);
+            bool gpu = gpu_buft && gr.prio < 9 && need <= budget && !(gr.prio == 2 && layers_full);
+            if (gr.prio == 2 && !gpu) layers_full = true;                    // keep the VRAM layers contiguous
+            if (gpu) budget -= need;
+            if (gpu && by_layer && gr.prio == 2 && gr.layer >= 0 && gr.layer < nl_all) kv_gpu[gr.layer] = true;
+            for (ggml_tensor* t : gr.t) (gpu ? on_gpu : on_cpu).push_back(t);
         }
-        size_t need = gr.bytes + (by_layer && gr.prio == 2 && gr.layer >= 0 && gr.layer < nl_all ? layer_mem(gr.layer) : 0);
-        bool gpu = gpu_buft && gr.prio < 9 && need <= budget && !(gr.prio == 2 && layers_full);
-        if (gr.prio == 2 && !gpu) layers_full = true;                    // keep the VRAM layers contiguous
-        if (gpu) budget -= need;
-        if (gpu && by_layer && gr.prio == 2 && gr.layer >= 0 && gr.layer < nl_all) kv_gpu[gr.layer] = true;
-        for (ggml_tensor* t : gr.t) (gpu ? on_gpu : on_cpu).push_back(t);
+        if (!by_layer && !kv_decided) {
+            const bool fit = gpu_buft && kv_need <= budget;
+            std::fill(kv_gpu.begin(), kv_gpu.end(), fit);
+        }
+        if (G == 1) { on_dev[0] = on_gpu; for (int i = 0; i < nl_all; ++i) ldev[i] = kv_gpu[i] ? 0 : -1; }
+    } else if (by_layer) {
+        // Several GPUs, whole layers: from the last layer backwards, fill the first GPU, then the next, then RAM.
+        // The output layer and the small global tensors go on the first GPU, next to the last layers.
+        int cur = 0;
+        for (const Group& gr : groups) {
+            const bool layer_group = gr.prio == 2 && gr.layer >= 0 && gr.layer < nl_all;
+            const size_t need = gr.bytes + (layer_group ? layer_mem(gr.layer) : 0);
+            int d = -1;
+            if (gr.prio == 2) { while (cur < G && need > budgets[cur]) ++cur; if (cur < G) d = cur; }   // contiguous
+            else if (gr.prio < 9) for (int k = 0; k < G && d < 0; ++k) if (need <= budgets[k]) d = k;
+            if (d >= 0) { budgets[d] -= need; for (ggml_tensor* t : gr.t) on_dev[d].push_back(t); if (layer_group) ldev[gr.layer] = d; }
+            else for (ggml_tensor* t : gr.t) on_cpu.push_back(t);
+        }
+    } else {
+        // Several GPUs, experts in RAM: each layer's attention, router and KV cache go on a GPU (from the last
+        // layer backwards, filling one GPU, then the next), then the experts: on their layer's GPU if it has room,
+        // else on another GPU, else in RAM.
+        std::vector<size_t> core(nl_all, 0);
+        for (const Group& gr : groups) if (gr.prio < 3 && gr.layer >= 0 && gr.layer < nl_all) core[gr.layer] += gr.bytes;
+        int cur = 0;
+        for (int il = nl_all - 1; il >= 0; --il) {
+            const size_t need = core[il] + layer_mem(il);
+            while (cur < G && need > budgets[cur]) ++cur;
+            if (cur == G) break;                                     // the remaining layers stay in RAM
+            ldev[il] = cur;
+            budgets[cur] -= need;
+        }
+        for (const Group& gr : groups) {
+            int d = -1;
+            if (gr.prio >= 9) d = -1;
+            else if (gr.prio < 3 && gr.layer >= 0 && gr.layer < nl_all) d = ldev[gr.layer];   // already counted
+            else {
+                const int pref = gr.layer >= 0 && gr.layer < nl_all ? ldev[gr.layer] : 0;
+                if (pref >= 0 && gr.bytes <= budgets[pref]) d = pref;
+                for (int k = 0; k < G && d < 0; ++k) if (gr.bytes <= budgets[k]) d = k;
+                if (d >= 0) budgets[d] -= gr.bytes;
+            }
+            for (ggml_tensor* t : gr.t) (d >= 0 ? on_dev[d] : on_cpu).push_back(t);
+        }
     }
-    if (!by_layer && !kv_decided) {
-        const bool fit = gpu_buft && kv_need <= budget;
-        std::fill(kv_gpu.begin(), kv_gpu.end(), fit);
-    }
+    if (G > 1) for (int i = 0; i < nl_all; ++i) kv_gpu[i] = ldev[i] >= 0;
     for (bool k : kv_gpu) m->place_.kv_gpu_layers += k;
     m->place_.kv_on_gpu = gpu_buft && m->place_.kv_gpu_layers == nl_all;
     m->layer_kv_gpu_ = kv_gpu;
+    m->layer_dev_ = ldev;
     auto alloc = [&](ggml_backend_buffer_type_t buft, std::vector<ggml_tensor*>& ts, uint64_t& bytes) {
         if (ts.empty()) return;
         ggml_backend_buffer* b = ggml_backend_buft_alloc_buffer_n(buft, ts.data(), (int)ts.size());
@@ -426,22 +509,31 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         }
     }
     try {
-        alloc(gpu_buft ? gpu_buft : cpu_buft, gpu_buft ? on_gpu : on_cpu, gpu_buft ? m->place_.gpu_weights : m->place_.cpu_weights);
-        if (gpu_buft) alloc(cpu_buft, on_cpu, m->place_.cpu_weights);
+        m->place_.gpus.resize(G);
+        for (int d = 0; d < G; ++d) {
+            m->place_.gpus[d].name = ggml_backend_dev_name(ggml_backend_get_device(m->gpus_[d]));
+            alloc(bufts[d], on_dev[d], m->place_.gpus[d].weights);
+            m->place_.gpu_weights += m->place_.gpus[d].weights;
+        }
+        alloc(cpu_buft, on_cpu, m->place_.cpu_weights);
         if (!on_repack.empty()) alloc(repack_buft, on_repack, m->place_.cpu_weights);
     } catch (...) { gguf_free(g); throw; }
     m->place_.repacked = (int)on_repack.size();
     m->weights_bytes_ = m->place_.gpu_weights + m->place_.cpu_weights;
     m->place_.layers = hp.n_layer;
-    if (gpu_buft) {
+    if (G) {
+        std::set<const ggml_tensor*> vram;
+        for (const auto& v : on_dev) vram.insert(v.begin(), v.end());
         for (int i = 0; i < hp.n_layer; ++i) {
             const std::string b = "blk." + std::to_string(i) + ".";
             auto in_vram = [&](const char* n) {
                 ggml_tensor* t = ggml_get_tensor(m->wctx_, (b + n).c_str());
-                return t && std::find(on_gpu.begin(), on_gpu.end(), t) != on_gpu.end();
+                return t && vram.count(t) > 0;
             };
             m->place_.attn_gpu += in_vram("attn_norm.weight");
-            m->place_.ffn_gpu += hp.n_expert > 0 ? (in_vram("ffn_down_exps.weight")) : in_vram("ffn_up.weight");
+            const bool f = hp.n_expert > 0 ? in_vram("ffn_down_exps.weight") : in_vram("ffn_up.weight");
+            m->place_.ffn_gpu += f;
+            m->place_.ffn_vram.push_back(f);
         }
     }
 
@@ -452,9 +544,16 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         if (!files.back()) { gguf_free(g); throw std::runtime_error("cannot open " + p); }
     }
     std::vector<char> chunk;
+    size_t total_bytes = 0, done_bytes = 0, next_report = 0;
+    for (const Source& s : sources) if (s.t->buffer) total_bytes += ggml_nbytes(s.t);
     for (const Source& s : sources) {
         if (!s.t->buffer) continue;                                    // not loaded (draft blocks)
         const size_t n = ggml_nbytes(s.t);
+        done_bytes += n;
+        if (opt.progress && (done_bytes >= next_report || done_bytes == total_bytes)) {
+            opt.progress(total_bytes ? (float)((double)done_bytes / total_bytes) : 1.0f);
+            next_report = done_bytes + total_bytes / 200;
+        }
         chunk.resize(n);
         auto& f = files[s.part];
         f.seekg((std::streamoff)s.offset);
@@ -554,10 +653,10 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     const ggml_type kv_type = (ggml_type)m->kv_t_;
     ggml_init_params kp{ (size_t)2 * nl_all * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     m->kvctx_ = ggml_init(kp);
-    std::vector<ggml_tensor*> kv_on_gpu_t, kv_on_cpu_t;
+    std::vector<std::vector<ggml_tensor*>> kv_t(G + 1);              // per GPU, then RAM
     for (int i = 0; i < nl_all; ++i) {
         auto& L = i < hp.n_layer ? m->layers_[i] : *m->mtp_;
-        auto& dst = (gpu_buft && m->layer_kv_gpu_[i]) ? kv_on_gpu_t : kv_on_cpu_t;
+        auto& dst = kv_t[m->layer_dev_[i] >= 0 ? m->layer_dev_[i] : G];
         if (L.recurrent) {                                            // DeltaNet: fixed-size state, always f32
             L.conv_state  = ggml_new_tensor_2d(m->kvctx_, GGML_TYPE_F32, hp.ssm_conv - 1, hp.ssm_conv_dim());
             L.ssm_state_t = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hp.ssm_state, hp.ssm_state, hp.ssm_v_heads);
@@ -570,28 +669,33 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         dst.push_back(L.k_cache);
         dst.push_back(L.v_cache);
     }
-    for (int tier = 0; tier < 2; ++tier) {
-        auto& ts = tier == 0 ? kv_on_gpu_t : kv_on_cpu_t;
+    for (int tier = 0; tier <= G; ++tier) {
+        auto& ts = kv_t[tier];
         if (ts.empty()) continue;
-        ggml_backend_buffer* b = ggml_backend_buft_alloc_buffer_n(tier == 0 ? gpu_buft : cpu_buft, ts.data(), (int)ts.size());
+        ggml_backend_buffer* b = ggml_backend_buft_alloc_buffer_n(tier < G ? bufts[tier] : cpu_buft, ts.data(), (int)ts.size());
         if (!b) throw std::runtime_error("not enough memory for the KV cache (try a smaller context)");
         ggml_backend_buffer_clear(b, 0);
         m->kv_bytes_ += ggml_backend_buffer_get_size(b);
+        if (tier < G) m->place_.gpus[tier].kv += ggml_backend_buffer_get_size(b);
         m->kvbufs_.push_back(b);
     }
+    for (int i = 0; i < hp.n_layer; ++i) if (m->layer_dev_[i] >= 0) m->place_.gpus[m->layer_dev_[i]].layers++;
 
     // Fused flash attention reads the cache once, with no copies. TIERLM_NO_FA=1 uses the plain version.
     m->flash_attn_ = opt.flash_attn >= 0 ? opt.flash_attn == 1 : std::getenv("TIERLM_NO_FA") == nullptr;
     if (ggml_is_quantized((ggml_type)m->kv_t_)) m->flash_attn_ = true;               // only flash attention reads a quantized cache
 
     // ---- scheduler: runs each op on the device, falling back to the CPU where needed ----
-    ggml_backend_t backends[2] = { m->main_, m->cpu_ };
-    const int n_backends = m->main_ == m->cpu_ ? 1 : 2;
+    std::vector<ggml_backend_t> backends(m->gpus_.begin(), m->gpus_.end());
+    backends.push_back(m->cpu_);
+    const int n_backends = (int)backends.size();
     // With weights split between VRAM and RAM, let the scheduler copy RAM weights to the GPU for big
     // batches (reading a long prompt), where that beats computing them on the CPU.
     const bool offload = m->main_ != m->cpu_ && (m->place_.cpu_weights > 0 || !m->place_.kv_on_gpu);
-    m->pin_layers_ = m->main_ != m->cpu_ && m->place_.mode == "layers" && m->place_.kv_gpu_layers < hp.n_layer;
-    m->sched_ = ggml_backend_sched_new(backends, nullptr, n_backends, kGraphSize, false, offload);
+    // Layer split: pin each layer's ops to its device (RAM layers to the CPU; with several GPUs, each layer to its
+    // GPU too, so ops without weights don't wander to another card).
+    m->pin_layers_ = m->main_ != m->cpu_ && m->place_.mode == "layers" && (m->place_.kv_gpu_layers < hp.n_layer || G > 1);
+    m->sched_ = ggml_backend_sched_new(backends.data(), nullptr, n_backends, kGraphSize, false, offload);
     if (!m->sched_) throw std::runtime_error("failed to create the scheduler");
     m->graph_mem_.resize(ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false));
 
@@ -622,9 +726,12 @@ void Model::pin_cpu_layers(const Graph& g) {
         }
     }
     if (!pin_layers_) return;
-    for (const auto& [t, layer] : g.owner)
-        if (layer >= 0 && layer < (int)layer_kv_gpu_.size() && !layer_kv_gpu_[layer])
-            ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
+    for (const auto& [t, layer] : g.owner) {
+        if (layer < 0 || layer >= (int)layer_dev_.size()) continue;
+        const int d = layer_dev_[layer];
+        if (d < 0) ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
+        else if (gpus_.size() > 1) ggml_backend_sched_set_tensor_backend(sched_, t, gpus_[d]);
+    }
 }
 
 void Model::reset() {

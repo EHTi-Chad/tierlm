@@ -83,28 +83,42 @@ The setup screen shows:
    active experts per token, a seed for repeatable replies, how to split a model that doesn't fit in VRAM, a
    **VRAM limit**, and **Force CPU**.
 
-Click **Load and start chatting**. Loading takes a few seconds; the first time on a GPU it can take a little
-longer while the graphics driver prepares itself. tierlm remembers the folder, and your settings for each
+Click **Load and start chatting**. A bar shows the loading progress; big models take a minute or so, and the
+first time on a GPU it can take a little longer while the graphics driver prepares itself.
+
+**Find the fastest settings** (next to it) does the experimenting for you: it loads the model and measures the
+settings that change speed on your PC (how to split the model, CPU threads, and speculative decoding with 1 to 4
+guesses), shows each result as it goes, then keeps the fastest and saves it for that model. It takes about a
+minute, longer for big models. Click **Start chatting** when it's done. tierlm remembers the folder, and your settings for each
 model, in `tierlm-settings.json`. **Change setup** (top right) brings this screen back.
 
 ## Step 5: Chat
 
 Type a message and press **Enter**, or click one of the suggestion buttons. The reply streams in word by word.
 
-The right-hand side is the live dashboard:
+**The side menu** on the left: click an icon to open its section, click it again (or the arrow at the bottom) to
+fold the menu away and give the chat more room.
 
-- **Generation speed**: tokens per second (a token is roughly ¾ of a word), and a chart of speed as the
-  conversation gets longer.
-- **Context window**: how much of the model's memory of this conversation is used. **New chat** clears it.
-- **Where the model lives**: whether the model is on your GPU or CPU, and how much memory it uses.
-- **Expert activity map**: the model has 64 "experts" in each of its 16 layers, and picks 8 per layer for
-  every token. Each cell is one expert; they flash as they're picked, and warm up the more they're used. Hover
-  over a cell for details.
-- **Hot-expert cache preview**: an estimate of how much a cache of the most-used experts would help, based on
-  your own conversation so far.
+- **Settings**: **Temperature** (how adventurous replies are: 0 always picks the most likely word), **Repeat
+  penalty**, **Max reply** (the default, **No limit**, lets the model finish; thinking models such as Qwen3.x often
+  use thousands of tokens before they answer), **Speculative decoding** on or off and guesses per check (when the
+  draft layer is loaded), and a **System prompt**: instructions the model follows in every reply.
+- **API**: the addresses for other apps, the **Allow other devices** switch and the API key (see below).
+- **Console**: what the engine is doing, as in its black window: loading, where each part went, every request
+  and its speed. **Verbose** adds the graphics driver's and ggml's own messages. **Copy log** helps with bug reports.
+- **Model info**: the model, where each part of it lives, and the hot-expert cache preview.
+- **Chats**: your past chats (kept in this browser), and system-prompt presets.
+- **Benchmark**: one click measures prompt reading and generation speed with the current settings, with a line to
+  copy and share.
 
-**Temperature** controls how adventurous replies are: 0 always picks the most likely word, higher values are
-more varied. **Max reply** caps the length of each reply; the default, **No limit**, lets the model finish (thinking models such as Qwen3.x often use thousands of tokens before they answer). **Stop** ends a reply early.
+**The live view** on the right: **Speed** (tokens per second; a token is roughly ¾ of a word) with a chart of speed
+as the conversation grows, **Context** (how much of the model's memory of this conversation is used; **New chat**
+clears it), **Memory** (what's in VRAM and RAM), and for mixture-of-experts models **Which experts are working**.
+That map has a **?** that explains it: each row is a layer, each square one of its experts, brighter means picked
+more often and a flash means picked for the word just written. In **Sorted** view each row shows its busiest experts
+first, and the strip on the left shows whether that layer's experts are in VRAM or RAM. **⤢** opens it full size.
+
+The **Auto / Light / Dark** switch at the top chooses the theme; Auto follows Windows. **Stop** ends a reply early.
 
 ## Step 6: Stop it
 

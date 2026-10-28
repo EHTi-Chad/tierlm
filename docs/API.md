@@ -99,9 +99,14 @@ Example (values depend on the model and machine):
   "weights_bytes": 4209221632, "kv_bytes": 536870912,
   "device_free": 12884901888, "device_total": 19219415040,
   "kv_type": "f16", "flash_attn": true, "batch": 256, "experts_default": 8, "seed": -1,
-  "version": "0.3.0"
+  "version": "0.4.0"
 }
 ```
+
+It also reports where the model lives: `vram_weights` and `ram_weights` (bytes), `split_mode`, `gpus` (one entry per
+GPU in use: `name`, `weights`, `kv`, `layers`), `ffn_vram` (per layer: are its experts in VRAM), and
+`speculative`, `draft_max`, `has_draft_block` and `mtp_loaded` (the draft layer is in memory, so `/api/spec` can
+switch speculation on).
 
 While a reply is streaming or a model is loading, `/api/info` returns the last known details with
 `"busy": true` instead of waiting.
@@ -114,7 +119,7 @@ While a reply is streaming or a model is loading, `/api/info` returns the last k
     "free": 17179869184, "total": 19219415040},
    {"id": "CPU", "description": "Intel(R) Core(TM) Ultra 7 258V", "type": "cpu", "backend": "CPU",
     "free": 11811160064, "total": 33822867456}],
- "threads": 4, "hw_threads": 8, "version": "0.3.0", "warnings": []}
+ "threads": 4, "hw_threads": 8, "version": "0.4.0", "warnings": []}
 ```
 
 `type` is `gpu` (dedicated), `igpu` (integrated, shares system memory) or `cpu`. Pass `id` as the `device`
@@ -181,10 +186,43 @@ requests from the same computer. Elsewhere it returns HTTP 501.
 | `experts_used` | Active experts per token for MoE models; 0 keeps the model's own value |
 | `seed` | -1 for random sampling; any other number makes replies repeatable |
 | `speculative` | `true` loads the model's MTP draft layer and uses speculative decoding (when the file, or an `mtp-*.gguf` next to it, has one: `"mtp": true` in `/api/models`) |
-| `draft_max` | Most tokens the draft layer guesses per check, 1 to 8 (default 3) |
+| `draft_max` | Most tokens the draft layer guesses per check, 1 to 8 (default: 2 for MoE models, 3 for dense) |
+| `device` | `auto` (default) or `gpu`: the best GPU, plus other GPUs of the same kind as further VRAM tiers; `cpu`; or one device by its `id` |
+| `split_mode` | When the model doesn't fit in VRAM: `auto` (default: `experts` for MoE models, `layers` for the rest), `layers` (whole layers in VRAM, the first ones in RAM) or `experts` (attention and context in VRAM, experts in RAM) |
+| `vram_limit_mb` | Use at most this much VRAM; 0 (default) uses what's free |
 
 Any loaded model is freed first. The settings are saved for this model. Returns
 `{"ok": true, "device": "...", "load_s": 3.2}`, or an `error` with HTTP 400/500.
+
+### POST /api/autotune
+
+Finds the fastest settings for a model on this PC. The body is the same as `/api/load`. The reply is a stream of
+server-sent events: `{"type":"status","text":"Measuring experts in RAM"}` while it works,
+`{"type":"result","label":"Split: experts in RAM","tps":17.0}` for each measurement, then
+`{"type":"done","tps":22.3,"settings":{...},"results":[...]}` with the settings it saved for the model (`split_mode`,
+`threads`, `speculative`, `draft_max`), or `{"type":"error","message":"..."}`. The model stays loaded with the winner.
+
+### POST /api/bench
+
+Measures the loaded model with its current settings: reads a 512-token prompt and generates 64 tokens.
+Returns `{"prompt_tps": 143.0, "gen_tps": 22.3, "speculative": true, "draft_max": 2, "threads": 8}`.
+
+### POST /api/spec
+
+Turns speculative decoding on or off, or changes the guesses per check, without reloading:
+`{"speculative": true, "draft_max": 2}`. Only when the model was loaded with its draft layer (`mtp_loaded` in
+`/api/info`); otherwise it answers 409.
+
+### GET /api/progress
+
+`{"loading": true, "progress": 0.42}` while a model loads (the share of its weights read so far). Answers even while
+the engine is busy.
+
+### GET /api/log?after=N
+
+The engine's recent log lines (what the black window shows), after line number `N` (-1 for all that are kept):
+`{"lines": [{"n": 12, "text": "reply: 212 tokens at 22.3 tok/s (end)", "v": false}], "next": 13}`. `v` marks lines
+from ggml and the graphics drivers (the console's Verbose view).
 
 ### POST /api/unload
 
