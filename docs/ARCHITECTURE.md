@@ -132,9 +132,8 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 1. **Real-model testing of the new families**, then more families: the Qwen3.5 hybrid (Gated DeltaNet
    linear attention), Gemma, Phi, DeepSeek, gpt-oss. Qwen3-30B-A3B (48 layers, 128 experts, 8 active, about
    18.6 GB in Q4) is larger than the Arc's 16 GB, which makes it the first real test of tiering.
-2. **Tier loader.** Place each expert unit in VRAM, RAM or SSD per the planner: VRAM experts in a device
-   buffer, RAM experts in host memory (computed on the CPU or copied to the GPU on demand), SSD experts
-   read with direct I/O when routed to.
+2. **Tier loader, next steps.** VRAM/RAM splitting works (see [TOOLS.md](TOOLS.md#splitting-models-between-vram-and-ram));
+   next are the SSD tier (rarely used experts read from disk when routed to) and finer-grained placement.
 3. **Hot-expert cache.** Use routing statistics (already captured) to keep the most-used experts in VRAM and
    swap them as usage shifts.
 4. **NVIDIA (CUDA) on an RTX 5090** and AMD testing.

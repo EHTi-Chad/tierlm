@@ -12,7 +12,8 @@
 //   POST /api/folder   {"folder": "D:\\models", "recursive": true}  sets the models folder (saved)
 //   POST /api/pick-folder  opens a folder picker on this computer (Windows; local requests only)
 //   POST /api/load     {"model": "sub/file.gguf", "device": "auto|cpu|<device>", "ctx": 4096, "threads": 4,
-//                       "flash_attn": true, "kv_type": "f16|f32", "batch": 256, "experts_used": 0, "seed": -1}
+//                       "flash_attn": true, "kv_type": "f16|f32", "batch": 256, "experts_used": 0, "seed": -1,
+//                       "vram_limit_mb": 0, "split_mode": "layers|experts"}
 //   POST /api/unload   frees the model
 //   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "top_k":40,
 //                     "min_p":0.05, "repeat_penalty":1.1, "repeat_last_n":64, "max_tokens":512}
@@ -43,6 +44,9 @@
 #include <thread>
 #include <vector>
 
+#ifdef GGML_USE_RPC
+#include "ggml-rpc.h"
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <shobjidl.h>
@@ -396,6 +400,10 @@ int main(int argc, char** argv) {
         else if (a.model.empty()) a.model = k;
     }
 
+#ifdef GGML_USE_RPC
+    // Testing hook: TIERLM_RPC=host:port adds a tierlm-rpc-server as a stand-in GPU.
+    if (const char* ep = std::getenv("TIERLM_RPC")) ggml_backend_register(ggml_backend_rpc_add_server(ep));
+#endif
     Engine eng;
     eng.threads = a.threads;
     std::mutex mu;                       // one load or generation at a time
@@ -467,6 +475,10 @@ int main(int argc, char** argv) {
             {"device_free", free}, {"device_total", total},
             {"kv_type", eng.model->kv_type()}, {"flash_attn", eng.model->flash_attn()}, {"load_s", eng.load_s},
             {"batch", eng.model->batch()}, {"experts_default", eng.model->experts_default()}, {"seed", eng.seed},
+            {"vram_weights", eng.model->placement().gpu_weights}, {"ram_weights", eng.model->placement().cpu_weights},
+            {"kv_on_gpu", eng.model->placement().kv_on_gpu}, {"attn_gpu", eng.model->placement().attn_gpu},
+            {"ffn_gpu", eng.model->placement().ffn_gpu}, {"kv_gpu_layers", eng.model->placement().kv_gpu_layers},
+            {"split_mode", eng.model->placement().mode},
             {"version", TIERLM_VERSION},
         };
         last_info = j;
@@ -622,6 +634,8 @@ int main(int argc, char** argv) {
             if (body.contains("kv_type")) o.kv_f32 = body.value("kv_type", std::string("f16")) == "f32" ? 1 : 0;
             o.batch = body.value("batch", 0);
             o.experts_used = body.value("experts_used", 0);
+            o.vram_budget_mb = body.value("vram_limit_mb", 0);
+            o.split_mode = body.value("split_mode", std::string("layers"));
             const int threads = body.value("threads", a.threads), seed = body.value("seed", -1);
             load(file.u8string(), o, threads, seed);
             // Remember these settings for this model, like LM Studio does.

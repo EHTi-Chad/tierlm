@@ -167,6 +167,15 @@ python3 -m venv ~/tierlm-oracle
 ./build/tierlm-tok-test ~/models/OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf tests/tok_cases.txt
 ```
 
+To test splitting a model between a GPU and RAM on a machine without a GPU, build with ggml's RPC backend; a
+local `tierlm-rpc-server` then stands in for a GPU, and every architecture is checked at 10 different splits:
+
+```bash
+cmake -S . -B build-rpc -G Ninja -DGGML_RPC=ON && cmake --build build-rpc
+./build-rpc/tierlm-rpc-server 127.0.0.1:50052 &
+TIERLM_RPC=127.0.0.1:50052 ~/tierlm-oracle/bin/python tests/tiny_models.py build-rpc/tierlm-logits
+```
+
 `tiny_models.py` runs two passes per architecture: with an exact f32 KV cache, results must match the NumPy
 reference to about 1e-6; with the normal f16 cache, they must agree within rounding and pick the same top
 token. Each test prints `PASS` when everything is right.

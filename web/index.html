@@ -277,6 +277,16 @@
             <div class="help">-1 is random. Any other number makes replies repeatable at the same settings.</div>
           </div>
           <div>
+            <label for="splitsel">When the model doesn't fit in VRAM</label>
+            <select id="splitsel"><option value="layers">Split by whole layers (recommended)</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
+            <div class="help">Whole layers: the GPU and CPU hand over once per token. Experts in RAM: the GPU does all the attention, but hands over twice per layer; can be faster with very long conversations.</div>
+          </div>
+          <div>
+            <label for="vramlim">VRAM limit (GiB)</label>
+            <input id="vramlim" type="number" value="0" min="0" step="0.5">
+            <div class="help">0 uses all free VRAM. A lower number keeps VRAM free for other apps, or lets you see how the model would run on a smaller GPU.</div>
+          </div>
+          <div>
             <label class="chk"><input type="checkbox" id="forcecpu"> Force CPU</label>
             <div class="help">Ignore the GPU and run everything on the CPU. Useful for troubleshooting.</div>
           </div>
@@ -427,7 +437,7 @@ async function loadInfo() {
   const moe = E > 0;
   $("mapcard").hidden = !moe; $("hitcard").hidden = !moe; $("densecard").hidden = moe;
   $("densenote").textContent = moe ? "" : `${info.name} is a dense model: every token uses all of its ${L} layers, so there are no experts to map. ` +
-    "For dense models, tiering will place whole layers in VRAM, RAM or SSD instead of individual experts.";
+    "When it doesn't fit in VRAM, tierlm splits it by whole layers between VRAM and RAM.";
   $("devname").textContent = info.device;
   $("devdot").classList.toggle("on", info.on_gpu);
   $("modelname").textContent = info.name;
@@ -437,10 +447,18 @@ async function loadInfo() {
   $("ctxof").textContent = "/ " + info.ctx.toLocaleString() + " tokens";
   setContext(info.n_past);
   const w = info.weights_bytes, kv = info.kv_bytes;
+  const vw = info.vram_weights || 0, rw = info.ram_weights || 0;
+  const what = n => E ? n + " of " + L + " expert layers" : n + " of " + L + " feed-forward layers";
   if (info.on_gpu) {
-    $("t-vram").textContent = fmtGiB(w + kv);
-    $("t-vram-sub").textContent = (E ? "all " + (L * E).toLocaleString() + " experts" : "all " + L + " layers") + " + KV cache";
-    $("t-ram").textContent = "0 GiB"; $("t-ram-sub").textContent = "spill-over tier (not needed yet)";
+    const kvv = kv * (info.kv_gpu_layers || 0) / L, kvr = kv - kvv;
+    const layersMode = info.split_mode !== "experts";
+    $("t-vram").textContent = fmtGiB(vw + kvv);
+    $("t-vram-sub").textContent = rw <= 0 ? "the whole model + KV cache"
+      : layersMode ? info.ffn_gpu + " of " + L + " layers + their KV cache"
+      : "attention " + info.attn_gpu + "/" + L + ", " + what(info.ffn_gpu) + (info.kv_on_gpu ? " + KV cache" : "");
+    $("t-ram").textContent = fmtGiB(rw + kvr);
+    $("t-ram-sub").textContent = rw <= 0 ? "spill-over tier (not needed)"
+      : (layersMode ? (L - info.ffn_gpu) + " of " + L + " layers" + (kvr > 0 ? " + their KV cache" : "") : what(L - info.ffn_gpu) + (kvr > 0 ? " + KV cache" : "")) + ", computed by the CPU";
   } else {
     $("t-vram").textContent = "0 GiB"; $("t-vram-sub").textContent = "no GPU in use";
     $("t-ram").textContent = fmtGiB(w + kv); $("t-ram-sub").textContent = (E ? "all experts" : "all layers") + " + KV cache";
@@ -451,7 +469,7 @@ async function loadInfo() {
     (info.device_type === "igpu" ? " · an integrated GPU shares system RAM, so its 'VRAM' is borrowed memory" : "") +
     " · KV cache " + info.kv_type + ", flash attention " + (info.flash_attn ? "on" : "off") +
     (info.experts_used !== info.experts_default ? " · " + info.experts_used + " active experts (model default " + info.experts_default + ")" : "") +
-    " · tiering across devices comes next";
+    (rw > 0 ? " · split between VRAM and RAM" : "") + " · SSD tier comes next";
   resizeCanvases();
 }
 function setContext(n) {
@@ -679,9 +697,12 @@ function plan() {
   const ctx = +$("ctxsel").value || defCtx, kv32 = $("kvsel").value === "f32";
   const need = selModel ? needBytes(selModel, ctx, kv32) : 0;
   const gpu = bestGpu(), cpu = cpuDev();
-  if ($("forcecpu").checked || !gpu) return { dev: cpu, need, why: $("forcecpu").checked ? "forced" : "nogpu" };
-  if (!selModel || gpu.free >= need) return { dev: gpu, need, why: "fits" };
-  return { dev: cpu, need, why: "toobig", gpu };
+  if ($("forcecpu").checked || !gpu) return { dev: cpu, need, vram: 0, ram: need, why: $("forcecpu").checked ? "forced" : "nogpu" };
+  // The tier loader fills VRAM first (keeping some free for working memory), then puts the rest in RAM.
+  const lim = +$("vramlim").value > 0 ? +$("vramlim").value * 1073741824 : Infinity;
+  const room = Math.max(0, Math.min(gpu.free, lim) - 768 * 1048576);
+  const vram = Math.min(need, room), ram = need - vram;
+  return { dev: gpu, need, vram, ram, why: !selModel || ram <= 0 ? "fits" : "split", cpuFree: cpu ? cpu.free : 0 };
 }
 async function loadSetup() {
   $("loadmsg").textContent = ""; $("loadmsg").className = "";
@@ -729,6 +750,8 @@ function applySaved() {
   if (s.repeat_penalty) $("rpen").value = s.repeat_penalty;
   for (const id of ["topk", "topp", "minp", "rpen"]) $(id).oninput();
   $("forcecpu").checked = !!s.force_cpu;
+  $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb / 1024).toFixed(1) : 0;
+  $("splitsel").value = s.split_mode || "layers";
   $("setnote").textContent = selModel ? (md.saved && md.saved[selModel.id] ? "Using your saved settings for this model" : "Settings are remembered per model") : "";
 }
 // Context choices go up to the model's own limit (read from the file), with the memory each one needs.
@@ -786,12 +809,12 @@ function renderSetup() {
   const pl = $("place");
   if (!selModel || !p.dev) { pl.innerHTML = ""; }
   else {
-    const onGpu = p.dev.type !== "cpu";
-    const vram = onGpu ? p.need : 0, ram = onGpu ? 0 : p.need, total = Math.max(1, vram + ram);
+    const vram = p.vram, ram = p.ram, total = Math.max(1, vram + ram);
     pl.innerHTML = `<div class="lbl"></div><div class="stack"><div style="background:var(--vram);width:${100 * vram / total}%"></div><div style="background:var(--ram);width:${100 * ram / total}%"></div><div style="background:var(--ssd);width:0"></div></div>
       <div class="stackleg"><span><i style="background:var(--vram)"></i>${p.dev.type === "igpu" ? "GPU memory (shared)" : "VRAM"} <b>${fmtGiB(vram)}</b></span><span><i style="background:var(--ram)"></i>RAM <b>${fmtGiB(ram)}</b></span><span><i style="background:var(--ssd)"></i>SSD <b>0 GiB</b></span></div>`;
     const msg = { fits: `The whole model fits on ${p.dev.description}.`,
-                  toobig: `Too big for ${p.gpu && p.gpu.description} (${fmtGiB(p.gpu ? p.gpu.free : 0)} free), so it will run from system RAM on the CPU. Splitting it between GPU and RAM comes with the tier loader.`,
+                  split: `It doesn't all fit on ${p.dev.description}, so tierlm splits it: as many layers as fit (with their part of the KV cache) go in VRAM, the rest in RAM, computed by the CPU. Expect speed between all-GPU and CPU-only.` +
+                         (ram > p.cpuFree ? ` Warning: that needs more RAM than is free (${fmtGiB(p.cpuFree)}); the SSD tier isn't built yet, so close other programs or pick a smaller model.` : ""),
                   forced: "Force CPU is on, so everything runs on the CPU.",
                   nogpu: "No GPU found, so everything runs on the CPU." }[p.why];
     pl.querySelector(".lbl").textContent = "Where this model will go: " + msg;
@@ -830,9 +853,9 @@ function renderSetup() {
     const kv32 = $("kvsel").value === "f32";
     $("rec").innerHTML = "";
     const b = document.createElement("b"); b.textContent = selModel.name || selModel.file;
-    $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description}, needing about ${fmtGiB(p.need)} ` +
+    $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description + (p.ram > 0 ? " and system RAM" : "")}, needing about ${fmtGiB(p.need)} ` +
       `(${fmtGiB(selModel.bytes)} model + ${fmtGiB((selModel.kv_bytes_per_token || 0) * ctx * (kv32 ? 2 : 1))} for ${ctx.toLocaleString()} tokens of context).` +
-      (p.dev.free < p.need ? " That's more than is free, so loading may fail; try a shorter context or close other programs." : ""));
+      (p.dev.type === "cpu" && p.dev.free < p.need ? " That's more than is free, so loading may fail; try a shorter context or close other programs." : ""));
   }
   $("ctxhelp").textContent = "How much conversation the model can remember, up to what this model was trained for (" +
     (selModel && selModel.ctx_train ? selModel.ctx_train.toLocaleString() + " tokens" : "unknown") + "). Longer uses more memory, shown next to each size.";
@@ -873,6 +896,7 @@ $("pathok").onclick = async () => {
 $("pathin").onkeydown = e => { if (e.key === "Enter") $("pathok").click(); if (e.key === "Escape") $("pathcancel").click(); };
 $("rescanhw").onclick = e => { e.preventDefault(); loadSetup(); };
 for (const id of ["ctxsel", "forcecpu"]) $(id).onchange = renderSetup;
+$("vramlim").oninput = renderSetup;
 $("kvsel").onchange = () => { buildCtx($("ctxsel").value); renderSetup(); };
 $("thr").oninput = () => $("thrv").textContent = $("thr").value;
 $("experts").oninput = () => $("expv").textContent = $("experts").value;
@@ -891,7 +915,7 @@ $("loadbtn").onclick = async () => {
   const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 force_cpu: $("forcecpu").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
+                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
   if ($("forcecpu").checked) body.device = "cpu";
   try {
     const r = await fetch("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

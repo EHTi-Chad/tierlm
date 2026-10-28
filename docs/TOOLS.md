@@ -55,11 +55,39 @@ tierlm-server [model.gguf] [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu|<de
 Generate text from a prompt, greedily (always the most likely token).
 
 ```
-tierlm-run model.gguf "prompt" [-n 32] [-t N] [-c 2048] [-d auto|cpu|gpu]
+tierlm-run model.gguf "prompt" [-n 32] [-t N] [-c 2048] [-d auto|cpu|gpu|<device>] [--split layers|experts] [--vram MiB]
 ```
 
-Prints the device, the top 5 candidates for the first token, the generated text, and prompt/generation
-speeds. The prompt is used as-is (no chat template); use the server for chat.
+Prints the device, where the model was placed, the top 5 candidates for the first token, the generated text,
+and prompt/generation speeds. The prompt is used as-is, with the model's start token if it wants one (no chat
+template); use the server for chat.
+
+- `--split` chooses how a model bigger than VRAM is split (see [Splitting models](#splitting-models-between-vram-and-ram)).
+- `--vram N` limits the VRAM tierlm may use to N MiB, for example to see how a model would run on a smaller GPU.
+- `TIERLM_PROFILE=1` adds a per-token time breakdown and the number of GPU<->CPU hand-offs (`graph splits`).
+
+## Splitting models between VRAM and RAM
+
+When a model doesn't fit in the GPU's memory, tierlm's tier loader splits it. You don't need to do anything:
+the setup screen shows the planned split before loading, and the dashboard shows where everything went.
+
+| Mode | What goes in VRAM | GPU<->CPU hand-offs per token | Best for |
+|---|---|---|---|
+| `layers` (default) | The last layers that fit, whole, with their part of the KV cache, plus the output layer | 1 | Almost always, especially on Windows |
+| `experts` | Attention, router and KV cache of every layer, then expert layers while they fit | 2 per layer in RAM | Very long conversations, where attention dominates |
+
+In `layers` mode, every operation of a RAM layer is pinned to the CPU. Otherwise ggml would send small
+weight-free operations (norms, attention over the cache) to the GPU and back, which cost more than they saved.
+
+Measured on a laptop RTX 3070 (8 GB) with a Ryzen 9 5900HX and Qwen3-30B-A3B Q3_K_M (14.7 GB), 100 tokens:
+
+| Setup | Generation |
+|---|---|
+| CPU only | 19.3 tok/s |
+| 22 of 48 layers in VRAM (`layers`) | 26.3 tok/s (27.1 with `-t 6`) |
+
+On laptops the CPU and GPU share a power budget, so the CPU part runs a little slower while the GPU is busy;
+desktops gain more.
 
 ## tierlm-bench
 
@@ -125,6 +153,8 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_NO_FA=1` | Use plain attention instead of flash attention |
 | `TIERLM_KV_F32=1` | Keep the KV cache in f32 instead of f16 (exact; used by the tests) |
 | `TIERLM_THREADS=N` | CPU threads for `tierlm-logits` and `tierlm-bench` |
+| `TIERLM_PROFILE=1` | `tierlm-run`: per-token time breakdown and number of graph splits |
+| `TIERLM_DUMP_SCHED=1` | Debugging: prints each point where the work switches between CPU and GPU |
 | `GGML_VK_VISIBLE_DEVICES=0` | Choose which Vulkan GPU(s) ggml uses |
 | `VK_LOADER_DEBUG=error,warn` | Make the Vulkan loader explain driver problems |
 

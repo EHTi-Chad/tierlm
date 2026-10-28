@@ -60,7 +60,8 @@ The setup screen shows:
    - **Find GGUF models on Hugging Face**: opens Hugging Face in your browser.
 3. **Settings**: **context length** (how much of the conversation the model remembers; longer uses more
    memory) and **CPU threads**. **Advanced** has more: flash attention, KV cache precision, prompt batch size,
-   active experts per token, a seed for repeatable replies, and **Force CPU**.
+   active experts per token, a seed for repeatable replies, how to split a model that doesn't fit in VRAM, a
+   **VRAM limit**, and **Force CPU**.
 
 Click **Load and start chatting**. Loading takes a few seconds; the first time on a GPU it can take a little
 longer while the graphics driver prepares itself. tierlm remembers the folder, and your settings for each

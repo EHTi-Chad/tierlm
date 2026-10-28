@@ -48,6 +48,32 @@ struct LoadOptions {
     int kv_f32 = -1;                 // 1 f32 cache, 0 f16, -1 default (f16, unless TIERLM_KV_F32 is set)
     int batch = 0;                   // tokens per graph when reading a prompt; 0 = 256
     int experts_used = 0;            // override active experts per token (MoE); 0 = the model's value
+    int vram_budget_mb = 0;          // most VRAM to use for weights + KV cache; 0 = whatever is free
+    // How to split a model that doesn't fit in VRAM:
+    //   "layers"   whole layers: the last ones (with their KV cache) in VRAM, the first ones in RAM.
+    //              One GPU<->CPU hand-off per token; usually fastest, especially on Windows.
+    //   "experts"  attention, router and KV cache of every layer in VRAM, then expert layers while they
+    //              fit. Two hand-offs per RAM layer per token; can win on long contexts.
+    std::string split_mode = "layers";
+};
+
+// Where the time goes, accumulated over every eval_batch call (for profiling).
+struct EvalStats {
+    int calls = 0, tokens = 0;
+    double build_ms = 0, alloc_ms = 0, input_ms = 0, compute_ms = 0, output_ms = 0;
+    int splits = 0, copies = 0;                  // of the last graph: GPU<->CPU hand-offs and tensor copies
+};
+
+// Where the tier loader put things.
+struct Placement {
+    uint64_t gpu_weights = 0, cpu_weights = 0;   // bytes of weights in VRAM and in system RAM
+    bool kv_on_gpu = false;                      // the whole KV cache is in VRAM
+    int kv_gpu_layers = 0;                       // layers whose KV cache is in VRAM
+    std::string mode;                            // split mode used
+    int layers = 0;
+    int attn_gpu = 0;                            // layers whose attention weights are in VRAM
+    int ffn_gpu = 0;                             // layers whose feed-forward / experts are in VRAM
+    bool split() const { return gpu_weights > 0 && cpu_weights > 0; }
 };
 
 // Forward pass through ggml's backend API, so it runs on any ggml device (CPU, Vulkan, CUDA, ...).
@@ -75,6 +101,9 @@ public:
     const std::string& device_name() const { return device_name_; }
     const std::string& arch() const { return hp_.arch; }
     uint64_t weights_bytes() const { return weights_bytes_; }
+    const Placement& placement() const { return place_; }
+    const EvalStats& stats() const { return stats_; }
+    void reset_stats() { stats_ = EvalStats(); }
     uint64_t kv_bytes() const { return kv_bytes_; }
     bool on_gpu() const { return main_ != cpu_; }
     bool integrated_gpu() const;                  // shares system memory (e.g. Intel Arc in a laptop)
@@ -96,8 +125,10 @@ private:
         struct ggml_cgraph* gf = nullptr;
         ggml_tensor *inp = nullptr, *pos = nullptr, *mask = nullptr, *logits = nullptr;
         std::vector<ggml_tensor*> orders;        // router rankings per layer (when routing is wanted)
+        std::vector<std::pair<ggml_tensor*, int>> owner;   // every op tensor of each layer, with its layer
     };
     Graph build(int n_tok, int n_past, bool want_routing);
+    void pin_cpu_layers(const Graph& g);        // keep every op of a RAM layer on the CPU
     std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
     struct Layer {
         ggml_tensor *attn_norm = nullptr, *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
@@ -113,11 +144,15 @@ private:
     ggml_backend_sched* sched_ = nullptr;
     ggml_context* wctx_ = nullptr;               // weight tensor descriptors
     ggml_context* kvctx_ = nullptr;              // KV cache tensor descriptors
-    ggml_backend_buffer* wbuf_ = nullptr;        // weight memory on the device
-    ggml_backend_buffer* kvbuf_ = nullptr;       // KV cache memory on the device
+    std::vector<ggml_backend_buffer*> wbufs_;    // weight memory: one buffer in VRAM, one in system RAM
+    Placement place_;
+    EvalStats stats_;
+    std::vector<ggml_backend_buffer*> kvbufs_;   // KV cache memory: VRAM part and RAM part
     std::vector<uint8_t> graph_mem_;             // scratch for building graphs
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
     std::vector<Layer> layers_;
+    std::vector<bool> layer_kv_gpu_;             // per layer: KV cache in VRAM
+    bool pin_layers_ = false;                    // layer split: RAM layers must run entirely on the CPU
     std::string device_name_;
     int max_ctx_ = 0, n_past_ = 0;
     uint64_t weights_bytes_ = 0, kv_bytes_ = 0;

@@ -126,7 +126,8 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Setup screen: automatic hardware placement, models folder, per-model settings
 - [x] Architecture layer: Llama 2/3, Mistral, Mixtral, Qwen2, Qwen3, Qwen3 MoE, OLMoE; Llama 3 / Qwen / SentencePiece tokenizers
 - [ ] Real-model testing of the new families; more families (Qwen3.5 hybrid, Gemma, Phi, DeepSeek, gpt-oss)
-- [ ] **Tier loader**: actually place each expert in VRAM, RAM or SSD according to the plan, with VRAM/RAM budget settings
+- [x] Tier loader, first version: models bigger than VRAM split between VRAM and RAM (whole layers or experts), VRAM limit setting
+- [ ] SSD tier (stream rarely used weights from disk) and a hot-expert cache in VRAM
 - [ ] Search and download GGUF models from Hugging Face inside tierlm
 - [ ] Routing statistics and a hot-expert cache that promotes busy experts to VRAM
 - [ ] NVIDIA (CUDA) testing on an RTX 5090; AMD testing via Vulkan/ROCm

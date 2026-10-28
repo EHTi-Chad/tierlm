@@ -121,25 +121,34 @@ def reference(arch, s, W, L, ids):
 
 # Two passes: exact (f32 KV cache, must match to ~1e-6) and the normal f16 cache (rounding only, same top token).
 names = sys.argv[2:] or list(CASES)
+# With TIERLM_RPC set (a tierlm-rpc-server standing in for a GPU), every case also runs split between the
+# device and RAM at several VRAM budgets (fractions of the model size), and must give the same results.
+SPLITS = [(mode, f) for mode in ("layers", "experts") for f in (0.0, 0.15, 0.4, 0.7, 2.0)] if os.environ.get("TIERLM_RPC") else [None]
 long_ids = list(np.random.default_rng(7).integers(0, V, 300))   # > 256: exercises batched prompts
 ok = True
 for idx, name in enumerate(names):
     arch, s = CASES[name]
-    path, W, L = make(arch, s, 100 + idx)
-    for label, env, tol in (("exact", {"TIERLM_KV_F32": "1"}, 1e-4), ("f16 cache", {}, 3e-2)):
+    path, W, L = make(arch, s, 100 + list(CASES).index(name))   # same random model however the tests are picked
+    size = os.path.getsize(path)
+    for frac in SPLITS:
+      split_env = {} if frac is None else {"TIERLM_SPLIT": frac[0], "TIERLM_VRAM_BYTES": str(int(size * frac[1]))}
+      for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", **split_env}, 1e-4), ("f16 cache", split_env, 3e-2)):
         worst, all_top = 0.0, True
+        placement = ""
         for mode in ([], ["--step"]):
             for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55], long_ids):
                 want = reference(arch, s, W, L, np.array(ids))
                 run = subprocess.run([sys.argv[1], path, *mode, *map(str, ids)], capture_output=True, text=True,
-                                     env={**os.environ, **env})
+                                     env={**os.environ, **env, "TIERLM_SHOW_PLACEMENT": "1"})
                 if run.returncode != 0:
                     sys.exit(f"{name}: tierlm-logits failed: {run.stderr.strip()}")
+                placement = next((l for l in run.stderr.splitlines() if "VRAM" in l), "")
                 got = np.array([float(v) for v in run.stdout.split()])
                 worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
                 all_top &= bool(got.argmax() == want.argmax())
         passed = worst < tol and all_top
         ok &= passed
-        print(f"{name:9s} {label:9s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {all_top}  ->  {'ok' if passed else 'FAIL'}")
+        where = "" if frac is None else f" [{placement.split(': ', 1)[-1]}]"
+        print(f"{name:9s} {label:9s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {all_top}  ->  {'ok' if passed else 'FAIL'}{where}")
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

@@ -5,6 +5,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,8 +28,8 @@ static constexpr int kGraphSize = 16384;
 
 Model::~Model() {
     if (sched_) ggml_backend_sched_free(sched_);
-    if (kvbuf_) ggml_backend_buffer_free(kvbuf_);
-    if (wbuf_) ggml_backend_buffer_free(wbuf_);
+    for (auto* b : kvbufs_) if (b) ggml_backend_buffer_free(b);
+    for (auto* b : wbufs_) if (b) ggml_backend_buffer_free(b);
     if (kvctx_) ggml_free(kvctx_);
     if (wctx_) ggml_free(wctx_);
     if (main_ && main_ != cpu_) ggml_backend_free(main_);
@@ -145,11 +146,110 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     m->n_expert_used_file_ = hp.n_expert_used;
     if (opt.experts_used > 0 && hp.n_expert > 0) hp.n_expert_used = std::min(opt.experts_used, hp.n_expert);
 
-    // ---- allocate every weight on the device, then stream the data in from the file ----
-    m->wbuf_ = ggml_backend_alloc_ctx_tensors(m->wctx_, m->main_);
-    if (!m->wbuf_) { gguf_free(g); throw std::runtime_error("not enough device memory for the weights"); }
-    ggml_backend_buffer_set_usage(m->wbuf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    m->weights_bytes_ = ggml_backend_buffer_get_size(m->wbuf_);
+    // ---- tier loader: decide where each weight lives, VRAM first, then system RAM ----
+    // Priority for VRAM: small always-used tensors, then attention, router and output, then the KV cache,
+    // then dense feed-forward layers, then expert layers. What doesn't fit stays in RAM, where the CPU
+    // computes with it (the scheduler moves activations between the two).
+    m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
+    // TIERLM_KV_F32=1 keeps the cache in f32 (exact; used by the tests to check the attention math).
+    m->kv_f32_ = opt.kv_f32 >= 0 ? opt.kv_f32 == 1 : std::getenv("TIERLM_KV_F32") != nullptr;
+    const size_t kv_need = (size_t)2 * hp.n_layer * hp.head_dim * hp.n_head_kv * (size_t)m->max_ctx_ * (m->kv_f32_ ? 4 : 2);
+    const bool tied = ggml_get_tensor(m->wctx_, "output.weight") == nullptr;
+    ggml_backend_buffer_type_t gpu_buft = m->main_ != m->cpu_ ? ggml_backend_get_default_buffer_type(m->main_) : nullptr;
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    size_t budget = 0;
+    if (gpu_buft) {
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory((ggml_backend_dev_t)m->dev_, &free, &total);
+        size_t avail = free;
+        if (opt.vram_budget_mb > 0) avail = std::min(avail, (size_t)opt.vram_budget_mb << 20);
+        const size_t reserve = (size_t)768 << 20;        // compute scratch memory and driver overhead
+        budget = avail > reserve ? avail - reserve : 0;
+        if (const char* b = std::getenv("TIERLM_VRAM_BYTES")) budget = (size_t)std::strtoull(b, nullptr, 10);   // tests only
+    }
+    struct Group { int prio, layer; std::vector<ggml_tensor*> t; size_t bytes = 0; };
+    std::vector<Group> groups;
+    const bool by_layer = opt.split_mode != "experts";
+    m->place_.mode = by_layer ? "layers" : "experts";
+    const size_t kv_layer = kv_need / std::max(1, hp.n_layer);
+    auto find_group = [&](int prio, int layer) -> Group& {
+        for (auto& gr : groups) if (gr.prio == prio && gr.layer == layer) return gr;
+        groups.push_back({prio, layer, {}, 0});
+        return groups.back();
+    };
+    for (ggml_tensor* t = ggml_get_first_tensor(m->wctx_); t; t = ggml_get_next_tensor(m->wctx_, t)) {
+        const std::string name = ggml_get_name(t);
+        int prio = 1, layer = -1;
+        bool own = false;                                                // a group of its own
+        if (name == "token_embd.weight") { prio = tied ? 1 : 9; own = true; }   // only looked up by row: fine in RAM
+        else if (name == "output.weight") { prio = 1; layer = hp.n_layer; own = true; }
+        else if (name.compare(0, 4, "blk.") == 0) {
+            layer = std::atoi(name.c_str() + 4);
+            const std::string rest = name.substr(name.find('.', 4) + 1);
+            if (by_layer) prio = 2;                                      // the whole layer moves together
+            else if (rest.find("_exps") != std::string::npos) prio = 4;
+            else if (rest.compare(0, 9, "ffn_gate.") == 0 || rest.compare(0, 7, "ffn_up.") == 0 || rest.compare(0, 9, "ffn_down.") == 0) prio = 3;
+            else own = true;
+        } else { prio = 0; own = true; }
+        Group& gr = own ? (groups.push_back({prio, layer, {}, 0}), groups.back()) : find_group(prio, layer);
+        gr.t.push_back(t);
+        if (gpu_buft) gr.bytes += GGML_PAD(ggml_backend_buft_get_alloc_size(gpu_buft, t), ggml_backend_buft_get_alignment(gpu_buft));
+    }
+    // Layer mode fills VRAM from the last layer backwards, so the hand-off to the GPU happens once, and the
+    // output layer (also in VRAM) follows straight on.
+    std::stable_sort(groups.begin(), groups.end(), [&](const Group& a, const Group& b) {
+        if (a.prio != b.prio) return a.prio < b.prio;
+        return a.prio == 2 ? a.layer > b.layer : a.layer < b.layer;
+    });
+    std::vector<ggml_tensor*> on_gpu, on_cpu;
+    std::vector<bool> kv_gpu(hp.n_layer, false);
+    bool kv_decided = false, layers_full = false;
+    for (const Group& gr : groups) {
+        if (!by_layer && gr.prio >= 3 && !kv_decided) {                  // the KV cache goes before the FFNs
+            const bool fit = gpu_buft && kv_need <= budget;
+            if (fit) budget -= kv_need;
+            std::fill(kv_gpu.begin(), kv_gpu.end(), fit);
+            kv_decided = true;
+        }
+        size_t need = gr.bytes + (by_layer && gr.prio == 2 ? kv_layer : 0);
+        bool gpu = gpu_buft && gr.prio < 9 && need <= budget && !(gr.prio == 2 && layers_full);
+        if (gr.prio == 2 && !gpu) layers_full = true;                    // keep the VRAM layers contiguous
+        if (gpu) budget -= need;
+        if (gpu && by_layer && gr.prio == 2 && gr.layer >= 0 && gr.layer < hp.n_layer) kv_gpu[gr.layer] = true;
+        for (ggml_tensor* t : gr.t) (gpu ? on_gpu : on_cpu).push_back(t);
+    }
+    if (!by_layer && !kv_decided) {
+        const bool fit = gpu_buft && kv_need <= budget;
+        std::fill(kv_gpu.begin(), kv_gpu.end(), fit);
+    }
+    for (bool k : kv_gpu) m->place_.kv_gpu_layers += k;
+    m->place_.kv_on_gpu = gpu_buft && m->place_.kv_gpu_layers == hp.n_layer;
+    m->layer_kv_gpu_ = kv_gpu;
+    auto alloc = [&](ggml_backend_buffer_type_t buft, std::vector<ggml_tensor*>& ts, uint64_t& bytes) {
+        if (ts.empty()) return;
+        ggml_backend_buffer* b = ggml_backend_buft_alloc_buffer_n(buft, ts.data(), (int)ts.size());
+        if (!b) throw std::runtime_error(std::string("not enough memory for the weights in ") + ggml_backend_buft_name(buft));
+        ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        bytes = ggml_backend_buffer_get_size(b);
+        m->wbufs_.push_back(b);
+    };
+    try {
+        alloc(gpu_buft ? gpu_buft : cpu_buft, gpu_buft ? on_gpu : on_cpu, gpu_buft ? m->place_.gpu_weights : m->place_.cpu_weights);
+        if (gpu_buft) alloc(cpu_buft, on_cpu, m->place_.cpu_weights);
+    } catch (...) { gguf_free(g); throw; }
+    m->weights_bytes_ = m->place_.gpu_weights + m->place_.cpu_weights;
+    m->place_.layers = hp.n_layer;
+    if (gpu_buft) {
+        for (int i = 0; i < hp.n_layer; ++i) {
+            const std::string b = "blk." + std::to_string(i) + ".";
+            auto in_vram = [&](const char* n) {
+                ggml_tensor* t = ggml_get_tensor(m->wctx_, (b + n).c_str());
+                return t && std::find(on_gpu.begin(), on_gpu.end(), t) != on_gpu.end();
+            };
+            m->place_.attn_gpu += in_vram("attn_q.weight");
+            m->place_.ffn_gpu += hp.n_expert > 0 ? in_vram("ffn_up_exps.weight") : in_vram("ffn_up.weight");
+        }
+    }
 
     std::ifstream file(std::filesystem::u8path(path), std::ios::binary);   // UTF-8 path, also on Windows
     if (!file) { gguf_free(g); throw std::runtime_error("cannot open " + path); }
@@ -209,20 +309,27 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
 
     // ---- KV cache on the same device, in f16: half the size and memory traffic of f32 ----
     const int hd = hp.head_dim;
-    m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
-    // TIERLM_KV_F32=1 keeps it in f32 (exact; used by the tests to check the attention math).
-    m->kv_f32_ = opt.kv_f32 >= 0 ? opt.kv_f32 == 1 : std::getenv("TIERLM_KV_F32") != nullptr;
     const ggml_type kv_type = m->kv_f32_ ? GGML_TYPE_F32 : GGML_TYPE_F16;
     ggml_init_params kp{ (size_t)2 * hp.n_layer * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     m->kvctx_ = ggml_init(kp);
-    for (auto& L : m->layers_) {
+    std::vector<ggml_tensor*> kv_on_gpu_t, kv_on_cpu_t;
+    for (int i = 0; i < hp.n_layer; ++i) {
+        auto& L = m->layers_[i];
         L.k_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
         L.v_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
+        auto& dst = (gpu_buft && m->layer_kv_gpu_[i]) ? kv_on_gpu_t : kv_on_cpu_t;
+        dst.push_back(L.k_cache);
+        dst.push_back(L.v_cache);
     }
-    m->kvbuf_ = ggml_backend_alloc_ctx_tensors(m->kvctx_, m->main_);
-    if (!m->kvbuf_) throw std::runtime_error("not enough device memory for the KV cache (try a smaller -c)");
-    ggml_backend_buffer_clear(m->kvbuf_, 0);
-    m->kv_bytes_ = ggml_backend_buffer_get_size(m->kvbuf_);
+    for (int tier = 0; tier < 2; ++tier) {
+        auto& ts = tier == 0 ? kv_on_gpu_t : kv_on_cpu_t;
+        if (ts.empty()) continue;
+        ggml_backend_buffer* b = ggml_backend_buft_alloc_buffer_n(tier == 0 ? gpu_buft : cpu_buft, ts.data(), (int)ts.size());
+        if (!b) throw std::runtime_error("not enough memory for the KV cache (try a smaller context)");
+        ggml_backend_buffer_clear(b, 0);
+        m->kv_bytes_ += ggml_backend_buffer_get_size(b);
+        m->kvbufs_.push_back(b);
+    }
 
     // Fused flash attention reads the cache once, with no copies. TIERLM_NO_FA=1 uses the plain version.
     m->flash_attn_ = opt.flash_attn >= 0 ? opt.flash_attn == 1 : std::getenv("TIERLM_NO_FA") == nullptr;
@@ -230,7 +337,11 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // ---- scheduler: runs each op on the device, falling back to the CPU where needed ----
     ggml_backend_t backends[2] = { m->main_, m->cpu_ };
     const int n_backends = m->main_ == m->cpu_ ? 1 : 2;
-    m->sched_ = ggml_backend_sched_new(backends, nullptr, n_backends, kGraphSize, false, false);
+    // With weights split between VRAM and RAM, let the scheduler copy RAM weights to the GPU for big
+    // batches (reading a long prompt), where that beats computing them on the CPU.
+    const bool offload = m->main_ != m->cpu_ && (m->place_.cpu_weights > 0 || !m->place_.kv_on_gpu);
+    m->pin_layers_ = m->main_ != m->cpu_ && m->place_.mode == "layers" && m->place_.kv_gpu_layers < hp.n_layer;
+    m->sched_ = ggml_backend_sched_new(backends, nullptr, n_backends, kGraphSize, false, offload);
     if (!m->sched_) throw std::runtime_error("failed to create the scheduler");
     m->graph_mem_.resize(ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false));
 
@@ -238,10 +349,22 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // of the context), so it is not re-planned on every token.
     const int n_res = std::min(m->batch_, m->max_ctx_);
     Graph worst = m->build(n_res, m->max_ctx_ - n_res, true);
+    m->pin_cpu_layers(worst);
     bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
     ggml_free(worst.ctx);
     if (!ok) throw std::runtime_error("failed to reserve compute memory");
     return m;
+}
+
+// ggml's scheduler gives any op without weights of its own (norms, RoPE, attention over the cache...) to the
+// GPU if it can run it, even in the middle of a layer whose weights are in RAM. Each such op costs two
+// GPU<->CPU hand-offs, which on Windows cost more than the GPU saves. So in a layer split, every op of a RAM
+// layer is pinned to the CPU, and the work changes device once per token.
+void Model::pin_cpu_layers(const Graph& g) {
+    if (!pin_layers_) return;
+    for (const auto& [t, layer] : g.owner)
+        if (layer >= 0 && layer < (int)layer_kv_gpu_.size() && !layer_kv_gpu_[layer])
+            ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
 }
 
 bool Model::integrated_gpu() const {
@@ -276,7 +399,17 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing) {
     const float scale = 1.0f / std::sqrt((float)hd);
 
     ggml_tensor* x = ggml_get_rows(c, tok_embd_, g.inp);                   // [n_embd, n_tok]
-    for (const Layer& L : layers_) {
+    // Remember which layer created each tensor, so a layer split can keep RAM layers wholly on the CPU.
+    ggml_tensor* mark = nullptr;
+    auto tag = [&](int layer) {
+        for (ggml_tensor* t = mark ? ggml_get_next_tensor(c, mark) : ggml_get_first_tensor(c); t; t = ggml_get_next_tensor(c, t)) {
+            if (layer >= 0 && pin_layers_) g.owner.push_back({t, layer});
+            mark = t;
+        }
+    };
+    for (int li = 0; li < (int)layers_.size(); ++li) {
+        tag(li - 1);
+        const Layer& L = layers_[li];
         // ---- attention ----
         ggml_tensor* h = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.attn_norm);
         ggml_tensor* q = ggml_mul_mat(c, L.wq, h);                            // [n_head*hd, n_tok]
@@ -356,6 +489,7 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing) {
         }
         x = ggml_add(c, x, moe);
     }
+    tag((int)layers_.size() - 1);
 
     x = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), out_norm_);
     ggml_tensor* last = ggml_view_2d(c, x, hp.n_embd, 1, x->nb[1], (size_t)(n_tok - 1) * x->nb[1]);
@@ -383,10 +517,37 @@ std::vector<float> Model::eval(const std::vector<int32_t>& ids, int n_threads, s
 std::vector<float> Model::eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing) {
     const Hparams& hp = hp_;
     const int n_past = n_past_, n_kv = n_past + n_tok;
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    auto t0 = clk::now();
     Graph g = build(n_tok, n_past, routing != nullptr);
+    auto t1 = clk::now();
 
     ggml_backend_sched_reset(sched_);
+    pin_cpu_layers(g);
     if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) { ggml_free(g.ctx); throw std::runtime_error("failed to allocate compute memory"); }
+    auto t2 = clk::now();
+    if (std::getenv("TIERLM_DUMP_SCHED") && n_tok == 1) {           // debugging: where the work switches device
+        ggml_backend_t prev = nullptr;
+        int layer = -1, shown = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(g.gf) && shown < 60; ++i) {
+            ggml_tensor* t = ggml_graph_node(g.gf, i);
+            if (t->op == GGML_OP_FLASH_ATTN_EXT || (t->op == GGML_OP_SOFT_MAX && !flash_attn_)) ++layer;
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched_, t);
+            if (b == prev) continue;
+            prev = b;
+            ++shown;
+            std::string srcs;
+            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                ggml_tensor* x = t->src[s];
+                ggml_backend_buffer* buf = x->view_src ? x->view_src->buffer : x->buffer;
+                srcs += std::string(" [") + ggml_op_desc(x) + (buf ? std::string(" in ") + ggml_backend_buffer_name(buf) : "") + "]";
+            }
+            std::fprintf(stderr, "switch at node %4d (layer ~%d): %-14s -> %-8s inputs:%s\n", i, layer, ggml_op_desc(t),
+                         b ? ggml_backend_name(b) : "?", srcs.c_str());
+        }
+        std::fprintf(stderr, "splits %d\n", ggml_backend_sched_get_n_splits(sched_));
+    }
 
     std::vector<int32_t> positions(n_tok);
     for (int i = 0; i < n_tok; ++i) positions[i] = n_past + i;
@@ -400,11 +561,13 @@ std::vector<float> Model::eval_batch(const int32_t* ids, int n_tok, int n_thread
         ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
     }
     ggml_backend_cpu_set_n_threads(cpu_, n_threads);
+    auto t3 = clk::now();
 
     if (ggml_backend_sched_graph_compute(sched_, g.gf) != GGML_STATUS_SUCCESS) {
         ggml_free(g.ctx);
         throw std::runtime_error("graph compute failed");
     }
+    auto t4 = clk::now();
     std::vector<float> out(hp.n_vocab);
     ggml_backend_tensor_get(g.logits, out.data(), 0, sizeof(float) * hp.n_vocab);
     if (routing) {
@@ -419,6 +582,11 @@ std::vector<float> Model::eval_batch(const int32_t* ids, int n_tok, int n_thread
         }
     }
     ggml_free(g.ctx);
+    auto t5 = clk::now();
+    stats_.calls++; stats_.tokens += n_tok;
+    stats_.build_ms += ms(t0, t1); stats_.alloc_ms += ms(t1, t2); stats_.input_ms += ms(t2, t3);
+    stats_.compute_ms += ms(t3, t4); stats_.output_ms += ms(t4, t5);
+    stats_.splits = ggml_backend_sched_get_n_splits(sched_); stats_.copies = ggml_backend_sched_get_n_copies(sched_);
     n_past_ = n_kv;
     return out;
 }
