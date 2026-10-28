@@ -36,6 +36,7 @@ independent engine built on the same principle.
   Face's tokenizers exactly on real Qwen3, Llama 3.2 and TinyLlama models.
 - **Own model graph for every supported family**: dense and mixture-of-experts, grouped-query attention, QK-norm,
   RoPE variants, verified against independent NumPy implementations, including when split between GPU and RAM.
+- **Split (multi-part) GGUFs**: models published as `-00001-of-0000N.gguf` files load as one model.
 - **Tier loader**: a model that doesn't fit in VRAM is split by whole layers (or with experts in RAM), with
   each RAM layer pinned to the CPU so a token changes device only once.
 - **KV cache in f16** and **flash attention**, with prompts processed in batches.

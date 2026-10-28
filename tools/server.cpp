@@ -21,6 +21,7 @@
 //                     (with the experts picked in every layer), then "done"
 //   POST /api/reset   clears the KV cache
 #include "model.h"
+#include "gguf_split.h"
 #include "tokenizer.h"
 #include "gguf.h"
 #include "ggml-backend.h"
@@ -341,6 +342,19 @@ json describe_model(const std::string& path) {
     json j = {{"file", std::filesystem::u8path(path).filename().u8string()}, {"supported", false}};
     std::error_code ec;
     j["bytes"] = (uint64_t)std::filesystem::file_size(std::filesystem::u8path(path), ec);
+    // A model split over several files: count every part's size, and make sure they're all there.
+    SplitInfo split;
+    try { split = gguf_split_info(path); } catch (const std::exception& e) { j["reason"] = e.what(); return j; }
+    if (split.count > 1) {
+        uint64_t total = 0;
+        for (const auto& p : split.paths) { std::error_code e2; auto n = std::filesystem::file_size(std::filesystem::u8path(p), e2); if (!e2) total += n; }
+        j["bytes"] = total;
+        j["parts"] = split.count;
+        if (!split.missing.empty()) {
+            j["reason"] = "part of the model is missing: " + split.missing + " should be in the same folder";
+            return j;
+        }
+    }
     gguf_init_params p{ true, nullptr };
     gguf_context* g = gguf_init_from_file(path.c_str(), p);
     if (!g) { j["reason"] = "not a readable GGUF file"; return j; }
@@ -537,11 +551,11 @@ int main(int argc, char** argv) {
             for (; !ec && it != fs::recursive_directory_iterator() && list.size() < 500; it.increment(ec)) {
                 if (it.depth() > 4) { it.disable_recursion_pending(); continue; }
                 std::error_code e2;
-                if (it->is_regular_file(e2) && it->path().extension() == ".gguf") add(it->path());
+                if (it->is_regular_file(e2) && it->path().extension() == ".gguf" && !gguf_is_later_part(it->path().filename().u8string())) add(it->path());
             }
         } else if (exists) {
             for (const auto& f : fs::directory_iterator(base, ec))
-                if (f.is_regular_file() && f.path().extension() == ".gguf") add(f.path());
+                if (f.is_regular_file() && f.path().extension() == ".gguf" && !gguf_is_later_part(f.path().filename().u8string())) add(f.path());
         }
         json suggest = json::array();
         for (const auto& f : known_model_folders()) {

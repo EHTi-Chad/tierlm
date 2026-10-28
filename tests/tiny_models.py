@@ -23,7 +23,7 @@ CASES = {
     "olmoe":     ("olmoe",    dict(E=48, H=4, KV=4, HD=12, FFX=24, NE=8, NU=2, qkn="full")),
 }
 
-def make(arch, s, seed):
+def make(arch, s, seed, parts=1):
     rng = np.random.default_rng(seed)
     E, H, KV, HD = s["E"], s["H"], s["KV"], s["HD"]
     r = lambda *sh: (rng.standard_normal(sh) * 0.2).astype(np.float32)
@@ -49,7 +49,8 @@ def make(arch, s, seed):
             W.update({b + "ffn_gate.weight": r(F, E), b + "ffn_up.weight": r(F, E), b + "ffn_down.weight": r(E, F)})
 
     path = os.path.join(tempfile.mkdtemp(), f"tiny-{arch}.gguf")
-    w = gguf.GGUFWriter(path, arch)
+    # parts > 1 writes a split model (tiny-x-00001-of-0000N.gguf ...), like big models on Hugging Face
+    w = gguf.GGUFWriter(path, arch, split_max_tensors=-(-len(W) // parts) if parts > 1 else 0)
     w.add_block_count(L); w.add_embedding_length(E); w.add_head_count(H); w.add_head_count_kv(KV)
     w.add_key_length(HD); w.add_value_length(HD); w.add_rope_dimension_count(HD)
     w.add_context_length(CTX); w.add_rope_freq_base(BASE); w.add_layer_norm_rms_eps(EPS)
@@ -61,6 +62,9 @@ def make(arch, s, seed):
         w.add_feed_forward_length(s["FF"])
     for name, t in W.items(): w.add_tensor(name, t)
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    if parts > 1:
+        path = path[:-5] + f"-00001-of-{parts:05d}.gguf"
+        assert os.path.exists(path), "split writer used an unexpected file name"
     return path, W, L
 
 def rms(x, g): return x / np.sqrt((x * x).mean(-1, keepdims=True) + EPS) * g
@@ -150,5 +154,24 @@ for idx, name in enumerate(names):
         ok &= passed
         where = "" if frac is None else f" [{placement.split(': ', 1)[-1]}]"
         print(f"{name:9s} {label:9s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {all_top}  ->  {'ok' if passed else 'FAIL'}{where}")
+
+# Split models: the same weights written as 3 files, loaded through part 1, must give the same results.
+if not os.environ.get("TIERLM_RPC"):
+    for name in names:
+        arch, s = CASES[name]
+        path, W, L = make(arch, s, 100 + list(CASES).index(name), parts=3)
+        worst, all_top = 0.0, True
+        for ids in ([5], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55]):
+            want = reference(arch, s, W, L, np.array(ids))
+            run = subprocess.run([sys.argv[1], path, *map(str, ids)], capture_output=True, text=True,
+                                 env={**os.environ, "TIERLM_KV_F32": "1"})
+            if run.returncode != 0:
+                sys.exit(f"{name} (3 files): tierlm-logits failed: {run.stderr.strip()}")
+            got = np.array([float(v) for v in run.stdout.split()])
+            worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
+            all_top &= bool(got.argmax() == want.argmax())
+        passed = worst < 1e-4 and all_top
+        ok &= passed
+        print(f"{name:9s} 3 files  : worst relative diff {worst:.1e} (limit 1e-04), top token matches: {all_top}  ->  {'ok' if passed else 'FAIL'}")
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

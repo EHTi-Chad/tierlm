@@ -1,4 +1,5 @@
 #include "model_map.h"
+#include "gguf_split.h"
 #include "ggml.h"
 #include "gguf.h"
 #include <cstdlib>
@@ -53,21 +54,36 @@ ModelMap load_model_map(const std::string& path) {
     m.n_experts      = get_u32(g, m.arch + ".expert_count");
     m.n_experts_used = get_u32(g, m.arch + ".expert_used_count");
 
-    const size_t data_off = gguf_get_data_offset(g);
-    const int64_t n = gguf_get_n_tensors(g);
-    m.tensors.reserve(n);
-    for (int64_t i = 0; i < n; ++i) {
-        TensorInfo t;
-        t.name   = gguf_get_tensor_name(g, i);
-        t.type   = ggml_type_name(gguf_get_tensor_type(g, i));
-        t.bytes  = gguf_get_tensor_size(g, i);
-        t.offset = data_off + gguf_get_tensor_offset(g, i);
-        t.role   = classify(t.name);
-        if (t.name.rfind("blk.", 0) == 0) t.layer = std::atoi(t.name.c_str() + 4);
-        if (ggml_tensor* tt = ggml_get_tensor(meta, t.name.c_str()))
-            for (int d = 0; d < ggml_n_dims(tt); ++d) t.shape.push_back(tt->ne[d]);
-        m.total_bytes += t.bytes;
-        m.tensors.push_back(std::move(t));
+    // Tensors can be spread over several files (a split model); part 1 holds the settings read above.
+    const SplitInfo split = gguf_split_info(path);
+    if (!split.missing.empty()) { gguf_free(g); ggml_free(meta); throw std::runtime_error("missing part: " + split.missing); }
+    m.parts = split.count;
+    for (int part = 0; part < split.count; ++part) {
+        gguf_context* gp = g;
+        ggml_context* mp = meta;
+        if (part > 0) {
+            mp = nullptr;
+            gguf_init_params pp{ /*no_alloc=*/true, /*ctx=*/&mp };
+            gp = gguf_init_from_file(split.paths[part].c_str(), pp);
+            if (!gp) { gguf_free(g); ggml_free(meta); throw std::runtime_error("failed to read GGUF: " + split.paths[part]); }
+        }
+        const size_t data_off = gguf_get_data_offset(gp);
+        const int64_t n = gguf_get_n_tensors(gp);
+        for (int64_t i = 0; i < n; ++i) {
+            TensorInfo t;
+            t.name   = gguf_get_tensor_name(gp, i);
+            t.type   = ggml_type_name(gguf_get_tensor_type(gp, i));
+            t.bytes  = gguf_get_tensor_size(gp, i);
+            t.offset = data_off + gguf_get_tensor_offset(gp, i);
+            t.part   = part;
+            t.role   = classify(t.name);
+            if (t.name.rfind("blk.", 0) == 0) t.layer = std::atoi(t.name.c_str() + 4);
+            if (ggml_tensor* tt = ggml_get_tensor(mp, t.name.c_str()))
+                for (int d = 0; d < ggml_n_dims(tt); ++d) t.shape.push_back(tt->ne[d]);
+            m.total_bytes += t.bytes;
+            m.tensors.push_back(std::move(t));
+        }
+        if (part > 0) { gguf_free(gp); ggml_free(mp); }
     }
     gguf_free(g);
     ggml_free(meta);

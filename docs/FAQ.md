@@ -44,6 +44,10 @@ can verify the zip against the `.sha256` file on the Releases page first.
 Put a supported `.gguf` file in the `models` folder next to `start-tierlm.bat` (the screen shows the exact
 folder), or use the **⋯** menu to choose the folder where your models already are, then click **Rescan**. See [Getting started](GETTING_STARTED.md#step-2-download-the-model).
 
+**My model comes in several files (`-00001-of-00003.gguf` ...)**
+That's normal for big models: Hugging Face limits files to 50 GB. Put all the parts in the same folder; tierlm
+lists the model once, marked "3 files", and loads every part. If one is missing, the setup screen names it.
+
 **My model shows as "not supported yet"**
 The label says which architecture (or tokenizer) the file uses that tierlm doesn't support yet, for example
 `qwen35` or `gemma3`. A file labelled **Vision add-on (mmproj)** isn't a model on its own: it's the image part of

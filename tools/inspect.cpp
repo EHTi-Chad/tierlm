@@ -13,6 +13,7 @@ int main(int argc, char** argv) {
     try { m = load_model_map(argv[1]); }
     catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
 
+    if (m.parts > 1) std::printf("split model: %d files\n", m.parts);
     std::printf("arch: %s | layers: %d | experts: %d (active %d) | tensors: %zu | total: %.2f GiB\n\n",
                 m.arch.c_str(), m.n_layers, m.n_experts, m.n_experts_used, m.tensors.size(), gib(m.total_bytes));
 

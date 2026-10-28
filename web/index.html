@@ -833,9 +833,10 @@ function renderSetup() {
     lab.className = "choice" + (selModel && m.id === selModel.id ? " sel" : "") + (m.supported ? "" : " off");
     lab.innerHTML = `<input type="radio" name="model"><div class="t"></div><div class="d"></div><div class="tags"></div>`;
     const inp = lab.querySelector("input"); inp.checked = selModel && m.id === selModel.id; inp.disabled = !m.supported;
-    lab.querySelector(".t").textContent = m.name || m.file;
+    lab.querySelector(".t").textContent = m.name || m.file.replace(/-00001-of-\d{5}\.gguf$/, "");
     lab.querySelector(".d").textContent = (m.folder ? m.folder + "/" : "") + m.file + " · " + fmtGiB(m.bytes || 0);
     const add = tagger(lab.querySelector(".tags"));
+    if (m.parts > 1) add(m.parts + " files");
     if (m.supported) {
       add("Supported", "good");
       if (m.experts) add(m.experts_used + " of " + m.experts + " experts per token"); else add("Dense");

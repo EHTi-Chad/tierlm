@@ -113,7 +113,7 @@ Summarises a GGUF model from its header only (fast, reads no weights).
 tierlm-inspect model.gguf [--tensors]
 ```
 
-Shows the architecture, layer and expert counts, total size, size and share by role (experts, attention,
+Works on split models too (give it part 1). Shows the architecture, layer and expert counts, total size, size and share by role (experts, attention,
 embedding, ...), and the per-layer size range. `--tensors` lists every tensor.
 
 ## tierlm-plan

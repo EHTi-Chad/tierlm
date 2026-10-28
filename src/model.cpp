@@ -1,4 +1,5 @@
 #include "model.h"
+#include "gguf_split.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -88,10 +89,42 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         m->dev_ = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
 
-    // ---- read the header: tensor shapes/types only, no data yet ----
-    gguf_init_params params{ /*no_alloc=*/true, /*ctx=*/&m->wctx_ };
-    gguf_context* g = gguf_init_from_file(path.c_str(), params);
-    if (!g) throw std::runtime_error("failed to load GGUF: " + path);
+    // ---- read the headers: tensor shapes/types only, no data yet ----
+    // A model may be split over several files; part 1 has the settings, every part has some tensors.
+    const SplitInfo split = gguf_split_info(path);
+    if (!split.missing.empty())
+        throw std::runtime_error("this model has " + std::to_string(split.count) + " parts, but " + split.missing + " is missing");
+    struct Source { int part; size_t offset; ggml_tensor* t; };
+    std::vector<Source> sources;
+    gguf_context* g = nullptr;                                     // part 1: the model's settings
+    {
+        std::vector<gguf_context*> gs;
+        std::vector<ggml_context*> cs;
+        auto cleanup = [&] { for (auto* x : gs) if (x && x != g) gguf_free(x); for (auto* c : cs) if (c) ggml_free(c); };
+        size_t n_total = 0;
+        for (const auto& p : split.paths) {
+            ggml_context* c = nullptr;
+            gguf_init_params params{ /*no_alloc=*/true, /*ctx=*/&c };
+            gguf_context* gi = gguf_init_from_file(p.c_str(), params);
+            if (!gi) { cleanup(); if (g) gguf_free(g); throw std::runtime_error("failed to load GGUF: " + p); }
+            if (!g) g = gi;
+            gs.push_back(gi); cs.push_back(c);
+            n_total += (size_t)gguf_get_n_tensors(gi);
+        }
+        ggml_init_params wp{ (n_total + 1) * ggml_tensor_overhead(), nullptr, /*no_alloc=*/true };
+        m->wctx_ = ggml_init(wp);
+        for (size_t pi = 0; pi < gs.size(); ++pi) {
+            const size_t data_off = gguf_get_data_offset(gs[pi]);
+            for (int64_t k = 0; k < gguf_get_n_tensors(gs[pi]); ++k) {
+                const char* name = gguf_get_tensor_name(gs[pi], k);
+                if (ggml_get_tensor(m->wctx_, name)) { cleanup(); gguf_free(g); throw std::runtime_error(std::string("tensor ") + name + " appears in two parts"); }
+                ggml_tensor* t = ggml_dup_tensor(m->wctx_, ggml_get_tensor(cs[pi], name));
+                ggml_set_name(t, name);
+                sources.push_back({(int)pi, data_off + gguf_get_tensor_offset(gs[pi], k), t});
+            }
+        }
+        cleanup();
+    }
 
     auto str = [&](const char* k) -> std::string { int64_t id = gguf_find_key(g, k); return id < 0 ? "" : gguf_get_val_str(g, id); };
     auto u32 = [&](const std::string& k, bool required) -> int {
@@ -251,17 +284,20 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         }
     }
 
-    std::ifstream file(std::filesystem::u8path(path), std::ios::binary);   // UTF-8 path, also on Windows
-    if (!file) { gguf_free(g); throw std::runtime_error("cannot open " + path); }
-    const size_t data_off = gguf_get_data_offset(g);
+    // ---- stream every tensor's data from its file into wherever the tier loader put it ----
+    std::vector<std::ifstream> files;
+    for (const auto& p : split.paths) {
+        files.emplace_back(std::filesystem::u8path(p), std::ios::binary);   // UTF-8 path, also on Windows
+        if (!files.back()) { gguf_free(g); throw std::runtime_error("cannot open " + p); }
+    }
     std::vector<char> chunk;
-    for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) {
-        ggml_tensor* t = ggml_get_tensor(m->wctx_, gguf_get_tensor_name(g, i));
-        const size_t n = ggml_nbytes(t);
+    for (const Source& s : sources) {
+        const size_t n = ggml_nbytes(s.t);
         chunk.resize(n);
-        file.seekg((std::streamoff)(data_off + gguf_get_tensor_offset(g, i)));
-        if (!file.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + path); }
-        ggml_backend_tensor_set(t, chunk.data(), 0, n);
+        auto& f = files[s.part];
+        f.seekg((std::streamoff)s.offset);
+        if (!f.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + split.paths[s.part]); }
+        ggml_backend_tensor_set(s.t, chunk.data(), 0, n);
     }
     gguf_free(g);
 

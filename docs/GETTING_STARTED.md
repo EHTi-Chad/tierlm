@@ -31,6 +31,9 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
 3. Move it into the **`models`** folder inside your tierlm folder, for example
    `C:\tierlm\models\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`. If you already keep models somewhere else
    (LM Studio's folder, say), leave it there: you can point tierlm at that folder in step 4.
+4. Big models often come as **several files**, named like `...-00001-of-00003.gguf`, `...-00002-of-00003.gguf`.
+   Download **all** of them into the same folder. tierlm shows them as one model ("3 files") and loads them
+   together.
 
 ## Step 3: Start it
 

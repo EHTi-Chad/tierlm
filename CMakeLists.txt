@@ -34,7 +34,7 @@ set(GGML_VULKAN ${TIERLM_VULKAN} CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/ggml)
 
-add_library(tierlm_core src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/model.cpp)
+add_library(tierlm_core src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/model.cpp src/gguf_split.cpp)
 target_include_directories(tierlm_core PUBLIC src)
 target_link_libraries(tierlm_core PUBLIC ggml)
 
@@ -43,6 +43,12 @@ foreach(tool inspect plan tok_test logits run bench)
   add_executable(tierlm-${name} tools/${tool}.cpp)
   target_link_libraries(tierlm-${name} PRIVATE tierlm_core)
 endforeach()
+
+# Test helper: with -DGGML_RPC=ON, serves the CPU as a stand-in GPU so VRAM/RAM splitting can be tested anywhere.
+if(GGML_RPC)
+  add_executable(tierlm-rpc-server tools/rpc_server.cpp)
+  target_link_libraries(tierlm-rpc-server PRIVATE ggml)
+endif()
 
 add_executable(tierlm-kv tools/kv.cpp)
 target_link_libraries(tierlm-kv PRIVATE ggml)

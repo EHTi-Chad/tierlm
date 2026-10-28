@@ -71,7 +71,8 @@ name doesn't exist), and `no_gpu` when a GPU build finds no GPU.
 Only the file headers are read, so this is fast. `kv_bytes_per_token` is the KV cache cost per token of
 context (f16), useful for estimating memory: model bytes + `kv_bytes_per_token` × context.
 
-`id` is the model's path relative to the folder; pass it to `/api/load`. With `recursive` on, subfolders are
+`id` is the model's path relative to the folder; pass it to `/api/load`. A model split over several files is
+listed once, by its first part, with `"parts": N` and the total size of all parts; parts 2..N are not listed. With `recursive` on, subfolders are
 searched too (up to 4 levels, as LM Studio stores models as `publisher/model/file.gguf`). `suggestions` lists
 other model folders found on this computer. `saved` holds the settings last used for each model, by `id`.
 
