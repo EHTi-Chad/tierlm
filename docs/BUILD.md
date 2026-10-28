@@ -138,12 +138,12 @@ scripts\package-windows.bat 0.2.0           &rem Vulkan: Intel, AMD and NVIDIA
 The CUDA build needs the CUDA toolkit 12.8 or newer on the build machine (for RTX 50-series) and bundles NVIDIA's
 redistributable runtime DLLs (`cudart`, `cuBLAS`, `cuBLASLt`, about 700 MB unzipped), so users only need an
 up-to-date NVIDIA driver. It builds into `build-release-<flavor>`, then writes
-`dist\tierlm-0.2.0-windows-x64-<flavor>.zip` (the tools, `web\`, `start-tierlm.bat`, an empty `models\` folder,
+`dist\tierlm-0.2.0-windows-nvidia.zip` (CUDA) or `dist\tierlm-0.2.0-windows-intel-amd.zip` (Vulkan) (the tools, `web\`, `start-tierlm.bat`, an empty `models\` folder,
 the docs and all licences) plus a `.sha256` checksum. Publish
 both on a GitHub release, for example from WSL:
 
 ```bash
-gh release create v0.2.0 /mnt/c/dev/tierlm/dist/tierlm-0.2.0-windows-x64-*.zip* --title "tierlm 0.2.0" --notes "..."
+gh release create v0.2.0 /mnt/c/dev/tierlm/dist/tierlm-0.2.0-windows-*.zip* --title "tierlm 0.2.0" --notes "..."
 ```
 
 ---

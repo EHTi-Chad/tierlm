@@ -82,15 +82,49 @@ next lever for it.
 
 ## Try it (Windows)
 
-1. Download the latest `tierlm-<version>-windows-x64-vulkan.zip` from
-   [Releases](https://github.com/EHTi-Chad/tierlm/releases) and extract it.
-2. Put a supported `.gguf` model in its `models` folder, for example
-   [`Llama-3.2-1B-Instruct-Q4_K_M.gguf`](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/tree/main) (0.8 GB) or
-   [`OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`](https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF/tree/main) (4.2 GB).
-3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040, where tierlm shows the
-   hardware it found and your models (or point it at a folder you already use, like LM Studio's), then chat.
+**tierlm's point is running models bigger than your GPU.** It fills GPU memory first, then puts the rest of the
+model in system RAM, automatically. On a laptop RTX 3070 with 8 GB, the 14.7 GB Qwen3-30B-A3B runs at about
+27 tokens/second.
 
-Nothing else to install: the graphics driver you already have is enough.
+**What you need**
+
+- **Windows 10 or 11, 64-bit**, with an AVX2 processor (almost any Intel or AMD CPU from 2015 on).
+- **System RAM: at least 32 GB** to run models bigger than your GPU; **64 GB or more is recommended**. The
+  model has to fit in GPU memory and RAM together, with about 8 GB left over for Windows and your other apps.
+- **A GPU** (optional, but much faster): an NVIDIA GeForce RTX card, Intel Arc or AMD Radeon. Without one,
+  tierlm runs on the CPU.
+
+| GPU memory | RAM | Biggest model, roughly |
+|---|---|---|
+| 8 GB | 32 GB | about 30 GB |
+| 8 GB | 64 GB | about 60 GB |
+| 16 GB | 64 GB | about 70 GB |
+| 32 GB | 64 GB | about 85 GB |
+
+Mixture-of-experts models (names with **A3B**, **A10B** and so on, such as Qwen3-30B-A3B or Qwen3.6-35B-A3B)
+only use a small part of the model for each word, so they stay fast even when most of the model is in RAM.
+These are the best fit for tierlm. Ordinary (dense) models also work, but slow down a lot once most of the
+model is in RAM.
+
+**Steps**
+
+1. From [Releases](https://github.com/EHTi-Chad/tierlm/releases), download the zip for your graphics card and
+   extract it:
+   - **`tierlm-<version>-windows-nvidia.zip`**: NVIDIA GeForce RTX 20, 30, 40 and 50 series. Uses CUDA, the
+     fastest option on NVIDIA. Everything it needs is included; you only need a current NVIDIA driver.
+   - **`tierlm-<version>-windows-intel-amd.zip`**: Intel Arc, AMD Radeon, older NVIDIA cards (GTX 10 series
+     and earlier), or no graphics card.
+2. Get a model. tierlm uses **GGUF** files, the same ones LM Studio uses; if you already have LM Studio models,
+   tierlm can use that folder directly. To download one, pick a size for your computer:
+   - Bigger than your GPU, the real test: [`Qwen3-30B-A3B` Q3_K_M](https://huggingface.co/bartowski/Qwen_Qwen3-30B-A3B-GGUF/tree/main)
+     (14.7 GB; needs 32 GB RAM with an 8 GB GPU)
+   - The newest: [`Qwen3.6-35B-A3B`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main) Q4_K_M (about 21 GB) or
+     Q8_0 (about 35 GB, for 64 GB RAM). Support is brand new; the first real-model test is under way.
+   - Just to check it works: [`Llama-3.2-1B-Instruct` Q4_K_M](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/tree/main) (0.8 GB)
+
+   Put the file in tierlm's `models` folder, or leave it where it is and choose that folder in step 3.
+3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040, where tierlm shows the
+   hardware it found and the models in your folder (the **⋯** menu changes the folder). Pick a model and chat.
 
 Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or the [PDF guide](docs/tierlm-0.2.0-guide.pdf) · Problems: [docs/FAQ.md](docs/FAQ.md)
 

@@ -62,8 +62,19 @@ the model next to it.
 **How does tierlm choose between my GPU and CPU?**
 Automatically. It uses a dedicated GPU if the model fits in its memory, then integrated graphics, then the CPU
 (the one marked **Will be used**). If a laptop has both Intel and NVIDIA graphics, the NVIDIA one is used. To
-run on the CPU anyway, open **Advanced** on the setup screen and tick **Force CPU**. Splitting a model that is
-too big for the GPU between GPU memory, RAM and SSD is the next big feature.
+run on the CPU anyway, open **Advanced** on the setup screen and tick **Force CPU**. A model too big for the
+GPU is split automatically: as much as fits goes in GPU memory, the rest in RAM. (An SSD tier is next.)
+
+**How much RAM do I need?**
+At least 32 GB to run models bigger than your GPU, and 64 GB or more is better. The model has to fit in GPU
+memory and RAM together, with about 8 GB left for Windows and other apps: an 8 GB GPU with 32 GB of RAM runs
+models up to about 30 GB, with 64 GB about 60 GB. Mixture-of-experts models (names with A3B, A10B...) stay fast
+with most of the model in RAM; ordinary dense models slow down a lot.
+
+**Which download do I need?**
+`tierlm-<version>-windows-nvidia.zip` for NVIDIA GeForce RTX 20/30/40/50 cards: it uses CUDA, the fastest
+option on NVIDIA, and includes NVIDIA's runtime, so you only need a current driver. Everyone else (Intel Arc,
+AMD Radeon, older NVIDIA cards, no GPU) gets `tierlm-<version>-windows-intel-amd.zip`, which uses Vulkan.
 
 **My models are already in another folder (LM Studio, say)**
 Click the **⋯** menu next to **GGUF models** and choose **Choose models folder…**, or the LM Studio entry if

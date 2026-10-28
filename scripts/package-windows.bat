@@ -9,7 +9,10 @@ if "%~1"=="" ( echo usage: scripts\package-windows.bat VERSION [vulkan^|cuda]   
 set "VER=%~1"
 set "FLAVOR=%~2"
 if "%FLAVOR%"=="" set "FLAVOR=vulkan"
-set "NAME=tierlm-%VER%-windows-x64-%FLAVOR%"
+rem Zips are named for who should download them: "nvidia" (CUDA) and "intel-amd" (Vulkan: Intel, AMD, older NVIDIA, or none)
+set "LABEL=intel-amd"
+if /i "%FLAVOR%"=="cuda" set "LABEL=nvidia"
+set "NAME=tierlm-%VER%-windows-%LABEL%"
 set "BDIR=build-release-%FLAVOR%"
 cd /d "%~dp0.."
 
