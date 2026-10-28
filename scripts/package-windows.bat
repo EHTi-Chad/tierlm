@@ -2,15 +2,15 @@
 rem Builds a portable Windows release of tierlm and zips it into dist\.
 rem Run from a Visual Studio Developer Command Prompt, in the project folder, with the CUDA toolkit (12.8 or newer,
 rem for RTX 50-series) and the Vulkan SDK installed:
-rem     scripts\package-windows.bat 0.2.0
+rem     scripts\package-windows.bat 0.3.0
 rem One download for every PC: it contains both GPU engines and picks one at start-up. NVIDIA GeForce RTX cards
 rem use CUDA (fastest on NVIDIA); Intel Arc, AMD Radeon and older NVIDIA cards use Vulkan; with no GPU, the CPU.
 rem NVIDIA's CUDA runtime DLLs are bundled, so users install nothing but their normal graphics driver.
-rem     scripts\package-windows.bat 0.2.0 lite      tierlm-0.2.0-windows-lite.zip: Vulkan only, about 55 MB. Runs on
+rem     scripts\package-windows.bat 0.3.0 lite      tierlm-0.3.0-windows-lite.zip: Vulkan only, about 55 MB. Runs on
 rem                                                Intel, AMD and NVIDIA GPUs (slower than CUDA on NVIDIA). Needs no CUDA toolkit to build.
-rem     scripts\package-windows.bat 0.2.0 both      both of the above
+rem     scripts\package-windows.bat 0.3.0 both      both of the above
 setlocal
-if "%~1"=="" ( echo usage: scripts\package-windows.bat VERSION [lite^|both]   e.g. 0.2.0 both & exit /b 1 )
+if "%~1"=="" ( echo usage: scripts\package-windows.bat VERSION [lite^|both]   e.g. 0.3.0 both & exit /b 1 )
 set "VER=%~1"
 set "FLAVOR=%~2"
 if "%FLAVOR%"=="" set "FLAVOR=full"
@@ -25,13 +25,13 @@ if /i "%FLAVOR%"=="both" (
 if /i "%FLAVOR%"=="full" (
   set "NAME=tierlm-%VER%-windows"
   set "BDIR=build-release"
-  echo == Building ^(portable: AVX2 baseline, static runtime, CUDA for RTX 20/30/40/50 + Vulkan^) ==
+  echo == Building ^(portable: a CPU engine for every x86 generation, static runtime, CUDA for RTX 20/30/40/50 + Vulkan^) ==
   rem CUDA architectures: 75 = RTX 20, 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
   cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_CUDA=ON -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=75;86;89;120" -DTIERLM_VERSION=%VER% || exit /b 1
 ) else if /i "%FLAVOR%"=="lite" (
   set "NAME=tierlm-%VER%-windows-lite"
   set "BDIR=build-release-vulkan"
-  echo == Building ^(portable: AVX2 baseline, static runtime, Vulkan only^) ==
+  echo == Building ^(portable: a CPU engine for every x86 generation, static runtime, Vulkan only^) ==
   cmake -S . -B build-release-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON -DTIERLM_VERSION=%VER% || exit /b 1
 ) else ( echo unknown option "%FLAVOR%": leave it out, or use lite or both & exit /b 1 )
 cmake --build %BDIR% || exit /b 1

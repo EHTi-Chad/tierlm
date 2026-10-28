@@ -99,7 +99,7 @@ Example (values depend on the model and machine):
   "weights_bytes": 4209221632, "kv_bytes": 536870912,
   "device_free": 12884901888, "device_total": 19219415040,
   "kv_type": "f16", "flash_attn": true, "batch": 256, "experts_default": 8, "seed": -1,
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
 ```
 
@@ -114,7 +114,7 @@ While a reply is streaming or a model is loading, `/api/info` returns the last k
     "free": 17179869184, "total": 19219415040},
    {"id": "CPU", "description": "Intel(R) Core(TM) Ultra 7 258V", "type": "cpu", "backend": "CPU",
     "free": 11811160064, "total": 33822867456}],
- "threads": 4, "hw_threads": 8, "version": "0.2.0", "warnings": []}
+ "threads": 4, "hw_threads": 8, "version": "0.3.0", "warnings": []}
 ```
 
 `type` is `gpu` (dedicated), `igpu` (integrated, shares system memory) or `cpu`. Pass `id` as the `device`

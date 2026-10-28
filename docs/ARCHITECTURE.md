@@ -130,6 +130,11 @@ same as without speculation (the tests check this, also with scripted, partly wr
 undo depth), and with sampling it follows the same distribution. The draft layer's math is checked against a
 NumPy version of Hugging Face's MTP block.
 
+**Measured.** RTX 3070 laptop, Qwen3.6-27B MTP Q4_K_M with 23 of 64 layers in VRAM, 16K context, 8-bit KV:
+3.0 tok/s without speculation; 3.9, **5.3** and 4.1 tok/s with 2, 3 and 4 guesses per check. At 3 guesses a check
+produced 2.6 tokens on average and 53% of guesses were kept. More guesses stop paying once the later ones are rarely
+kept but still cost a position in the check, so 3 is the default.
+
 **KV cache precision.** The cache can be stored at 8 bits (`q8_0`, about 1% from exact) or 4 bits (`q4_0`), which
 leaves VRAM for more of the model's layers. Quantized caches are read by flash attention, which turns on with them.
 

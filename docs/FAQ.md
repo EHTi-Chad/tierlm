@@ -22,7 +22,8 @@ model's weights produces more than one word: faster replies, with exactly the an
 It's greyed out when the model file has no draft layer. Some publishers (Unsloth) put it in a separate file named
 `mtp-<model>.gguf`: download that too and keep it in the same folder, and tierlm uses it automatically (the setup
 screen lists it as a **Draft add-on**). The chat shows "tokens per check" after each reply: above about 1.5 it's
-helping.
+helping. **Guesses per check** defaults to 3, the fastest on our tests (on a laptop RTX 3070 with Qwen3.6-27B: 3.0 tok/s
+off, 3.9 with 2, 5.3 with 3, 4.1 with 4); try 2 or 4 for your model and PC.
 
 **Can I use a different model?**
 Yes, for the common families: Llama (2, 3.x), Mistral and Mixtral, Qwen2/2.5, Qwen3 and Qwen3 MoE, the Qwen3.5 /
@@ -91,7 +92,7 @@ with most of the model in RAM; ordinary dense models slow down a lot.
 
 **Which download do I need?**
 Both run on every PC; tierlm picks the fastest engine it has when it starts. `tierlm-<version>-windows.zip`
-(about 1.1 GB) includes NVIDIA's **CUDA** engine, the fastest option on GeForce RTX 20/30/40/50 cards: get it if
+(about 550 MB) includes NVIDIA's **CUDA** engine, the fastest option on GeForce RTX 20/30/40/50 cards: get it if
 you have one. `tierlm-<version>-windows-lite.zip` (about 55 MB) has only the **Vulkan** engine, which runs on
 Intel Arc, AMD Radeon and NVIDIA cards (slower than CUDA on NVIDIA). Without a GPU, either uses the CPU. With the
 full download on a PC without an NVIDIA card, the black window may say CUDA found no device; that's expected.

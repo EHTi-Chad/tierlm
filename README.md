@@ -14,7 +14,7 @@ are split between VRAM and RAM automatically**: on a laptop RTX 3070 (8 GB), the
 about **27 tokens/second**, 40% faster than on the CPU alone. A web page lets you pick a model and chat, with a
 live dashboard showing speed, where the model lives, and the router picking experts.
 
-**New user? Read the [tierlm 0.2.0 guide (PDF)](docs/tierlm-0.2.0-guide.pdf)**: what tierlm is, step-by-step
+**New user? Read the [tierlm 0.3.0 guide (PDF)](docs/tierlm-0.3.0-guide.pdf)**: what tierlm is, step-by-step
 setup, every setting, how it works, and all test results, with diagrams.
 
 > **Status: early.** VRAM and RAM tiering works; the SSD tier and a hot-expert cache are next. Not every model
@@ -40,7 +40,10 @@ independent engine built on the same principle.
 - **Split (multi-part) GGUFs**: models published as `-00001-of-0000N.gguf` files load as one model.
 - **Tier loader**: a model that doesn't fit in VRAM is split by whole layers (or with experts in RAM), with
   each RAM layer pinned to the CPU so a token changes device only once.
-- **KV cache in f16** and **flash attention**, with prompts processed in batches.
+- **KV cache in f16, 8-bit or 4-bit** and **flash attention**, with prompts processed in batches.
+- **Every x86 CPU generation**: release builds carry a CPU engine per generation (plain x86-64 up to AVX2, AVX-512 and
+  AMX) and load the best one at start-up; common quantizations are rearranged for the CPU's wide instructions on load
+  (prompts read about 3.5× faster on the CPU).
 - **Runs on any ggml device**: CPU, Vulkan (Intel, AMD, NVIDIA) and CUDA builds, with automatic CPU fallback for
   any operation a device can't run.
 - **Setup screen**: detects every GPU (Intel, AMD, NVIDIA) and the CPU with free memory and places the model
@@ -72,6 +75,20 @@ independent engine built on the same principle.
 | Llama 3.2 1B Q4_K_M | VRAM, CUDA | 198.1 tok/s |
 | Qwen3-30B-A3B Q3_K_M (14.7 GB) | CPU only | 19.3 tok/s |
 | Qwen3-30B-A3B Q3_K_M (14.7 GB) | 22 of 48 layers in VRAM, rest in RAM (CUDA) | **27.1 tok/s** |
+
+**Speculative decoding**, same laptop. Qwen3.6-27B MTP Q4_K_M (Unsloth, dense, 17 GB), 16K context, 8-bit context
+memory, 23 of 64 layers in VRAM and the rest in RAM (CUDA):
+
+| Guesses per check | Generation |
+|---|---|
+| Off | 3.0 tok/s |
+| 2 | 3.9 tok/s |
+| **3 (the default)** | **5.3 tok/s** (2.6 tokens per check, 53% of guesses kept) |
+| 4 | 4.1 tok/s |
+
+A dense model with most of its weights in RAM is limited by how fast RAM can be read; checking several guessed
+tokens per read makes it about 1.75× faster here, with the same answers. More guesses isn't always better: each extra
+guess is less likely to be kept but still has to be checked.
 
 **Intel Arc 140V (integrated), Intel Core Ultra 7 258V:**
 
@@ -122,7 +139,7 @@ model is in RAM.
 **Steps**
 
 1. From [Releases](https://github.com/EHTi-Chad/tierlm/releases), download one of the two zips and extract it:
-   - **`tierlm-<version>-windows.zip`** (about 1.1 GB): everything, including NVIDIA's CUDA engine, the fastest
+   - **`tierlm-<version>-windows.zip`** (about 550 MB): everything, including NVIDIA's CUDA engine, the fastest
      option on NVIDIA GeForce RTX cards. Works on every PC. Get this one if you have an NVIDIA RTX card.
    - **`tierlm-<version>-windows-lite.zip`** (about 55 MB): the same app without CUDA. Runs on Intel Arc, AMD
      Radeon and NVIDIA cards through Vulkan (slower than CUDA on NVIDIA), or on the CPU.
@@ -141,7 +158,7 @@ model is in RAM.
 3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040, where tierlm shows the
    hardware it found and the models in your folder (the **⋯** menu changes the folder). Pick a model and chat.
 
-Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or the [PDF guide](docs/tierlm-0.2.0-guide.pdf) · Problems: [docs/FAQ.md](docs/FAQ.md)
+Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or the [PDF guide](docs/tierlm-0.3.0-guide.pdf) · Problems: [docs/FAQ.md](docs/FAQ.md)
 
 ### Supported models
 
@@ -152,7 +169,7 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | Llama 3.x | Llama-3.2-1B-Instruct |
 | Llama 2 / Mistral 7B / TinyLlama (SentencePiece) | TinyLlama-1.1B-Chat |
 | Mixtral, Qwen2/2.5 | model math verified, real weights not yet tested |
-| Qwen3.5 / 3.6 / 3.8 dense (`qwen35`, hybrid Gated DeltaNet) | model math verified, real weights not yet tested |
+| Qwen3.5 / 3.6 / 3.8 dense (`qwen35`, hybrid Gated DeltaNet) | Qwen3.6-27B (Unsloth MTP Q4_K_M) on an RTX 3070 laptop, with speculative decoding |
 | Qwen3.5 / 3.6 MoE (`qwen35moe`, e.g. Qwen3.6-35B-A3B) | Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
 | Qwen3-Next / Qwen3-Coder-Next (`qwen3next`, 80B-A3B) | model math verified, real weights not yet tested |
 
@@ -192,7 +209,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 
 ## Documentation
 
-- **[docs/tierlm-0.2.0-guide.pdf](docs/tierlm-0.2.0-guide.pdf)**: the full guide with diagrams and test results
+- **[docs/tierlm-0.3.0-guide.pdf](docs/tierlm-0.3.0-guide.pdf)**: the full guide with diagrams and test results
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): download, run, and use tierlm (no programming needed)
 - [docs/FAQ.md](docs/FAQ.md): questions and troubleshooting
 - [docs/BUILD.md](docs/BUILD.md): building on Windows and Linux, GPU backends, making a release

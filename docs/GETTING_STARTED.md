@@ -25,7 +25,7 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
 
 1. Go to the [Releases page](https://github.com/EHTi-Chad/tierlm/releases).
 2. Download one of the two zips:
-   - **`tierlm-<version>-windows.zip`** (about 1.1 GB): everything, including NVIDIA's CUDA engine, the fastest
+   - **`tierlm-<version>-windows.zip`** (about 550 MB): everything, including NVIDIA's CUDA engine, the fastest
      option on NVIDIA GeForce RTX cards. Get this one if you have an NVIDIA RTX card.
    - **`tierlm-<version>-windows-lite.zip`** (about 55 MB): the same app without CUDA, for Intel Arc, AMD Radeon,
      or no graphics card. It also runs on NVIDIA cards, through Vulkan, just slower.
@@ -155,14 +155,14 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Family | GGUF architecture | Examples | Status |
 |---|---|---|---|
 | OLMoE | `olmoe` | OLMoE-1B-7B-0924-Instruct | Tested on real hardware |
-| Qwen3 | `qwen3` | Qwen3-0.6B ... Qwen3-32B | New: model math verified, real-model test pending |
-| Qwen3 MoE | `qwen3moe` | Qwen3-30B-A3B, Qwen3-235B-A22B | New: model math verified, real-model test pending |
-| Qwen2 / 2.5 | `qwen2` | Qwen2.5-7B-Instruct, Qwen2.5-Coder | New: model math verified, real-model test pending |
-| Llama 3 / 3.1 / 3.2 / 3.3 | `llama` | Llama-3.2-3B-Instruct, Llama-3.1-8B-Instruct | New: model math verified, real-model test pending |
-| Llama 2, Mistral 7B, Mixtral, TinyLlama | `llama` | Mistral-7B-Instruct, Mixtral-8x7B | New: model math verified, real-model test pending |
-| Qwen3.5 / 3.6 / 3.8 dense (hybrid) | `qwen35` | Qwen3.8-27B, Qwen3.5-9B | New: model math verified, real-model test pending |
+| Qwen3 | `qwen3` | Qwen3-0.6B ... Qwen3-32B | Tested: Qwen3-0.6B |
+| Qwen3 MoE | `qwen3moe` | Qwen3-30B-A3B, Qwen3-235B-A22B | Tested: Qwen3-30B-A3B Q3_K_M on an RTX 3070 laptop |
+| Qwen2 / 2.5 | `qwen2` | Qwen2.5-7B-Instruct, Qwen2.5-Coder | Model math verified, real-model test pending |
+| Llama 3 / 3.1 / 3.2 / 3.3 | `llama` | Llama-3.2-3B-Instruct, Llama-3.1-8B-Instruct | Tested: Llama-3.2-1B |
+| Llama 2, Mistral 7B, Mixtral, TinyLlama | `llama` | Mistral-7B-Instruct, Mixtral-8x7B | Tested: TinyLlama-1.1B; Mistral and Mixtral math verified |
+| Qwen3.5 / 3.6 / 3.8 dense (hybrid) | `qwen35` | Qwen3.8-27B, Qwen3.5-9B | Tested: Qwen3.6-27B on an RTX 3070 laptop, with speculative decoding |
 | Qwen3.5 / 3.6 MoE (hybrid) | `qwen35moe` | Qwen3.6-35B-A3B, Qwen3.5-122B-A10B | Tested: Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
-| Qwen3-Next (hybrid MoE) | `qwen3next` | Qwen3-Coder-Next-80B-A3B, Qwen3-Next-80B-A3B | New: model math verified, real-model test pending |
+| Qwen3-Next (hybrid MoE) | `qwen3next` | Qwen3-Coder-Next-80B-A3B, Qwen3-Next-80B-A3B | Model math verified, real-model test pending |
 | Gemma, Phi, DeepSeek, GLM, gpt-oss, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision add-on** (for reading images). tierlm lists it but

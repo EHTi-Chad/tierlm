@@ -134,23 +134,23 @@ runtime is linked in, so users don't need the Visual C++ redistributable. From a
 project folder:
 
 ```bat
-scripts\package-windows.bat 0.2.0 both
+scripts\package-windows.bat 0.3.0 both
 ```
 
-It makes two downloads. **`tierlm-0.2.0-windows.zip`** has both GPU engines, CUDA (for NVIDIA RTX 20/30/40/50)
+It makes two downloads. **`tierlm-0.3.0-windows.zip`** has both GPU engines, CUDA (for NVIDIA RTX 20/30/40/50)
 and Vulkan (Intel, AMD, older NVIDIA), and tierlm picks one at start-up; it runs on every PC.
-**`tierlm-0.2.0-windows-lite.zip`** (`lite` on its own) is Vulkan only, about 55 MB. Leave out the second word
+**`tierlm-0.3.0-windows-lite.zip`** (`lite` on its own) is Vulkan only, about 55 MB. Leave out the second word
 to make just the full one. The build machine needs the CUDA toolkit 12.8 or newer
 (for RTX 50-series) and the Vulkan SDK. NVIDIA's redistributable runtime DLLs (`cudart`, `cuBLAS`, `cuBLASLt`,
 about 700 MB unzipped) are bundled, so users only need an up-to-date graphics driver. NVIDIA's driver DLL
 (`nvcuda.dll`) is delay-loaded, so the same program starts on PCs without an NVIDIA card. Without the CUDA toolkit, make
 only the `lite` one. They build into `build-release` and `build-release-vulkan`, then write
-`dist\tierlm-0.2.0-windows.zip` and `dist\tierlm-0.2.0-windows-lite.zip` (the tools, `web\`, `start-tierlm.bat`, an empty `models\` folder,
+`dist\tierlm-0.3.0-windows.zip` and `dist\tierlm-0.3.0-windows-lite.zip` (the tools, `web\`, `start-tierlm.bat`, an empty `models\` folder,
 the docs and all licences) plus a `.sha256` checksum. Publish
 both on a GitHub release, for example from WSL:
 
 ```bash
-gh release create v0.2.0 /mnt/c/dev/tierlm/dist/tierlm-0.2.0-windows-*.zip* --title "tierlm 0.2.0" --notes "..."
+gh release create v0.3.0 /mnt/c/dev/tierlm/dist/tierlm-0.3.0-windows-*.zip* --title "tierlm 0.3.0" --notes "..."
 ```
 
 ---
