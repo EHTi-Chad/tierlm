@@ -7,12 +7,17 @@ the project, making the design calls, and testing and debugging it on real hardw
 [ggml](https://github.com/ggml-org/ggml)'s math kernels, but the tokenizer, model graph, KV cache, attention,
 memory planner, server and dashboard are all tierlm's own. It does not use llama.cpp.
 
-It currently runs **OLMoE-1B-7B** (a 64-expert MoE model) on the CPU or on any GPU with Vulkan, including the
-Intel Arc 140V integrated GPU, where it generates at **about 68 tokens/second**. A built-in web page lets you
-chat with the model while a live dashboard shows the router picking experts for every token.
+It runs the common model families (**Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, OLMoE**) on the
+CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA. **Models bigger than the GPU's memory
+are split between VRAM and RAM automatically**: on a laptop RTX 3070 (8 GB), the 14.7 GB Qwen3-30B-A3B runs at
+about **27 tokens/second**, 40% faster than on the CPU alone. A web page lets you pick a model and chat, with a
+live dashboard showing speed, where the model lives, and the router picking experts.
 
-> **Status: early.** One model family is supported, and VRAM/RAM/SSD tiering is planned and modelled but not
-> yet loading weights across tiers. See the [roadmap](#roadmap).
+**New user? Read the [tierlm 0.2.0 guide (PDF)](docs/tierlm-0.2.0-guide.pdf)**: what tierlm is, step-by-step
+setup, every setting, how it works, and all test results, with diagrams.
+
+> **Status: early.** VRAM and RAM tiering works; the SSD tier and a hot-expert cache are next. Not every model
+> family is supported yet. See [Supported models](#supported-models) and the [roadmap](#roadmap).
 
 ## Why
 
@@ -27,10 +32,12 @@ independent engine built on the same principle.
 - **Own GGUF reader and model map**: lists every tensor's size, type, position, layer and role.
 - **Placement planner** (dry run): splits experts into individual units and assigns each to VRAM, RAM or SSD
   within a memory budget, and estimates per-token traffic from each tier.
-- **Own byte-level BPE tokenizer**: matches Hugging Face's tokenizer exactly on all test cases, including
-  added tokens, accents, CJK, emoji and code.
-- **Own OLMoE graph**: QK-norm attention, RoPE, top-8 of 64 expert routing, verified against an independent
-  NumPy implementation.
+- **Own tokenizers**: byte-level BPE (GPT-2, Llama 3 and Qwen splitting) and SentencePiece, matching Hugging
+  Face's tokenizers exactly on real Qwen3, Llama 3.2 and TinyLlama models.
+- **Own model graph for every supported family**: dense and mixture-of-experts, grouped-query attention, QK-norm,
+  RoPE variants, verified against independent NumPy implementations, including when split between GPU and RAM.
+- **Tier loader**: a model that doesn't fit in VRAM is split by whole layers (or with experts in RAM), with
+  each RAM layer pinned to the CPU so a token changes device only once.
 - **KV cache in f16** and **flash attention**, with prompts processed in batches.
 - **Runs on any ggml device**: CPU, Vulkan (Intel, AMD, NVIDIA) and CUDA builds, with automatic CPU fallback for
   any operation a device can't run.
@@ -42,6 +49,17 @@ independent engine built on the same principle.
 - **Local HTTP API** with streaming replies (Server-Sent Events): see [docs/API.md](docs/API.md). OpenAI-compatible endpoints are on the roadmap.
 
 ## Benchmarks
+
+**RTX 3070 Laptop (8 GB) + Ryzen 9 5900HX, Windows 11:**
+
+| Model | Where it runs | Generation |
+|---|---|---|
+| Llama 3.2 1B Q4_K_M | VRAM, Vulkan | 230.7 tok/s |
+| Llama 3.2 1B Q4_K_M | VRAM, CUDA | 198.1 tok/s |
+| Qwen3-30B-A3B Q3_K_M (14.7 GB) | CPU only | 19.3 tok/s |
+| Qwen3-30B-A3B Q3_K_M (14.7 GB) | 22 of 48 layers in VRAM, rest in RAM (CUDA) | **27.1 tok/s** |
+
+**Intel Arc 140V (integrated), Intel Core Ultra 7 258V:**
 
 OLMoE-1B-7B-0924-Instruct, Q4_K_M (3.9 GiB), generation speed as context grows (`tierlm-bench`):
 
@@ -64,33 +82,44 @@ next lever for it.
 
 1. Download the latest `tierlm-<version>-windows-x64-vulkan.zip` from
    [Releases](https://github.com/EHTi-Chad/tierlm/releases) and extract it.
-2. Download [`OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`](https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF/tree/main)
-   (4.2 GB) into its `models` folder.
-3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040, where you pick your GPU (or
-   CPU) and the model, then chat.
+2. Put a supported `.gguf` model in its `models` folder, for example
+   [`Llama-3.2-1B-Instruct-Q4_K_M.gguf`](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/tree/main) (0.8 GB) or
+   [`OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf`](https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF/tree/main) (4.2 GB).
+3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040, where tierlm shows the
+   hardware it found and your models (or point it at a folder you already use, like LM Studio's), then chat.
 
-Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** · Problems: [docs/FAQ.md](docs/FAQ.md)
+Nothing else to install: the graphics driver you already have is enough.
+
+Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or the [PDF guide](docs/tierlm-0.2.0-guide.pdf) · Problems: [docs/FAQ.md](docs/FAQ.md)
 
 ### Supported models
 
-Only the **OLMoE** family for now: `OLMoE-1B-7B-0924-Instruct` (Q4_K_M tested; other quantizations should
-work). Other GGUF models are not supported yet and fail with "expected olmoe". Qwen3 MoE is next.
+| Family | Tested on real weights |
+|---|---|
+| OLMoE | OLMoE-1B-7B-0924-Instruct |
+| Qwen3, Qwen3 MoE | Qwen3-0.6B, Qwen3-30B-A3B |
+| Llama 3.x | Llama-3.2-1B-Instruct |
+| Llama 2 / Mistral 7B / TinyLlama (SentencePiece) | TinyLlama-1.1B-Chat |
+| Mixtral, Qwen2/2.5 | model math verified, real weights not yet tested |
 
-## Build from source (Windows, Vulkan)
+Not yet: the Qwen3.5/3.6 hybrid (`qwen35`), Gemma, Phi, DeepSeek, gpt-oss and others. The setup screen says which
+of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
+
+## Build from source (Windows)
 
 Full instructions, including Linux/WSL and common pitfalls, are in [docs/BUILD.md](docs/BUILD.md).
 
 ```bat
 git clone --recurse-submodules https://github.com/EHTi-Chad/tierlm.git C:\dev\tierlm
 cd /d C:\dev\tierlm
-cmake -S . -B build -G Ninja -DTIERLM_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -G Ninja -DTIERLM_VULKAN=ON -DTIERLM_CUDA=ON
 cmake --build build
 build\tierlm-devices.exe
-build\tierlm-server.exe C:\models\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf --port 8040
+build\tierlm-server.exe --models C:\models --port 8040
 ```
 
 Then open http://127.0.0.1:8040. Run these from a Visual Studio Developer Command Prompt with the Vulkan SDK
-installed.
+installed (and the CUDA Toolkit for `-DTIERLM_CUDA=ON`; leave it out for a Vulkan-only build).
 
 ## Tools
 
@@ -109,6 +138,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 
 ## Documentation
 
+- **[docs/tierlm-0.2.0-guide.pdf](docs/tierlm-0.2.0-guide.pdf)**: the full guide with diagrams and test results
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): download, run, and use tierlm (no programming needed)
 - [docs/FAQ.md](docs/FAQ.md): questions and troubleshooting
 - [docs/BUILD.md](docs/BUILD.md): building on Windows and Linux, GPU backends, making a release
