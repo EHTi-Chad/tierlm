@@ -8,7 +8,7 @@
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --ink: #1d2230; --muted: #636a7a; --faint: #9aa0ad;
     --line: #e2e5eb; --accent: #0f7b6c; --accent-ink: #ffffff; --accent-soft: #dff2ee;
-    --vram: #0f7b6c; --ram: #b8730a; --ssd: #b4472b; --heat-lo: #eef0f3; --flash: #10b39c;
+    --vram: #0f7b6c; --ram: #b8730a; --ssd: #b4472b; --kv: #6a55c8; --work: #7d8799; --other: #c3c8d2; --heat-lo: #eef0f3; --flash: #10b39c;
     --user: #1e3a5f; --user-ink: #ffffff; --danger: #b4472b;
     --radius: 10px; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
   }
@@ -16,7 +16,7 @@
     :root {
       --bg: #12151b; --panel: #1a1e26; --panel-2: #222733; --ink: #e6e8ee; --muted: #a0a6b4; --faint: #6c7383;
       --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35;
-      --vram: #2bb39e; --ram: #e0a043; --ssd: #e07a5f; --heat-lo: #232834; --flash: #6ff0dc;
+      --vram: #2bb39e; --ram: #e0a043; --ssd: #e07a5f; --kv: #a08cf5; --work: #7a8396; --other: #3c4250; --heat-lo: #232834; --flash: #6ff0dc;
       --user: #2f5d93; --user-ink: #ffffff; --danger: #e07a5f;
     }
   }
@@ -141,6 +141,13 @@
   .place .lbl { font-size: 13px; margin-bottom: 6px; }
   .stack { display: flex; height: 14px; border-radius: 5px; overflow: hidden; background: var(--panel-2); }
   .stack > div { height: 100%; }
+  .membar { margin-top: 10px; }
+  .membar .mt { font-size: 12.5px; font-weight: 600; margin-bottom: 4px; display: flex; gap: 8px; }
+  .membar .mt span { font-weight: 400; color: var(--muted); }
+  .membar .stack > div + div { box-shadow: inset 1px 0 0 var(--panel); }
+  .membar .stack .hatch { background-image: repeating-linear-gradient(135deg, transparent 0 3px, rgba(127,127,127,.35) 3px 5px); }
+  .memnote { font-size: 12.5px; margin-top: 8px; color: var(--muted); }
+  .memnote b { color: var(--ink); }
   .stackleg { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
   .stackleg i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
   .stackleg b { color: var(--ink); font-weight: 600; }
@@ -748,7 +755,15 @@ function showSetup() {
   loadSetup();
 }
 function showApp() { $("setup").hidden = true; $("app").hidden = false; $("setupbtn").hidden = false; resizeCanvases(); }
-function needBytes(m, ctx, kv32) { return (m.bytes || 0) + (m.kv_bytes_per_token || 0) * ctx * (kv32 ? 2 : 1) + 600 * 1048576; }
+const WORK = 768 * 1048576;   // working memory the engine keeps free on the GPU (as the tier loader does)
+// Memory the loaded model holds now. Loading another one frees it first, so it counts as free when planning.
+function heldNow(gpu) {
+  if (!info || !info.loaded) return { vram: 0, ram: 0 };
+  const onThisGpu = gpu && info.on_gpu && String(info.device || "").startsWith(gpu.id);
+  const kvG = info.layers ? (info.kv_bytes || 0) * (info.kv_gpu_layers || 0) / info.layers : 0;
+  return { vram: onThisGpu ? (info.vram_weights || 0) + kvG : 0,
+           ram: (info.ram_weights || 0) + (info.kv_bytes || 0) - (onThisGpu ? kvG : 0) };
+}
 // Same order as the engine's "auto": the dedicated GPU with the most memory, then an integrated GPU.
 function bestGpu() {
   for (const t of ["gpu", "igpu"]) {
@@ -758,18 +773,34 @@ function bestGpu() {
   return null;
 }
 function cpuDev() { return devices.find(d => d.type === "cpu") || null; }
-// Where the model will go. Until the tier loader exists, the whole model goes on one device:
-// the best GPU if it fits there, otherwise the CPU (system RAM).
+// Where the model will go, as the tier loader will place it: the model's weights and its context (KV cache),
+// in VRAM first and the rest in RAM. "layers" moves whole layers with their part of the context; "experts" puts
+// all of the context (and attention) in VRAM first, then as many experts as fit.
 function plan() {
   const ctx = +$("ctxsel").value || defCtx, kv32 = $("kvsel").value === "f32";
-  const need = selModel ? needBytes(selModel, ctx, kv32) : 0;
+  const W = selModel ? selModel.bytes || 0 : 0;
+  const KV = selModel ? (selModel.kv_bytes_per_token || 0) * ctx * (kv32 ? 2 : 1) : 0;
   const gpu = bestGpu(), cpu = cpuDev();
-  if ($("forcecpu").checked || !gpu) return { dev: cpu, need, vram: 0, ram: need, why: $("forcecpu").checked ? "forced" : "nogpu" };
-  // The tier loader fills VRAM first (keeping some free for working memory), then puts the rest in RAM.
+  const held = heldNow(gpu);
+  const ramFree = cpu ? cpu.free + held.ram : 0;
+  const base = { W, KV, gpu, cpu, held, ramFree };
+  if ($("forcecpu").checked || !gpu)
+    return { ...base, dev: cpu, wv: 0, kvv: 0, wr: W, kvr: KV, why: $("forcecpu").checked ? "forced" : "nogpu" };
   const lim = +$("vramlim").value > 0 ? +$("vramlim").value * 1073741824 : Infinity;
-  const room = Math.max(0, Math.min(gpu.free, lim) - 768 * 1048576);
-  const vram = Math.min(need, room), ram = need - vram;
-  return { dev: gpu, need, vram, ram, why: !selModel || ram <= 0 ? "fits" : "split", cpuFree: cpu ? cpu.free : 0 };
+  const room = Math.max(0, Math.min(gpu.free + held.vram, lim) - WORK);
+  let wv, kvv;
+  if (W + KV <= room) { wv = W; kvv = KV; }
+  else if ($("splitsel").value === "experts") { kvv = Math.min(KV, room); wv = Math.min(W, room - kvv); }
+  else { const f = (W + KV) ? room / (W + KV) : 0; wv = W * f; kvv = KV * f; }
+  return { ...base, dev: gpu, wv, kvv, wr: W - wv, kvr: KV - kvv, room, why: !selModel || W + KV <= room ? "fits" : "split" };
+}
+// One memory bar: the device's whole memory, with what tierlm would put there, what other programs use, and what's free.
+function memBar(title, sub, total, parts) {
+  const used = parts.reduce((t, x) => t + x.v, 0);
+  const all = [...parts, { v: Math.max(0, total - used), c: "transparent", l: "Free" }];
+  const segs = all.filter(x => x.v > 0).map(x => `<div class="${x.h ? "hatch" : ""}" style="background-color:${x.c};width:${100 * x.v / Math.max(1, total, used)}%" title="${x.l}: ${fmtGiB(x.v)}"></div>`).join("");
+  const leg = all.filter(x => x.v > 0 || x.always).map(x => `<span><i class="${x.h ? "hatch" : ""}" style="background-color:${x.c === "transparent" ? "var(--panel-2)" : x.c}"></i>${x.l} <b>${fmtGiB(x.v)}</b></span>`).join("");
+  return `<div class="membar"><div class="mt">${title}<span>${sub}</span></div><div class="stack">${segs}</div><div class="stackleg">${leg}</div></div>`;
 }
 async function loadSetup() {
   $("loadmsg").textContent = ""; $("loadmsg").className = "";
@@ -872,18 +903,39 @@ function renderSetup() {
     if (d.alsoVulkan) add("CUDA (Vulkan also available)");
     dl.appendChild(el);
   }
-  // placement bar
+  // placement: one bar for GPU memory, one for system RAM
   const pl = $("place");
   if (!selModel || !p.dev) { pl.innerHTML = ""; }
   else {
-    const vram = p.vram, ram = p.ram, total = Math.max(1, vram + ram);
-    pl.innerHTML = `<div class="lbl"></div><div class="stack"><div style="background:var(--vram);width:${100 * vram / total}%"></div><div style="background:var(--ram);width:${100 * ram / total}%"></div><div style="background:var(--ssd);width:0"></div></div>
-      <div class="stackleg"><span><i style="background:var(--vram)"></i>${p.dev.type === "igpu" ? "GPU memory (shared)" : "VRAM"} <b>${fmtGiB(vram)}</b></span><span><i style="background:var(--ram)"></i>RAM <b>${fmtGiB(ram)}</b></span><span><i style="background:var(--ssd)"></i>SSD <b>0 GiB</b></span></div>`;
-    const msg = { fits: `The whole model fits on ${p.dev.description}.`,
-                  split: `It doesn't all fit on ${p.dev.description}, so tierlm splits it: as many layers as fit (with their part of the KV cache) go in VRAM, the rest in RAM, computed by the CPU. Expect speed between all-GPU and CPU-only.` +
-                         (ram > p.cpuFree ? ` Warning: that needs more RAM than is free (${fmtGiB(p.cpuFree)}); the SSD tier isn't built yet, so close other programs or pick a smaller model.` : ""),
-                  forced: "Force CPU is on, so everything runs on the CPU.",
-                  nogpu: "No GPU found, so everything runs on the CPU." }[p.why];
+    const other = d => Math.max(0, d.total - d.free - (d === p.gpu ? p.held.vram : p.held.ram));
+    let html = `<div class="lbl"></div>`;
+    if (p.dev === p.gpu) {
+      const ig = p.gpu.type === "igpu";
+      html += memBar(ig ? "GPU memory (shared)" : "VRAM", p.gpu.description + " · " + fmtGiB(p.gpu.total), p.gpu.total, [
+        { v: p.wv, c: "var(--vram)", l: "Model", always: true },
+        { v: p.kvv, c: "var(--kv)", l: "Context (KV cache)", always: true },
+        { v: p.wv + p.kvv > 0 ? WORK : 0, c: "var(--work)", l: "Working memory" },
+        { v: other(p.gpu), c: "var(--other)", h: true, l: "Other programs" }]);
+    }
+    if (p.wr + p.kvr > 0 && p.cpu) {
+      html += memBar("System RAM", fmtGiB(p.cpu.total), p.cpu.total, [
+        { v: p.wr, c: "var(--ram)", l: "Model", always: true },
+        { v: p.kvr, c: "var(--kv)", l: "Context (KV cache)" },
+        { v: other(p.cpu), c: "var(--other)", h: true, l: "Windows and other programs" }]);
+    }
+    const otherG = p.gpu ? other(p.gpu) : 0;
+    if (p.why === "split" && otherG > 1.5 * 1073741824)
+      html += `<div class="memnote">Other programs are using <b>${fmtGiB(otherG)}</b> of VRAM (another tierlm window, LM Studio, a game?). Closing them gives tierlm more room; then click <b>Rescan</b>.</div>`;
+    pl.innerHTML = html;
+    const ram = p.wr + p.kvr;
+    const msg = { fits: `The whole model fits on ${p.dev.description}: ${fmtGiB(p.W)} of model plus ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context.`,
+                  split: `It doesn't all fit on ${p.dev.description}, so tierlm splits it: ` +
+                         ($("splitsel").value === "experts" ? "the context and as much of the model as fits go in VRAM, the rest of the model in RAM, computed by the CPU."
+                                                            : "as many layers as fit (with their part of the context) go in VRAM, the rest in RAM, computed by the CPU.") +
+                         " Expect speed between all-GPU and CPU-only." +
+                         (ram > p.ramFree ? ` Warning: that needs more RAM than is free (${fmtGiB(p.ramFree)}); the SSD tier isn't built yet, so close other programs, pick a shorter context, or a smaller model.` : ""),
+                  forced: "Force CPU is on, so everything runs on the CPU, in system RAM.",
+                  nogpu: "No GPU found, so everything runs on the CPU, in system RAM." }[p.why];
     pl.querySelector(".lbl").textContent = "Where this model will go: " + msg;
   }
   // models
@@ -918,12 +970,11 @@ function renderSetup() {
   if (!selModel) {
     $("rec").textContent = models.length ? "None of the models in this folder are supported yet. tierlm runs OLMoE models so far." : "";
   } else if (p.dev) {
-    const kv32 = $("kvsel").value === "f32";
     $("rec").innerHTML = "";
     const b = document.createElement("b"); b.textContent = selModel.name || selModel.file;
-    $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description + (p.ram > 0 ? " and system RAM" : "")}, needing about ${fmtGiB(p.need)} ` +
-      `(${fmtGiB(selModel.bytes)} model + ${fmtGiB((selModel.kv_bytes_per_token || 0) * ctx * (kv32 ? 2 : 1))} for ${ctx.toLocaleString()} tokens of context).` +
-      (p.dev.type === "cpu" && p.dev.free < p.need ? " That's more than is free, so loading may fail; try a shorter context or close other programs." : ""));
+    $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description + (p.wr + p.kvr > 0 ? " and system RAM" : "")}, needing about ${fmtGiB(p.W + p.KV)} ` +
+      `(${fmtGiB(p.W)} model + ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context).` +
+      (p.wr + p.kvr > p.ramFree ? " That's more than is free, so loading may fail; try a shorter context or close other programs." : ""));
   }
   $("ctxhelp").textContent = "How much conversation the model can remember, up to what this model was trained for (" +
     (selModel && selModel.ctx_train ? selModel.ctx_train.toLocaleString() + " tokens" : "unknown") + "). Longer uses more memory, shown next to each size.";
@@ -963,7 +1014,7 @@ $("pathok").onclick = async () => {
 };
 $("pathin").onkeydown = e => { if (e.key === "Enter") $("pathok").click(); if (e.key === "Escape") $("pathcancel").click(); };
 $("rescanhw").onclick = e => { e.preventDefault(); loadSetup(); };
-for (const id of ["ctxsel", "forcecpu"]) $(id).onchange = renderSetup;
+for (const id of ["ctxsel", "forcecpu", "splitsel"]) $(id).onchange = renderSetup;
 $("vramlim").oninput = renderSetup;
 $("kvsel").onchange = () => { buildCtx($("ctxsel").value); renderSetup(); };
 $("thr").oninput = () => $("thrv").textContent = $("thr").value;

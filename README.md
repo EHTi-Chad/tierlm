@@ -110,10 +110,14 @@ model is in RAM.
 
 **Steps**
 
-1. Download **`tierlm-<version>-windows.zip`** from [Releases](https://github.com/EHTi-Chad/tierlm/releases)
-   and extract it. It's the same download for every PC: tierlm finds your graphics card and uses the fastest
-   engine for it by itself (CUDA on NVIDIA GeForce RTX, Vulkan on Intel Arc, AMD Radeon and older NVIDIA cards,
-   the CPU if there's no GPU). Nothing else to install: your normal graphics driver is enough.
+1. From [Releases](https://github.com/EHTi-Chad/tierlm/releases), download one of the two zips and extract it:
+   - **`tierlm-<version>-windows.zip`** (about 1.1 GB): everything, including NVIDIA's CUDA engine, the fastest
+     option on NVIDIA GeForce RTX cards. Works on every PC. Get this one if you have an NVIDIA RTX card.
+   - **`tierlm-<version>-windows-lite.zip`** (about 55 MB): the same app without CUDA. Runs on Intel Arc, AMD
+     Radeon and NVIDIA cards through Vulkan (slower than CUDA on NVIDIA), or on the CPU.
+
+   tierlm finds your graphics card and picks the fastest engine it has by itself. Nothing else to install: your
+   normal graphics driver is enough.
 2. Get a model. tierlm uses **GGUF** files, the same ones LM Studio uses; if you already have LM Studio models,
    tierlm can use that folder directly. To download one, pick a size for your computer:
    - Bigger than your GPU, the real test: [`Qwen3-30B-A3B` Q3_K_M](https://huggingface.co/bartowski/Qwen_Qwen3-30B-A3B-GGUF/tree/main)

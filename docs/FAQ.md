@@ -71,11 +71,12 @@ memory and RAM together, with about 8 GB left for Windows and other apps: an 8 G
 models up to about 30 GB, with 64 GB about 60 GB. Mixture-of-experts models (names with A3B, A10B...) stay fast
 with most of the model in RAM; ordinary dense models slow down a lot.
 
-**Does it matter which graphics card I have?**
-No, there's one download for everyone. It contains two GPU engines and picks one when it starts: **CUDA** on
-NVIDIA GeForce RTX 20/30/40/50 cards (the fastest option on NVIDIA; NVIDIA's runtime is included, so you only
-need a current driver), and **Vulkan** on Intel Arc, AMD Radeon and older NVIDIA cards. Without a GPU it uses
-the CPU. On a PC without an NVIDIA card, the black window may say CUDA found no device; that's expected.
+**Which download do I need?**
+Both run on every PC; tierlm picks the fastest engine it has when it starts. `tierlm-<version>-windows.zip`
+(about 1.1 GB) includes NVIDIA's **CUDA** engine, the fastest option on GeForce RTX 20/30/40/50 cards: get it if
+you have one. `tierlm-<version>-windows-lite.zip` (about 55 MB) has only the **Vulkan** engine, which runs on
+Intel Arc, AMD Radeon and NVIDIA cards (slower than CUDA on NVIDIA). Without a GPU, either uses the CPU. With the
+full download on a PC without an NVIDIA card, the black window may say CUDA found no device; that's expected.
 
 **Can other apps use tierlm, like they use LM Studio or Ollama?**
 Yes: tierlm has an OpenAI-compatible API at `http://127.0.0.1:8040/v1`. Open WebUI, Continue, LibreChat and

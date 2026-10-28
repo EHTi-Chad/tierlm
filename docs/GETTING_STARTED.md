@@ -15,8 +15,8 @@ OLMoE) but not yet everything on Hugging Face. See [Supported models](#supported
   about 85 GB). Small models that fit in the GPU run with less.
 - **Disk space** for the models you download (1 to 60 GB each) plus about 1 GB for tierlm.
 - **Optional: a GPU** for much faster replies: NVIDIA GeForce, Intel Arc (including the built-in Arc graphics in
-  Core Ultra laptops) or AMD Radeon. tierlm picks the fastest engine for it by itself: CUDA on NVIDIA RTX cards,
-  Vulkan on the rest. Without a GPU, tierlm runs on the CPU, which is slower but works.
+  Core Ultra laptops) or AMD Radeon. tierlm picks the fastest engine it has by itself: CUDA on NVIDIA RTX cards
+  (in the full download), Vulkan on the rest. Without a GPU, tierlm runs on the CPU, which is slower but works.
 - Keep your **graphics driver up to date**; Vulkan support comes with it.
 
 On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
@@ -24,7 +24,11 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
 ## Step 1: Download tierlm
 
 1. Go to the [Releases page](https://github.com/EHTi-Chad/tierlm/releases).
-2. Download the latest **`tierlm-<version>-windows.zip`**. It's the same download for every PC.
+2. Download one of the two zips:
+   - **`tierlm-<version>-windows.zip`** (about 1.1 GB): everything, including NVIDIA's CUDA engine, the fastest
+     option on NVIDIA GeForce RTX cards. Get this one if you have an NVIDIA RTX card.
+   - **`tierlm-<version>-windows-lite.zip`** (about 55 MB): the same app without CUDA, for Intel Arc, AMD Radeon,
+     or no graphics card. It also runs on NVIDIA cards, through Vulkan, just slower.
 3. Right-click the zip, choose **Extract All...**, and extract it somewhere simple, such as `C:\tierlm`.
 
 ## Step 2: Download the model
@@ -56,7 +60,11 @@ The setup screen shows:
 
 1. **Detected hardware**: every GPU tierlm found, plus the CPU, with free memory. You don't choose: tierlm
    uses the GPU if the model fits there (a dedicated GPU first, then integrated graphics), otherwise the CPU,
-   and marks it **Will be used**. A bar shows where the model will go: GPU memory, RAM or SSD. Integrated
+   and marks it **Will be used**. Below them, a **VRAM** bar shows how the GPU's memory will be used: the
+   **model**, its **context** (the KV cache, which grows with the context length you choose), the engine's
+   **working memory**, what **other programs** already use, and what's left **free**. If the model doesn't all
+   fit, a **System RAM** bar shows the part that goes there. If other programs are using a lot of VRAM (another
+   tierlm window, LM Studio, a game), tierlm says so: close them and click **Rescan**. Integrated
    graphics, such as Intel Arc in a laptop, are labelled **Shares system RAM**: they work well, but use the
    computer's normal memory.
 2. **GGUF models**: the `.gguf` files in your models folder and its subfolders. Supported ones can be
