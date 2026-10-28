@@ -1,5 +1,6 @@
 // tierlm-devices: lists the compute devices this build can use, and explains why a GPU backend is missing.
 #include "ggml-backend.h"
+#include "backends.h"
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -40,6 +41,14 @@ static void warn_vk_env() {
 int main() {
     std::printf("tierlm %s\n", TIERLM_VERSION);
     warn_vk_env();
+    tierlm::load_backends();
+#ifdef GGML_BACKEND_DL
+    // Release builds: each engine is a separate file, loaded if this PC can run it.
+    std::printf("Engines loaded:");
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) std::printf(" %s", ggml_backend_reg_name(ggml_backend_reg_get(i)));
+    std::printf("\n(No CUDA here means no NVIDIA driver was found; no Vulkan means no Vulkan driver.)\n");
+#endif
+    try { std::printf("CPU engine uses: %s\n", tierlm::cpu_features().c_str()); } catch (const std::exception& e) { std::printf("%s\n", e.what()); }
 #ifdef GGML_USE_VULKAN
     std::printf("Vulkan backend: built in\n");
     std::fflush(stdout);   // so this shows even if the driver crashes below
@@ -56,7 +65,7 @@ int main() {
     } catch (...) {
         std::printf("Vulkan failed to start (unknown error)\n");
     }
-#else
+#elif !defined(GGML_BACKEND_DL)
     std::printf("Vulkan backend: NOT built in (configure with -DTIERLM_VULKAN=ON)\n");
 #endif
 #ifdef GGML_USE_CUDA

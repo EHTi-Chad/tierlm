@@ -12,7 +12,7 @@
 //   POST /api/folder   {"folder": "D:\\models", "recursive": true}  sets the models folder (saved)
 //   POST /api/pick-folder  opens a folder picker on this computer (Windows; local requests only)
 //   POST /api/load     {"model": "sub/file.gguf", "device": "auto|cpu|<device>", "ctx": 4096, "threads": 4,
-//                       "flash_attn": true, "kv_type": "f16|f32", "batch": 256, "experts_used": 0, "seed": -1,
+//                       "flash_attn": true, "kv_type": "f16|q8_0|q4_0|f32", "batch": 256, "experts_used": 0, "seed": -1,
 //                       "vram_limit_mb": 0, "split_mode": "layers|experts"}
 //   POST /api/unload   frees the model
 //   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "top_k":40,
@@ -28,6 +28,7 @@
 //   GET  /v1/models            the loaded model and every supported model in the models folder
 //   POST /v1/chat/completions  chat, streamed or not; naming another model loads it first
 #include "model.h"
+#include "speculate.h"
 #include "gguf_split.h"
 #include "tokenizer.h"
 #include "gguf.h"
@@ -54,9 +55,7 @@
 #include <thread>
 #include <vector>
 
-#ifdef GGML_USE_RPC
-#include "ggml-rpc.h"
-#endif
+#include "backends.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <shobjidl.h>
@@ -337,6 +336,8 @@ std::string pick_folder_windows(const std::string& start, bool& cancelled) {
 
 // The loaded model and everything that belongs to it.
 struct Engine {
+    std::unique_ptr<Speculator> spec;   // speculative decoding with the model's MTP draft block, when turned on
+    int draft_max = 3;                  // most tokens the draft block guesses per check
     std::unique_ptr<Model> model;
     Tokenizer tok;
     ChatFmt chat = ChatFmt::Plain;
@@ -389,7 +390,22 @@ json describe_model(const std::string& path) {
     const int64_t head_dim = u32(arch + ".attention.key_length") ? u32(arch + ".attention.key_length") : (heads ? embd / heads : 0);
     // Only attention layers keep a KV cache; in hybrid models (qwen35, qwen35moe) that's one layer in every few.
     int64_t kv_layers = layers;
-    if (arch == "qwen35" || arch == "qwen35moe") {
+    // A multi-token-prediction (MTP) draft block, in the file or in a separate "mtp-" file next to it, makes
+    // speculative decoding possible. A file that holds only a draft block is an add-on, not a model.
+    const bool mtp_arch = arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next";
+    const bool draft_only = u32(arch + ".nextn_predict_layers") > 0 && gguf_find_tensor(g, "blk.0.attn_norm.weight") < 0;
+    if (draft_only) {
+        j["kind"] = "draft";
+        j["reason"] = "Draft add-on (MTP) that speeds up its model with speculative decoding; not a model on its own";
+        gguf_free(g);
+        return j;
+    }
+    if (mtp_arch && u32(arch + ".nextn_predict_layers") > 0) j["mtp"] = true;
+    else if (mtp_arch) {
+        const std::string comp = mtp_companion(path);
+        if (!comp.empty()) { j["mtp"] = true; j["mtp_file"] = fs::u8path(comp).filename().u8string(); }
+    }
+    if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") {
         const int64_t interval = u32(arch + ".full_attention_interval") ? u32(arch + ".full_attention_interval") : 4;
         kv_layers = layers / interval;
         j["hybrid"] = true;
@@ -515,10 +531,9 @@ int main(int argc, char** argv) {
         else if (a.model.empty()) a.model = k;
     }
 
-#ifdef GGML_USE_RPC
+    load_backends();                     // in release builds: the best CPU engine for this PC, and the GPU engines
     // Testing hook: TIERLM_RPC=host:port adds a tierlm-rpc-server as a stand-in GPU.
-    if (const char* ep = std::getenv("TIERLM_RPC")) ggml_backend_register(ggml_backend_rpc_add_server(ep));
-#endif
+    if (const char* ep = std::getenv("TIERLM_RPC")) add_rpc_server(ep);
     Engine eng;
     eng.threads = a.threads;
     std::mutex mu;                       // one load or generation at a time
@@ -536,11 +551,13 @@ int main(int argc, char** argv) {
     auto load = [&](const std::string& path, const LoadOptions& opt, int threads, int seed) {
         json info = describe_model(path);
         if (!info.value("supported", false)) throw std::runtime_error(info.value("reason", std::string("unsupported model")));
+        eng.spec.reset();
         eng.model.reset();               // free the old model (and its GPU memory) first
         eng.cached.clear();
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
         eng.model = Model::load(path, opt);
+        if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max);
         eng.chat = detect_chat(eng.tok);
         eng.path = path;
         eng.name = gguf_string(path, "general.name");
@@ -557,11 +574,12 @@ int main(int argc, char** argv) {
         o.device = body.value("device", std::string("auto"));
         o.max_ctx = body.value("ctx", a.ctx);
         if (body.contains("flash_attn")) o.flash_attn = body.value("flash_attn", true) ? 1 : 0;
-        if (body.contains("kv_type")) o.kv_f32 = body.value("kv_type", std::string("f16")) == "f32" ? 1 : 0;
+        if (body.contains("kv_type")) o.kv_type = body.value("kv_type", std::string("f16"));   // f16, f32, q8_0, q4_0
         o.batch = body.value("batch", 0);
         o.experts_used = body.value("experts_used", 0);
         o.vram_budget_mb = body.value("vram_limit_mb", 0);
         o.split_mode = body.value("split_mode", std::string("layers"));
+        o.mtp = body.value("speculative", false);      // load the MTP draft block for speculative decoding
         return o;
     };
     if (!a.model.empty()) {
@@ -607,6 +625,7 @@ int main(int argc, char** argv) {
             {"kv_on_gpu", eng.model->placement().kv_on_gpu}, {"attn_gpu", eng.model->placement().attn_gpu},
             {"ffn_gpu", eng.model->placement().ffn_gpu}, {"kv_gpu_layers", eng.model->placement().kv_gpu_layers},
             {"split_mode", eng.model->placement().mode},
+            {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"has_draft_block", hp.n_nextn > 0},
             {"version", TIERLM_VERSION},
         };
         last_info = j;
@@ -642,6 +661,7 @@ int main(int argc, char** argv) {
                 if (c["backend"] == "CUDA" && c["description"] == d["description"]) d["same_gpu_as"] = c["id"];
         }
         json j = {{"devices", list}, {"threads", a.threads}, {"hw_threads", (int)std::thread::hardware_concurrency()},
+                  {"cpu_features", cpu_features()},
                   {"warnings", hardware_warnings(have_gpu)}, {"version", TIERLM_VERSION}};
         res.set_content(dump(j), "application/json");
     });
@@ -764,6 +784,7 @@ int main(int argc, char** argv) {
         }
         try {
             const LoadOptions o = load_options(body);
+            eng.draft_max = std::max(1, std::min(8, body.value("draft_max", 3)));
             const int threads = body.value("threads", a.threads), seed = body.value("seed", -1);
             load(file.u8string(), o, threads, seed);
             // Remember these settings for this model, like LM Studio does.
@@ -775,6 +796,7 @@ int main(int argc, char** argv) {
             write_settings(a.settings, settings);
             res.set_content(dump({{"ok", true}, {"device", eng.model->device_name()}, {"load_s", eng.load_s}}), "application/json");
         } catch (const std::exception& e) {
+            eng.spec.reset();
             eng.model.reset();
             eng.path.clear();
             res.status = 500;
@@ -784,6 +806,7 @@ int main(int argc, char** argv) {
 
     svr.Post("/api/unload", [&](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lk(mu);
+        eng.spec.reset();
         eng.model.reset();
         eng.cached.clear();
         eng.path.clear();
@@ -801,7 +824,8 @@ int main(int argc, char** argv) {
     //   on_prompt  once, after the conversation has been read
     //   on_token   for each piece of new text (with the experts each layer picked); return false to stop
     // `stops` are strings that end the reply (OpenAI's "stop"); text that might be the start of one is held back.
-    struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0; double prompt_s = 0, gen_s = 0; std::string stop = "length", text; };
+    struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0, drafted = 0, accepted = 0, checks = 0; double prompt_s = 0, gen_s = 0;
+                 std::string stop = "length", text; };
     auto generate = [&](const json& messages, const Sampling& sp, int max_tokens, const std::vector<std::string>& stops,
                         const std::function<void(const json&)>& on_prompt,
                         const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token) {
@@ -825,11 +849,13 @@ int main(int argc, char** argv) {
 
         std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;
         auto p0 = Clock::now();
-        std::vector<float> lg = model->eval(suffix, eng.threads, &routing);
+        std::vector<float> lg;
+        if (eng.spec) { lg = eng.spec->prompt(toks, eng.threads); eng.spec->reset_stats(); }   // also feeds the draft block
+        else lg = model->eval(suffix, eng.threads, &routing);
         r.prompt_s = since(p0);
         r.n_prompt = toks.size();
         r.reused = common;
-        cached.insert(cached.end(), suffix.begin(), suffix.end());
+        cached = toks;
 
         std::vector<int> counts((size_t)L * E, 0);                // experts used while reading the prompt
         if (K > 0) for (size_t i = 0; i < routing.size(); ++i) counts[((i / K) % L) * E + routing[i]]++;
@@ -848,17 +874,17 @@ int main(int argc, char** argv) {
             return on_token ? on_token(delta, out.size() / std::max(since(g0), 1e-9), routing) : true;
         };
         std::string visible;
-        for (int i = 0; i < max_tokens; ++i) {
-            // Recent tokens for the repetition penalty, leaving out control tokens such as the
-            // end-of-reply marker: penalising those would stop the model from finishing.
-            std::vector<int32_t> recent;
-            for (size_t j = cached.size(); j > 0 && (int)recent.size() < sp.repeat_last_n; --j) {
-                const int32_t t = cached[j - 1];
-                if (t != tok.eos() && t != tok.eot() && !tok.is_control(t)) recent.push_back(t);
-            }
-            int32_t id = sample(lg, sp, recent, eng.rng);
-            if (id == tok.eos() || id == tok.eot() || tok.is_control(id)) { r.stop = "end"; break; }
-            if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
+        auto is_end = [&](int32_t t) { return t == tok.eos() || t == tok.eot() || tok.is_control(t); };
+        // Recent tokens for the repetition penalty (the cache, then `extra`), leaving out control tokens such as the
+        // end-of-reply marker: penalising those would stop the model from finishing.
+        auto recent_with = [&](const std::vector<int32_t>& extra) {
+            std::vector<int32_t> rc;
+            for (size_t j = extra.size(); j > 0 && (int)rc.size() < sp.repeat_last_n; --j) if (!is_end(extra[j - 1])) rc.push_back(extra[j - 1]);
+            for (size_t j = cached.size(); j > 0 && (int)rc.size() < sp.repeat_last_n; --j) if (!is_end(cached[j - 1])) rc.push_back(cached[j - 1]);
+            return rc;
+        };
+        // Adds a chosen token to the reply and streams its text. False when the reply must end here.
+        auto add = [&](int32_t id) {
             out.push_back(id);
             const std::string text = tok.decode(out);
             visible = text.substr(0, utf8_complete(text));
@@ -866,16 +892,55 @@ int main(int argc, char** argv) {
             size_t cut = std::string::npos;
             for (const auto& st : stops)
                 if (!st.empty()) { size_t p = visible.find(st, shown > st.size() ? shown - st.size() : 0); if (p < cut) cut = p; }
-            if (cut != std::string::npos) { emit(visible, std::max(cut, shown)); r.stop = "stop"; break; }
+            if (cut != std::string::npos) { emit(visible, std::max(cut, shown)); r.stop = "stop"; return false; }
             // Hold back text that could be the start of a stop string.
             size_t hold = 0;
             for (const auto& st : stops)
                 for (size_t k = st.empty() ? 0 : std::min(st.size() - 1, visible.size()); k > hold; --k)
                     if (visible.compare(visible.size() - k, k, st, 0, k) == 0) { hold = k; break; }
-
-            lg = model->eval({id}, eng.threads, &routing);            // also tells us which experts it used
-            cached.push_back(id);
-            if (!emit(visible, visible.size() - hold)) { r.stop = "abort"; break; }
+            if (!emit(visible, visible.size() - hold)) { r.stop = "abort"; return false; }
+            return true;
+        };
+        if (!eng.spec) {
+            for (;;) {
+                if ((int)out.size() >= max_tokens) { r.stop = "length"; break; }
+                const int32_t id = sample(lg, sp, recent_with({}), eng.rng);
+                if (is_end(id)) { r.stop = "end"; break; }
+                if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
+                lg = model->eval({id}, eng.threads, &routing);            // also tells us which experts it used
+                cached.push_back(id);
+                if (!add(id)) break;
+            }
+        } else {
+            // Speculative decoding: each check yields one or more tokens, all chosen by the model itself.
+            routing.clear();
+            int32_t cur = -1;                                             // the token being checked
+            auto pick = [&](const float* row, const std::vector<int32_t>& acc) {
+                std::vector<int32_t> extra;
+                if (cur >= 0) extra.push_back(cur);
+                extra.insert(extra.end(), acc.begin(), acc.end());
+                return sample(std::vector<float>(row, row + hp.n_vocab), sp, recent_with(extra), eng.rng);
+            };
+            int32_t x = pick(lg.data(), {});
+            for (;;) {
+                if ((int)out.size() >= max_tokens) { r.stop = "length"; break; }
+                if (is_end(x)) { r.stop = "end"; break; }
+                if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
+                cur = x;
+                const std::vector<int32_t> prod = eng.spec->step(x, eng.threads, pick, is_end);
+                cur = -1;
+                cached.push_back(x);                                      // x and the accepted guesses are now cached
+                cached.insert(cached.end(), prod.begin(), prod.end() - 1);
+                bool go = add(x);
+                for (size_t j = 0; go && j + 1 < prod.size(); ++j) {
+                    if ((int)out.size() >= max_tokens) { r.stop = "length"; go = false; break; }
+                    go = add(prod[j]);
+                }
+                if (!go) break;
+                x = prod.back();
+            }
+            const SpecStats& st = eng.spec->stats();
+            r.drafted = st.drafted; r.accepted = st.accepted; r.checks = st.steps;
         }
         if (r.stop != "stop" && r.stop != "abort") emit(visible, visible.size());   // release held-back text
         r.n_gen = out.size();
@@ -927,8 +992,10 @@ int main(int argc, char** argv) {
                                 picks.push_back(std::vector<int32_t>(routing.begin() + (size_t)l * K, routing.begin() + (size_t)(l + 1) * K));
                         return send({{"type", "token"}, {"text", delta}, {"tps", tps}, {"n_past", eng.model->n_past()}, {"routing", picks}});
                     });
-                send({{"type", "done"}, {"n_gen", g.n_gen}, {"gen_s", g.gen_s},
-                      {"gen_tps", g.n_gen / std::max(g.gen_s, 1e-9)}, {"stop", g.stop}, {"n_past", eng.model->n_past()}});
+                json done = {{"type", "done"}, {"n_gen", g.n_gen}, {"gen_s", g.gen_s},
+                             {"gen_tps", g.n_gen / std::max(g.gen_s, 1e-9)}, {"stop", g.stop}, {"n_past", eng.model->n_past()}};
+                if (g.checks > 0) done["spec"] = {{"checks", g.checks}, {"drafted", g.drafted}, {"accepted", g.accepted}};
+                send(done);
             } catch (const std::exception& e) {
                 send({{"type", "error"}, {"message", e.what()}});
             }
@@ -986,11 +1053,12 @@ int main(int argc, char** argv) {
             if (in_folder) {
                 try {
                     json saved = settings.value("models", json::object()).value(rel.generic_u8string(), json::object());
+                    eng.draft_max = std::max(1, std::min(8, saved.value("draft_max", 3)));
                     load(file.u8string(), load_options(saved), saved.value("threads", a.threads), saved.value("seed", -1));
                     settings["last_model"] = rel.generic_u8string();
                     write_settings(a.settings, settings);
                 } catch (const std::exception& e) {
-                    eng.model.reset(); eng.path.clear();
+                    eng.spec.reset(); eng.model.reset(); eng.path.clear();
                     return oai_error(res, 500, std::string("could not load ") + want + ": " + e.what(), "server_error");
                 }
             }

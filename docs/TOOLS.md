@@ -141,6 +141,9 @@ template...).
 |---|---|
 | `tierlm-tok-test model.gguf tests/tok_cases.txt` | Tokenizer test: compares token IDs with Hugging Face's, and checks decoding round-trips |
 | `tierlm-logits model.gguf [--step] id ...` | Prints last-position logits for token IDs; `--step` feeds one token per call through the KV cache. Used by `tests/tiny_models.py` |
+| `tierlm-logits model.gguf --mtp[-step] id ...` | The MTP draft layer's prediction after the ids (all at once, or one position at a time). Used by `tests/tiny_qwen35.py` |
+| `tierlm-logits model.gguf --rollback B KEEP id ...` | Evaluates the last B+1 ids as an undoable check, keeps KEEP of the B, then the last id: must match plain evaluation |
+| `tierlm-logits model.gguf --gen[-spec] N id ...` | N tokens of greedy generation, without or with speculative decoding (prints token ids and, for `--gen-spec`, how many guesses were kept). `TIERLM_DRAFT_SCRIPT` / `TIERLM_DRAFT_CORRUPT` replace the draft layer with scripted, partly wrong guesses |
 
 See [BUILD.md](BUILD.md#running-the-tests).
 
@@ -157,6 +160,7 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_DUMP_SCHED=1` | Debugging: prints each point where the work switches between CPU and GPU |
 | `TIERLM_CPU_OPS=MUL_MAT,...` | Debugging: runs the listed ggml operation types on the CPU, to find which GPU kernel differs |
 | `TIERLM_DEVICE=cpu` | `tierlm-logits` (tests): device to load the model on |
+| `TIERLM_KV_TYPE=q8_0` | KV cache precision for the tools and tests: `f16`, `q8_0`, `q4_0` or `f32` |
 | `GGML_VK_VISIBLE_DEVICES=0` | Choose which Vulkan GPU(s) ggml uses |
 | `VK_LOADER_DEBUG=error,warn` | Make the Vulkan loader explain driver problems |
 

@@ -1,12 +1,14 @@
-"""Correctness test for the Qwen3.5 / 3.6 / 3.8 hybrid architecture (GGUF archs "qwen35" and "qwen35moe"), with
-no real model.
+"""Correctness test for the Qwen3.5 / 3.6 / 3.8 hybrid architecture (GGUF archs "qwen35" and "qwen35moe") and its
+predecessor Qwen3-Next / Qwen3-Coder-Next ("qwen3next"), with no real model.
 
 Builds a tiny random Qwen3.5 in Hugging Face's own parameterisation, writes it to GGUF the way the converter
 does (norm weights stored as 1 + w, A_log stored as -exp(A_log), linear-attention value heads reordered from
 grouped to tiled order, plus a multi-token-prediction block that must be ignored), then compares tierlm with a
 plain NumPy implementation of Hugging Face's Qwen3_5 forward pass (Gated DeltaNet + gated attention).
-Three variants: dense; MoE (Qwen3.6-35B-A3B style: routed experts plus a sigmoid-gated shared expert); and MoE with
-the experts' gate and up weights stored as one tensor, as newer conversions do.
+Variants: dense; MoE (Qwen3.6-35B-A3B style: routed experts plus a sigmoid-gated shared expert); MoE with the experts'
+gate and up weights stored as one tensor, as newer conversions do; and Qwen3-Next, which is the same model math stored
+differently: value heads left grouped by key head, beta and alpha in one tensor (per key head), and in older files
+q, k, v and z in one tensor (per key head).
 
 usage: python tests/tiny_qwen35.py build/tierlm-logits
 """
@@ -45,6 +47,13 @@ for i in range(L):
         p.update({"q": r(H * HD * 2, E), "k": r(KV * HD, E), "v": r(KV * HD, E), "o": r(E, H * HD),
                   "q_norm": small(HD), "k_norm": small(HD)})
     P[i] = p
+# The MTP draft block (Hugging Face's mtp.*): a full-attention decoder layer, fed by fc([norm(embedding) ; norm(hidden)]),
+# with its own final norm; it shares the model's output head. Stored in the file as layer L, with nextn.* tensors.
+P[L] = {"in_norm": small(E), "post_norm": small(E), "gate": r(FF, E), "up": r(FF, E), "down": r(E, FF),
+        "q": r(H * HD * 2, E), "k": r(KV * HD, E), "v": r(KV * HD, E), "o": r(E, H * HD), "q_norm": small(HD), "k_norm": small(HD),
+        "fc": r(E, 2 * E), "enorm": small(E), "hnorm": small(E), "mnorm": small(E)}
+M[L] = {"router": m(NE, E), "eg": m(NE, FE, E), "eu": m(NE, FE, E), "ed": m(NE, E, FE),
+        "sg": m(FS, E), "su": m(FS, E), "sd": m(E, FS), "sgate": m(1, E)}
 
 # ---- write the GGUF the way the converter does ----
 def tiled(x, axis, head):              # value heads: grouped by key head [g0v0 g0v1 g1v0 g1v1] -> tiled [g0v0 g1v0 g0v1 g1v1]
@@ -55,8 +64,9 @@ def tiled(x, axis, head):              # value heads: grouped by key head [g0v0 
 
 def write_gguf(variant):
     T = {"token_embd.weight": P["embed"], "output_norm.weight": 1 + P["norm"], "output.weight": P["lm_head"]}
-    for i in range(L):
+    for i in range(L + NEXTN):
         p, b = P[i], f"blk.{i}."
+        rec = i < L and recurrent[i]
         T.update({b + "attn_norm.weight": 1 + p["in_norm"], b + "post_attention_norm.weight": 1 + p["post_norm"],
                   })
         if variant == "dense":
@@ -70,7 +80,20 @@ def write_gguf(variant):
                 T[b + "ffn_gate_up_exps.weight"] = np.concatenate([q["eg"], q["eu"]], axis=1)   # gate rows, then up rows
             else:
                 T.update({b + "ffn_gate_exps.weight": q["eg"], b + "ffn_up_exps.weight": q["eu"]})
-        if recurrent[i]:
+        if rec and variant.startswith("next"):
+            # Qwen3-Next: Hugging Face's grouped head order, kept as is
+            qk = 2 * HK * S
+            q_, k_, v_, z_ = p["qkv"][:HK * S], p["qkv"][HK * S:qk], p["qkv"][qk:], p["z"]
+            ba = np.concatenate([np.concatenate([p["b"][g * R:(g + 1) * R], p["a"][g * R:(g + 1) * R]]) for g in range(HK)])
+            T.update({b + "ssm_ba.weight": ba, b + "ssm_conv1d.weight": p["conv"], b + "ssm_dt.bias": p["dt_bias"],
+                      b + "ssm_a": -np.exp(p["A_log"]), b + "ssm_norm.weight": p["gnorm"], b + "ssm_out.weight": p["out"]})
+            if variant == "next_legacy":    # older files: in_proj_qkvz as Hugging Face stores it, [q k v z] per key head
+                T[b + "ssm_in.weight"] = np.concatenate([np.concatenate([q_[g * S:(g + 1) * S], k_[g * S:(g + 1) * S],
+                                                                         v_[g * R * S:(g + 1) * R * S], z_[g * R * S:(g + 1) * R * S]])
+                                                         for g in range(HK)])
+            else:
+                T.update({b + "attn_qkv.weight": p["qkv"], b + "attn_gate.weight": z_})
+        elif rec:
             qk = 2 * HK * S
             T.update({b + "attn_qkv.weight": np.concatenate([p["qkv"][:qk], tiled(p["qkv"][qk:], 0, S)]),
                       b + "attn_gate.weight": tiled(p["z"], 0, S),
@@ -82,11 +105,12 @@ def write_gguf(variant):
             T.update({b + "attn_q.weight": p["q"], b + "attn_k.weight": p["k"], b + "attn_v.weight": p["v"],
                       b + "attn_output.weight": p["o"], b + "attn_q_norm.weight": 1 + p["q_norm"],
                       b + "attn_k_norm.weight": 1 + p["k_norm"]})
-    # a draft (multi-token prediction) block after the real layers: present in files, never run
-    b = f"blk.{L}."
-    T.update({b + "attn_norm.weight": np.full(E, 1e3, np.float32), b + "nextn.eh_proj.weight": r(E, 2 * E)})
+    # the draft (MTP) block's own tensors; it only runs when speculative decoding loads it
+    b, p = f"blk.{L}.", P[L]
+    T.update({b + "nextn.eh_proj.weight": p["fc"], b + "nextn.enorm.weight": 1 + p["enorm"],
+              b + "nextn.hnorm.weight": 1 + p["hnorm"], b + "nextn.shared_head_norm.weight": 1 + p["mnorm"]})
 
-    arch = "qwen35" if variant == "dense" else "qwen35moe"
+    arch = "qwen35" if variant == "dense" else "qwen3next" if variant.startswith("next") else "qwen35moe"
     path = os.path.join(tempfile.mkdtemp(), f"tiny-{variant}.gguf")
     w = gguf.GGUFWriter(path, arch)
     w.add_block_count(L + NEXTN); w.add_nextn_predict_layers(NEXTN)
@@ -167,20 +191,38 @@ def moe(i, h):
     shared = (silu(h @ q["sg"].T) * (h @ q["su"].T)) @ q["sd"].T
     return out + shared * (1 / (1 + np.exp(-(h @ q["sgate"].T))))
 
-def reference(ids, variant):
+def ffn(i, h, variant):
+    p = P[i]
+    return (silu(h @ p["gate"].T) * (h @ p["up"].T)) @ p["down"].T if variant == "dense" else moe(i, h)
+
+def hidden_states(ids, variant):                            # final-norm hidden state of every position
     x = P["embed"][ids].astype(np.float64); pos = np.arange(len(ids), dtype=np.float64)
     for i in range(L):
         p = P[i]
         h = norm1(x, p["in_norm"])
         x = x + (deltanet(p, h) if recurrent[i] else attention(p, h, pos))
-        h = norm1(x, p["post_norm"])
-        x = x + ((silu(h @ p["gate"].T) * (h @ p["up"].T)) @ p["down"].T if variant == "dense" else moe(i, h))
-    return norm1(x, P["norm"])[-1] @ P["lm_head"].T
+        x = x + ffn(i, norm1(x, p["post_norm"]), variant)
+    return norm1(x, P["norm"])
+
+def reference(ids, variant):
+    return hidden_states(ids, variant)[-1] @ P["lm_head"].T
+
+def mtp_reference(ids, variant):
+    # Hugging Face's MTP: at position t, fc(cat(norm(embed(x_t)), norm(h_{t-1}))) -> decoder layer -> norm -> lm_head,
+    # predicting x_{t+1}. Position 0 has no earlier hidden state: zeros.
+    H = hidden_states(ids, variant)
+    hprev = np.concatenate([np.zeros((1, E)), H[:-1]])
+    p = P[L]; pos = np.arange(len(ids), dtype=np.float64)
+    x = np.concatenate([norm1(P["embed"][ids].astype(np.float64), p["enorm"]), norm1(hprev, p["hnorm"])], -1) @ p["fc"].T
+    x = x + attention(p, norm1(x, p["in_norm"]), pos)
+    x = x + ffn(L, norm1(x, p["post_norm"]), variant)
+    return norm1(x, p["mnorm"])[-1] @ P["lm_head"].T
 
 
 # Two passes:
 #   exact   on the CPU with an f32 KV cache: the math itself, which must match the reference to ~1e-5.
 #           (With a stand-in RPC GPU for split tests, on that device: it computes exactly too.)
+#   kv 8-bit  the KV cache stored at 8 bits (q8_0): close to exact.
 #   normal  the usual settings on the default device (a GPU if there is one): f16 KV cache, and GPU kernels that
 #           round (flash attention in f16, TF32 tensor cores for small batches on RTX 30-series and newer), so
 #           differences up to a few % of the logit range are expected; the top token must still match. Real bugs
@@ -189,19 +231,25 @@ def PASSES(extra):
     exact_env = {"TIERLM_KV_F32": "1", **extra}
     if not os.environ.get("TIERLM_RPC") and "TIERLM_DEVICE" not in os.environ:
         exact_env["TIERLM_DEVICE"] = "cpu"
-    return (("exact", exact_env, 1e-4), ("normal", dict(extra), 6e-2))
+    passes = [("exact", exact_env, 1e-4, True), ("normal", dict(extra), 6e-2, True)]
+    if not extra:
+        # 8-bit KV cache: about 1% from exact. On these tiny random models the top two tokens are often nearly tied,
+        # so only the size of the difference is checked.
+        passes.append(("kv 8-bit", {"TIERLM_KV_TYPE": "q8_0", "TIERLM_DEVICE": os.environ.get("TIERLM_DEVICE", "cpu")}, 6e-2, False))
+    return passes
 long_ids = list(np.random.default_rng(7).integers(0, V, 300))   # > 256: the running memory must carry across batches
 # With TIERLM_RPC set (a tierlm-rpc-server standing in for a GPU), each variant also runs split between that
 # "GPU" and the CPU, in both split modes, at several VRAM budgets (fractions of the file size).
 SPLITS = [(mode, f) for mode in ("layers", "experts") for f in (0.0, 0.15, 0.4, 0.7, 2.0)] if os.environ.get("TIERLM_RPC") else [None]
 ok = True
-for variant in ("dense", "moe", "moe_fused"):
+NAMES = {"dense": "qwen35", "moe": "qwen35moe", "moe_fused": "qwen35moe fused", "next": "qwen3next", "next_legacy": "qwen3next old"}
+for variant in NAMES:
     path = write_gguf(variant)
-    name = "qwen35" if variant == "dense" else "qwen35moe" + (" fused" if variant == "moe_fused" else "")
+    name = NAMES[variant]
     for split in SPLITS:
         split_env = {} if split is None else {"TIERLM_SPLIT": split[0], "TIERLM_VRAM_BYTES": str(int(os.path.getsize(path) * split[1]))}
         tag = "" if split is None else f" {split[0]}@{split[1]:.2f}"
-        for label, env, tol in PASSES(split_env):
+        for label, env, tol, need_top in PASSES(split_env):
             worst_mode = {}
             all_top = True
             for mode in ([], ["--step"]):
@@ -220,9 +268,40 @@ for variant in ("dense", "moe", "moe_fused"):
                     all_top &= bool(got.argmax() == want.argmax())
                 worst_mode["one token at a time" if mode else "whole prompt"] = worst
             worst = max(worst_mode.values())
-            passed = worst < tol and all_top
+            passed = worst < tol and (all_top or not need_top)
             ok &= passed
             detail = ", ".join(f"{k} {v:.1e}" for k, v in worst_mode.items())
             print(f"{name + tag:16s}{label:7s}: worst relative diff {worst:.1e} (limit {tol:.0e}; {detail}), top token matches: {all_top}  ->  {'ok' if passed else 'FAIL'}")
+        if split is None or split[1] in (0.0, 0.4):
+            # The MTP draft block, all at once and one position at a time (exact settings).
+            env = PASSES(split_env)[0][1]
+            worst = 0.0
+            for mode in (["--mtp"], ["--mtp-step"]):
+                for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55], long_ids):
+                    want = mtp_reference(np.array(ids), variant)
+                    run = subprocess.run([sys.argv[1], path, *mode, *map(str, ids)], capture_output=True, text=True,
+                                         encoding="utf-8", errors="replace", env={**os.environ, **env})
+                    if run.returncode != 0:
+                        sys.exit(f"tierlm-logits failed: {run.stderr.strip()}")
+                    got = np.array([float(x) for x in run.stdout.split()])
+                    worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
+            passed = worst < 1e-4
+            ok &= passed
+            print(f"{name + tag:16s}{'MTP':7s}: worst relative diff {worst:.1e} (limit 1e-04)  ->  {'ok' if passed else 'FAIL'}")
+            # Speculative decoding: greedy output must not change, with the real draft block (poor guesses on random
+            # weights) and with scripted guesses that are partly wrong (every 3rd or 5th), exercising undo at every depth.
+            def gen(mode, extra=None):
+                run = subprocess.run([sys.argv[1], path, mode, "80", "5", "9", "13"], capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", env={**os.environ, **env, **(extra or {})})
+                if run.returncode != 0:
+                    sys.exit(f"tierlm-logits failed: {run.stderr.strip()}")
+                return run.stdout.split(), run.stderr.strip()
+            plain, _ = gen("--gen")
+            checks = [gen("--gen-spec")] + [gen("--gen-spec", {"TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k})
+                                            for k in ("3", "5")]
+            same = all(c[0] == plain for c in checks)
+            ok &= same
+            print(f"{name + tag:16s}{'spec':7s}: greedy output with speculation {'identical' if same else 'DIFFERENT'} "
+                  f"({'; '.join(c[1] for c in checks)})  ->  {'ok' if same else 'FAIL'}")
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

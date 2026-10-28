@@ -247,6 +247,17 @@
           <div class="help" id="ctxhelp">How much conversation the model can remember. Longer uses more memory.</div>
         </div>
         <div>
+          <label for="kvsel">Context memory precision</label>
+          <select id="kvsel"><option value="f16">16-bit (normal)</option><option value="q8_0">8-bit: half the memory, practically the same quality</option><option value="q4_0">4-bit: a quarter of the memory, lower quality</option><option value="f32">32-bit: exact, twice the memory</option></select>
+          <div class="help">How the context (KV cache) is stored. Smaller leaves room for a longer context, or for more of the model in VRAM: watch the purple part of the bars. 8-bit and 4-bit use flash attention.</div>
+        </div>
+        <div>
+          <label class="chk"><input type="checkbox" id="specon"> Speculative decoding</label>
+          <select id="specn" title="Guesses per check"><option value="2">2 guesses per check</option><option value="3" selected>3 guesses per check</option><option value="4">4 guesses per check</option><option value="6">6 guesses per check</option></select>
+          <div class="help" id="spechelp">Faster replies with the same answers: the model's small built-in draft layer guesses the next few words, and
+            the model checks them all in one pass. Helps most when the model doesn't fit in VRAM.</div>
+        </div>
+        <div>
           <label for="thr">CPU threads: <span id="thrv"></span></label>
           <input id="thr" type="range" min="1" max="8" step="1">
           <div class="help">Used for any work that runs on the CPU. On laptops, fewer threads is often faster.</div>
@@ -258,11 +269,6 @@
           <div>
             <label class="chk"><input type="checkbox" id="fa" checked> Flash attention</label>
             <div class="help">Faster attention that reads the context once. Turn off only to compare or troubleshoot.</div>
-          </div>
-          <div>
-            <label for="kvsel">KV cache precision</label>
-            <select id="kvsel"><option value="f16">f16 (half the memory)</option><option value="f32">f32 (exact, twice the memory)</option></select>
-            <div class="help">How the conversation memory is stored.</div>
           </div>
           <div>
             <label for="batchsel">Prompt batch size</label>
@@ -591,7 +597,12 @@ async function send(text) {
         const ev = JSON.parse(line.slice(6));
         if (ev.type === "prompt") onPrompt(ev);
         else if (ev.type === "token") { reply += ev.text; bubble.textContent = reply; onToken(ev); $("messages").scrollTop = $("messages").scrollHeight; }
-        else if (ev.type === "done") { meta = ev.n_gen + " tokens · " + ev.gen_tps.toFixed(1) + " tok/s" + (ev.stop === "length" ? " · hit the max reply length (raise Max reply below)" : ev.stop === "context" ? " · context full" : ""); onDone(ev); }
+        else if (ev.type === "done") {
+          meta = ev.n_gen + " tokens · " + ev.gen_tps.toFixed(1) + " tok/s" + (ev.stop === "length" ? " · hit the max reply length (raise Max reply below)" : ev.stop === "context" ? " · context full" : "");
+          if (ev.spec && ev.spec.checks) meta += " · speculative: " + (ev.n_gen / ev.spec.checks).toFixed(1) + " tokens per check, " +
+            Math.round(100 * ev.spec.accepted / Math.max(1, ev.spec.drafted)) + "% of guesses kept";
+          onDone(ev);
+        }
         else if (ev.type === "error") throw new Error(ev.message);
       }
     }
@@ -755,7 +766,11 @@ function showSetup() {
   loadSetup();
 }
 function showApp() { $("setup").hidden = true; $("app").hidden = false; $("setupbtn").hidden = false; resizeCanvases(); }
-const WORK = 768 * 1048576;   // working memory the engine keeps free on the GPU (as the tier loader does)
+let cpuFeatures = "";
+const WORK = 768 * 1048576;
+// KV cache size relative to 16-bit: q8_0 stores 32 values in 34 bytes, q4_0 in 18.
+const KV_FACTOR = { f16: 1, f32: 2, q8_0: 34 / 64, q4_0: 18 / 64 };
+function kvFactor() { return KV_FACTOR[$("kvsel").value] || 1; }   // working memory the engine keeps free on the GPU (as the tier loader does)
 // Memory the loaded model holds now. Loading another one frees it first, so it counts as free when planning.
 function heldNow(gpu) {
   if (!info || !info.loaded) return { vram: 0, ram: 0 };
@@ -777,9 +792,9 @@ function cpuDev() { return devices.find(d => d.type === "cpu") || null; }
 // in VRAM first and the rest in RAM. "layers" moves whole layers with their part of the context; "experts" puts
 // all of the context (and attention) in VRAM first, then as many experts as fit.
 function plan() {
-  const ctx = +$("ctxsel").value || defCtx, kv32 = $("kvsel").value === "f32";
+  const ctx = +$("ctxsel").value || defCtx;
   const W = selModel ? selModel.bytes || 0 : 0;
-  const KV = selModel ? (selModel.kv_bytes_per_token || 0) * ctx * (kv32 ? 2 : 1) : 0;
+  const KV = selModel ? (selModel.kv_bytes_per_token || 0) * ctx * kvFactor() : 0;
   const gpu = bestGpu(), cpu = cpuDev();
   const held = heldNow(gpu);
   const ramFree = cpu ? cpu.free + held.ram : 0;
@@ -798,8 +813,9 @@ function plan() {
 function memBar(title, sub, total, parts) {
   const used = parts.reduce((t, x) => t + x.v, 0);
   const all = [...parts, { v: Math.max(0, total - used), c: "transparent", l: "Free" }];
-  const segs = all.filter(x => x.v > 0).map(x => `<div class="${x.h ? "hatch" : ""}" style="background-color:${x.c};width:${100 * x.v / Math.max(1, total, used)}%" title="${x.l}: ${fmtGiB(x.v)}"></div>`).join("");
-  const leg = all.filter(x => x.v > 0 || x.always).map(x => `<span><i class="${x.h ? "hatch" : ""}" style="background-color:${x.c === "transparent" ? "var(--panel-2)" : x.c}"></i>${x.l} <b>${fmtGiB(x.v)}</b></span>`).join("");
+  const MiB = 1048576;                      // leave out slivers (e.g. "Free 0.1 MiB" when VRAM is full)
+  const segs = all.filter(x => x.v >= MiB).map(x => `<div class="${x.h ? "hatch" : ""}" style="background-color:${x.c};width:${100 * x.v / Math.max(1, total, used)}%" title="${x.l}: ${fmtGiB(x.v)}"></div>`).join("");
+  const leg = all.filter(x => x.v >= MiB || x.always).map(x => `<span><i class="${x.h ? "hatch" : ""}" style="background-color:${x.c === "transparent" ? "var(--panel-2)" : x.c}"></i>${x.l} <b>${fmtGiB(x.v)}</b></span>`).join("");
   return `<div class="membar"><div class="mt">${title}<span>${sub}</span></div><div class="stack">${segs}</div><div class="stackleg">${leg}</div></div>`;
 }
 async function loadSetup() {
@@ -810,6 +826,7 @@ async function loadSetup() {
     devices = dv.devices.filter(d => !d.same_gpu_as);
     for (const d of devices) d.alsoVulkan = dv.devices.some(x => x.same_gpu_as === d.id);
     warnings = dv.warnings || []; hwThreads = dv.hw_threads || 8; defThreads = dv.threads || 4;
+    cpuFeatures = dv.cpu_features || "";
     md = m; models = m.models; defCtx = m.default_ctx || 4096;
     if (dv.version) $("ver").textContent = "v" + dv.version;
   } catch (e) { $("loadmsg").textContent = "Could not reach the tierlm server."; $("loadmsg").className = "err"; return; }
@@ -835,8 +852,10 @@ function applySaved() {
   const s = (selModel && md.saved && md.saved[selModel.id]) || {};
   $("thr").value = s.threads || defThreads; $("thrv").textContent = $("thr").value;
   $("kvsel").value = s.kv_type || "f16";
+  if (![...$("kvsel").options].some(o => o.value === $("kvsel").value)) $("kvsel").value = "f16";
   buildCtx(s.ctx || defCtx);
   $("fa").checked = s.flash_attn !== false;
+  syncFa();
   $("batchsel").value = String(s.batch || 256);
   const E = (selModel && selModel.experts) || 0, K = (selModel && selModel.experts_used) || 0;
   $("experts").disabled = !E; $("experts").max = Math.max(1, E);
@@ -850,6 +869,13 @@ function applySaved() {
   $("forcecpu").checked = !!s.force_cpu;
   $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb / 1024).toFixed(1) : 0;
   $("splitsel").value = s.split_mode || "layers";
+  const canSpec = !!(selModel && selModel.mtp);
+  $("specon").disabled = !canSpec; $("specn").disabled = !canSpec;
+  $("specon").checked = canSpec && s.speculative !== false;     // on by default when the model has a draft layer
+  $("specn").value = String(s.draft_max || 3);
+  $("spechelp").textContent = canSpec
+    ? "Faster replies with the same answers: the model's small built-in draft layer guesses the next few words, and the model checks them all in one pass. Helps most when the model doesn't fit in VRAM."
+    : "Not available for this model: its file has no built-in draft layer (Qwen3.5, 3.6 and 3.8 files usually include one).";
   $("setnote").textContent = selModel ? (md.saved && md.saved[selModel.id] ? "Using your saved settings for this model" : "Settings are remembered per model") : "";
 }
 // Context choices go up to the model's own limit (read from the file), with the memory each one needs.
@@ -857,7 +883,7 @@ function buildCtx(want) {
   const max = selModel && selModel.ctx_train ? selModel.ctx_train : 4096;
   const opts = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576].filter(v => v <= max);
   if (!opts.includes(max)) opts.push(max);
-  const kvpt = (selModel && selModel.kv_bytes_per_token || 0) * ($("kvsel").value === "f32" ? 2 : 1);
+  const kvpt = (selModel && selModel.kv_bytes_per_token || 0) * kvFactor();
   const sel = $("ctxsel"); sel.innerHTML = "";
   for (const v of opts) {
     const o = document.createElement("option"); o.value = v;
@@ -901,6 +927,11 @@ function renderSetup() {
     if (p.dev && d.id === p.dev.id) add("Will be used", "good");
     if (d.type === "igpu") add("Shares system RAM", "warn");
     if (d.alsoVulkan) add("CUDA (Vulkan also available)");
+    if (d.type === "cpu" && cpuFeatures) {                      // the CPU engine tierlm picked for this processor
+      const f = " " + cpuFeatures + " ";
+      add(f.includes(" AMX_INT8 ") ? "Uses AMX + AVX-512" : f.includes(" AVX512 ") ? "Uses AVX-512" : f.includes(" AVX_VNNI ") ? "Uses AVX-VNNI"
+          : f.includes(" AVX2 ") ? "Uses AVX2" : f.includes(" AVX ") ? "Uses AVX" : "Uses SSE", "good");
+    }
     dl.appendChild(el);
   }
   // placement: one bar for GPU memory, one for system RAM
@@ -961,7 +992,9 @@ function renderSetup() {
       if (m.experts) add(m.experts_used + " of " + m.experts + " experts per token"); else add(m.hybrid ? "Hybrid (linear attention)" : "Dense");
       if (m.arch) add(m.arch);
       if (m.layers) add(m.layers + " layers");
+      if (m.mtp) add("Speculative decoding", "good");
     } else if (m.kind === "mmproj") add("Vision add-on (mmproj): used together with its model, not on its own", "warn");
+    else if (m.kind === "draft") add("Draft add-on (MTP): makes its model faster with Speculative decoding, not a model on its own", "warn");
     else add(m.reason || "Not supported", "bad");
     if (m.supported) lab.onclick = e => { e.preventDefault(); if (selModel && selModel.id === m.id) return; selModel = m; applySaved(); renderSetup(); };
     ml.appendChild(lab);
@@ -1016,7 +1049,12 @@ $("pathin").onkeydown = e => { if (e.key === "Enter") $("pathok").click(); if (e
 $("rescanhw").onclick = e => { e.preventDefault(); loadSetup(); };
 for (const id of ["ctxsel", "forcecpu", "splitsel"]) $(id).onchange = renderSetup;
 $("vramlim").oninput = renderSetup;
-$("kvsel").onchange = () => { buildCtx($("ctxsel").value); renderSetup(); };
+function syncFa() {                       // a quantized cache needs flash attention
+  const q = $("kvsel").value.startsWith("q");
+  if (q) $("fa").checked = true;
+  $("fa").disabled = q;
+}
+$("kvsel").onchange = () => { syncFa(); buildCtx($("ctxsel").value); renderSetup(); };
 $("thr").oninput = () => $("thrv").textContent = $("thr").value;
 $("experts").oninput = () => $("expv").textContent = $("experts").value;
 $("topk").oninput = () => $("topkv").textContent = +$("topk").value || "off";
@@ -1033,6 +1071,7 @@ $("loadbtn").onclick = async () => {
   const exp = +$("experts").value;
   const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
+                 speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
                  force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
   if ($("forcecpu").checked) body.device = "cpu";

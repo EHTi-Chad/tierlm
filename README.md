@@ -48,11 +48,21 @@ independent engine built on the same principle.
   Studio's), and remembers LM Studio-style load settings per model.
 - **Web interface**: streaming chat, plus a live dashboard with an expert activity map, speed vs. context,
   memory placement, and a "hot-expert cache" preview built from real routing data.
+- **Speculative decoding** with the model's own built-in draft layer (MTP, in Qwen3.5 / 3.6 / 3.8 and Qwen3-Next
+  files, or a separate `mtp-*.gguf` next to the model): the model checks several guessed tokens in one pass, so
+  each read of its weights from RAM produces more than one token. Same answers, faster replies; most useful when the
+  model doesn't fit in VRAM. Plus **8-bit and 4-bit context memory** (KV cache) to fit more of the model in VRAM.
 - **OpenAI-compatible API** (`/v1/models`, `/v1/chat/completions`, streamed or not): Open WebUI, Continue, LibreChat
   and anything built on the OpenAI SDK can use tierlm. An **Allow other devices** switch and an optional API key
   control who can connect. See [docs/API.md](docs/API.md) and [Connect other apps](docs/GETTING_STARTED.md#connect-other-apps).
 
 ## Benchmarks
+
+**RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB DDR5, Windows 11:**
+
+| Model | Where it runs | Generation |
+|---|---|---|
+| Qwen3.6-35B-A3B Q8_0 (46 GB file), 128K context | split between VRAM and RAM (CUDA) | **36.6 tok/s** |
 
 **RTX 3070 Laptop (8 GB) + Ryzen 9 5900HX, Windows 11:**
 
@@ -90,7 +100,8 @@ model in system RAM, automatically. On a laptop RTX 3070 with 8 GB, the 14.7 GB 
 
 **What you need**
 
-- **Windows 10 or 11, 64-bit**, with an AVX2 processor (almost any Intel or AMD CPU from 2015 on).
+- **Windows 10 or 11, 64-bit**, on any 64-bit Intel or AMD processor. tierlm picks the fastest code your CPU
+  supports when it starts, from plain x86-64 up to AVX2, AVX-512 (Ryzen 7000/9000, Intel workstation chips) and AMX.
 - **System RAM: at least 32 GB** to run models bigger than your GPU; **64 GB or more is recommended**. The
   model has to fit in GPU memory and RAM together, with about 8 GB left over for Windows and your other apps.
 - **A GPU** (optional, but much faster): an NVIDIA GeForce RTX card, Intel Arc or AMD Radeon. Without one,
@@ -123,7 +134,7 @@ model is in RAM.
    - Bigger than your GPU, the real test: [`Qwen3-30B-A3B` Q3_K_M](https://huggingface.co/bartowski/Qwen_Qwen3-30B-A3B-GGUF/tree/main)
      (14.7 GB; needs 32 GB RAM with an 8 GB GPU)
    - The newest: [`Qwen3.6-35B-A3B`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main) Q4_K_M (about 21 GB) or
-     Q8_0 (about 35 GB, for 64 GB RAM). Support is brand new; the first real-model test is under way.
+     Q8_0 (for 64 GB RAM). The Q8_0 runs at about 36 tokens/second on an RTX 5090 with 64 GB RAM.
    - Just to check it works: [`Llama-3.2-1B-Instruct` Q4_K_M](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/tree/main) (0.8 GB)
 
    Put the file in tierlm's `models` folder, or leave it where it is and choose that folder in step 3.
@@ -142,9 +153,10 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | Llama 2 / Mistral 7B / TinyLlama (SentencePiece) | TinyLlama-1.1B-Chat |
 | Mixtral, Qwen2/2.5 | model math verified, real weights not yet tested |
 | Qwen3.5 / 3.6 / 3.8 dense (`qwen35`, hybrid Gated DeltaNet) | model math verified, real weights not yet tested |
-| Qwen3.5 / 3.6 MoE (`qwen35moe`, e.g. Qwen3.6-35B-A3B) | model math verified, real weights not yet tested |
+| Qwen3.5 / 3.6 MoE (`qwen35moe`, e.g. Qwen3.6-35B-A3B) | Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
+| Qwen3-Next / Qwen3-Coder-Next (`qwen3next`, 80B-A3B) | model math verified, real weights not yet tested |
 
-Not yet: Qwen3-Next / Qwen3-Coder-Next (`qwen3next`), Gemma, Phi, DeepSeek, gpt-oss and others. The setup screen says which
+Not yet: Gemma, Phi, DeepSeek, gpt-oss and others. The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
 
 ## Build from source (Windows)
@@ -199,7 +211,8 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Architecture layer: Llama 2/3, Mistral, Mixtral, Qwen2, Qwen3, Qwen3 MoE, OLMoE; Llama 3 / Qwen / SentencePiece tokenizers
 - [x] Qwen3.5 / 3.6 / 3.8 dense: hybrid Gated DeltaNet + gated attention, verified against a NumPy reference
 - [x] Qwen3.5 / 3.6 MoE: the same hybrid with routed experts and a gated shared expert
-- [ ] Real-model testing of the new families; more families (Qwen3-Next, Gemma, Phi, DeepSeek, gpt-oss)
+- [ ] Real-model testing of the new families; more families (Gemma 3/4, Phi, DeepSeek, gpt-oss)
+- [x] Qwen3-Next / Qwen3-Coder-Next (both GGUF layouts), verified against a NumPy reference
 - [x] Tier loader, first version: models bigger than VRAM split between VRAM and RAM (whole layers or experts), VRAM limit setting
 - [ ] SSD tier (stream rarely used weights from disk) and a hot-expert cache in VRAM
 - [ ] Search and download GGUF models from Hugging Face inside tierlm
@@ -207,7 +220,8 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] OpenAI-compatible API, with an Allow other devices switch and optional API key
 - [ ] Tool (function) calling in the API, for coding agents (Cursor agent mode, Cline, Continue agent)
 - [ ] NVIDIA (CUDA) testing on an RTX 5090; AMD testing via Vulkan/ROCm
-- [ ] Quantized KV cache, speculative decoding
+- [x] Speculative decoding with the built-in MTP draft layer; 8-bit and 4-bit KV cache
+- [ ] Prompt-lookup drafting (free guesses for code and edits); activation sparsity for dense models
 
 ## Credits and licence
 

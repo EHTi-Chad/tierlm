@@ -9,7 +9,7 @@ CMake options.
 | `-DTIERLM_VULKAN=ON` | off | Vulkan backend: Intel Arc, AMD and NVIDIA GPUs (needs the Vulkan SDK) |
 | `-DTIERLM_CUDA=ON` | off | CUDA backend: NVIDIA GPUs (needs the CUDA toolkit) |
 | `-DCMAKE_BUILD_TYPE=Release` | Release | Optimised build. Debug builds are roughly 10× slower |
-| `-DTIERLM_PORTABLE=ON` | off | Binaries for distribution: AVX2 baseline instead of the build machine's CPU, static MSVC runtime |
+| `-DTIERLM_PORTABLE=ON` | off | Binaries for distribution: ggml's engines as separate files, with one CPU engine per x86 generation (x86-64, SSE4.2, AVX, AVX2, AVX-VNNI, AVX-512, Zen 4, AMX...) of which the best is loaded at start-up; static MSVC runtime |
 
 Get the source with the submodule:
 
@@ -126,9 +126,12 @@ cmake --build build
 
 ## Making a Windows release
 
-`scripts\package-windows.bat` builds a portable release and zips it: binaries tuned for any AVX2 CPU instead
-of the build machine (`-DTIERLM_PORTABLE=ON`), with the C runtime linked in so users don't need the Visual C++
-redistributable. From a Developer Command Prompt in the project folder:
+`scripts\package-windows.bat` builds a portable release and zips it. Portable builds (`-DTIERLM_PORTABLE=ON`) run on
+every 64-bit Intel or AMD CPU: ggml's engines are separate `ggml*.dll` files next to the programs, with a CPU engine
+for each x86 generation; when tierlm starts, ggml loads the best one the processor supports (AVX-512 on a Ryzen 9000,
+AVX2 on most PCs from 2015 on, plain x86-64 on anything older) and any GPU engine whose driver is present. The C
+runtime is linked in, so users don't need the Visual C++ redistributable. From a Developer Command Prompt in the
+project folder:
 
 ```bat
 scripts\package-windows.bat 0.2.0 both

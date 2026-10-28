@@ -7,8 +7,8 @@ OLMoE) but not yet everything on Hugging Face. See [Supported models](#supported
 
 ## What you need
 
-- **Windows 10 or 11, 64-bit**, with a processor that supports AVX2 (almost every Intel or AMD CPU from 2015
-  onwards)
+- **Windows 10 or 11, 64-bit**, on any 64-bit Intel or AMD processor. tierlm uses the fastest instructions your
+  CPU has (the hardware card says which: AVX-512 on a Ryzen 7000/9000, AVX2 on most PCs from 2015 on).
 - **System RAM: at least 32 GB** to run models bigger than your GPU, which is what tierlm is for; **64 GB or
   more is recommended**. The model must fit in GPU memory and RAM together, with about 8 GB to spare for Windows
   and your other apps (8 GB GPU + 32 GB RAM: models up to about 30 GB; 8 GB + 64 GB: about 60 GB; 32 GB + 64 GB:
@@ -74,7 +74,12 @@ The setup screen shows:
    - **Include subfolders**: on by default.
    - **Find GGUF models on Hugging Face**: opens Hugging Face in your browser.
 3. **Settings**: **context length** (how much of the conversation the model remembers; longer uses more
-   memory) and **CPU threads**. **Advanced** has more: flash attention, KV cache precision, prompt batch size,
+   memory), **context memory precision** (16-bit normally; **8-bit** halves the context's memory with practically
+   the same quality, which can let more of the model fit in VRAM; 4-bit quarters it at some cost in quality) and
+   **CPU threads**, and **Speculative decoding** for models that include a draft layer (most Qwen3.5 / 3.6 / 3.8
+   files, or with a matching `mtp-*.gguf` file in the same folder; the model card says "Speculative decoding"): the
+   draft layer guesses a few words ahead and the model checks them all at once, for faster replies with the same
+   answers. It's on by default when available; the chat shows how many tokens each check produced. **Advanced** has more: flash attention, prompt batch size,
    active experts per token, a seed for repeatable replies, how to split a model that doesn't fit in VRAM, a
    **VRAM limit**, and **Force CPU**.
 
@@ -156,8 +161,8 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Llama 3 / 3.1 / 3.2 / 3.3 | `llama` | Llama-3.2-3B-Instruct, Llama-3.1-8B-Instruct | New: model math verified, real-model test pending |
 | Llama 2, Mistral 7B, Mixtral, TinyLlama | `llama` | Mistral-7B-Instruct, Mixtral-8x7B | New: model math verified, real-model test pending |
 | Qwen3.5 / 3.6 / 3.8 dense (hybrid) | `qwen35` | Qwen3.8-27B, Qwen3.5-9B | New: model math verified, real-model test pending |
-| Qwen3.5 / 3.6 MoE (hybrid) | `qwen35moe` | Qwen3.6-35B-A3B, Qwen3.5-122B-A10B | New: model math verified, real-model test pending |
-| Qwen3-Next | `qwen3next` | Qwen3-Coder-Next-80B-A3B | Not yet |
+| Qwen3.5 / 3.6 MoE (hybrid) | `qwen35moe` | Qwen3.6-35B-A3B, Qwen3.5-122B-A10B | Tested: Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
+| Qwen3-Next (hybrid MoE) | `qwen3next` | Qwen3-Coder-Next-80B-A3B, Qwen3-Next-80B-A3B | New: model math verified, real-model test pending |
 | Gemma, Phi, DeepSeek, GLM, gpt-oss, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision add-on** (for reading images). tierlm lists it but

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -20,11 +21,14 @@ namespace tierlm {
 //   qwen3     Qwen3 dense: per-head QK-norm, head size not tied to the model width
 //   qwen3moe  Qwen3 MoE (e.g. Qwen3-30B-A3B)
 //   olmoe     OLMoE: QK-norm over the full width, expert weights not renormalised
+//   qwen3next Qwen3-Next / Qwen3-Coder-Next (80B-A3B): the hybrid's predecessor, with differently stored weights
 //   qwen35moe Qwen3.5 / 3.6 MoE (e.g. Qwen3.6-35B-A3B): the same hybrid, with experts plus a shared expert
 //   qwen35    Qwen3.5 / 3.6 / 3.8 dense: a hybrid. Three of every four layers use Gated DeltaNet linear
 //             attention (a fixed-size running memory instead of a KV cache); the rest use gated full
 //             attention with partial RoPE.
 bool arch_supported(const std::string& arch);
+// A separate MTP draft file ("mtp-*.gguf") in the same folder that matches this model, or "".
+std::string mtp_companion(const std::string& model_path);
 std::vector<std::string> supported_archs();
 
 struct Hparams {
@@ -48,6 +52,8 @@ struct Hparams {
     int ssm_conv = 0;                 // causal convolution width (4)
     int ssm_state = 0;                // head size of the linear attention (128)
     int ssm_k_heads = 0, ssm_v_heads = 0;
+    bool v_grouped = false;
+    int n_nextn = 0;                  // multi-token-prediction draft blocks in the file (after the n_layer layers)           // value heads grouped by key head (Qwen3-Next) instead of tiled (Qwen3.5)
     bool is_recurrent(int il) const { return hybrid && il < (int)recurrent.size() && recurrent[il]; }
     int ssm_conv_dim() const { return 2 * ssm_k_heads * ssm_state + ssm_v_heads * ssm_state; }
 };
@@ -59,6 +65,7 @@ struct LoadOptions {
     std::string device = "auto";     // "auto", "cpu", "gpu", or a ggml device name ("Vulkan0", "CUDA0")
     int flash_attn = -1;             // 1 on, 0 off, -1 default (on, unless TIERLM_NO_FA is set)
     int kv_f32 = -1;                 // 1 f32 cache, 0 f16, -1 default (f16, unless TIERLM_KV_F32 is set)
+    std::string kv_type;             // "f16", "f32", "q8_0" or "q4_0"; overrides kv_f32 when set
     int batch = 0;                   // tokens per graph when reading a prompt; 0 = 256
     int experts_used = 0;            // override active experts per token (MoE); 0 = the model's value
     int vram_budget_mb = 0;          // most VRAM to use for weights + KV cache; 0 = whatever is free
@@ -68,6 +75,8 @@ struct LoadOptions {
     //   "experts"  attention, router and KV cache of every layer in VRAM, then expert layers while they
     //              fit. Two hand-offs per RAM layer per token; can win on long contexts.
     std::string split_mode = "layers";
+    bool repack = true;              // store CPU-side weights in ggml's faster repacked layout where it has one
+    bool mtp = false;                // also load the MTP draft block, for speculative decoding (if the file has one)
 };
 
 // Where the time goes, accumulated over every eval_batch call (for profiling).
@@ -86,6 +95,7 @@ struct Placement {
     int layers = 0;
     int attn_gpu = 0;                            // layers whose attention weights are in VRAM
     int ffn_gpu = 0;                             // layers whose feed-forward / experts are in VRAM
+    int repacked = 0;                            // CPU-side weight tensors stored in the repacked layout
     bool split() const { return gpu_weights > 0 && cpu_weights > 0; }
 };
 
@@ -108,6 +118,23 @@ public:
     // experts the router picked: n_tok x n_layer x n_expert_used ids, best first.
     std::vector<float> eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing = nullptr);
     void reset();                                 // forget the conversation
+
+    // ---- speculative decoding ----
+    struct EvalOut {
+        std::vector<float> logits;                // n_logits x n_vocab: predictions for the last n_logits positions
+        std::vector<float> hidden;                // n_tok x n_embd final-norm hidden states (if asked for)
+    };
+    // Like eval, for one batch of up to batch() tokens, with more outputs. snapshots > 1 makes the batch undoable:
+    // accept(n_keep) then keeps only its first n_keep tokens (snapshots must be at least the batch size).
+    EvalOut eval_ex(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
+                    std::vector<int32_t>* routing = nullptr);
+    void accept(int n_keep);
+    // The MTP draft block (when loaded with LoadOptions::mtp): ids[i] at position pos0 + i, paired with the
+    // final hidden state h[i] of the position before it. Writes the block's KV cache at those positions.
+    // Returns its prediction for the position after the last one; h_out gets its hidden states (n_tok x n_embd).
+    bool has_mtp() const { return mtp_ != nullptr; }
+    std::vector<float> mtp_eval(const int32_t* ids, const float* h, int n_tok, int pos0, int n_threads,
+                                std::vector<float>* h_out = nullptr);
     // Keep only the first n tokens. Hybrid models can't rewind their running memory, so for them anything
     // short of the whole conversation means starting over (n_past() tells the caller where it stands).
     void truncate(int n);
@@ -124,7 +151,7 @@ public:
     bool integrated_gpu() const;                  // shares system memory (e.g. Intel Arc in a laptop)
     void device_memory(size_t& free, size_t& total) const;   // of the device holding the weights
     bool flash_attn() const { return flash_attn_; }
-    const char* kv_type() const { return kv_f32_ ? "f32" : "f16"; }
+    const char* kv_type() const;      // "f16", "f32", "q8_0" or "q4_0"
     int batch() const { return batch_; }
     int experts_default() const { return n_expert_used_file_; }   // active experts the model was trained with
 
@@ -139,12 +166,23 @@ private:
         ggml_context* ctx = nullptr;
         struct ggml_cgraph* gf = nullptr;
         ggml_tensor *inp = nullptr, *pos = nullptr, *mask = nullptr, *logits = nullptr;
+        ggml_tensor *hidden = nullptr;           // final-norm hidden states of every position (for the MTP head)
+        ggml_tensor *h_in = nullptr;             // MTP head: the target model's hidden states, as input
+        int n_tok = 0;
+        // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
+        std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
         std::vector<ggml_tensor*> orders;        // router rankings per layer (when routing is wanted)
         std::vector<std::pair<ggml_tensor*, int>> owner;   // every op tensor of each layer, with its layer
     };
-    Graph build(int n_tok, int n_past, bool want_routing);
+    Graph build(int n_tok, int n_past, bool want_routing, int n_logits = 1, bool want_hidden = false, int snapshots = 1);
+    struct Layer;
+    ggml_tensor* attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
+    ggml_tensor* ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing);
     void pin_cpu_layers(const Graph& g);        // keep every op of a RAM layer on the CPU
     std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
+    void release_pending();
+    Graph build_mtp(int n_tok, int n_past);
+    void* pending_ = nullptr;                    // Graph of the last undoable batch, until accept()
     struct Layer {
         ggml_tensor *attn_norm = nullptr, *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
         ggml_tensor *bq = nullptr, *bk = nullptr, *bv = nullptr, *q_norm = nullptr, *k_norm = nullptr;
@@ -158,7 +196,10 @@ private:
         bool recurrent = false;
         ggml_tensor *wqkv = nullptr, *wgate = nullptr, *ssm_conv1d = nullptr, *ssm_dt = nullptr, *ssm_a = nullptr;
         ggml_tensor *ssm_beta = nullptr, *ssm_alpha = nullptr, *ssm_norm = nullptr, *ssm_out = nullptr;
+        ggml_tensor *ssm_ba = nullptr, *ssm_in = nullptr;    // Qwen3-Next: fused beta/alpha, and older fused q/k/v/z
         ggml_tensor *conv_state = nullptr;       // [ssm_conv - 1, conv_dim]: the last few inputs
+        // MTP draft block only
+        ggml_tensor *eh_proj = nullptr, *enorm = nullptr, *hnorm = nullptr, *mtp_embd = nullptr, *head_norm = nullptr, *head = nullptr;
         ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
     };
     Hparams hp_;
@@ -174,6 +215,7 @@ private:
     std::vector<uint8_t> graph_mem_;             // scratch for building graphs
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
     std::vector<Layer> layers_;
+    std::unique_ptr<Layer> mtp_;                 // the MTP draft block, when loaded
     std::vector<bool> layer_kv_gpu_;             // per layer: KV cache in VRAM
     bool pin_layers_ = false;                    // layer split: RAM layers must run entirely on the CPU
     std::string device_name_;
@@ -181,6 +223,7 @@ private:
     uint64_t weights_bytes_ = 0, kv_bytes_ = 0;
     void* dev_ = nullptr;                        // ggml_backend_dev_t of the main device
     bool flash_attn_ = true, kv_f32_ = false;
+    int kv_t_ = 1;                               // ggml_type of the KV cache (GGML_TYPE_F16)
     int batch_ = 256, n_expert_used_file_ = 0;
 };
 using OlmoeModel = Model;

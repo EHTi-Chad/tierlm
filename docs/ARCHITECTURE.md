@@ -98,7 +98,53 @@ so editing an earlier message recomputes the conversation. Draft (multi-token pr
 skipped and never loaded. The MoE versions (`qwen35moe`, e.g. Qwen3.6-35B-A3B) replace the feed-forward block
 with routed experts (softmax, top 8, renormalised) plus a **shared expert** that runs on every token, scaled by its
 own sigmoid gate; files that store each expert's gate and up weights as one tensor (`ffn_gate_up_exps`) are read
-as-is, with one matrix multiply for both halves.
+as-is, with one matrix multiply for both halves. **Qwen3-Next** (`qwen3next`, e.g. Qwen3-Coder-Next) is
+the same math stored differently: its value heads stay grouped by key head (tierlm repeats each key head in
+place instead of relying on ggml's tiled broadcast), beta and alpha come as one tensor interleaved per key head
+(`ssm_ba`), and older files keep q, k, v and z interleaved per key head in one tensor (`ssm_in`).
+
+## Speculative decoding
+
+When a model doesn't fit in VRAM, generating a token is limited by how fast its weights in RAM can be read: a dense
+27B model with 14 GB in RAM manages about 3 tokens/second on a laptop. Speculative decoding gets several tokens
+out of each read. Qwen3.5 / 3.6 / 3.8 and Qwen3-Next ship a small **MTP draft layer** (multi-token prediction):
+one full-attention block that takes the token just chosen and the model's last hidden state, and predicts the
+next token. Unsloth publishes it as a separate `mtp-<model>.gguf`; tierlm loads it from either place.
+
+Each step (`src/speculate.cpp`):
+
+1. **Guess.** The draft layer runs up to `draft_max` times (default 3), feeding its own hidden state forward,
+   which is cheap: one layer, usually in VRAM.
+2. **Check.** The model evaluates the chosen token and the guesses in **one pass** (`Model::eval_ex`), producing a
+   prediction for every position. Its weights are read once for all of them.
+3. **Keep.** At each position the model's own token is picked from its prediction, with the normal sampling
+   settings; while it equals the guess, the next position is checked too. At the first difference the model's
+   token is kept and the rest are undone (`Model::accept`): attention layers just forget the extra keys and
+   values; DeltaNet layers, whose running memory can't be rewound, restore it from a per-token snapshot that
+   ggml's `gated_delta_net` op keeps for exactly this, along with the convolution's last inputs.
+4. **Catch up.** The draft layer re-reads the kept tokens with the model's real hidden states, so its own cache
+   matches what the model saw.
+
+Every token that comes out is the model's own choice at that position, so with temperature 0 the reply is the
+same as without speculation (the tests check this, also with scripted, partly wrong guesses that exercise every
+undo depth), and with sampling it follows the same distribution. The draft layer's math is checked against a
+NumPy version of Hugging Face's MTP block.
+
+**KV cache precision.** The cache can be stored at 8 bits (`q8_0`, about 1% from exact) or 4 bits (`q4_0`), which
+leaves VRAM for more of the model's layers. Quantized caches are read by flash attention, which turns on with them.
+
+## Using the CPU fully
+
+**One CPU engine per generation.** Release builds ship ggml's engines as separate files: a CPU engine for each x86
+generation (plain x86-64, SSE4.2, AVX, AVX2, AVX-VNNI, AVX-512, Zen 4, AMX) plus CUDA and Vulkan. When tierlm starts
+(`src/backends.cpp`), ggml scores each CPU engine against the processor and loads the best one; a GPU engine whose
+driver isn't installed simply doesn't load. So a 2010 PC runs the plain build and a Ryzen 9000 runs the Zen 4 build
+with AVX-512, from the same download. The hardware card shows which instruction set is in use.
+
+**Repacked weights.** Weights the CPU computes with are stored in ggml's repacked layout where one exists (Q4_0,
+Q4_K, IQ4_NL, and Q2_K with AVX-512, on x86): several rows interleaved so its matrix kernels read whole blocks at
+once. Results are the same (checked to 3e-6); reading a prompt on the CPU was 3.5x faster in testing. Generation is
+limited by RAM speed either way. The embedding table, looked up by row rather than multiplied, keeps the plain layout.
 
 ## Memory and devices
 
@@ -142,7 +188,7 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 
 ## What's next
 
-1. **Real-model testing of the new families**, then more families: Qwen3-Next (Qwen3-Coder-Next), Gemma, Phi, DeepSeek, gpt-oss. Qwen3-30B-A3B (48 layers, 128 experts, 8 active, about
+1. **Real-model testing of the new families**, then more families: Gemma, Phi, DeepSeek, gpt-oss. Qwen3-30B-A3B (48 layers, 128 experts, 8 active, about
    18.6 GB in Q4) is larger than the Arc's 16 GB, which makes it the first real test of tiering.
 2. **Tier loader, next steps.** VRAM/RAM splitting works (see [TOOLS.md](TOOLS.md#splitting-models-between-vram-and-ram));
    next are the SSD tier (rarely used experts read from disk when routed to) and finer-grained placement.

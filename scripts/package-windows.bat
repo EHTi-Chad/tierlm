@@ -41,6 +41,9 @@ set "OUT=dist\%NAME%"
 if exist "%OUT%" rmdir /s /q "%OUT%"
 mkdir "%OUT%\web" "%OUT%\models" "%OUT%\licenses" || exit /b 1
 for %%t in (server run bench devices inspect plan kv) do copy /y "%BDIR%\tierlm-%%t.exe" "%OUT%\" >nul || exit /b 1
+rem ggml's engines: one CPU engine per x86 generation (tierlm loads the best one this PC supports), plus CUDA and Vulkan
+copy /y "%BDIR%\ggml*.dll" "%OUT%\" >nul || ( echo The ggml engine files ^(ggml*.dll^) are missing from %BDIR%. & exit /b 1 )
+if not exist "%OUT%\ggml-cpu-x64.dll" ( echo The CPU engines are missing: is TIERLM_PORTABLE on? & exit /b 1 )
 copy /y web\index.html "%OUT%\web\" >nul
 if /i "%FLAVOR%"=="full" (
   rem NVIDIA's redistributable runtime: cudart, cuBLAS, cuBLASLt (CUDA 12 keeps them in bin, CUDA 13 in bin\x64)

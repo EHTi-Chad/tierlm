@@ -7,9 +7,27 @@ No. tierlm runs on the CPU too; it's just slower. With a GPU that supports Vulka
 NVIDIA GeForce), replies are typically 1.5 to 2 times faster. The pill at the top-left of the page shows which
 device is in use.
 
+**Why is a dense model (like Qwen3.6-27B) so much slower than a bigger MoE model when it doesn't fit in VRAM?**
+A dense model reads all of its weights for every word. When most of them are in RAM, speed is limited by how fast
+RAM delivers them: a laptop's RAM gives roughly 40 GB/s, so 14 GB of weights in RAM means about 3 words per second.
+A mixture-of-experts model (names with A3B, A10B...) only reads the few experts each word uses, about 3 billion
+parameters for an A3B model, so it stays fast with most of the model in RAM. To speed up a dense model, shorten the
+context or set **Context memory precision** to **8-bit** (the context takes VRAM that could hold more layers), or
+pick a smaller quantization; better, use an MoE model.
+
+**What is speculative decoding, and why is it greyed out?**
+Many Qwen3.5 / 3.6 / 3.8 files include a small "draft" layer trained to guess the next word. With **Speculative
+decoding** on, it guesses a few words ahead and the model checks all of them in one pass, so each read of the
+model's weights produces more than one word: faster replies, with exactly the answers the model would give anyway.
+It's greyed out when the model file has no draft layer. Some publishers (Unsloth) put it in a separate file named
+`mtp-<model>.gguf`: download that too and keep it in the same folder, and tierlm uses it automatically (the setup
+screen lists it as a **Draft add-on**). The chat shows "tokens per check" after each reply: above about 1.5 it's
+helping.
+
 **Can I use a different model?**
 Yes, for the common families: Llama (2, 3.x), Mistral and Mixtral, Qwen2/2.5, Qwen3 and Qwen3 MoE, the Qwen3.5 /
-3.6 / 3.8 dense models (such as Qwen3.8-27B) and MoE models (such as Qwen3.6-35B-A3B), and OLMoE.
+3.6 / 3.8 dense models (such as Qwen3.8-27B) and MoE models (such as Qwen3.6-35B-A3B), Qwen3-Next and
+Qwen3-Coder-Next, and OLMoE.
 More families are being added. The setup screen says which of your files are supported, and why the others
 aren't. See [Supported models](GETTING_STARTED.md#supported-models).
 

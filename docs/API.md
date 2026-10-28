@@ -176,10 +176,12 @@ requests from the same computer. Elsewhere it returns HTTP 501.
 | `ctx` | Context length in tokens |
 | `threads` | CPU threads |
 | `flash_attn` | Flash attention on/off |
-| `kv_type` | `f16` or `f32` KV cache |
+| `kv_type` | KV cache precision: `f16` (default), `q8_0` (8-bit, half the memory), `q4_0` (4-bit, a quarter, lower quality) or `f32` (exact). 8-bit and 4-bit turn on flash attention |
 | `batch` | Tokens per step when reading a prompt (default 256) |
 | `experts_used` | Active experts per token for MoE models; 0 keeps the model's own value |
 | `seed` | -1 for random sampling; any other number makes replies repeatable |
+| `speculative` | `true` loads the model's MTP draft layer and uses speculative decoding (when the file, or an `mtp-*.gguf` next to it, has one: `"mtp": true` in `/api/models`) |
+| `draft_max` | Most tokens the draft layer guesses per check, 1 to 8 (default 3) |
 
 Any loaded model is freed first. The settings are saved for this model. Returns
 `{"ok": true, "device": "...", "load_s": 3.2}`, or an `error` with HTTP 400/500.
@@ -244,6 +246,10 @@ tokens.
 ```json
 {"type": "done", "n_gen": 42, "gen_s": 0.7, "gen_tps": 60.0, "stop": "end", "n_past": 100}
 ```
+
+With speculative decoding, `done` also has `"spec": {"checks": 21, "drafted": 63, "accepted": 41}`: the model's
+checks, the tokens the draft layer guessed, and how many of them the model kept (each check also adds one token of
+its own, so tokens per check = `n_gen / checks`). Token events then carry no `routing`.
 
 `stop` is `end` (the model finished), `length` (hit `max_tokens`), `context` (the context window is full)
 or `abort` (the client disconnected).
