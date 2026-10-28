@@ -71,10 +71,11 @@ memory and RAM together, with about 8 GB left for Windows and other apps: an 8 G
 models up to about 30 GB, with 64 GB about 60 GB. Mixture-of-experts models (names with A3B, A10B...) stay fast
 with most of the model in RAM; ordinary dense models slow down a lot.
 
-**Which download do I need?**
-`tierlm-<version>-windows-nvidia.zip` for NVIDIA GeForce RTX 20/30/40/50 cards: it uses CUDA, the fastest
-option on NVIDIA, and includes NVIDIA's runtime, so you only need a current driver. Everyone else (Intel Arc,
-AMD Radeon, older NVIDIA cards, no GPU) gets `tierlm-<version>-windows-intel-amd.zip`, which uses Vulkan.
+**Does it matter which graphics card I have?**
+No, there's one download for everyone. It contains two GPU engines and picks one when it starts: **CUDA** on
+NVIDIA GeForce RTX 20/30/40/50 cards (the fastest option on NVIDIA; NVIDIA's runtime is included, so you only
+need a current driver), and **Vulkan** on Intel Arc, AMD Radeon and older NVIDIA cards. Without a GPU it uses
+the CPU. On a PC without an NVIDIA card, the black window may say CUDA found no device; that's expected.
 
 **My models are already in another folder (LM Studio, say)**
 Click the **⋯** menu next to **GGUF models** and choose **Choose models folder…**, or the LM Studio entry if

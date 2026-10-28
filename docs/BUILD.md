@@ -131,14 +131,16 @@ of the build machine (`-DTIERLM_PORTABLE=ON`), with the C runtime linked in so u
 redistributable. From a Developer Command Prompt in the project folder:
 
 ```bat
-scripts\package-windows.bat 0.2.0 cuda      &rem NVIDIA RTX 20/30/40/50 (fastest on NVIDIA)
-scripts\package-windows.bat 0.2.0           &rem Vulkan: Intel, AMD and NVIDIA
+scripts\package-windows.bat 0.2.0
 ```
 
-The CUDA build needs the CUDA toolkit 12.8 or newer on the build machine (for RTX 50-series) and bundles NVIDIA's
-redistributable runtime DLLs (`cudart`, `cuBLAS`, `cuBLASLt`, about 700 MB unzipped), so users only need an
-up-to-date NVIDIA driver. It builds into `build-release-<flavor>`, then writes
-`dist\tierlm-0.2.0-windows-nvidia.zip` (CUDA) or `dist\tierlm-0.2.0-windows-intel-amd.zip` (Vulkan) (the tools, `web\`, `start-tierlm.bat`, an empty `models\` folder,
+It makes **one download for every PC**, with both GPU engines: CUDA (for NVIDIA RTX 20/30/40/50) and Vulkan
+(Intel, AMD, older NVIDIA), and tierlm picks one at start-up. The build machine needs the CUDA toolkit 12.8 or newer
+(for RTX 50-series) and the Vulkan SDK. NVIDIA's redistributable runtime DLLs (`cudart`, `cuBLAS`, `cuBLASLt`,
+about 700 MB unzipped) are bundled, so users only need an up-to-date graphics driver. NVIDIA's driver DLL
+(`nvcuda.dll`) is delay-loaded, so the same program starts on PCs without an NVIDIA card. Without the CUDA toolkit,
+`scripts\package-windows.bat 0.2.0 vulkan` makes a Vulkan-only build. It builds into `build-release`, then writes
+`dist\tierlm-0.2.0-windows.zip` (the tools, `web\`, `start-tierlm.bat`, an empty `models\` folder,
 the docs and all licences) plus a `.sha256` checksum. Publish
 both on a GitHub release, for example from WSL:
 

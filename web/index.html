@@ -326,7 +326,7 @@
       <div class="row">
         <label class="small">Temperature <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.7"> <span id="tempv">0.70</span></label>
         <label class="small" title="Makes words used in the last 64 tokens less likely, so the model doesn't loop. 1.00 = off.">Repeat penalty <input id="rpen" type="range" min="1" max="1.5" step="0.01" value="1.1"> <span id="rpenv">1.10</span></label>
-        <label class="small">Max tokens <input id="maxtok" type="range" min="32" max="1024" step="32" value="512"> <span id="maxv">512</span></label>
+        <label class="small" title="Longest reply. Thinking models (Qwen3.x) can use thousands of tokens before they answer.">Max reply <input id="maxtok" type="range" min="0" max="8" step="1" value="8"> <span id="maxv">No limit</span></label>
         <span class="grow"></span>
         <button class="ghost" id="newchat">New chat</button>
         <button id="stop" style="display:none">Stop</button>
@@ -506,7 +506,7 @@ async function send(text) {
   try {
     const res = await fetch("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
-      body: JSON.stringify({ messages: history, temperature: +$("temp").value, max_tokens: +$("maxtok").value,
+      body: JSON.stringify({ messages: history, temperature: +$("temp").value, max_tokens: maxTokens(),
         top_p: +$("topp").value, top_k: +$("topk").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value }),
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
@@ -523,7 +523,7 @@ async function send(text) {
         const ev = JSON.parse(line.slice(6));
         if (ev.type === "prompt") onPrompt(ev);
         else if (ev.type === "token") { reply += ev.text; bubble.textContent = reply; onToken(ev); $("messages").scrollTop = $("messages").scrollHeight; }
-        else if (ev.type === "done") { meta = ev.n_gen + " tokens · " + ev.gen_tps.toFixed(1) + " tok/s" + (ev.stop === "length" ? " · hit max tokens" : ""); onDone(ev); }
+        else if (ev.type === "done") { meta = ev.n_gen + " tokens · " + ev.gen_tps.toFixed(1) + " tok/s" + (ev.stop === "length" ? " · hit the max reply length (raise Max reply below)" : ev.stop === "context" ? " · context full" : ""); onDone(ev); }
         else if (ev.type === "error") throw new Error(ev.message);
       }
     }
@@ -660,7 +660,13 @@ $("stop").onclick = () => controller?.abort();
 $("input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
 document.querySelectorAll(".suggest button").forEach(b => b.onclick = () => send(b.dataset.q));
 $("temp").oninput = () => $("tempv").textContent = (+$("temp").value).toFixed(2);
-$("maxtok").oninput = () => $("maxv").textContent = $("maxtok").value;
+// Reply length steps; the last one means no limit (the reply ends when the model is done or the context is full).
+const MAXTOK_STEPS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, -1];
+function maxTokens() { return MAXTOK_STEPS[+$("maxtok").value]; }
+function showMaxTok() { const v = maxTokens(); $("maxv").textContent = v < 0 ? "No limit" : v >= 1024 ? (v / 1024) + "K" : String(v); }
+$("maxtok").oninput = () => { showMaxTok(); try { localStorage.setItem("tierlm.maxtok", $("maxtok").value); } catch (e) {} };
+try { const sv = localStorage.getItem("tierlm.maxtok"); if (sv !== null && +sv >= 0 && +sv < MAXTOK_STEPS.length) $("maxtok").value = sv; } catch (e) {}
+showMaxTok();
 $("slots").oninput = updateHits;
 $("newchat").onclick = async () => {
   if (busy) return;

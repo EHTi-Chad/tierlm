@@ -14,9 +14,9 @@ OLMoE) but not yet everything on Hugging Face. See [Supported models](#supported
   and your other apps (8 GB GPU + 32 GB RAM: models up to about 30 GB; 8 GB + 64 GB: about 60 GB; 32 GB + 64 GB:
   about 85 GB). Small models that fit in the GPU run with less.
 - **Disk space** for the models you download (1 to 60 GB each) plus about 1 GB for tierlm.
-- **Optional: a GPU** for much faster replies. NVIDIA GeForce RTX cards use CUDA (the NVIDIA download);
-  Intel Arc (including the built-in Arc graphics in Core Ultra laptops), AMD Radeon and older NVIDIA cards use
-  Vulkan (the Intel/AMD download). Without a GPU, tierlm runs on the CPU, which is slower but works.
+- **Optional: a GPU** for much faster replies: NVIDIA GeForce, Intel Arc (including the built-in Arc graphics in
+  Core Ultra laptops) or AMD Radeon. tierlm picks the fastest engine for it by itself: CUDA on NVIDIA RTX cards,
+  Vulkan on the rest. Without a GPU, tierlm runs on the CPU, which is slower but works.
 - Keep your **graphics driver up to date**; Vulkan support comes with it.
 
 On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
@@ -24,11 +24,7 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
 ## Step 1: Download tierlm
 
 1. Go to the [Releases page](https://github.com/EHTi-Chad/tierlm/releases).
-2. Download the zip for your graphics card:
-   - **`tierlm-<version>-windows-nvidia.zip`** for NVIDIA GeForce RTX 20, 30, 40 and 50 series (CUDA, the
-     fastest option on NVIDIA; everything it needs is included, you only need a current NVIDIA driver).
-   - **`tierlm-<version>-windows-intel-amd.zip`** for Intel Arc, AMD Radeon, older NVIDIA cards (GTX 10 series
-     and earlier), or no graphics card.
+2. Download the latest **`tierlm-<version>-windows.zip`**. It's the same download for every PC.
 3. Right-click the zip, choose **Extract All...**, and extract it somewhere simple, such as `C:\tierlm`.
 
 ## Step 2: Download the model
@@ -95,7 +91,7 @@ The right-hand side is the live dashboard:
   your own conversation so far.
 
 **Temperature** controls how adventurous replies are: 0 always picks the most likely word, higher values are
-more varied. **Max tokens** caps the length of each reply. **Stop** ends a reply early.
+more varied. **Max reply** caps the length of each reply; the default, **No limit**, lets the model finish (thinking models such as Qwen3.x often use thousands of tokens before they answer). **Stop** ends a reply early.
 
 ## Step 6: Stop it
 

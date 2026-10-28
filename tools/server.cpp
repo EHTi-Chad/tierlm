@@ -16,7 +16,7 @@
 //                       "vram_limit_mb": 0, "split_mode": "layers|experts"}
 //   POST /api/unload   frees the model
 //   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "top_k":40,
-//                     "min_p":0.05, "repeat_penalty":1.1, "repeat_last_n":64, "max_tokens":512}
+//                     "min_p":0.05, "repeat_penalty":1.1, "repeat_last_n":64, "max_tokens":-1}
 //                     streams Server-Sent Events: one "prompt" event, a "token" event per token
 //                     (with the experts picked in every layer), then "done"
 //   POST /api/reset   clears the KV cache
@@ -28,6 +28,7 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <climits>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -721,7 +722,10 @@ int main(int argc, char** argv) {
                 sp.min_p = body.value("min_p", sp.min_p);
                 sp.repeat_penalty = body.value("repeat_penalty", sp.repeat_penalty);
                 sp.repeat_last_n = body.value("repeat_last_n", sp.repeat_last_n);
-                const int max_tokens = body.value("max_tokens", 512);
+                // Longest reply in tokens; 0 or less (the default) means no limit: the reply ends when the model
+                // finishes or the context window is full. Thinking models (Qwen3.x) need thousands of tokens.
+                int max_tokens = body.value("max_tokens", -1);
+                if (max_tokens <= 0) max_tokens = INT_MAX;
                 if (eng.seed >= 0) eng.rng.seed((uint32_t)eng.seed);    // same seed, same reply
                 auto& model = eng.model; auto& tok = eng.tok; auto& cached = eng.cached;
                 const auto& hp = model->hparams();

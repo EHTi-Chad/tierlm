@@ -1,29 +1,31 @@
 @echo off
 rem Builds a portable Windows release of tierlm and zips it into dist\.
-rem Run from a Visual Studio Developer Command Prompt, in the project folder:
-rem     scripts\package-windows.bat 0.2.0           Vulkan build (any GPU; needs the Vulkan SDK to build)
-rem     scripts\package-windows.bat 0.2.0 cuda      CUDA build for NVIDIA RTX 20/30/40/50 (needs CUDA 12.8+ to build).
-rem                                                The CUDA runtime DLLs are bundled, so users install nothing.
+rem Run from a Visual Studio Developer Command Prompt, in the project folder, with the CUDA toolkit (12.8 or newer,
+rem for RTX 50-series) and the Vulkan SDK installed:
+rem     scripts\package-windows.bat 0.2.0
+rem One download for every PC: it contains both GPU engines and picks one at start-up. NVIDIA GeForce RTX cards
+rem use CUDA (fastest on NVIDIA); Intel Arc, AMD Radeon and older NVIDIA cards use Vulkan; with no GPU, the CPU.
+rem NVIDIA's CUDA runtime DLLs are bundled, so users install nothing but their normal graphics driver.
+rem     scripts\package-windows.bat 0.2.0 vulkan    (for building without the CUDA toolkit: Vulkan only)
 setlocal
-if "%~1"=="" ( echo usage: scripts\package-windows.bat VERSION [vulkan^|cuda]   e.g. 0.2.0 cuda & exit /b 1 )
+if "%~1"=="" ( echo usage: scripts\package-windows.bat VERSION [vulkan]   e.g. 0.2.0 & exit /b 1 )
 set "VER=%~1"
 set "FLAVOR=%~2"
-if "%FLAVOR%"=="" set "FLAVOR=vulkan"
-rem Zips are named for who should download them: "nvidia" (CUDA) and "intel-amd" (Vulkan: Intel, AMD, older NVIDIA, or none)
-set "LABEL=intel-amd"
-if /i "%FLAVOR%"=="cuda" set "LABEL=nvidia"
-set "NAME=tierlm-%VER%-windows-%LABEL%"
-set "BDIR=build-release-%FLAVOR%"
+if "%FLAVOR%"=="" set "FLAVOR=full"
 cd /d "%~dp0.."
 
-if /i "%FLAVOR%"=="cuda" (
-  echo == Building ^(portable: AVX2 baseline, static runtime, CUDA for RTX 20/30/40/50^) ==
-  rem 75 = RTX 20, 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
-  cmake -S . -B %BDIR% -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_CUDA=ON -DTIERLM_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=75;86;89;120" -DTIERLM_VERSION=%VER% || exit /b 1
+if /i "%FLAVOR%"=="full" (
+  set "NAME=tierlm-%VER%-windows"
+  set "BDIR=build-release"
+  echo == Building ^(portable: AVX2 baseline, static runtime, CUDA for RTX 20/30/40/50 + Vulkan^) ==
+  rem CUDA architectures: 75 = RTX 20, 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
+  cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_CUDA=ON -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=75;86;89;120" -DTIERLM_VERSION=%VER% || exit /b 1
 ) else if /i "%FLAVOR%"=="vulkan" (
-  echo == Building ^(portable: AVX2 baseline, static runtime, Vulkan^) ==
-  cmake -S . -B %BDIR% -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON -DTIERLM_VERSION=%VER% || exit /b 1
-) else ( echo unknown flavor "%FLAVOR%": use vulkan or cuda & exit /b 1 )
+  set "NAME=tierlm-%VER%-windows-vulkan-only"
+  set "BDIR=build-release-vulkan"
+  echo == Building ^(portable: AVX2 baseline, static runtime, Vulkan only^) ==
+  cmake -S . -B build-release-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON -DTIERLM_VERSION=%VER% || exit /b 1
+) else ( echo unknown option "%FLAVOR%": leave it out, or use vulkan & exit /b 1 )
 cmake --build %BDIR% || exit /b 1
 
 echo == Collecting files ==
@@ -32,7 +34,7 @@ if exist "%OUT%" rmdir /s /q "%OUT%"
 mkdir "%OUT%\web" "%OUT%\models" "%OUT%\licenses" || exit /b 1
 for %%t in (server run bench devices inspect plan kv) do copy /y "%BDIR%\tierlm-%%t.exe" "%OUT%\" >nul || exit /b 1
 copy /y web\index.html "%OUT%\web\" >nul
-if /i "%FLAVOR%"=="cuda" (
+if /i "%FLAVOR%"=="full" (
   rem NVIDIA's redistributable runtime: cudart, cuBLAS, cuBLASLt (CUDA 12 keeps them in bin, CUDA 13 in bin\x64)
   for %%d in ("%CUDA_PATH%\bin" "%CUDA_PATH%\bin\x64") do (
     for %%f in ("%%~d\cudart64_*.dll" "%%~d\cublas64_*.dll" "%%~d\cublasLt64_*.dll") do copy /y "%%~f" "%OUT%\" >nul

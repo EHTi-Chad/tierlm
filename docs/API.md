@@ -130,13 +130,13 @@ Request:
   ],
   "temperature": 0.7,
   "top_p": 0.9,
-  "max_tokens": 512
+  "max_tokens": 2048
 }
 ```
 
 - `messages` is the whole conversation; roles are `system`, `user` and `assistant`. The server formats it
   with the OLMoE-Instruct (Tulu) chat template.
-- `temperature` 0 means greedy (always the most likely token). Defaults: 0.7, top_p 0.9, max_tokens 512.
+- `temperature` 0 means greedy (always the most likely token). Defaults: 0.7, top_p 0.9, and no limit on `max_tokens` (0 or less, or leaving it out, means the reply runs until the model finishes or the context is full).
 - Whatever part of the conversation is already in the KV cache is reused, so follow-up messages only process
   the new text.
 
