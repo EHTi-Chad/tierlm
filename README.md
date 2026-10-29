@@ -1,8 +1,7 @@
 # tierlm
 
-**A performance-first local LLM engine: it puts every part of a model in the right memory. The parts used for every
-word go in VRAM, the rest in RAM (soon SSD), so big models run as fast as your PC allows, and your RAM, not your
-GPU, sets how big you can go.**
+**A performance-first local LLM engine: it puts every part of a model in the preferred memory location. Big 
+models run as fast as your PC allows, and your RAM, not your GPU, sets how big you can go.**
 
 tierlm is written from scratch in C++ by **Claude** (Anthropic's AI), with **Chad Jameson (EHTi)** directing
 the project, making the design calls, and testing and debugging it on real hardware. It uses
