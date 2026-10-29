@@ -148,6 +148,31 @@
   .msg.assistant.streaming::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
   .msg .meta { display: block; margin-top: 6px; font-size: 11.5px; color: var(--faint); white-space: normal; }
   .msg.error { align-self: center; background: transparent; color: var(--danger); font-size: 13px; }
+  /* Markdown in replies */
+  .msg.assistant { white-space: normal; }
+  .md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+  .md p { margin: 0 0 .7em; }
+  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 1em 0 .45em; line-height: 1.25; font-weight: 700; }
+  .md h1 { font-size: 1.35em; } .md h2 { font-size: 1.22em; } .md h3 { font-size: 1.1em; } .md h4, .md h5, .md h6 { font-size: 1em; }
+  .md ul, .md ol { margin: 0 0 .7em; padding-left: 1.5em; } .md li { margin: .15em 0; } .md li > ul, .md li > ol { margin: .2em 0; }
+  .md blockquote { margin: 0 0 .7em; padding: .2em .9em; border-left: 3px solid var(--accent); color: var(--muted); }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+  .md code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .9em; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  .md .codeblock { position: relative; margin: 0 0 .8em; }
+  .md pre { margin: 0; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; line-height: 1.45; }
+  .md pre code { background: none; padding: 0; font-size: 12.5px; white-space: pre; }
+  .md .codelang { position: absolute; top: 4px; left: 10px; font-size: 10.5px; color: var(--faint); }
+  .md .codeblock.haslang pre { padding-top: 20px; }
+  .md .copy { position: absolute; top: 4px; right: 6px; font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); cursor: pointer; }
+  .md .copy:hover { color: var(--ink); }
+  .md .tablewrap { overflow-x: auto; margin: 0 0 .8em; }
+  .md table { border-collapse: collapse; font-size: .95em; }
+  .md th, .md td { border: 1px solid var(--line); padding: 5px 10px; text-align: left; vertical-align: top; }
+  .md th { background: var(--panel); font-weight: 650; }
+  .md a { color: var(--accent); }
+  .md details.think { margin: 0 0 .8em; padding: 6px 10px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); font-size: .93em; }
+  .md details.think summary { cursor: pointer; font-weight: 600; }
+  .md details.think > div { margin-top: 6px; }
   @keyframes blink { 50% { opacity: 0; } }
   .empty { margin: auto; text-align: center; color: var(--muted); max-width: 360px; }
   .empty b { color: var(--ink); }
@@ -773,12 +798,117 @@ function setContext(n) {
   $("ctxbar").style.width = info ? Math.min(100, 100 * n / info.ctx) + "%" : "0";
 }
 
+// ---------- Markdown ----------
+// A small, safe Markdown renderer for replies: the text is HTML-escaped first, so nothing the model writes can become
+// markup except what these rules produce. Headings, bold/italic/strike, inline code, fenced code (with a copy button),
+// lists (nested by indent), quotes, rules, tables and http(s) links; <think>...</think> folds into "Thinking".
+function mdInline(t) {
+  const codes = [];
+  t = t.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return "\u0000" + (codes.length - 1) + "\u0000"; });
+  t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  t = t.replace(/\*\*\*([^*\n]+)\*\*\*/g, "<b><i>$1</i></b>").replace(/\*\*([^*\n]+?)\*\*/g, "<b>$1</b>").replace(/__([^_\n]+?)__/g, "<b>$1</b>")
+       .replace(/(^|[^*\w])\*([^*\s][^*\n]*?)\*(?!\w)/g, "$1<i>$2</i>").replace(/(^|[^_\w])_([^_\s][^_\n]*?)_(?!\w)/g, "$1<i>$2</i>")
+       .replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+  return t.replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + codes[+i] + "</code>");
+}
+function mdBlocks(src) {
+  const lines = src.split("\n"), out = [];
+  let i = 0;
+  const isTableSep = l => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l) && l.includes("-");
+  const cells = l => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => mdInline(c.trim()));
+  const listRe = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+  while (i < lines.length) {
+    const l = lines[i];
+    let m;
+    if ((m = l.match(/^\s*(```|~~~)\s*([\w+#.-]*)\s*$/))) {            // fenced code
+      const fence = m[1], lang = m[2]; const body = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith(fence); i++) body.push(lines[i]);
+      i++;
+      out.push(`<div class="codeblock${lang ? " haslang" : ""}">${lang ? `<span class="codelang">${lang}</span>` : ""}<button class="copy" type="button">Copy</button><pre><code>${body.join("\n")}</code></pre></div>`);
+      continue;
+    }
+    if (!l.trim()) { i++; continue; }
+    if ((m = l.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/))) { out.push(`<h${m[1].length}>${mdInline(m[2])}</h${m[1].length}>`); i++; continue; }
+    if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(l)) { out.push("<hr>"); i++; continue; }
+    if (l.includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1])) {   // table
+      const head = cells(l); i += 2; const rows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) rows.push(cells(lines[i++]));
+      out.push(`<div class="tablewrap"><table><thead><tr>${head.map(c => `<th>${c}</th>`).join("")}</tr></thead><tbody>` +
+               rows.map(r => `<tr>${head.map((_, k) => `<td>${r[k] ?? ""}</td>`).join("")}</tr>`).join("") + "</tbody></table></div>");
+      continue;
+    }
+    if (/^\s*&gt;\s?/.test(l)) {                                          // quote (the text is already escaped)
+      const body = [];
+      while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])) body.push(lines[i++].replace(/^\s*&gt;\s?/, ""));
+      out.push(`<blockquote>${mdBlocks(body.join("\n"))}</blockquote>`);
+      continue;
+    }
+    if (listRe.test(l)) {                                                   // lists, nested by indentation
+      const items = [];
+      while (i < lines.length && (listRe.test(lines[i]) || (lines[i].trim() && /^\s{2,}/.test(lines[i]) && items.length))) {
+        const mm = lines[i].match(listRe);
+        if (mm) items.push({ ind: mm[1].replace(/\t/g, "    ").length, ord: /\d/.test(mm[2]), num: parseInt(mm[2]), text: mm[3] });
+        else items[items.length - 1].text += " " + lines[i].trim();
+        i++;
+      }
+      let html = "", k = 0;
+      const build = ind => {
+        const ord = items[k].ord, start = items[k].num;
+        let h = ord ? `<ol${start > 1 ? ` start="${start}"` : ""}>` : "<ul>";
+        while (k < items.length && items[k].ind >= ind) {
+          if (items[k].ind === ind && items[k].ord !== ord) break;           // bullets then numbers: two lists
+          if (items[k].ind > ind) { h = h.replace(/<\/li>$/, "") + build(items[k].ind) + "</li>"; continue; }
+          h += `<li>${mdInline(items[k].text)}</li>`; k++;
+        }
+        return h + (ord ? "</ol>" : "</ul>");
+      };
+      while (k < items.length) html += build(items[k].ind);
+      out.push(html);
+      continue;
+    }
+    const para = [];                                                        // paragraph: lines until a blank or a block
+    while (i < lines.length && lines[i].trim() && !/^\s*(```|~~~|#{1,6}\s|&gt;)/.test(lines[i]) && !listRe.test(lines[i]) &&
+           !(lines[i].includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1]))) para.push(lines[i++]);
+    if (!para.length) para.push(lines[i++]);
+    out.push(`<p>${mdInline(para.join("\n")).replace(/\n/g, "<br>")}</p>`);
+  }
+  return out.join("");
+}
+function renderMd(text) {
+  let t = esc(text);
+  let think = "";
+  const open = t.indexOf("&lt;think&gt;");
+  if (open >= 0) {                                                        // a thinking model's reasoning, folded away
+    const close = t.indexOf("&lt;/think&gt;", open);
+    const inner = t.slice(open + 13, close < 0 ? t.length : close);
+    think = `<details class="think"${close < 0 ? " open" : ""}><summary>${close < 0 ? "Thinking…" : "Thinking"}</summary><div>${mdBlocks(inner.trim())}</div></details>`;
+    t = t.slice(0, open) + (close < 0 ? "" : t.slice(close + 14));
+  }
+  return think + mdBlocks(t.replace(/\r/g, ""));
+}
+function setReply(bubble, text) {
+  let body = bubble.querySelector(".md");
+  if (!body) { body = document.createElement("div"); body.className = "md"; bubble.prepend(body); }
+  body.innerHTML = renderMd(text);
+  const d = body.querySelector("details.think");                         // keep it the way the reader left it
+  if (d && bubble.dataset.think) d.open = bubble.dataset.think === "open";
+}
+document.addEventListener("click", e => {
+  const sum = e.target.closest(".md details.think > summary");
+  if (sum) { const d = sum.parentElement; d.closest(".msg").dataset.think = d.open ? "closed" : "open"; return; }
+  const b = e.target.closest(".md .copy");
+  if (!b) return;
+  const code = b.parentElement.querySelector("code").textContent;
+  navigator.clipboard?.writeText(code).then(() => { b.textContent = "Copied"; setTimeout(() => b.textContent = "Copy", 1200); },
+                                              () => { b.textContent = "Select and copy"; });
+});
+
 // ---------- chat ----------
 function addMsg(role, text) {
   $("empty")?.remove();
   const d = document.createElement("div");
   d.className = "msg " + role;
-  d.textContent = text;
+  if (role === "assistant") setReply(d, text); else d.textContent = text;
   $("messages").appendChild(d);
   $("messages").scrollTop = $("messages").scrollHeight;
   return d;
@@ -799,7 +929,7 @@ async function send(text) {
   bubble.classList.add("streaming");
   setBusy(true);
   controller = new AbortController();
-  let reply = "", meta = "";
+  let reply = "", meta = "", drawPending = false;
   try {
     const res = await api("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
@@ -819,7 +949,10 @@ async function send(text) {
         if (!line.startsWith("data: ")) continue;
         const ev = JSON.parse(line.slice(6));
         if (ev.type === "prompt") onPrompt(ev);
-        else if (ev.type === "token") { reply += ev.text; bubble.textContent = reply; onToken(ev); $("messages").scrollTop = $("messages").scrollHeight; }
+        else if (ev.type === "token") {
+          reply += ev.text; onToken(ev);
+          if (!drawPending) { drawPending = true; requestAnimationFrame(() => { drawPending = false; setReply(bubble, reply); $("messages").scrollTop = $("messages").scrollHeight; }); }
+        }
         else if (ev.type === "done") {
           meta = ev.n_gen + " tokens · " + ev.gen_tps.toFixed(1) + " tok/s" + (ev.stop === "length" ? " · hit the max reply length (raise Max reply below)" : ev.stop === "context" ? " · context full" : "");
           if (ev.spec && ev.spec.checks) meta += " · speculative: " + (ev.n_gen / ev.spec.checks).toFixed(1) + " tokens per check, " +
@@ -834,6 +967,7 @@ async function send(text) {
     else addMsg("error", "⚠ " + e.message);
   }
   bubble.classList.remove("streaming");
+  setReply(bubble, reply);
   if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m); }
   if (reply) history.push({ role: "assistant", content: reply, meta });
   else if (!reply && history.at(-1)?.role === "user" && meta !== "stopped") history.pop();
