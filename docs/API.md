@@ -199,7 +199,9 @@ Any loaded model is freed first. The settings are saved for this model. Returns
 
 ### POST /api/autotune
 
-Finds the fastest settings for a model on this PC. The body is the same as `/api/load`. The reply is a stream of
+Finds the fastest settings for a model on this PC. The body is the same as `/api/load`, plus the chat's sampling
+(`temperature`, `top_k`, `top_p`, `min_p`, `repeat_penalty`), which every measurement uses: each one answers two
+questions exactly as `/api/chat` would. The reply is a stream of
 server-sent events: `{"type":"status","text":"Measuring experts in RAM"}` while it works,
 `{"type":"result","label":"Split: experts in RAM","tps":17.0}` for each measurement, then
 `{"type":"done","tps":22.3,"settings":{...},"results":[...]}` with the settings it saved for the model (`split_mode`,
@@ -207,7 +209,9 @@ server-sent events: `{"type":"status","text":"Measuring experts in RAM"}` while 
 
 ### POST /api/bench
 
-Measures the loaded model with its current settings: reads a 512-token prompt and generates 64 tokens.
+Measures the loaded model with its current settings: reads a 512-token prompt, then answers two questions exactly
+as `/api/chat` would. The optional body sets the sampling to measure with (`temperature`, `top_k`, `top_p`, `min_p`,
+`repeat_penalty`, as in `/api/chat`). `gen_tps` is the speed a chat runs at.
 Returns `{"prompt_tps": 143.0, "gen_tps": 22.3, "speculative": true, "draft_max": 2, "threads": 8}`.
 
 ### POST /api/spec

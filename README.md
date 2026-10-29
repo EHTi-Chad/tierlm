@@ -13,8 +13,7 @@ It runs the common model families (**Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwe
 dense and MoE, Qwen3-Next, OLMoE**) on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with
 CUDA, on **Windows** (ready-to-run download) and **Linux** (build from source; a ready-made download is coming). **Models bigger than the GPU's memory are split between VRAM and RAM automatically**: on a laptop RTX 3070
 (8 GB), the 17 GB Qwen3.6-35B-A3B runs at about **33 tokens/second** (35 with speculative decoding), and on an
-RTX 5090 the 46 GB Qwen3.6-35B-A3B Q8_0 ran at **36.6 tokens/second** with 128K of context (measured with 0.4.0;
-0.5.0 is faster on NVIDIA, new numbers coming). A web page lets you pick a model and chat, with a
+RTX 5090 the 37 GB Qwen3.6-35B-A3B Q8_0 runs at about **94 tokens/second** in a normal chat. A web page lets you pick a model and chat, with a
 live dashboard showing speed, where the model lives, and the router picking experts.
 
 **New user? Read the [tierlm 0.5.0 guide (PDF)](docs/tierlm-0.5.0-guide.pdf)**: what tierlm is, step-by-step
@@ -97,7 +96,8 @@ decoding helps most.
 - **Several GPUs**: with more than one card of the same kind (two NVIDIA cards with CUDA, say), the model fills the
   first GPU, then the next, then RAM.
 - **Find the fastest settings**: one click loads the model and measures the settings that affect speed on this PC
-  (split mode, CPU threads, speculative decoding and how far ahead to guess), then keeps the fastest.
+  (split mode, CPU threads, speculative decoding and how far ahead to guess), then keeps the fastest. It measures
+  exactly the way a chat runs, with your sampling settings, so its numbers are the speed you get in chats.
 - **Web interface**: streaming chat with a collapsible side menu (live settings and system prompt, API, a console
   showing what the engine is doing, model info, saved chats and system-prompt presets, a one-click benchmark), a
   thin live view (speed, context, memory and an explained expert map that shows which experts work and where they
@@ -112,11 +112,14 @@ decoding helps most.
 
 ## Benchmarks
 
-**RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB DDR5, Windows 11:**
+**RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB DDR5, Windows 11 (0.5.1):** Qwen3.6-35B-A3B Q8_0 (lmstudio-community,
+37 GB file, 34.4 GiB), 32K context, CUDA, attention in VRAM and experts split between VRAM and RAM:
 
-| Model | Where it runs | Generation |
-|---|---|---|
-| Qwen3.6-35B-A3B Q8_0 (46 GB file), 128K context | split between VRAM and RAM (CUDA) | **36.6 tok/s** |
+| | Speed |
+|---|---|
+| A normal chat (an 813-token reply, temperature 0.7) | **93.7 tok/s** |
+| Benchmark (answers two questions the way a chat does) | 95.9 tok/s |
+| Reading the prompt | 648.8 tok/s |
 
 **RTX 5080 (16 GB) + Ryzen 7 9800X3D, 32 GB DDR5-6000, Windows 11 (0.5.0):** Qwen3.6-35B-A3B Q6_K (27 GB file),
 32K context, measured by **Find the fastest settings**:
@@ -154,7 +157,8 @@ tokens per read makes it about 1.75× faster here, with the same answers. More g
 guess is less likely to be kept but still has to be checked.
 
 **Mixture-of-experts on the same laptop.** Qwen3.6-35B-A3B MTP UD-Q3_K_XL (Unsloth, 17 GB), 16K context (CUDA),
-measured by **Find the fastest settings** (short replies at temperature 0, so real chats come out somewhat lower):
+measured by **Find the fastest settings** in 0.5.0 (short replies at temperature 0; since 0.5.1 it measures real chat
+replies, which on this laptop come out about 27 tok/s with speculative decoding at temperature 0.7):
 
 | Setting | Without CUDA graphs | 0.5.0 |
 |---|---|---|
@@ -232,7 +236,7 @@ model is in RAM.
    - Bigger than your GPU, the real test: [`Qwen3-30B-A3B` Q3_K_M](https://huggingface.co/bartowski/Qwen_Qwen3-30B-A3B-GGUF/tree/main)
      (14.7 GB; needs 32 GB RAM with an 8 GB GPU)
    - The newest: [`Qwen3.6-35B-A3B`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main) Q4_K_M (about 21 GB) or
-     Q8_0 (for 64 GB RAM). The Q8_0 runs at about 36 tokens/second on an RTX 5090 with 64 GB RAM.
+     Q8_0 (for 64 GB RAM). The Q8_0 runs at about 94 tokens/second on an RTX 5090 with 64 GB RAM.
    - Just to check it works: [`Llama-3.2-1B-Instruct` Q4_K_M](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/tree/main) (0.8 GB)
 
    Put the file in tierlm's `models` folder, or leave it where it is and choose that folder in step 3.

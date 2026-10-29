@@ -35,8 +35,9 @@ combined yet: tierlm uses the bigger one.
 It loads the model and measures, on your PC, the settings that only change speed: how to split a model that doesn't
 fit in VRAM, how many CPU threads to use, and speculative decoding with 1 to 4 guesses per check. It keeps the fastest
 and saves it for that model. Answers are the same whichever settings win; only the speed differs. On a laptop RTX
-3070 it takes Qwen3.6-35B-A3B from 13 tokens/second (whole layers) to about 35. It measures with short replies
-at temperature 0, so the speeds it shows are a little higher than you'll see in a normal chat.
+3070 it takes Qwen3.6-35B-A3B from 13 tokens/second (whole layers) to about 35. Since 0.5.1 it measures exactly the
+way a chat runs, with your sampling settings, so the speed it shows is the speed you'll see in chats (a long
+conversation slows down a little as it grows).
 
 **What are "hot experts"?**
 In a mixture-of-experts model only a few experts are picked per word, and some far more often than others. tierlm

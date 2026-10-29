@@ -223,12 +223,14 @@ Details: [GGML_CHANGES.md](GGML_CHANGES.md).
 ## Auto-tune
 
 `/api/autotune` measures what only changes speed, one setting at a time in the order that matters most: the split
-mode (a reload each), then CPU threads, then speculative decoding with 1 to 4 guesses. Each measurement generates
-the same text greedily (end-of-reply tokens skipped, so every run is equally long) after a short warm-up, and runs
-for about 5 seconds. Threads and speculation only win by a clear margin (2-3%), so noise doesn't pick them. Hot
-experts are kept on only if they measured fastest. Measuring greedily on a fixed text is repeatable but flatters
-speculative decoding a little (guesses are kept more often than in a real chat); measuring with the chat's own
-sampling settings is next.
+mode (a reload each), then CPU threads, then speculative decoding with 1 to 4 guesses. Since 0.5.1 each measurement
+runs exactly what a chat runs: the chat's own reply code, in the model's chat format, with the chat's sampling
+settings (temperature, top-k, top-p, min-p, repeat penalty), recording the experts used, answering two different
+questions for about 3 seconds each. A fixed seed makes every setting answer the same way, so they are compared
+fairly. Only the replies are timed. Threads and speculation only win by a clear margin (2-3%), so noise doesn't
+pick them, and hot experts are kept on only if they measured fastest. The **Benchmark** in the side menu measures
+the same way. (Before 0.5.1 it generated a fixed text greedily, which overstated chat speed by a quarter to a third;
+part of that gap was the chat reading each layer's experts back from the GPU separately, now one read per token.)
 
 ## CPU and GPU at the same time
 

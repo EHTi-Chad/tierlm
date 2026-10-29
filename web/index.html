@@ -590,7 +590,7 @@
     <div class="sec" data-sec="bench">
       <button class="sechead" aria-expanded="false"><span>Benchmark</span><small>speed with these settings</small></button>
       <div class="secbody">
-        <div class="help">Reads a 512-token prompt and generates 64 tokens with the current settings. Takes a few seconds, longer for big models.</div>
+        <div class="help">Reads a 512-token prompt, then answers two questions exactly as a chat would, with your sampling settings. Generation is the speed you'll see in chats. Takes about 10 seconds, longer for big models.</div>
         <button class="primary" id="benchbtn">Run benchmark</button>
         <div class="benchgrid">
           <div class="bstat"><div class="bl">Prompt reading</div><div class="bv"><span id="b-prompt">–</span> <small>tok/s</small></div></div>
@@ -1498,13 +1498,17 @@ $("loadbtn").onclick = async () => {
   btn.disabled = false;
 };
 // The /api/load body for the settings on the setup screen.
+// The chat's sampling settings, so speed tests measure what a chat does.
+function samplingBody() {
+  return { temperature: +$("temp").value, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
+}
 function loadBody(p) {
   const exp = +$("experts").value;
   const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : (p.gpus || []).length > 1 ? "gpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, hot_experts: $("hotexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
+                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, hot_experts: $("hotexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, temperature: +$("temp").value };
   if ($("forcecpu").checked) body.device = "cpu";
   return body;
 }
@@ -1546,7 +1550,7 @@ $("tunebtn").onclick = async () => {
     if (!fin) throw new Error("the measurement stopped early");
     const st = fin.settings;
     const parts = [];
-    if (st.split_mode === "experts") parts.push("experts in RAM"); else if (st.split_mode === "layers") parts.push("whole layers");
+    if (st.split_mode === "experts") parts.push(st.hot_experts ? "experts in RAM, busiest experts in VRAM" : "experts in RAM"); else if (st.split_mode === "layers") parts.push("whole layers");
     parts.push(st.threads + " CPU threads");
     parts.push(st.speculative ? "speculative decoding, " + st.draft_max + (st.draft_max === 1 ? " guess" : " guesses") + " per check" : "no speculative decoding");
     for (const li of rows) if (Math.abs(+li.dataset.tps - fin.tps) < 0.05) { li.classList.add("best"); break; }
@@ -1764,7 +1768,7 @@ $("benchbtn").onclick = async () => {
   setBusy(true); $("status").textContent = "benchmarking…";
   $("b-prompt").textContent = $("b-gen").textContent = "…"; $("benchline").textContent = ""; $("benchcopy").hidden = true;
   try {
-    const r = await api("/api/bench", { method: "POST" });
+    const r = await api("/api/bench", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(samplingBody()) });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || r.statusText);
     $("b-prompt").textContent = j.prompt_tps.toFixed(1); $("b-gen").textContent = j.gen_tps.toFixed(1);

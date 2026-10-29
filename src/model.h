@@ -188,7 +188,8 @@ private:
         int n_tok = 0;
         // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
-        std::vector<ggml_tensor*> orders;        // router rankings per layer (when routing is wanted)
+        std::vector<ggml_tensor*> orders;        // each layer's chosen experts (when routing is wanted)
+        ggml_tensor* routing = nullptr;          // all of them joined: [n_used, n_tok * n_layer], one read
         std::vector<std::pair<ggml_tensor*, int>> owner;   // every op tensor of each layer, with its layer
         std::vector<ggml_tensor*> cpu_ops;       // small ops that must run on the CPU (hot-expert bookkeeping)
     };

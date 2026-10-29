@@ -1011,7 +1011,10 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         ggml_tensor* probs = ggml_soft_max(c, ggml_mul_mat(c, L.router, h)); // [n_expert, n_tok]
         ggml_tensor* order = ggml_argsort(c, probs, GGML_SORT_ORDER_DESC);  // [n_expert, n_tok] best first
         ggml_tensor* sel   = ggml_view_2d(c, order, hp.n_expert_used, n_tok, order->nb[1], 0);   // top n_used
-        if (want_routing) { ggml_set_output(order); g.orders.push_back(order); }
+        // Routing for the dashboard and expert learning: just the chosen experts, copied out compactly. The rankings
+        // themselves are not made outputs, so the GPU can still fuse the router's steps; all layers are joined and
+        // read back in one go at the end (see build), instead of one GPU read per layer.
+        if (want_routing) g.orders.push_back(ggml_cont(c, sel));         // [n_used, n_tok]
         ggml_tensor* w     = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, hp.n_expert, n_tok), sel); // [1, n_used, n_tok]
         if (hp.expert_renorm) {                                             // chosen weights sum to 1
             ggml_tensor* w2 = ggml_reshape_2d(c, w, hp.n_expert_used, n_tok);
@@ -1253,6 +1256,14 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing, int n_logits
     }
     tag((int)layers_.size() - 1);
 
+    if (!g.orders.empty()) {                                               // every layer's picks in one tensor
+        ggml_tensor* r = g.orders[0];
+        for (size_t l = 1; l < g.orders.size(); ++l) r = ggml_concat(c, r, g.orders[l], 1);   // [n_used, n_tok * L]
+        ggml_set_output(r);
+        ggml_build_forward_expand(g.gf, r);
+        g.routing = r;
+    }
+
     x = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), out_norm_);
     if (want_hidden) { g.hidden = x; ggml_set_output(x); }                  // [n_embd, n_tok]: what the MTP head reads
     n_logits = std::max(1, std::min(n_logits, n_tok));                     // predictions for the last n_logits positions
@@ -1441,12 +1452,13 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
     if (routing) {
         const int L = (int)g.orders.size(), K = hp.n_expert_used;
         routing->assign((size_t)n_tok * L * K, 0);
-        std::vector<int32_t> buf((size_t)hp.n_expert * n_tok);
-        for (int l = 0; l < L; ++l) {
-            ggml_backend_tensor_get(g.orders[l], buf.data(), 0, sizeof(int32_t) * buf.size());
-            for (int t = 0; t < n_tok; ++t)
-                for (int k = 0; k < K; ++k)
-                    (*routing)[((size_t)t * L + l) * K + k] = buf[(size_t)t * hp.n_expert + k];
+        if (g.routing) {                                                  // laid out [layer][token][pick]
+            std::vector<int32_t> buf((size_t)K * n_tok * L);
+            ggml_backend_tensor_get(g.routing, buf.data(), 0, sizeof(int32_t) * buf.size());
+            for (int l = 0; l < L; ++l)
+                for (int t = 0; t < n_tok; ++t)
+                    for (int k = 0; k < K; ++k)
+                        (*routing)[((size_t)t * L + l) * K + k] = buf[((size_t)l * n_tok + t) * K + k];
         }
     }
     if (snapshots > 1) { pending_ = new Graph(g); }              // kept for accept()

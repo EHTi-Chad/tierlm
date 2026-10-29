@@ -1188,9 +1188,8 @@ int main(int argc, char** argv) {
         });
     });
 
-
     // ---------------- Speed measurement (auto-tune and benchmark) ----------------
-    // The text every measurement generates after; long enough to be a realistic prompt.
+    // Text for measuring prompt reading, and for learning expert usage when nothing has been learned yet.
     const std::string text =
         "Explain, step by step, how a computer's memory hierarchy works: registers, caches, main memory and "
         "storage. For each level, describe how fast and how big it typically is, why the trade-off exists, "
@@ -1202,39 +1201,46 @@ int main(int argc, char** argv) {
             if (!is_end(i) && (b < 0 || row[i] > row[b])) b = i;
         return b;
     };
-    // Generation speed (tokens/second) with the loaded model: n tokens after the prompt, timed after a
-    // short warm-up. draft = 0: no speculation; otherwise guesses per check.
-    const int warm = 4;
+    // Generation speed (tokens/second) the way a chat really runs: the same generate() a chat uses (chat format,
+    // sampling with these settings, the experts recorded for the dashboard and for learning, speculative decoding
+    // with `draft` guesses per check or none), over two different questions, n tokens each. A fixed seed makes every
+    // setting answer the same way, so the settings are compared fairly. Only the reply is timed, not reading the
+    // question. This is what the chat shows, minus the browser drawing it.
+    Sampling meas_sp;                                                   // set by /api/autotune and /api/bench
     auto measure = [&](int n, int draft) -> double {
-        eng.model->reset();
-        eng.cached.clear();
-        const std::vector<int32_t> toks = eng.tok.encode(text);
-        n = std::max(4, std::min(n, eng.model->max_ctx() - (int)toks.size() - warm - draft - 8));
-        std::vector<float> lg;
-        std::unique_ptr<Speculator> sp;
-        if (draft > 0) { sp = std::make_unique<Speculator>(*eng.model, draft); lg = sp->prompt(toks, eng.threads); }
-        else lg = eng.model->eval(toks, eng.threads);
-        int32_t x = best_token(lg.data());
-        auto greedy = [&](const float* row, const std::vector<int32_t>&) { return best_token(row); };
-        int made = 0, from = -1;
-        Clock::time_point tw;
-        for (;;) {
-            if (from < 0 && made >= warm) { from = made; tw = Clock::now(); }
-            if (from >= 0 && made - from >= n) break;
-            if (sp) {
-                const std::vector<int32_t> prod = sp->step(x, eng.threads, greedy, [](int32_t) { return false; });
-                made += (int)prod.size();
-                x = prod.back();
-            } else {
-                lg = eng.model->eval({x}, eng.threads);
-                x = best_token(lg.data());
-                ++made;
+        static const char* questions[] = {
+            "Explain step by step how a refrigerator keeps food cold, for someone with no science background.",
+            "Write a Python function that finds the longest palindrome in a string, with comments, then explain how it works.",
+        };
+        std::unique_ptr<Speculator> saved = std::move(eng.spec);
+        const int saved_seed = eng.seed;
+        if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft);
+        eng.seed = 4242;
+        double toks = 0, secs = 0;
+        try {
+            for (const char* q : questions) {
+                eng.model->reset();
+                eng.cached.clear();
+                const json msgs = json::array({json{{"role", "user"}, {"content", q}}});
+                const Gen g = generate(msgs, meas_sp, std::max(4, n), {}, nullptr, nullptr);
+                toks += (double)g.n_gen;
+                secs += g.gen_s;
             }
-        }
-        const double tps = (made - from) / std::max(since(tw), 1e-9);
+        } catch (...) { eng.spec = std::move(saved); eng.seed = saved_seed; throw; }
+        eng.spec = std::move(saved);
+        eng.seed = saved_seed;
         eng.model->reset();
         eng.cached.clear();
-        return tps;
+        return toks / std::max(secs, 1e-9);
+    };
+    auto sampling_of = [&](const json& b) {
+        Sampling sp;
+        sp.temperature = b.value("temperature", sp.temperature);
+        sp.top_p = b.value("top_p", sp.top_p);
+        sp.top_k = b.value("top_k", sp.top_k);
+        sp.min_p = b.value("min_p", sp.min_p);
+        sp.repeat_penalty = b.value("repeat_penalty", sp.repeat_penalty);
+        return sp;
     };
     // Prompt reading speed (tokens/second): about n tokens of text read in one go, as a long prompt would be.
     auto measure_prompt = [&](int n) -> double {
@@ -1259,9 +1265,9 @@ int main(int argc, char** argv) {
     // them. Streams {"type":"status"|"result"|"done"|"error"} events; the winner is saved for the model and stays
     // loaded.
     //
-    // Each measurement generates a fixed text greedily (end-of-reply tokens skipped, so every run is the same
-    // length) after a warm-up, and times only the generation. Searched one setting at a time, in the order that
-    // matters most: split mode (a reload each), then threads, then guesses per check.
+    // Each measurement answers two questions the way a chat does, with the chat's sampling settings and a fixed seed
+    // (see measure), and times only the replies. Searched one setting at a time, in the order that matters most:
+    // split mode (a reload each), then threads, then guesses per check.
     svr.Post("/api/autotune", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("model")) {
@@ -1298,6 +1304,7 @@ int main(int argc, char** argv) {
                 const int t0 = std::max(1, body.value("threads", a.threads));
                 const int seed = body.value("seed", -1);
                 LoadOptions base = load_options(body);
+                meas_sp = sampling_of(body);                 // measured with the chat's own sampling settings
                 base.mtp = has_mtp;                          // the draft layer stays loaded so guesses can be tried
 
                 json results = json::array();
@@ -1308,8 +1315,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "autotune: %s: %.1f tok/s\n", label.c_str(), tps);
                     return send({{"type", "result"}, {"label", label}, {"tps", setting["tps"]}});
                 };
-                int n_gen = 32;                               // set from the first measurement: about 5 s per run
-                auto size_runs = [&](double tps) { n_gen = std::max(12, std::min(96, (int)std::lround(tps * 5))); };
+                int n_gen = 48;                               // tokens per question, set from the first measurement
+                auto size_runs = [&](double tps) { n_gen = std::max(48, std::min(320, (int)std::lround(tps * 3))); };   // per question: about 3 s each
 
                 // ---- 1. split mode (when the model doesn't fit in VRAM) ----
                 std::string mode = "auto";
@@ -1459,7 +1466,7 @@ int main(int argc, char** argv) {
 
 
     // ---------------- Benchmark: the loaded model's speed with its current settings ----------------
-    svr.Post("/api/bench", [&](const httplib::Request&, httplib::Response& res) {
+    svr.Post("/api/bench", [&](const httplib::Request& req, httplib::Response& res) {
         if (!mu.try_lock_for(std::chrono::seconds(3))) {
             res.status = 409;
             res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
@@ -1468,11 +1475,13 @@ int main(int argc, char** argv) {
         std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
         if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
         try {
-            std::fprintf(stderr, "benchmark: reading 512 tokens, then generating 64\n");
+            std::fprintf(stderr, "benchmark: reading 512 tokens, then answering two questions like a chat\n");
+            const json bb = json::parse(req.body.empty() ? std::string("{}") : req.body, nullptr, false);
+            meas_sp = sampling_of(bb.is_object() ? bb : json::object());
             const double p = measure_prompt(512);
             const int draft = eng.spec ? eng.draft_max : 0;
             measure(4, draft);                                  // warm-up
-            const double g = measure(64, draft);
+            const double g = measure(160, draft);
             eng.model->reset();
             eng.cached.clear();
             std::fprintf(stderr, "benchmark: prompt %.1f tok/s, generation %.1f tok/s\n", p, g);
