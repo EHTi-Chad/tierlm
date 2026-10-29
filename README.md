@@ -118,6 +118,18 @@ decoding helps most.
 |---|---|---|
 | Qwen3.6-35B-A3B Q8_0 (46 GB file), 128K context | split between VRAM and RAM (CUDA) | **36.6 tok/s** |
 
+**RTX 5080 (16 GB) + Ryzen 7 9800X3D, 32 GB DDR5-6000, Windows 11 (0.5.0):** Qwen3.6-35B-A3B Q6_K (27 GB file),
+32K context, measured by **Find the fastest settings**:
+
+| Split mode | Generation |
+|---|---|
+| Whole layers | 37.0 tok/s |
+| **Experts in RAM** | **65.2 tok/s** |
+| Experts in RAM, busiest experts in VRAM | 61.9 tok/s |
+
+In a normal chat (a 900-token reply at temperature 0.7) it ran at 55.6 tok/s. This file has no draft layer, so
+speculative decoding wasn't used.
+
 **RTX 3070 Laptop (8 GB) + Ryzen 9 5900HX, Windows 11:**
 
 | Model | Where it runs | Generation |
