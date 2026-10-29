@@ -92,7 +92,17 @@ easily, especially on vague prompts.
 
 **"Windows protected your PC" when starting it**
 tierlm isn't code-signed, so SmartScreen doesn't recognise it. Click **More info**, then **Run anyway**. You
-can verify the zip against the `.sha256` file on the Releases page first.
+can verify the zip against the `.sha256` file on the Releases page first. Code signing is on the way.
+
+**"Part of this app has been blocked"**
+This comes from Windows' Smart App Control, which is on for some Windows 11 PCs. It checks every file a program
+loads, and because tierlm isn't code-signed yet, it can refuse one. Since 0.5.0 tierlm only loads the files it
+actually uses (before, it also tried every spare CPU engine, and those were what got blocked). If you still see it,
+the black window or **tierlm-devices.exe** shows what didn't load; please
+[open an issue](https://github.com/EHTi-Chad/tierlm/issues) with the file name. To find it, run this in PowerShell
+as administrator:
+`Get-WinEvent -LogName "Microsoft-Windows-CodeIntegrity/Operational" -MaxEvents 20 | Format-List TimeCreated, Message`.
+Smart App Control can't make an exception for one program; signed releases are the real fix and are on the way.
 
 **The setup screen says "No models found"**
 Put a supported `.gguf` file in the `models` folder next to `start-tierlm.bat` (the screen shows the exact
