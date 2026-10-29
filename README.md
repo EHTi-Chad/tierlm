@@ -11,7 +11,7 @@ server and dashboard are all tierlm's own. It does not use llama.cpp.
 
 It runs the common model families (**Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8
 dense and MoE, Qwen3-Next, OLMoE**) on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with
-CUDA. **Models bigger than the GPU's memory are split between VRAM and RAM automatically**: on a laptop RTX 3070
+CUDA, on **Windows** (ready-to-run download) and **Linux** (build from source; a ready-made download is coming). **Models bigger than the GPU's memory are split between VRAM and RAM automatically**: on a laptop RTX 3070
 (8 GB), the 17 GB Qwen3.6-35B-A3B runs at about **33 tokens/second** (35 with speculative decoding), and on an
 RTX 5090 the 46 GB Qwen3.6-35B-A3B Q8_0 ran at **36.6 tokens/second** with 128K of context (measured with 0.4.0;
 0.5.0 is faster on NVIDIA, new numbers coming). A web page lets you pick a model and chat, with a
@@ -88,7 +88,8 @@ decoding helps most.
   automatically (GPU first, then CPU), lists the GGUF models in any folder you point it at (including LM
   Studio's), and remembers LM Studio-style load settings per model.
 - **CUDA graphs**: on NVIDIA cards each token's GPU work is recorded once and replayed with a single launch instead
-  of thousands, which made generation about 50% faster on a laptop RTX 3070 (21.7 → 33.3 tok/s, same results).
+  of thousands, which made generation about 50% faster than 0.4.0 on a laptop RTX 3070 with part of the model in RAM
+  (21.7 → 33.3 tok/s, same results).
 - **Hot experts (adaptive tiering)**: tierlm learns which experts each mixture-of-experts model actually uses as you
   chat, and can keep those individual experts in VRAM instead of whole expert layers, so most of the router's picks
   are served from fast memory. Whether that beats the plain split depends on the PC, so it is off by default and
@@ -177,6 +178,8 @@ next lever for it.
 
 ## Try it (Windows)
 
+On Linux? See [Build from source (Linux)](#build-from-source-linux) below: a few commands, and the same web page.
+
 **tierlm's point is running models bigger than your GPU.** It fills GPU memory first, then puts the rest of the
 model in system RAM, automatically. On a laptop RTX 3070 with 8 GB, the 14.7 GB Qwen3-30B-A3B runs at about
 27 tokens/second.
@@ -258,6 +261,23 @@ build\tierlm-server.exe --models C:\models --port 8040
 Then open http://127.0.0.1:8040. Run these from a Visual Studio Developer Command Prompt with the Vulkan SDK
 installed (and the CUDA Toolkit for `-DTIERLM_CUDA=ON`; leave it out for a Vulkan-only build).
 
+## Build from source (Linux)
+
+tierlm builds and runs on Linux too (its tests run there). A ready-made Linux download is coming; until then, on
+Ubuntu or Debian:
+
+```bash
+sudo apt install -y build-essential cmake git ninja-build
+sudo apt install -y libvulkan-dev glslc                  # for Vulkan (Intel, AMD, NVIDIA)
+git clone --recurse-submodules https://github.com/EHTi-Chad/tierlm.git ~/tierlm
+cd ~/tierlm
+cmake -S . -B build -G Ninja -DTIERLM_VULKAN=ON         # or -DTIERLM_CUDA=ON with the CUDA toolkit installed
+cmake --build build
+./build/tierlm-server --models ~/models --port 8040
+```
+
+Then open http://127.0.0.1:8040. Details, CUDA versions and WSL notes: [docs/BUILD.md](docs/BUILD.md#linux-and-wsl-cpu-vulkan-or-cuda).
+
 ## Tools
 
 | Tool | What it does |
@@ -307,7 +327,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [ ] AMD GPU testing via Vulkan/ROCm
 - [x] Several GPUs as VRAM tiers; auto-tuning of the speed settings; new chat layout with console, chats and benchmark
 - [x] Hot experts: per-model expert usage learned from use, the busiest experts kept in VRAM
-- [x] CUDA graphs: each token's GPU work replayed with one launch (about 50% faster generation on a laptop RTX 3070)
+- [x] CUDA graphs: each token's GPU work replayed with one launch (about 50% faster generation than 0.4.0 on a laptop RTX 3070)
 - [ ] Find the fastest settings measured like a real chat (your sampling settings, longer replies)
 - [ ] CPU and GPU working on the same layer at once (the VRAM and RAM experts of a layer in parallel; needs changes to ggml's scheduler)
 - [x] Speculative decoding with the built-in MTP draft layer; 8-bit and 4-bit KV cache
