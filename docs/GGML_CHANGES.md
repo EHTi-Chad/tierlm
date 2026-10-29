@@ -94,7 +94,7 @@ profile:   CPU         30.0 splits,   58.0 inputs: copy in   1.46 ms, work  17.8
 
 **What it found.** The GPU line above: 22.6 ms of GPU work per token for a part of the model that an RTX 3070 can
 read in 2–3 ms. The GPU was spending its time launching thousands of small kernels, not computing. That led to
-Finding 1, which made generation about 50% faster.
+Finding 1, which made generation about 50% faster (21.7 → 33.3 tok/s on that laptop).
 
 ---
 
