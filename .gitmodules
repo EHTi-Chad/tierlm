@@ -1,3 +1,4 @@
 [submodule "third_party/ggml"]
 	path = third_party/ggml
-	url = https://github.com/ggml-org/ggml.git
+	url = https://github.com/EHTi-Chad/ggml.git
+	branch = tierlm

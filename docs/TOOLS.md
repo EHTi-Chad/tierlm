@@ -156,11 +156,17 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_NO_FA=1` | Use plain attention instead of flash attention |
 | `TIERLM_KV_F32=1` | Keep the KV cache in f32 instead of f16 (exact; used by the tests) |
 | `TIERLM_THREADS=N` | CPU threads for `tierlm-logits` and `tierlm-bench` |
-| `TIERLM_PROFILE=1` | `tierlm-run`: per-token time breakdown and number of graph splits |
+| `TIERLM_PROFILE=1` | Timing: `tierlm-run` prints a per-token breakdown and the number of graph splits; every tool and the server also print, every 64 reply steps, each device's input-copy and work time per step (`profile:` lines). Each split is waited for while it's on, so everything runs a little slower |
 | `TIERLM_DUMP_SCHED=1` | Debugging: prints each point where the work switches between CPU and GPU |
 | `TIERLM_CPU_OPS=MUL_MAT,...` | Debugging: runs the listed ggml operation types on the CPU, to find which GPU kernel differs |
 | `TIERLM_DEVICE=cpu` | `tierlm-logits` (tests): device to load the model on |
 | `TIERLM_KV_TYPE=q8_0` | KV cache precision for the tools and tests: `f16`, `q8_0`, `q4_0` or `f32` |
+| `TIERLM_NO_REPACK=1` | Keep RAM weights in the file's layout instead of rearranging them for the CPU |
+| `TIERLM_RPC=host:port[,host:port]` | Tests: add `tierlm-rpc-server` instances as stand-in GPUs (needs a build with `-DGGML_RPC=ON`) |
+| `TIERLM_VRAM_MB=N` / `TIERLM_VRAM_BYTES=n[,n...]` | Tests: VRAM budget for `tierlm-logits`, in MiB, or in bytes per GPU |
+| `TIERLM_SPLIT=layers\|experts` | Tests: split mode for `tierlm-logits` |
+| `TIERLM_EXPERT_USAGE=seed` | Tests: made-up expert usage counts, so models load with hot experts (some layers whole, some split) |
+| `TIERLM_SHOW_PLACEMENT=1` | `tierlm-logits`: print where the model was placed (per GPU, and the hot-expert count) |
 | `GGML_VK_VISIBLE_DEVICES=0` | Choose which Vulkan GPU(s) ggml uses |
 | `VK_LOADER_DEBUG=error,warn` | Make the Vulkan loader explain driver problems |
 

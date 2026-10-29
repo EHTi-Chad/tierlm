@@ -6,9 +6,17 @@ keep these notices and licence files with it.
 
 | Component | Used for | Licence | Location |
 |---|---|---|---|
-| [ggml](https://github.com/ggml-org/ggml) | Tensor math kernels, quantized formats, device backends (CPU, Vulkan, CUDA), GGUF file reader | MIT, Copyright (c) 2023-2026 The ggml authors | `third_party/ggml/LICENSE` (git submodule) |
+| [ggml](https://github.com/ggml-org/ggml), **modified** | Tensor math kernels, quantized formats, device backends (CPU, Vulkan, CUDA), GGUF file reader | MIT, Copyright (c) 2023-2026 The ggml authors | `third_party/ggml/LICENSE` (git submodule: the `tierlm` branch of [EHTi-Chad/ggml](https://github.com/EHTi-Chad/ggml)) |
 | [cpp-httplib](https://github.com/yhirose/cpp-httplib) v0.63.0 | Embedded HTTP server in `tierlm-server` | MIT, Copyright (c) 2017 yhirose | `third_party/httplib/LICENSE` |
 | [nlohmann/json](https://github.com/nlohmann/json) v3.12.0 | JSON parsing and output in `tierlm-server` | MIT, Copyright (c) 2013-2025 Niels Lohmann | `third_party/json/LICENSE.MIT` |
+
+### Changes to ggml
+
+tierlm uses ggml with two small changes (50 lines in 4 files): the CPU's expert multiply skips negative expert ids
+(used to split a mixture-of-experts layer between VRAM and RAM), and the scheduler can time each split
+(`TIERLM_PROFILE`). Every changed line, the reasons and measurements are in [docs/GGML_CHANGES.md](docs/GGML_CHANGES.md);
+the changes as a patch are in [docs/ggml-tierlm.patch](docs/ggml-tierlm.patch). They are released under ggml's MIT
+licence.
 
 ## Used for testing only (not shipped)
 

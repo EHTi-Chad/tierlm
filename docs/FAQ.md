@@ -24,7 +24,7 @@ It's greyed out when the model file has no draft layer. Some publishers (Unsloth
 screen lists it as a **Draft add-on**). The chat shows "tokens per check" after each reply: above about 1.5 it's
 helping. **Guesses per check** defaults to 3 for dense models, the fastest on our tests (on a laptop RTX 3070 with Qwen3.6-27B: 3.0 tok/s
 off, 3.9 with 2, 5.3 with 3, 4.1 with 4); try 2 or 4 for your model and PC. For mixture-of-experts models the default is 2 (Qwen3.6-35B-A3B on the same laptop:
-22.3 tok/s with 2, 18.7 with 3), because each guess the model checks pulls in its own experts.
+35 tok/s with 1 or 2, 28 with 3), because each guess the model checks pulls in its own experts.
 
 **Does tierlm use two graphics cards?**
 Yes, when they're the same kind (two NVIDIA cards with CUDA, say): the model fills the first card, then the second,
@@ -35,7 +35,24 @@ combined yet: tierlm uses the bigger one.
 It loads the model and measures, on your PC, the settings that only change speed: how to split a model that doesn't
 fit in VRAM, how many CPU threads to use, and speculative decoding with 1 to 4 guesses per check. It keeps the fastest
 and saves it for that model. Answers are the same whichever settings win; only the speed differs. On a laptop RTX
-3070, picking the right split and guesses by hand took Qwen3.6-35B-A3B from 9.9 to 22.3 tokens/second.
+3070 it takes Qwen3.6-35B-A3B from 13 tokens/second (whole layers) to about 35. It measures with short replies
+at temperature 0, so the speeds it shows are a little higher than you'll see in a normal chat.
+
+**What are "hot experts"?**
+In a mixture-of-experts model only a few experts are picked per word, and some far more often than others. tierlm
+counts which ones each model uses as you chat (only the counts, kept next to its settings file), and the next time
+that model loads with experts in RAM, it puts the busiest experts in VRAM instead of whole expert layers. The expert
+map rings them. It's off by default, because whether it's faster depends on the PC: on our RTX 3070 laptop the
+experts in VRAM did 71% of the expert work, but the plain split was still a little faster. **Find the fastest
+settings** learns the experts right away, measures both, and turns it on only if it wins on your PC. You can also tick
+**Keep the busiest experts in VRAM** under **Advanced** on the setup screen yourself, and reset what it learned in
+**Model info**.
+
+**Why is 0.5.0 so much faster on NVIDIA cards?**
+It uses **CUDA graphs**: each token's GPU work is recorded once and then replayed with a single launch, instead of
+thousands of small launches. On a laptop RTX 3070, Qwen3.6-35B-A3B with experts in RAM went from 21.7 to 33.3
+tokens/second, with exactly the same answers. Intel and AMD cards (Vulkan) and the CPU aren't affected.
+[GGML_CHANGES.md](GGML_CHANGES.md) explains what it took.
 
 **Can I use a different model?**
 Yes, for the common families: Llama (2, 3.x), Mistral and Mixtral, Qwen2/2.5, Qwen3 and Qwen3 MoE, the Qwen3.5 /
@@ -105,7 +122,7 @@ with most of the model in RAM; ordinary dense models slow down a lot.
 **Which download do I need?**
 Both run on every PC; tierlm picks the fastest engine it has when it starts. `tierlm-<version>-windows.zip`
 (about 550 MB) includes NVIDIA's **CUDA** engine, the fastest option on GeForce RTX 20/30/40/50 cards: get it if
-you have one. `tierlm-<version>-windows-lite.zip` (about 55 MB) has only the **Vulkan** engine, which runs on
+you have one. `tierlm-<version>-windows-lite.zip` (about 20 MB) has only the **Vulkan** engine, which runs on
 Intel Arc, AMD Radeon and NVIDIA cards (slower than CUDA on NVIDIA). Without a GPU, either uses the CPU. With the
 full download on a PC without an NVIDIA card, the black window may say CUDA found no device; that's expected.
 

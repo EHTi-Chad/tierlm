@@ -57,6 +57,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "%s: %s, VRAM %.2f MiB, RAM %.2f MiB, KV %d/%d, attention %d/%d, ffn %d/%d layers in VRAM\n",
                          m->device_name().c_str(), p.mode.c_str(), p.gpu_weights / 1048576.0, p.cpu_weights / 1048576.0,
                          p.kv_gpu_layers, p.layers, p.attn_gpu, p.layers, p.ffn_gpu, p.layers);
+            if (p.hot_experts > 0) {
+                int split = 0;
+                for (size_t l = 0; l < p.hot.size(); ++l) split += !p.hot[l].empty() && !p.ffn_vram[l];
+                std::fprintf(stderr, "  hot experts in VRAM: %d, layers split between VRAM and RAM: %d\n", p.hot_experts, split);
+            }
             if (p.gpus.size() > 1)
                 for (const auto& gp : p.gpus)
                     std::fprintf(stderr, "  %s: %.2f MiB weights, %d layers' KV\n", gp.name.c_str(), gp.weights / 1048576.0, gp.layers);

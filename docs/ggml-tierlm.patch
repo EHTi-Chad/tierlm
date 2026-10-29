@@ -1,0 +1,118 @@
+diff --git a/include/ggml-backend.h b/include/ggml-backend.h
+index 7a65d81..c045df8 100644
+--- a/include/ggml-backend.h
++++ b/include/ggml-backend.h
+@@ -369,6 +369,10 @@ extern "C" {
+     // The correct way to use this API is to discard the deallocated tensors and create new ones.
+     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
+ 
++    // tierlm: split timing collected while TIERLM_PROFILE is set; arrays have 16 entries (GGML_SCHED_MAX_BACKENDS),
++    // indexed like the backends given to ggml_backend_sched_new. Any pointer may be NULL.
++    GGML_API void                 ggml_backend_sched_profile(double * copy_us, double * compute_us, int64_t * splits, int64_t * inputs, int64_t * graphs, bool reset);
++
+     // Set a callback to be called for each resulting node during graph compute
+     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+ 
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+index ffbcba3..0f8271a 100644
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -1862,16 +1862,37 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     }
+ }
+ 
++// tierlm: optional timing of every split (TIERLM_PROFILE=1). Each split is waited for, so the times add up;
++// that costs some speed while it is on.
++static struct {
++    double  copy_us[GGML_SCHED_MAX_BACKENDS], compute_us[GGML_SCHED_MAX_BACKENDS];
++    int64_t splits[GGML_SCHED_MAX_BACKENDS], inputs[GGML_SCHED_MAX_BACKENDS], graphs;
++} g_sched_prof;
++
++void ggml_backend_sched_profile(double * copy_us, double * compute_us, int64_t * splits, int64_t * inputs, int64_t * graphs, bool reset) {
++    for (int i = 0; i < GGML_SCHED_MAX_BACKENDS; ++i) {
++        if (copy_us)    copy_us[i]    = g_sched_prof.copy_us[i];
++        if (compute_us) compute_us[i] = g_sched_prof.compute_us[i];
++        if (splits)     splits[i]     = g_sched_prof.splits[i];
++        if (inputs)     inputs[i]     = g_sched_prof.inputs[i];
++    }
++    if (graphs) *graphs = g_sched_prof.graphs;
++    if (reset) memset(&g_sched_prof, 0, sizeof(g_sched_prof));
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
+     int prev_backend_id = -1;
++    static const bool prof = getenv("TIERLM_PROFILE") != nullptr;
++    if (prof) g_sched_prof.graphs++;
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
++        const int64_t prof_t0 = prof ? ggml_time_us() : 0;
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+@@ -1896,11 +1917,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        int64_t prof_t1 = 0;
++        if (prof) {
++            ggml_backend_synchronize(split_backend);
++            prof_t1 = ggml_time_us();
++            g_sched_prof.copy_us[split_backend_id] += (double)(prof_t1 - prof_t0);
++            g_sched_prof.splits[split_backend_id] += 1;
++            g_sched_prof.inputs[split_backend_id] += split->n_inputs;
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
++            if (prof) {
++                ggml_backend_synchronize(split_backend);
++                g_sched_prof.compute_us[split_backend_id] += (double)(ggml_time_us() - prof_t1);
++            }
+         } else {
+             // similar to ggml_backend_compare_graph_backend
+             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index ab82e3d..a8344c7 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1652,7 +1652,12 @@ static void ggml_compute_forward_mul_mat_id(
+             for (int id = 0; id < n_ids; ++id) {
+                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+ 
+-                assert(i02 >= 0 && i02 < n_as);
++                // tierlm: a negative id means "no expert here" (a pick computed elsewhere): its output row is zero
++                if (i02 < 0) {
++                    memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
++                    continue;
++                }
++                assert(i02 < n_as);
+ 
+                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                 matrix_row_counts[i02] += 1;
+diff --git a/src/ggml-cpu/repack.cpp b/src/ggml-cpu/repack.cpp
+index 2632ae3..3f5f71a 100644
+--- a/src/ggml-cpu/repack.cpp
++++ b/src/ggml-cpu/repack.cpp
+@@ -4855,7 +4855,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+                     const int32_t i02 =
+                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+ 
+-                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
++                    // tierlm: a negative id means "no expert here" (a pick computed elsewhere): its output row is zero
++                    if (i02 < 0) {
++                        memset((char *) dst->data + id * dst->nb[1] + iid1 * dst->nb[2], 0, dst->ne[0] * sizeof(float));
++                        continue;
++                    }
++                    GGML_ASSERT(i02 < n_as);
+ 
+                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
+                     matrix_row_counts[i02] += 1;

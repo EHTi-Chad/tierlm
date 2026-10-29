@@ -245,6 +245,36 @@ void write_settings(const std::string& path, const json& j) {
 
 std::string env(const char* k) { const char* v = std::getenv(k); return v ? v : ""; }
 
+// How often each expert of a model has been picked (n_layer x n_expert counts), kept between runs in
+// tierlm-usage/<hash of the model's path>.bin next to the settings file. Loading a mixture-of-experts model that
+// doesn't fit in VRAM uses it to keep the busiest experts in VRAM ("hot experts"), so tierlm learns each model's
+// habits from use. Nothing but the counts is stored.
+std::string usage_file(const std::string& settings_path, const std::string& model_path) {
+    std::error_code ec;
+    const std::string key = fs::weakly_canonical(fs::u8path(model_path), ec).generic_u8string();
+    uint64_t hsh = 1469598103934665603ull;                      // FNV-1a
+    for (unsigned char ch : key) { hsh ^= ch; hsh *= 1099511628211ull; }
+    char name[32];
+    std::snprintf(name, sizeof name, "%016llx.bin", (unsigned long long)hsh);
+    return (fs::u8path(settings_path).parent_path() / "tierlm-usage" / name).u8string();
+}
+bool read_usage(const std::string& path, int L, int E, std::vector<float>& out) {
+    std::ifstream f(fs::u8path(path), std::ios::binary);
+    char magic[4]; int32_t l = 0, e = 0;
+    if (!f.read(magic, 4) || std::memcmp(magic, "TLMU", 4) != 0 || !f.read((char*)&l, 4) || !f.read((char*)&e, 4) || l != L || e != E) return false;
+    out.assign((size_t)L * E, 0.0f);
+    return (bool)f.read((char*)out.data(), (std::streamsize)(out.size() * sizeof(float)));
+}
+void write_usage(const std::string& path, int L, int E, const std::vector<float>& u) {
+    std::error_code ec;
+    fs::create_directories(fs::u8path(path).parent_path(), ec);
+    std::ofstream f(fs::u8path(path), std::ios::binary);
+    if (!f) return;
+    const int32_t l = L, e = E;
+    f.write("TLMU", 4); f.write((const char*)&l, 4); f.write((const char*)&e, 4);
+    f.write((const char*)u.data(), (std::streamsize)(u.size() * sizeof(float)));
+}
+
 // Folders where other apps keep GGUF models, offered as one-click choices if they exist.
 std::vector<std::string> known_model_folders() {
     std::vector<std::string> out;
@@ -351,6 +381,30 @@ struct Engine {
     int threads = 1, seed = -1;
     double load_s = 0;
     std::mt19937 rng{std::random_device{}()};
+    // Expert usage of the loaded model (n_layer x n_expert pick counts), learned from every prompt and reply.
+    std::vector<float> usage;
+    double hot_share = 0;                // share of the learned expert use that the VRAM experts cover
+    std::string usage_path;
+    bool usage_dirty = false;
+    Clock::time_point usage_saved;
+    int hot_E = 0, hot_L = 0;
+    void add_usage(const std::vector<int32_t>& routing, int K) {
+        if (usage.empty() || K <= 0) return;
+        for (size_t i = 0; i < routing.size(); ++i) {
+            const size_t l = (i / K) % hot_L;
+            if (routing[i] >= 0 && routing[i] < hot_E) usage[l * hot_E + routing[i]] += 1.0f;
+        }
+        usage_dirty = true;
+    }
+    void save_usage(bool force = false) {
+        if (!usage_dirty || usage_path.empty() || (!force && since(usage_saved) < 10.0)) return;
+        // Older habits fade: once the counts get large, halve them, so recent use weighs more.
+        double tot = 0; for (float v : usage) tot += v;
+        if (tot > 4e6) for (float& v : usage) v *= 0.5f;
+        write_usage(usage_path, hot_L, hot_E, usage);
+        usage_dirty = false;
+        usage_saved = Clock::now();
+    }
 };
 
 // Header-only look at a GGUF file: what it is, how big, and whether tierlm can run it.
@@ -611,22 +665,33 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "tierlm %s\nmodels folder: %s\n", TIERLM_VERSION, a.models.c_str());
 
-    auto load = [&](const std::string& path, const LoadOptions& opt, int threads, int seed) {
+    // hot: keep the model's busiest experts in VRAM, from what tierlm learned about it before (MoE models, experts in RAM).
+    auto load = [&](const std::string& path, const LoadOptions& opt, int threads, int seed, bool hot = true) {
         json info = describe_model(path);
         if (!info.value("supported", false)) throw std::runtime_error(info.value("reason", std::string("unsupported model")));
+        eng.save_usage(true);            // what the previous model learned
         eng.spec.reset();
         eng.model.reset();               // free the old model (and its GPU memory) first
         eng.cached.clear();
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
         LoadOptions o = opt;
+        const int uL = info.value("layers", 0), uE = info.value("experts", 0);
+        eng.usage.clear(); eng.usage_path.clear(); eng.usage_dirty = false; eng.hot_L = uL; eng.hot_E = uE;
+        if (uE > 0 && uL > 0) {
+            eng.usage_path = usage_file(a.settings, path);
+            if (!read_usage(eng.usage_path, uL, uE, eng.usage)) eng.usage.assign((size_t)uL * uE, 0.0f);
+            double tot = 0; for (float v : eng.usage) tot += v;
+            if (hot && tot > 0) o.expert_usage = eng.usage;
+            eng.usage_saved = Clock::now();
+        }
         o.progress = [&](float f) { load_progress = f; };
         load_progress = 0.0f;
         loading = true;
         struct Done { std::atomic<bool>& b; ~Done() { b = false; } } done{loading};
         eng.model = Model::load(path, o);
         // Each guess an MoE model checks pulls in its own experts, so shorter guesses pay off there
-        // (Qwen3.6-35B-A3B: 22.3 tok/s with 2, 18.7 with 3); dense models do best with 3.
+        // (Qwen3.6-35B-A3B, RTX 3070 laptop: 35 tok/s with 1 or 2, 28 with 3); dense models do best with 3.
         if (eng.draft_max <= 0) eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
         if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max);
         eng.chat = detect_chat(eng.tok);
@@ -638,6 +703,22 @@ int main(int argc, char** argv) {
         eng.load_s = since(t0);
         std::fprintf(stderr, "loaded %s (%s, %s chat format) on %s in %.1fs\n", path.c_str(), eng.model->arch().c_str(),
                      chat_fmt_name(eng.chat), eng.model->device_name().c_str(), eng.load_s);
+        const Placement& pl = eng.model->placement();
+        if (pl.hot_experts > 0) {
+            int split = 0; for (size_t l = 0; l < pl.hot.size(); ++l) split += !pl.hot[l].empty() && !pl.ffn_vram[l];
+            // How much of the past expert work the VRAM experts would have done: what the CPU is spared.
+            double all = 0, in_vram = 0;
+            for (int l = 0; l < uL && (size_t)l < pl.hot.size(); ++l) {
+                for (int e = 0; e < uE; ++e) all += eng.usage[(size_t)l * uE + e];
+                if (l < (int)pl.ffn_vram.size() && pl.ffn_vram[l])
+                    for (int e = 0; e < uE; ++e) in_vram += eng.usage[(size_t)l * uE + e];
+                else
+                    for (int e : pl.hot[l]) in_vram += eng.usage[(size_t)l * uE + e];
+            }
+            eng.hot_share = all > 0 ? in_vram / all : 0;
+            std::fprintf(stderr, "hot experts: %d of %d experts in VRAM, chosen from earlier use (%d layers split between VRAM and RAM); "
+                         "they did %.0f%% of the expert work so far\n", pl.hot_experts, uL * uE, split, 100 * eng.hot_share);
+        }
     };
     // Load settings from a /api/load body (or the settings saved for a model).
     auto load_options = [&](const json& body) {
@@ -651,6 +732,7 @@ int main(int argc, char** argv) {
         o.vram_budget_mb = body.value("vram_limit_mb", 0);
         o.split_mode = body.value("split_mode", std::string("auto"));
         o.mtp = body.value("speculative", false);      // load the MTP draft block for speculative decoding
+        o.multi_gpu = body.value("multi_gpu", true);
         return o;
     };
     if (!a.model.empty()) {
@@ -700,6 +782,8 @@ int main(int argc, char** argv) {
                                g.push_back({{"name", x.name}, {"weights", x.weights}, {"kv", x.kv}, {"layers", x.layers}}); return g; }()},
             {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"has_draft_block", hp.n_nextn > 0},
             {"mtp_loaded", eng.model->has_mtp()}, {"ffn_vram", eng.model->placement().ffn_vram},
+            {"hot_experts", eng.model->placement().hot_experts}, {"hot_share", eng.hot_share}, {"hot", eng.model->placement().hot},
+            {"learned_tokens", [&] { double t = 0; for (float v : eng.usage) t += v; return hp.n_layer * hp.n_expert_used > 0 ? (long long)(t / (hp.n_layer * hp.n_expert_used)) : 0LL; }()},
             {"version", TIERLM_VERSION},
         };
         last_info = j;
@@ -867,7 +951,7 @@ int main(int argc, char** argv) {
             const LoadOptions o = load_options(body);
             eng.draft_max = std::min(8, std::max(0, body.value("draft_max", 0)));
             const int threads = body.value("threads", a.threads), seed = body.value("seed", -1);
-            load(file.u8string(), o, threads, seed);
+            load(file.u8string(), o, threads, seed, body.value("hot_experts", false));
             // Remember these settings for this model, like LM Studio does.
             const std::string id = body.value("model", std::string());
             json saved = body;
@@ -887,6 +971,7 @@ int main(int argc, char** argv) {
 
     svr.Post("/api/unload", [&](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::timed_mutex> lk(mu);
+        eng.save_usage(true);
         eng.spec.reset();
         eng.model.reset();
         eng.cached.clear();
@@ -942,6 +1027,7 @@ int main(int argc, char** argv) {
 
         std::vector<int> counts((size_t)L * E, 0);                // experts used while reading the prompt
         if (K > 0) for (size_t i = 0; i < routing.size(); ++i) counts[((i / K) % L) * E + routing[i]]++;
+        eng.add_usage(routing, K);
         if (on_prompt)
             on_prompt({{"n_prompt", toks.size()}, {"n_new", suffix.size()}, {"reused", common}, {"prompt_s", r.prompt_s},
                        {"prompt_tps", suffix.size() / std::max(r.prompt_s, 1e-9)}, {"counts", counts}, {"n_past", model->n_past()}});
@@ -991,6 +1077,7 @@ int main(int argc, char** argv) {
                 if (is_end(id)) { r.stop = "end"; break; }
                 if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
                 lg = model->eval({id}, eng.threads, &routing);            // also tells us which experts it used
+                eng.add_usage(routing, K);
                 cached.push_back(id);
                 if (!add(id)) break;
             }
@@ -1016,6 +1103,7 @@ int main(int argc, char** argv) {
                 if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
                 cur = x;
                 const std::vector<int32_t> prod = eng.spec->step(x, eng.threads, pick, is_end, K > 0 ? &kept : nullptr);
+                eng.add_usage(kept, K);
                 cur = -1;
                 cached.push_back(x);                                      // x and the accepted guesses are now cached
                 cached.insert(cached.end(), prod.begin(), prod.end() - 1);
@@ -1035,6 +1123,7 @@ int main(int argc, char** argv) {
         if (r.stop != "stop" && r.stop != "abort") emit(visible, visible.size());   // release held-back text
         r.n_gen = out.size();
         r.gen_s = since(g0);
+        eng.save_usage();
         if (r.checks > 0)
             std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s); speculative: %.1f tokens per check, %zu of %zu guesses kept\n", r.n_gen,
                          r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str(), (double)r.n_gen / r.checks, r.accepted, r.drafted);
@@ -1225,14 +1314,43 @@ int main(int argc, char** argv) {
                 // ---- 1. split mode (when the model doesn't fit in VRAM) ----
                 std::string mode = "auto";
                 std::string loaded_mode;
+                // Split modes: "layers", "experts" (whole expert layers in VRAM), "hot" (experts in RAM, with the
+                // busiest experts in VRAM, from what tierlm has learned about this model).
                 auto load_mode = [&](const std::string& m) {
                     LoadOptions o = base;
-                    o.split_mode = m;
+                    o.split_mode = m == "hot" ? "experts" : m;
                     eng.draft_max = 0;
-                    load(file.u8string(), o, t0, seed);
+                    load(file.u8string(), o, t0, seed, m == "hot");
                     loaded_mode = m;
                 };
-                const char* mode_label[] = {"whole layers", "experts in RAM"};
+                auto learned = [&] { double t = 0; for (float v : eng.usage) t += v; return t; };
+                // Learns which experts this model uses from a mix of everyday text, code and maths, when nothing has
+                // been learned yet (afterwards, every chat keeps teaching it).
+                auto calibrate = [&] {
+                    static const char* texts[] = {
+                        "Write a friendly email to a colleague asking to move tomorrow's meeting to Thursday afternoon.",
+                        "def merge_sort(items):\n    \"\"\"Sort a list with merge sort and explain each step.\"\"\"\n",
+                        "Explain why the sky is blue, then work out 17 * 23 and 144 / 12, showing each step.",
+                        "Summarize the main causes of the First World War in a short paragraph for a history class.",
+                        "Translate into French and Spanish: The library opens at nine and closes at six on weekdays."};
+                    const int L_ = eng.model->hparams().n_layer, K_ = eng.model->hparams().n_expert_used;
+                    for (const char* t : texts) {
+                        eng.model->reset();
+                        std::vector<int32_t> routing;
+                        std::vector<float> lg = eng.model->eval(eng.tok.encode(t), eng.threads, &routing);
+                        eng.add_usage(routing, K_);
+                        for (int i = 0; i < 48 && eng.model->n_past() + 2 < eng.model->max_ctx(); ++i) {
+                            const int32_t x = best_token(lg.data());
+                            lg = eng.model->eval({x}, eng.threads, &routing);
+                            eng.add_usage(routing, K_);
+                        }
+                    }
+                    (void)L_;
+                    eng.model->reset();
+                    eng.cached.clear();
+                    eng.save_usage(true);
+                };
+                const char* mode_label[] = {"whole layers", "experts in RAM", "experts in RAM, busiest experts in VRAM"};
                 if (!status("Loading the model")) throw std::runtime_error("cancelled");
                 load_mode("layers");
                 const Placement& pl = eng.model->placement();
@@ -1244,11 +1362,20 @@ int main(int argc, char** argv) {
                 }
                 double best = 0;
                 if (split) {
-                    const std::string modes[] = {"layers", "experts"};
-                    for (int i = 0; i < 2; ++i) {
+                    const std::string modes[] = {"layers", "experts", "hot"};
+                    const int n_modes = eng.model->hparams().is_moe() ? 3 : 2;
+                    for (int i = 0; i < n_modes; ++i) {
+                        if (i == 2 && learned() <= 0) {
+                            if (!status("Learning which experts this model uses")) throw std::runtime_error("cancelled");
+                            calibrate();
+                        }
                         if (loaded_mode != modes[i]) {
                             if (!status(std::string("Loading with ") + mode_label[i])) throw std::runtime_error("cancelled");
                             load_mode(modes[i]);
+                        }
+                        if (i == 2 && eng.model->placement().hot_experts == 0) {   // nothing to gain: no VRAM left for experts
+                            loaded_mode = "experts";
+                            continue;
                         }
                         if (!status(std::string("Measuring ") + mode_label[i])) throw std::runtime_error("cancelled");
                         const double t = measure(n_gen, 0);
@@ -1311,7 +1438,8 @@ int main(int argc, char** argv) {
                 const std::string id = body.value("model", std::string());
                 json saved = body;
                 saved.erase("model");
-                saved["split_mode"] = split ? mode : body.value("split_mode", std::string("auto"));
+                saved["split_mode"] = split ? (mode == "hot" ? "experts" : mode) : body.value("split_mode", std::string("auto"));
+                saved["hot_experts"] = mode == "hot";                          // on only where it measured fastest
                 saved["threads"] = threads;
                 saved["speculative"] = draft > 0;
                 if (draft > 0) saved["draft_max"] = draft;
@@ -1377,6 +1505,17 @@ int main(int argc, char** argv) {
         eng.model->reset();
         std::fprintf(stderr, "speculative decoding %s%s\n", on ? "on, " : "off", on ? (std::to_string(d) + (d == 1 ? " guess per check" : " guesses per check")).c_str() : "");
         res.set_content(dump({{"ok", true}, {"speculative", on}, {"draft_max", d}}), "application/json");
+    });
+
+    // ---------------- Forget what was learned about the loaded model's experts ----------------
+    svr.Post("/api/usage/reset", [&](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::timed_mutex> lk(mu);
+        std::fill(eng.usage.begin(), eng.usage.end(), 0.0f);
+        std::error_code ec;
+        if (!eng.usage_path.empty()) fs::remove(fs::u8path(eng.usage_path), ec);
+        eng.usage_dirty = false;
+        std::fprintf(stderr, "expert usage for this model forgotten; the next load places whole expert layers again\n");
+        res.set_content("{\"ok\":true}", "application/json");
     });
 
     // ---------------- Loading progress and the console (no lock: they answer while a model loads) ----------------
@@ -1447,7 +1586,7 @@ int main(int argc, char** argv) {
                 try {
                     json saved = settings.value("models", json::object()).value(rel.generic_u8string(), json::object());
                     eng.draft_max = std::min(8, std::max(0, saved.value("draft_max", 0)));
-                    load(file.u8string(), load_options(saved), saved.value("threads", a.threads), saved.value("seed", -1));
+                    load(file.u8string(), load_options(saved), saved.value("threads", a.threads), saved.value("seed", -1), saved.value("hot_experts", false));
                     settings["last_model"] = rel.generic_u8string();
                     write_settings(a.settings, settings);
                 } catch (const std::exception& e) {

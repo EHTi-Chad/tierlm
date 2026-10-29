@@ -6,7 +6,7 @@ rem     scripts\package-windows.bat 0.4.0
 rem One download for every PC: it contains both GPU engines and picks one at start-up. NVIDIA GeForce RTX cards
 rem use CUDA (fastest on NVIDIA); Intel Arc, AMD Radeon and older NVIDIA cards use Vulkan; with no GPU, the CPU.
 rem NVIDIA's CUDA runtime DLLs are bundled, so users install nothing but their normal graphics driver.
-rem     scripts\package-windows.bat 0.4.0 lite      tierlm-0.4.0-windows-lite.zip: Vulkan only, about 55 MB. Runs on
+rem     scripts\package-windows.bat 0.4.0 lite      tierlm-0.4.0-windows-lite.zip: Vulkan only, about 20 MB. Runs on
 rem                                                Intel, AMD and NVIDIA GPUs (slower than CUDA on NVIDIA). Needs no CUDA toolkit to build.
 rem     scripts\package-windows.bat 0.4.0 both      both of the above
 setlocal

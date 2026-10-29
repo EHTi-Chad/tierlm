@@ -7,6 +7,7 @@
 #include "gguf.h"
 #include <algorithm>
 #include <set>
+#include <functional>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -163,7 +164,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             gs.push_back(gi); cs.push_back(c);
             n_total += (size_t)gguf_get_n_tensors(gi);
         }
-        ggml_init_params wp{ (n_total + 256) * ggml_tensor_overhead(), nullptr, /*no_alloc=*/true };   // + room for an MTP file
+        ggml_init_params wp{ (2 * n_total + 256) * ggml_tensor_overhead(), nullptr, /*no_alloc=*/true };   // + an MTP file, hot-expert parts
         m->wctx_ = ggml_init(wp);
         for (size_t pi = 0; pi < gs.size(); ++pi) {
             const size_t data_off = gguf_get_data_offset(gs[pi]);
@@ -390,6 +391,62 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     std::vector<bool> kv_gpu(nl_all, false);
     std::vector<std::vector<ggml_tensor*>> on_dev(G);       // per GPU
     std::vector<int> ldev(nl_all, -1);                      // per layer: the GPU holding its KV cache, or -1
+    // Hot experts (experts in RAM, one GPU, with usage counts from earlier use): once the attention, router and KV
+    // cache are placed, the VRAM left goes to the most-used individual experts rather than to whole expert layers.
+    // A layer whose chosen experts are only some of its experts is split in two (see Layer::map_hot).
+    struct HotSplit { ggml_tensor *orig, *hot, *cold; };
+    struct HotLayer { std::vector<int> ids; std::vector<HotSplit> parts; ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *mask = nullptr; };
+    std::map<int, HotLayer> hot_layers;
+    const int E = hp.n_expert;
+    std::vector<float> usage_env;                                     // tests: TIERLM_EXPERT_USAGE=<seed> makes up usage counts
+    if (const char* e = std::getenv("TIERLM_EXPERT_USAGE"); e && opt.expert_usage.empty() && hp.is_moe()) {
+        uint32_t x = (uint32_t)std::strtoul(e, nullptr, 10) * 2654435761u + 1;
+        usage_env.resize((size_t)hp.n_layer * E);
+        for (auto& u : usage_env) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; u = (float)(x % 1000) * (x % 3 == 0 ? 0.0f : 1.0f); }
+    }
+    const std::vector<float>& usage = opt.expert_usage.empty() ? usage_env : opt.expert_usage;
+    const bool use_hot = G == 1 && !by_layer && hp.is_moe() && usage.size() == (size_t)hp.n_layer * E;
+    std::vector<std::vector<int>> hot_ids(hp.n_layer);
+    bool hot_decided = false;
+    auto choose_hot = [&]() {
+        std::vector<size_t> per(hp.n_layer, 0);                      // VRAM per expert, per layer
+        for (const Group& gr : groups)
+            if (gr.prio == 4 && gr.layer >= 0 && gr.layer < hp.n_layer) per[gr.layer] = gr.bytes / E + 1;
+        struct Cand { float u; int l, e; };
+        std::vector<Cand> cs;
+        for (int l = 0; l < hp.n_layer; ++l)
+            for (int e = 0; e < E; ++e)
+                if (per[l] && usage[(size_t)l * E + e] > 0) cs.push_back({usage[(size_t)l * E + e], l, e});
+        std::stable_sort(cs.begin(), cs.end(), [](const Cand& a, const Cand& b) { return a.u > b.u; });
+        std::vector<std::vector<char>> taken(hp.n_layer, std::vector<char>(E, 0));
+        auto take = [&](int l, int e) {
+            const size_t need = per[l] * (hot_ids[l].empty() ? 2 : 1);   // the first one also pays for the zero expert
+            if (need > budget) return false;
+            budget -= need;
+            hot_ids[l].push_back(e);
+            taken[l][e] = 1;
+            return true;
+        };
+        for (const Cand& c : cs) take(c.l, c.e);
+        // VRAM still free: the never-used experts too, layer by layer (whole layers need no split)
+        for (int l = 0; l < hp.n_layer; ++l)
+            for (int e = 0; e < E && per[l]; ++e)
+                if (!taken[l][e]) take(l, e);
+        // Both parts of a split layer need at least n_used experts (the zero expert included), so each token's
+        // picks can be made distinct there (see distinct_ids). Too few in VRAM: the layer stays in RAM; too few
+        // left in RAM: the least-used chosen ones go back (they were taken busiest first).
+        const int need_part = std::max(1, hp.n_expert_used);
+        for (int l = 0; l < hp.n_layer; ++l) {
+            int H = (int)hot_ids[l].size();
+            if (H == 0 || H == E) continue;
+            if (H + 1 < need_part) { budget += per[l] * (H + 1); hot_ids[l].clear(); continue; }
+            while (E - H + 1 < need_part) { hot_ids[l].pop_back(); budget += per[l]; --H; }
+        }
+        for (int l = 0; l < hp.n_layer; ++l) {
+            if ((int)hot_ids[l].size() == E) budget += per[l];        // complete layer: no zero expert needed
+            std::sort(hot_ids[l].begin(), hot_ids[l].end());
+        }
+    };
     if (G <= 1) {
         bool kv_decided = false, layers_full = false;
         for (const Group& gr : groups) {
@@ -398,6 +455,29 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 if (fit) budget -= kv_need;
                 std::fill(kv_gpu.begin(), kv_gpu.end(), fit);
                 kv_decided = true;
+            }
+            if (use_hot && gr.prio == 4 && gr.layer >= 0 && gr.layer < hp.n_layer) {
+                if (!hot_decided) { choose_hot(); hot_decided = true; }
+                const int H = (int)hot_ids[gr.layer].size();
+                if (H == E || H == 0) { for (ggml_tensor* t : gr.t) (H ? on_gpu : on_cpu).push_back(t); continue; }
+                HotLayer& hl = hot_layers[gr.layer];
+                hl.ids = hot_ids[gr.layer];
+                for (ggml_tensor* t : gr.t) {
+                    const std::string nm = ggml_get_name(t);
+                    ggml_tensor* th = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], H + 1);
+                    ggml_tensor* tc = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], E - H + 1);
+                    ggml_set_name(th, (nm + ".hot").c_str());
+                    ggml_set_name(tc, (nm + ".cold").c_str());
+                    on_gpu.push_back(th);
+                    on_cpu.push_back(tc);
+                    hl.parts.push_back({t, th, tc});
+                }
+                const std::string b = "blk." + std::to_string(gr.layer) + ".tier_";
+                hl.map_hot = ggml_new_tensor_2d(m->wctx_, GGML_TYPE_I32, 1, E);  ggml_set_name(hl.map_hot, (b + "map_hot").c_str());
+                hl.map_cold = ggml_new_tensor_2d(m->wctx_, GGML_TYPE_I32, 1, E); ggml_set_name(hl.map_cold, (b + "map_cold").c_str());
+                hl.mask = ggml_new_tensor_2d(m->wctx_, GGML_TYPE_F32, 1, E);    ggml_set_name(hl.mask, (b + "mask").c_str());
+                on_cpu.push_back(hl.map_hot); on_cpu.push_back(hl.map_cold); on_cpu.push_back(hl.mask);
+                continue;
             }
             size_t need = gr.bytes + (by_layer && gr.prio == 2 && gr.layer >= 0 && gr.layer < nl_all ? layer_mem(gr.layer) : 0);
             bool gpu = gpu_buft && gr.prio < 9 && need <= budget && !(gr.prio == 2 && layers_full);
@@ -485,7 +565,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 const std::string n = ggml_get_name(t);
                 const bool matmul = ggml_n_dims(t) >= 2 && t->ne[1] > 1 && n.find("embd") == std::string::npos &&
                                     n.find("embed") == std::string::npos && n.find("norm") == std::string::npos &&
-                                    n.find("conv1d") == std::string::npos;
+                                    n.find("conv1d") == std::string::npos && n.find("tier_") == std::string::npos;
                 bool ok = false;
                 if (matmul) {                             // would the CPU engine run a multiply with it repacked?
                     ggml_reset(tc);
@@ -535,6 +615,13 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             m->place_.ffn_gpu += f;
             m->place_.ffn_vram.push_back(f);
         }
+        if (use_hot) {
+            m->place_.hot.assign(hp.n_layer, {});
+            for (int i = 0; i < hp.n_layer; ++i) {
+                m->place_.hot[i] = hot_ids[i];
+                m->place_.hot_experts += (int)hot_ids[i].size();
+            }
+        }
     }
 
     // ---- stream every tensor's data from its file into wherever the tier loader put it ----
@@ -544,9 +631,43 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         if (!files.back()) { gguf_free(g); throw std::runtime_error("cannot open " + p); }
     }
     std::vector<char> chunk;
+    std::map<const ggml_tensor*, std::pair<const HotLayer*, const HotSplit*>> split_of;
+    for (const auto& [l, hl] : hot_layers) {
+        for (const HotSplit& sp : hl.parts) split_of[sp.orig] = {&hl, &sp};
+        // Each expert's place in the VRAM part and the RAM part; picks that live in the other part go to the zero expert.
+        const int H = (int)hl.ids.size();
+        std::vector<int32_t> mh(E, H), mc(E, E - H);
+        std::vector<float> mk(E, 0.0f);
+        int ci = 0;
+        std::vector<char> is_hot(E, 0);
+        for (int k = 0; k < H; ++k) { mh[hl.ids[k]] = k; mk[hl.ids[k]] = 1.0f; is_hot[hl.ids[k]] = 1; }
+        for (int e = 0; e < E; ++e) if (!is_hot[e]) mc[e] = ci++;
+        ggml_backend_tensor_set(hl.map_hot, mh.data(), 0, ggml_nbytes(hl.map_hot));
+        ggml_backend_tensor_set(hl.map_cold, mc.data(), 0, ggml_nbytes(hl.map_cold));
+        ggml_backend_tensor_set(hl.mask, mk.data(), 0, ggml_nbytes(hl.mask));
+    }
     size_t total_bytes = 0, done_bytes = 0, next_report = 0;
-    for (const Source& s : sources) if (s.t->buffer) total_bytes += ggml_nbytes(s.t);
+    for (const Source& s : sources) if (s.t->buffer || split_of.count(s.t)) total_bytes += ggml_nbytes(s.t);
     for (const Source& s : sources) {
+        if (auto it = split_of.find(s.t); it != split_of.end()) {      // an expert tensor split into VRAM and RAM parts
+            const HotLayer& hl = *it->second.first;
+            const HotSplit& sp = *it->second.second;
+            const size_t n = ggml_nbytes(s.t), per = s.t->nb[2];
+            done_bytes += n;
+            chunk.resize(n);
+            auto& f = files[s.part];
+            f.seekg((std::streamoff)s.offset);
+            if (!f.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + paths[s.part]); }
+            std::vector<char> hb(ggml_nbytes(sp.hot), 0), cb(ggml_nbytes(sp.cold), 0);   // the last expert of each stays zero
+            std::vector<char> is_hot(E, 0);
+            for (int k = 0; k < (int)hl.ids.size(); ++k) { std::memcpy(hb.data() + (size_t)k * per, chunk.data() + (size_t)hl.ids[k] * per, per); is_hot[hl.ids[k]] = 1; }
+            for (int e = 0, ci = 0; e < E; ++e)
+                if (!is_hot[e]) std::memcpy(cb.data() + (size_t)ci++ * per, chunk.data() + (size_t)e * per, per);
+            ggml_backend_tensor_set(sp.hot, hb.data(), 0, hb.size());
+            ggml_backend_tensor_set(sp.cold, cb.data(), 0, cb.size());
+            if (opt.progress) opt.progress(total_bytes ? (float)((double)done_bytes / total_bytes) : 1.0f);
+            continue;
+        }
         if (!s.t->buffer) continue;                                    // not loaded (draft blocks)
         const size_t n = ggml_nbytes(s.t);
         done_bytes += n;
@@ -574,6 +695,18 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     if (!m->output_) m->output_ = m->tok_embd_;      // tied embeddings
     hp.n_vocab = (int)m->tok_embd_->ne[1];
 
+    auto bind_hot = [&](Layer& L, int i) {                         // a layer whose experts are split into VRAM and RAM parts
+        auto it = hot_layers.find(i);
+        if (it == hot_layers.end()) return;
+        for (const HotSplit& sp : it->second.parts) {
+            const std::string nm = ggml_get_name(sp.orig);
+            if (nm.find("ffn_gate_up_exps") != std::string::npos) { L.gate_up_xh = sp.hot; L.gate_up_xc = sp.cold; }
+            else if (nm.find("ffn_gate_exps") != std::string::npos) { L.gate_xh = sp.hot; L.gate_xc = sp.cold; }
+            else if (nm.find("ffn_up_exps") != std::string::npos) { L.up_xh = sp.hot; L.up_xc = sp.cold; }
+            else if (nm.find("ffn_down_exps") != std::string::npos) { L.down_xh = sp.hot; L.down_xc = sp.cold; }
+        }
+        L.map_hot = it->second.map_hot; L.map_cold = it->second.map_cold; L.hot_mask = it->second.mask;
+    };
     auto bind_layer = [&](int i) {
         const std::string b = "blk." + std::to_string(i) + ".";
         Layer L;
@@ -633,7 +766,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         }
         return L;
     };
-    for (int i = 0; i < hp.n_layer; ++i) m->layers_.push_back(bind_layer(i));
+    for (int i = 0; i < hp.n_layer; ++i) { Layer L = bind_layer(i); bind_hot(L, i); m->layers_.push_back(L); }
     if (want_mtp) {
         // The MTP block: a full-attention layer like the model's own, plus its input projection: it combines the
         // next token's embedding with the model's last hidden state.
@@ -697,7 +830,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     m->pin_layers_ = m->main_ != m->cpu_ && m->place_.mode == "layers" && (m->place_.kv_gpu_layers < hp.n_layer || G > 1);
     m->sched_ = ggml_backend_sched_new(backends.data(), nullptr, n_backends, kGraphSize, false, offload);
     if (!m->sched_) throw std::runtime_error("failed to create the scheduler");
-    m->graph_mem_.resize(ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false));
+    for (auto& gm : m->graph_mem_) gm.resize(ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false));
 
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
     // of the context), so it is not re-planned on every token.
@@ -725,6 +858,7 @@ void Model::pin_cpu_layers(const Graph& g) {
                 ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
         }
     }
+    for (ggml_tensor* t : g.cpu_ops) ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
     if (!pin_layers_) return;
     for (const auto& [t, layer] : g.owner) {
         if (layer < 0 || layer >= (int)layer_dev_.size()) continue;
@@ -763,7 +897,7 @@ void Model::device_memory(size_t& free, size_t& total) const {
 // projection (to be added to the residual stream). Shared by the model's layers and the MTP draft head.
 ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past) {
     const Hparams& hp = hp_;
-    const int hd = hp.head_dim, n_kv = n_past + n_tok;
+    const int hd = hp.head_dim, n_kv = kv_span(n_past + n_tok);     // padded: see kv_span
     const float scale = 1.0f / std::sqrt((float)hd);
         // Qwen3.5's attention layers project each head's query together with an output gate: [q | gate]
         ggml_tensor* qg = hp.hybrid ? ggml_mul_mat(c, L.wq, h) : nullptr;    // [2*hd*n_head, n_tok]
@@ -788,13 +922,16 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
         q = ggml_rope_ext(c, q, g.pos, rope_freqs_, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
         k = ggml_rope_ext(c, k, g.pos, rope_freqs_, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
 
-        // Write this batch's keys/values into the cache at positions [n_past, n_kv). These copies are
-        // added to the graph first, so they run before the attention below reads the cache.
+        // Write this batch's keys/values into the cache at their positions (g.pos: n_past, n_past + 1, ...).
+        // Written by index rather than into a view at n_past, so the graph is the same from one token to the
+        // next (CUDA graphs can replay it). Added to the graph first, so they run before the attention below.
         const size_t knb1 = L.k_cache->nb[1], knb2 = L.k_cache->nb[2];
         const size_t vnb1 = L.v_cache->nb[1], vnb2 = L.v_cache->nb[2];
-        ggml_build_forward_expand(g.gf, ggml_cpy(c, k, ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_tok, knb1, knb2, (size_t)n_past * knb2)));
-        ggml_build_forward_expand(g.gf, ggml_cpy(c, v, ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_tok, vnb1, vnb2, (size_t)n_past * vnb2)));
-        ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_kv, knb1, knb2, 0);   // all tokens so far
+        ggml_tensor* krows = ggml_reshape_2d(c, L.k_cache, hd * hp.n_head_kv, L.k_cache->ne[2]);
+        ggml_tensor* vrows = ggml_reshape_2d(c, L.v_cache, hd * hp.n_head_kv, L.v_cache->ne[2]);
+        ggml_build_forward_expand(g.gf, ggml_set_rows(c, krows, ggml_reshape_2d(c, k, hd * hp.n_head_kv, n_tok), g.pos));
+        ggml_build_forward_expand(g.gf, ggml_set_rows(c, vrows, ggml_reshape_2d(c, v, hd * hp.n_head_kv, n_tok), g.pos));
+        ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_kv, knb1, knb2, 0);   // all tokens so far, padded
         ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_kv, vnb1, vnb2, 0);
 
         ggml_tensor* Q = ggml_permute(c, q, 0, 2, 1, 3);                     // [hd, n_tok, n_head]
@@ -824,6 +961,45 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
 
 // Feed-forward for one layer: dense SwiGLU, or mixture of experts (with an optional shared expert).
 // Returns the output to be added to the residual stream.
+// Makes the expert ids of each token distinct (see the hot-expert split in ffn_block). ids is I32
+// [n_used, n_tok]; userdata is the number of experts in the part. A repeated id is replaced by the lowest id
+// this token does not use yet (the placement keeps every part at least n_used experts big).
+static void distinct_ids(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void* userdata) {
+    if (ith != 0) return;
+    (void)nth;
+    const int64_t n_used = a->ne[0], n_tok = a->ne[1];
+    for (int64_t t = 0; t < n_tok; ++t) {
+        const int32_t* in = (const int32_t*)((const char*)a->data + t * a->nb[1]);
+        int32_t* out = (int32_t*)((char*)dst->data + t * dst->nb[1]);
+        const int32_t n_part = (int32_t)(intptr_t)userdata;
+        for (int64_t k = 0; k < n_used; ++k) out[k] = in[k];
+        for (int64_t k = 0; k < n_used; ++k) {
+            bool dup = false;
+            for (int64_t j = 0; j < k; ++j) if (out[j] == out[k]) { dup = true; break; }
+            if (!dup) continue;
+            for (int32_t cand = 0; cand < n_part; ++cand) {
+                bool used = false;
+                for (int64_t j = 0; j < n_used; ++j) if (out[j] == cand) { used = true; break; }
+                if (!used) { out[k] = cand; break; }
+            }
+        }
+    }
+}
+
+// For the RAM part of a split layer when the CPU computes it (a few tokens): picks that point at the zero expert
+// (the part's last one; userdata is the part's size) become -1, which the CPU kernel skips, writing zeros. So
+// the CPU computes only the experts that live in RAM, instead of multiplying the zero expert out as well.
+static void skip_zero_ids(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void* userdata) {
+    if (ith != 0) return;
+    (void)nth;
+    const int32_t zero = (int32_t)(intptr_t)userdata - 1;
+    for (int64_t t = 0; t < a->ne[1]; ++t) {
+        const int32_t* in = (const int32_t*)((const char*)a->data + t * a->nb[1]);
+        int32_t* out = (int32_t*)((char*)dst->data + t * dst->nb[1]);
+        for (int64_t k = 0; k < a->ne[0]; ++k) out[k] = in[k] == zero ? -1 : in[k];
+    }
+}
+
 ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing) {
     const Hparams& hp = hp_;
         if (!hp.is_moe()) {
@@ -844,24 +1020,79 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         }
         if (hp.expert_scale != 0.0f && hp.expert_scale != 1.0f) w = ggml_scale(c, w, hp.expert_scale);
         ggml_tensor* h3    = ggml_reshape_3d(c, h, hp.n_embd, 1, n_tok);
-        ggml_tensor *up, *gate;
-        if (L.gate_up_x) {                                                   // [2*n_ff_exp, n_used, n_tok]: gate, then up
-            ggml_tensor* gu = ggml_mul_mat_id(c, L.gate_up_x, h3, sel);
-            const int64_t f = gu->ne[0] / 2;
-            gate = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
-            up   = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], f * gu->nb[0]);
+        // The chosen experts' outputs, weighted and summed: [n_embd, n_tok]. ids: [n_used, n_tok] into these tensors.
+        auto experts = [&](ggml_tensor* gate_up_x, ggml_tensor* gate_x, ggml_tensor* up_x, ggml_tensor* down_x,
+                           ggml_tensor* ids, ggml_tensor* wt) {
+            ggml_tensor *up, *gate;
+            if (gate_up_x) {                                                 // [2*n_ff_exp, n_used, n_tok]: gate, then up
+                ggml_tensor* gu = ggml_mul_mat_id(c, gate_up_x, h3, ids);
+                const int64_t f = gu->ne[0] / 2;
+                gate = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
+                up   = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], f * gu->nb[0]);
+            } else {
+                up   = ggml_mul_mat_id(c, up_x, h3, ids);                    // [n_ff_exp, n_used, n_tok]
+                gate = ggml_mul_mat_id(c, gate_x, h3, ids);
+            }
+            ggml_tensor* act  = gate_up_x ? ggml_swiglu_split(c, gate, up)  // works on the two halves in place
+                                          : ggml_mul(c, ggml_silu(c, gate), up);
+            ggml_tensor* down = ggml_mul_mat_id(c, down_x, act, ids);        // [n_embd, n_used, n_tok]
+            down = ggml_mul(c, down, wt);                                    // weight each expert's output
+            ggml_tensor* sum = nullptr;
+            for (int e = 0; e < hp.n_expert_used; ++e) {
+                ggml_tensor* s = ggml_view_2d(c, down, hp.n_embd, n_tok, down->nb[2], e * down->nb[1]);
+                sum = sum ? ggml_add(c, sum, s) : s;
+            }
+            return sum;
+        };
+        ggml_tensor* moe;
+        if (L.map_hot) {
+            // Hot-expert split: each pick is computed by the part that holds it (VRAM or RAM); in the other part it
+            // goes to the all-zero expert with weight 0, so it adds nothing. The sum is the same as unsplit.
+            // Looked up for the whole ranking (contiguous), then the top n_used rows are used, like sel.
+            ggml_tensor* order1 = ggml_reshape_1d(c, order, (int64_t)hp.n_expert * n_tok);
+            auto lookup = [&](ggml_tensor* map) {                            // [n_used, n_tok] view of map[order]
+                ggml_tensor* all = ggml_reshape_2d(c, ggml_get_rows(c, map, order1), hp.n_expert, n_tok);
+                return ggml_view_2d(c, all, hp.n_expert_used, n_tok, all->nb[1], 0);
+            };
+            // Made contiguous on the CPU before they go anywhere: a strided view copied to the GPU as an input
+            // gave CUDA bad ids (an illegal memory access on an RTX 3070).
+            // A token's picks that live in the other part all point at the zero expert, so the same id can repeat
+            // within one token. GPU kernels assume a token never picks an expert twice (CUDA's sorter then writes
+            // past its buffer), so the repeats are moved to distinct unused experts of this part; their weight is
+            // 0 there, so the sum does not change.
+            // The RAM part needs it only for big batches (a prompt): those are handed to the GPU, which copies the
+            // experts over (ggml's op offload, from 32 tokens). For a few tokens the CPU does it: there the zero-expert
+            // picks become -1 and are skipped (see skip_zero_ids), so the CPU computes only the experts in RAM.
+            auto remap = [&](ggml_tensor* map, const ggml_tensor* part, bool distinct) {
+                ggml_tensor* ids = ggml_cont(c, lookup(map));
+                g.cpu_ops.push_back(ids);
+                return ggml_map_custom1(c, ids, distinct ? distinct_ids : skip_zero_ids, 1, (void*)(intptr_t)part->ne[2]);
+            };
+            // All the bookkeeping runs on the CPU, next to the RAM experts, so the work changes device only twice
+            // per layer (to the CPU after the router, back to the GPU for the VRAM experts), as with whole layers.
+            ggml_tensor* mcont  = ggml_cont(c, lookup(L.hot_mask));
+            ggml_tensor* mask   = ggml_reshape_3d(c, mcont, 1, hp.n_expert_used, n_tok);
+            ggml_tensor* w_hot  = ggml_mul(c, w, mask);                     // [1, n_used, n_tok]
+            ggml_tensor* w_cold = ggml_sub(c, w, w_hot);
+            static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
+            ggml_tensor* ids_c  = remap(L.map_cold, L.down_xc, n_tok >= std::min(offload_batch, 32));
+            ggml_tensor* ids_h  = remap(L.map_hot, L.down_xh, true);
+            for (ggml_tensor* t : {mcont->src[0]->view_src, mcont, w_hot, w_cold, ids_c, ids_c->src[0]->src[0]->view_src, ids_h, ids_h->src[0]->src[0]->view_src})
+                if (t) g.cpu_ops.push_back(t);
+            // The router weights of the chosen experts (picked out of probs, renormalized, scaled) too.
+            std::function<void(ggml_tensor*, int)> on_cpu = [&](ggml_tensor* t, int depth) {
+                if (!t || t == probs || t == order || depth > 8) return;
+                const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+                if (!view && t->op != GGML_OP_NONE) g.cpu_ops.push_back(t);
+                for (ggml_tensor* src : t->src) if (src && src != probs && src != order) on_cpu(src, depth + 1);
+            };
+            on_cpu(w, 0);
+            ggml_build_forward_expand(g.gf, w_cold);                        // weights first, then the lookups: one hand-off
+            ggml_tensor* cold = experts(L.gate_up_xc, L.gate_xc, L.up_xc, L.down_xc, ids_c, w_cold);
+            ggml_tensor* hot  = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_hot);
+            moe = ggml_add(c, cold, hot);                                   // cold first: the graph runs the RAM part, then the VRAM part
         } else {
-            up   = ggml_mul_mat_id(c, L.up_x, h3, sel);                      // [n_ff_exp, n_used, n_tok]
-            gate = ggml_mul_mat_id(c, L.gate_x, h3, sel);
-        }
-        ggml_tensor* act   = L.gate_up_x ? ggml_swiglu_split(c, gate, up)   // works on the two halves in place
-                                     : ggml_mul(c, ggml_silu(c, gate), up);
-        ggml_tensor* down  = ggml_mul_mat_id(c, L.down_x, act, sel);         // [n_embd, n_used, n_tok]
-        down = ggml_mul(c, down, w);                                         // weight each expert's output
-        ggml_tensor* moe = nullptr;
-        for (int e = 0; e < hp.n_expert_used; ++e) {
-            ggml_tensor* s = ggml_view_2d(c, down, hp.n_embd, n_tok, down->nb[2], e * down->nb[1]);
-            moe = moe ? ggml_add(c, moe, s) : s;
+            moe = experts(L.gate_up_x, L.gate_x, L.up_x, L.down_x, sel, w);
         }
         if (L.up_s) {                                                        // shared expert
             ggml_tensor* sh = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, L.gate_s, h)), ggml_mul_mat(c, L.up_s, h));
@@ -874,13 +1105,34 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
 
 // Builds the compute graph for n_tok new tokens placed after n_past cached ones.
 // Only a description: the scheduler allocates its memory on the right device later.
+// TIERLM_PROFILE=1: every 64 graphs of up to 8 tokens (replies, not prompts), prints where the time per graph
+// went: preparing it, and per device the input copies and the work. Each split is waited for while this is on.
+void Model::profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms) {
+    if (n_tok > 8) { ggml_backend_sched_profile(nullptr, nullptr, nullptr, nullptr, nullptr, true); prof_ = {}; return; }
+    prof_.graphs++; prof_.tokens += n_tok; prof_.prep += prep_ms; prof_.compute += compute_ms; prof_.out += out_ms;
+    if (prof_.graphs < 64) return;
+    double copy[16], work[16]; int64_t splits[16], inputs[16], graphs = 0;
+    ggml_backend_sched_profile(copy, work, splits, inputs, &graphs, true);
+    const double n = (double)prof_.graphs;
+    std::fprintf(stderr, "profile: %d graphs, %.1f tokens each: %.2f ms each = prepare %.2f + compute %.2f + read out %.2f\n",
+                 prof_.graphs, prof_.tokens / n, (prof_.prep + prof_.compute + prof_.out) / n, prof_.prep / n, prof_.compute / n, prof_.out / n);
+    std::vector<ggml_backend_t> bs(gpus_.begin(), gpus_.end());
+    bs.push_back(cpu_);
+    for (size_t i = 0; i < bs.size() && i < 16; ++i)
+        if (splits[i])
+            std::fprintf(stderr, "profile:   %-10s %5.1f splits, %6.1f inputs: copy in %6.2f ms, work %6.2f ms per graph\n",
+                         ggml_backend_name(bs[i]), splits[i] / n, inputs[i] / n, copy[i] / 1000.0 / n, work[i] / 1000.0 / n);
+    prof_ = {};
+}
+
 Model::Graph Model::build(int n_tok, int n_past, bool want_routing, int n_logits, bool want_hidden, int snapshots) {
     const Hparams& hp = hp_;
-    const int n_kv = n_past + n_tok;
+    const int n_kv = kv_span(n_past + n_tok);
     const int hd = hp.head_dim;
 
     Graph g;
-    ggml_init_params ip{ graph_mem_.size(), graph_mem_.data(), /*no_alloc=*/true };
+    std::vector<uint8_t>& gm = graph_mem(n_tok == 1 ? 0 : 1);
+    ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
     ggml_context* c = g.ctx = ggml_init(ip);
     g.gf = ggml_new_graph_custom(c, kGraphSize, false);
 
@@ -1019,9 +1271,10 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing, int n_logits
 Model::Graph Model::build_mtp(int n_tok, int n_past) {
     const Hparams& hp = hp_;
     const Layer& L = *mtp_;
-    const int n_kv = n_past + n_tok;
+    const int n_kv = kv_span(n_past + n_tok);
     Graph g;
-    ggml_init_params ip{ graph_mem_.size(), graph_mem_.data(), /*no_alloc=*/true };
+    std::vector<uint8_t>& gm = graph_mem(2);
+    ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
     ggml_context* c = g.ctx = ggml_init(ip);
     g.gf = ggml_new_graph_custom(c, kGraphSize, false);
     g.n_tok = n_tok;
@@ -1061,7 +1314,7 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     ggml_backend_tensor_set(g.pos, positions.data(), 0, sizeof(int32_t) * n_tok);
     ggml_backend_tensor_set(g.h_in, h, 0, sizeof(float) * (size_t)hp.n_embd * n_tok);
     if (g.mask) {
-        const int n_kv = pos0 + n_tok;
+        const int n_kv = kv_span(pos0 + n_tok);                    // padded columns are future: -inf
         const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
         std::vector<ggml_fp16_t> mask((size_t)n_kv * n_tok);
         for (int t = 0; t < n_tok; ++t)
@@ -1163,10 +1416,11 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
     ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
     ggml_backend_tensor_set(g.pos, positions.data(), 0, sizeof(int32_t) * n_tok);
     if (g.mask) {
+        const int span = kv_span(n_kv);                            // padded columns are future: -inf
         const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-        std::vector<ggml_fp16_t> mask((size_t)n_kv * n_tok);
+        std::vector<ggml_fp16_t> mask((size_t)span * n_tok);
         for (int t = 0; t < n_tok; ++t)
-            for (int j = 0; j < n_kv; ++j) mask[(size_t)t * n_kv + j] = j <= n_past + t ? zero : ninf;
+            for (int j = 0; j < span; ++j) mask[(size_t)t * span + j] = j <= n_past + t ? zero : ninf;
         ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
     }
     set_n_threads(cpu_, n_threads);
@@ -1203,6 +1457,7 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
     stats_.compute_ms += ms(t3, t4); stats_.output_ms += ms(t4, t5);
     stats_.splits = ggml_backend_sched_get_n_splits(sched_); stats_.copies = ggml_backend_sched_get_n_copies(sched_);
     n_past_ = n_kv;
+    if (std::getenv("TIERLM_PROFILE")) profile_step(n_tok, ms(t0, t3), ms(t3, t4), ms(t4, t5));
     return res;
 }
 

@@ -27,7 +27,7 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
 2. Download one of the two zips:
    - **`tierlm-<version>-windows.zip`** (about 550 MB): everything, including NVIDIA's CUDA engine, the fastest
      option on NVIDIA GeForce RTX cards. Get this one if you have an NVIDIA RTX card.
-   - **`tierlm-<version>-windows-lite.zip`** (about 55 MB): the same app without CUDA, for Intel Arc, AMD Radeon,
+   - **`tierlm-<version>-windows-lite.zip`** (about 20 MB): the same app without CUDA, for Intel Arc, AMD Radeon,
      or no graphics card. It also runs on NVIDIA cards, through Vulkan, just slower.
 3. Right-click the zip, choose **Extract All...**, and extract it somewhere simple, such as `C:\tierlm`.
 
@@ -80,8 +80,9 @@ The setup screen shows:
    files, or with a matching `mtp-*.gguf` file in the same folder; the model card says "Speculative decoding"): the
    draft layer guesses a few words ahead and the model checks them all at once, for faster replies with the same
    answers. It's on by default when available; the chat shows how many tokens each check produced. **Advanced** has more: flash attention, prompt batch size,
-   active experts per token, a seed for repeatable replies, how to split a model that doesn't fit in VRAM, a
-   **VRAM limit**, and **Force CPU**.
+   active experts per token, a seed for repeatable replies, how to split a model that doesn't fit in VRAM,
+   **Keep the busiest experts in VRAM** (off by default; see the [FAQ](FAQ.md)), a **VRAM limit**, and **Force CPU**.
+   Or click **Find the fastest settings** and let tierlm measure what's fastest on your PC.
 
 Click **Load and start chatting**. A bar shows the loading progress; big models take a minute or so, and the
 first time on a GPU it can take a little longer while the graphics driver prepares itself.
@@ -106,7 +107,8 @@ fold the menu away and give the chat more room.
 - **API**: the addresses for other apps, the **Allow other devices** switch and the API key (see below).
 - **Console**: what the engine is doing, as in its black window: loading, where each part went, every request
   and its speed. **Verbose** adds the graphics driver's and ggml's own messages. **Copy log** helps with bug reports.
-- **Model info**: the model, where each part of it lives, and the hot-expert cache preview.
+- **Model info**: the model, where each part of it lives, and the hot experts: how many are in VRAM and the share of
+  the expert work they did (**Forget** resets what tierlm has learned).
 - **Chats**: your past chats (kept in this browser), and system-prompt presets.
 - **Benchmark**: one click measures prompt reading and generation speed with the current settings, with a line to
   copy and share.

@@ -411,7 +411,11 @@
           <div>
             <label for="splitsel">When the model doesn't fit in VRAM</label>
             <select id="splitsel"><option value="auto">Automatic (recommended)</option><option value="layers">Split by whole layers</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
-            <div class="help">Automatic uses experts in RAM for mixture-of-experts models and whole layers for the rest. Experts in RAM: the GPU does all the attention and the CPU only the few experts each word picks, much faster for MoE models (Qwen3.6-35B-A3B on a laptop: 17 against 9.9 tok/s). Whole layers: the GPU and CPU hand over once per word; best for dense models.</div>
+            <div class="help">Automatic uses experts in RAM for mixture-of-experts models and whole layers for the rest. Experts in RAM: the GPU does all the attention and the CPU only the few experts each word picks, much faster for MoE models (Qwen3.6-35B-A3B on an RTX 3070 laptop: 33 against 13 tok/s). Whole layers: the GPU and CPU hand over once per word; best for dense models.</div>
+          </div>
+          <div>
+            <label class="chk"><input type="checkbox" id="hotexp"> Keep the busiest experts in VRAM</label>
+            <div class="help">Mixture-of-experts models split with experts in RAM: tierlm learns which experts this model uses most as you chat, and the next time it loads, puts those in VRAM instead of whole expert layers. Off by default: whether it beats the plain split depends on the PC. <b>Find the fastest settings</b> learns the experts straight away, measures both and turns this on only if it wins.</div>
           </div>
           <div>
             <label for="vramlim">VRAM limit (GiB)</label>
@@ -535,6 +539,8 @@
           <div class="tier"><div class="name"><span class="sw" style="background:var(--ssd)"></span>SSD</div><div class="val" id="t-ssd">0 GiB</div><div class="sub">coming soon</div></div>
         </div>
         <div class="note" id="devmem">–</div>
+        <div class="note" id="hotnote" hidden></div>
+        <button class="tiny ghost" id="hotforget" hidden>Forget what tierlm learned about this model</button>
         <div class="note" id="densenote" hidden></div>
         <div id="hitcard">
           <div class="subhead">Hot-expert cache preview</div>
@@ -633,7 +639,7 @@
         <div class="maphelp" id="maphelp" hidden>
           <p>This model is a <b>mixture of experts</b>: each of its <span class="hL">–</span> layers has <span class="hE">–</span> small specialist networks, and for every word a router picks just <span class="hK">–</span> of them.</p>
           <p>Each <b>row</b> is a layer (top = first). In <b>Sorted</b> view each row lists its experts busiest first; <b>Brighter</b> = picked more often this session, and a <b>flash</b> = picked for the word just written. Hover for details.</p>
-          <p>The strip on the left shows where each layer's experts live: <span class="swatch v"></span> VRAM (fast) or <span class="swatch r"></span> RAM. When a few experts do most of the work, keeping those in VRAM makes the model faster.</p>
+          <p>The strip on the left shows where each layer's experts live: <span class="swatch v"></span> VRAM (fast) or <span class="swatch r"></span> RAM; a part-filled strip means only that layer's busiest experts are in VRAM, and those are <b>ringed</b>. When a few experts do most of the work, keeping those in VRAM makes the model faster, and tierlm learns which ones as you chat.</p>
         </div>
         <div class="row maptools">
           <button class="tiny on" id="m-sorted">Sorted</button>
@@ -687,7 +693,7 @@ const $ = id => document.getElementById(id);
 const fmtGiB = b => !b ? "0 GiB" : b < 1073741824 ? Math.max(0.1, b / 1048576).toFixed(b < 10485760 ? 1 : 0) + " MiB" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 1 : 2) + " GiB";
 let info = null, L = 16, E = 64, K = 8;
 let counts = new Float64Array(L * E), flash = new Float64Array(L * E), totalPicks = 0;
-let mapMode = "heat", mapSorted = true, ffnVram = [], history = [], busy = false, controller = null;
+let mapMode = "heat", mapSorted = true, ffnVram = [], hotSets = [], history = [], busy = false, controller = null;
 let speedPts = [], tokTimes = [], tokCount = 0;   // speed vs. context
 
 // ---------- info ----------
@@ -710,6 +716,19 @@ async function loadInfo() {
   document.querySelectorAll(".hE").forEach(x => x.textContent = E);
   document.querySelectorAll(".hK").forEach(x => x.textContent = K);
   ffnVram = info.ffn_vram || [];
+  hotSets = (info.hot || []).map(a => new Set(a));
+  const hn = $("hotnote"), learned = info.learned_tokens || 0;
+  if (moe && info.hot_experts > 0) {
+    hn.hidden = false;
+    hn.innerHTML = `<b>${info.hot_experts.toLocaleString()} of ${(L * E).toLocaleString()} experts</b> are in VRAM: the ones this model has used most, ` +
+      `learned from about ${learned.toLocaleString()} words so far` + (info.hot_share > 0 ? `; they did ${Math.round(info.hot_share * 100)}% of the expert work` : "") +
+      `. They're ringed on the expert map. It keeps learning as you chat; the next load uses what it learned.`;
+  } else if (moe && info.ram_weights > 0 && info.split_mode === "experts") {
+    hn.hidden = false;
+    hn.textContent = learned > 0 ? `tierlm has learned this model's busiest experts from about ${learned.toLocaleString()} words. Turn on "Keep the busiest experts in VRAM" and load again to put them in VRAM; Find the fastest settings checks whether that's faster on this PC.`
+      : "tierlm learns which experts this model uses as you chat. With \"Keep the busiest experts in VRAM\" on, the busiest go in VRAM at the next load; Find the fastest settings learns them straight away and checks whether that's faster.";
+  } else hn.hidden = true;
+  $("hotforget").hidden = !(moe && learned > 0);
   renderMiniMem();
   syncLiveSpec();
   $("devname").textContent = info.device;
@@ -727,11 +746,14 @@ async function loadInfo() {
     const kvv = kv * (info.kv_gpu_layers || 0) / L, kvr = kv - kvv;
     const layersMode = info.split_mode !== "experts";
     $("t-vram").textContent = fmtGiB(vw + kvv);
+    const hotN = info.hot_experts || 0;
     $("t-vram-sub").textContent = rw <= 0 ? "the whole model + KV cache"
+      : hotN > 0 && !layersMode ? "attention " + info.attn_gpu + "/" + L + ", the " + hotN.toLocaleString() + " busiest experts" + (info.kv_on_gpu ? " + KV cache" : "")
       : layersMode ? info.ffn_gpu + " of " + L + " layers + their KV cache"
       : "attention " + info.attn_gpu + "/" + L + ", " + what(info.ffn_gpu) + (info.kv_on_gpu ? " + KV cache" : "");
     $("t-ram").textContent = fmtGiB(rw + kvr);
     $("t-ram-sub").textContent = rw <= 0 ? "spill-over tier (not needed)"
+      : hotN > 0 && !layersMode ? "the other " + (L * E - hotN).toLocaleString() + " experts" + (kvr > 0 ? " + KV cache" : "") + ", computed by the CPU"
       : (layersMode ? (L - info.ffn_gpu) + " of " + L + " layers" + (kvr > 0 ? " + their KV cache" : "") : what(L - info.ffn_gpu) + (kvr > 0 ? " + KV cache" : "")) + ", computed by the CPU";
   } else {
     $("t-vram").textContent = "0 GiB"; $("t-vram-sub").textContent = "no GPU in use";
@@ -874,7 +896,12 @@ function draw(now) {
   const lo = css("--heat-lo"), fl = css("--flash"), cv = css("--vram"), cr = css("--ram");
   rowOrder = mapSorted ? sortedRows() : null;
   for (let l = 0; l < L; l++) {
-    if (ffnVram.length === L) { mctx.fillStyle = ffnVram[l] ? cv : cr; mctx.fillRect(0, l * ch + gap / 2, strip - 2 * dpr, ch - gap); }
+    const hotRow = hotSets[l] && hotSets[l].size && hotSets[l].size < E ? hotSets[l] : null;
+    if (hotRow) {                                                    // part of this layer's experts are in VRAM
+      const f = hotRow.size / E;
+      mctx.fillStyle = cr; mctx.fillRect(0, l * ch + gap / 2, strip - 2 * dpr, ch - gap);
+      mctx.fillStyle = cv; mctx.fillRect(0, l * ch + gap / 2, (strip - 2 * dpr) * f, ch - gap);
+    } else if (ffnVram.length === L) { mctx.fillStyle = ffnVram[l] ? cv : cr; mctx.fillRect(0, l * ch + gap / 2, strip - 2 * dpr, ch - gap); }
     for (let pos = 0; pos < E; pos++) {
       const e = rowOrder ? rowOrder[l][pos] : pos, i = l * E + e, x = strip + pos * cw, y = l * ch;
       mctx.fillStyle = mapMode === "heat" && mx > 0 && counts[i] > 0 ? heatColor(Math.log1p(counts[i]) / Math.log1p(mx)) : lo;
@@ -886,6 +913,10 @@ function draw(now) {
         mctx.globalAlpha = 1;
         flash[i] *= Math.exp(-dt * 5);
       } else flash[i] = 0;
+      if (hotRow && hotRow.has(e) && cw >= 3 * dpr) {                // ringed: kept in VRAM
+        mctx.strokeStyle = css("--ink"); mctx.lineWidth = Math.max(1, 1.5 * dpr);
+        mctx.strokeRect(x + gap / 2 + 0.5, y + gap / 2 + 0.5, Math.max(1, cw - gap) - 1, Math.max(1, ch - gap) - 1);
+      }
     }
   }
   drawSpeed();
@@ -933,7 +964,8 @@ map.addEventListener("mousemove", ev => {
   const c = counts[l * E + e];
   const tip = $("tip");
   tip.textContent = `Layer ${l + 1} · expert #${e} · picked ${c.toLocaleString()}×` + (row ? ` (${(100 * c / row).toFixed(1)}% of this layer)` : "") +
-    (ffnVram.length === L ? (ffnVram[l] ? " · in VRAM" : " · in RAM") : "");
+    (hotSets[l] && hotSets[l].size && hotSets[l].size < E ? (hotSets[l].has(e) ? " · in VRAM (busy expert)" : " · in RAM") :
+     ffnVram.length === L ? (ffnVram[l] ? " · in VRAM" : " · in RAM") : "");
   tip.style.display = "block"; tip.style.left = ev.clientX + 12 + "px"; tip.style.top = ev.clientY + 12 + "px";
 });
 map.addEventListener("mouseleave", () => $("tip").style.display = "none");
@@ -1111,6 +1143,7 @@ function applySaved() {
   $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb / 1024).toFixed(1) : 0;
   // Settings saved before "Automatic" existed (no settings_v) had whole layers as the default: treat as Automatic.
   $("splitsel").value = (s.settings_v >= 2 || s.split_mode === "experts") && s.split_mode ? s.split_mode : "auto";
+  $("hotexp").checked = s.hot_experts === true;   // opt-in: Find the fastest settings turns it on where it wins
   const canSpec = !!(selModel && selModel.mtp);
   $("specon").disabled = !canSpec; $("specn").disabled = !canSpec;
   $("specon").checked = canSpec && s.speculative !== false;     // on by default when the model has a draft layer
@@ -1337,7 +1370,7 @@ function loadBody(p) {
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
+                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, hot_experts: $("hotexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
   if ($("forcecpu").checked) body.device = "cpu";
   return body;
 }
@@ -1609,6 +1642,12 @@ $("benchbtn").onclick = async () => {
   } catch (e) { $("benchline").textContent = "Could not run: " + e.message; $("b-prompt").textContent = $("b-gen").textContent = "–"; }
   setBusy(false);
   setContext(0);
+};
+
+$("hotforget").onclick = async () => {
+  if (busy || !confirm("Forget which experts this model uses? The next load goes back to whole expert layers until it learns again.")) return;
+  await api("/api/usage/reset", { method: "POST" });
+  await loadInfo();
 };
 
 // ---------- loading progress (setup screen) ----------

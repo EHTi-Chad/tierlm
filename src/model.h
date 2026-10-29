@@ -84,6 +84,10 @@ struct LoadOptions {
     // as further VRAM tiers, filled after the first one and before system RAM.
     bool multi_gpu = true;
     std::function<void(float)> progress;   // called while the weights are read, with the share done (0..1)
+    // Hot experts: how often each expert has been picked, n_layer x n_expert (from earlier use of this model). With
+    // experts in RAM, the most-used experts of each layer then go in VRAM ahead of whole expert layers, so most
+    // picks are served from fast memory. Empty: whole expert layers, as before.
+    std::vector<float> expert_usage;
 };
 
 // Where the time goes, accumulated over every eval_batch call (for profiling).
@@ -106,6 +110,9 @@ struct Placement {
     struct Gpu { std::string name; uint64_t weights = 0, kv = 0; int layers = 0; };
     std::vector<Gpu> gpus;                       // per GPU (more than one with several cards): what it holds
     std::vector<bool> ffn_vram;                  // per layer: its feed-forward part (the experts, in MoE models) is in VRAM
+    std::vector<std::vector<int>> hot;           // per layer: experts kept in VRAM by the hot-expert placement (all of
+                                                 // them when ffn_vram is set; empty when none or not used)
+    int hot_experts = 0;                         // experts in VRAM through the hot-expert placement, all layers
     bool split() const { return gpu_weights > 0 && cpu_weights > 0; }
 };
 
@@ -183,6 +190,7 @@ private:
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
         std::vector<ggml_tensor*> orders;        // router rankings per layer (when routing is wanted)
         std::vector<std::pair<ggml_tensor*, int>> owner;   // every op tensor of each layer, with its layer
+        std::vector<ggml_tensor*> cpu_ops;       // small ops that must run on the CPU (hot-expert bookkeeping)
     };
     Graph build(int n_tok, int n_past, bool want_routing, int n_logits = 1, bool want_hidden = false, int snapshots = 1);
     struct Layer;
@@ -200,6 +208,12 @@ private:
         ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;          // dense FFN
         ggml_tensor *router = nullptr, *gate_x = nullptr, *up_x = nullptr, *down_x = nullptr;   // experts
         ggml_tensor *gate_up_x = nullptr;                                     // gate+up experts in one tensor
+        // Hot-expert split: the layer's busiest experts in VRAM (..._h, plus one all-zero expert at the end), the rest
+        // in RAM (..._c, likewise). The router's picks are mapped to each part's own numbering; a pick that lives
+        // in the other part goes to the zero expert with weight 0.
+        ggml_tensor *gate_xh = nullptr, *up_xh = nullptr, *down_xh = nullptr, *gate_up_xh = nullptr;
+        ggml_tensor *gate_xc = nullptr, *up_xc = nullptr, *down_xc = nullptr, *gate_up_xc = nullptr;
+        ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *hot_mask = nullptr;   // [1, n_expert]
         ggml_tensor *up_s = nullptr, *gate_s = nullptr, *down_s = nullptr, *gate_inp_s = nullptr;   // shared expert
         ggml_tensor *k_cache = nullptr, *v_cache = nullptr;   // [head_dim, n_head_kv, max_ctx]
         // Hybrid models: Gated DeltaNet layer
@@ -223,12 +237,20 @@ private:
     Placement place_;
     EvalStats stats_;
     std::vector<ggml_backend_buffer*> kvbufs_;   // KV cache memory: VRAM part and RAM part
-    std::vector<uint8_t> graph_mem_;             // scratch for building graphs
+    // Scratch for building graphs, one per kind (one token; several tokens; the MTP draft block): the GPU keeps a
+    // recorded replay (CUDA graph) per graph, found by where it was built, so each kind keeps its own.
+    std::vector<uint8_t> graph_mem_[3];
+    std::vector<uint8_t>& graph_mem(int kind) { return graph_mem_[kind]; }
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
     std::vector<Layer> layers_;
     std::unique_ptr<Layer> mtp_;                 // the MTP draft block, when loaded
     std::vector<bool> layer_kv_gpu_;             // per layer: KV cache in VRAM
     std::vector<int> layer_dev_;                 // per layer: the GPU (index into gpus_) holding its KV cache, or -1 for RAM
+    struct { int graphs = 0; double tokens = 0, prep = 0, compute = 0, out = 0; } prof_;   // TIERLM_PROFILE
+    // Attention covers the cache in steps of 256 positions (the extra ones are masked out), so the graph keeps the
+    // same shapes from one token to the next and the GPU can replay it (CUDA graphs) instead of launching each op.
+    int kv_span(int n) const { const int s = (n + 255) / 256 * 256; return s < max_ctx_ ? s : (n > max_ctx_ ? n : max_ctx_); }
+    void profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms);
     bool pin_layers_ = false;                    // layer split: RAM layers must run entirely on the CPU
     std::string device_name_;
     int max_ctx_ = 0, n_past_ = 0;

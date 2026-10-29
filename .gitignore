@@ -3,3 +3,4 @@ build-*/
 dist/
 *.gguf
 tierlm-settings.json
+scripts/dev-test*

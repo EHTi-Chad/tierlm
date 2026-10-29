@@ -156,9 +156,10 @@ limited by RAM speed either way. The embedding table, looked up by row rather th
 - **Weights** are read from the GGUF file into a buffer on the chosen device (`ggml_backend_alloc_ctx_tensors`
   plus `ggml_backend_tensor_set`), streamed tensor by tensor.
 - **KV cache**: one K and one V tensor per layer, `[head_dim, n_kv_heads, max_ctx]`, stored in **f16** (half
-  the size and traffic of f32). Writing new entries is a `ggml_cpy` into a view at the current position;
-  attention reads a view of the first `n_past + n_new` positions. Truncating a conversation just moves
-  `n_past` back.
+  the size and traffic of f32), or 8 or 4 bits. New entries are written by index (`ggml_set_rows` with the token
+  positions as input), and attention reads the cache in steps of 256 positions, the ones not written yet masked
+  out, so the graph keeps the same shapes from one token to the next (see CUDA graphs below). Truncating a
+  conversation just moves `n_past` back.
 - **Scheduler.** Graphs run through `ggml_backend_sched`, with the main device first and the CPU as fallback,
   so any operation a GPU backend can't run is sent to the CPU automatically. Compute memory is reserved once,
   for the largest graph (a full 256-token batch at the end of the context), so it is not re-planned on every
@@ -166,6 +167,39 @@ limited by RAM speed either way. The embedding table, looked up by row rather th
 - **Routing capture.** When asked, each layer's expert ranking (`argsort` of router probabilities) is marked
   as an output and read back after the step. This is what feeds the dashboard's expert map, and it will feed
   the hot-expert cache.
+
+## Hot experts (adaptive tiering)
+
+A mixture-of-experts model picks a few experts per token, and some are picked far more than others: on real models a
+handful per layer take most of the picks. With experts in RAM, VRAM left after attention, routers and the KV cache
+used to hold whole expert layers. Now it holds the **most-used experts of any layer**:
+
+1. **Learning.** Every prompt and reply adds the router's picks to a per-model count (n_layer x n_expert), saved in
+   `tierlm-usage/` next to the settings file (counts only). Old habits fade: when the counts get large they're halved.
+   **Find the fastest settings** learns from a short mixed text (writing, code, maths, translation) when nothing has
+   been learned yet, then measures the result against whole expert layers.
+2. **Placing.** At load, experts are ranked by count and added to VRAM until it's full (never-used ones last), so a
+   layer can have all, some or none of its experts in VRAM.
+3. **Computing a split layer.** Its expert tensors become two: the chosen experts in VRAM and the rest in RAM, each
+   with one extra all-zero expert at the end. The router's picks are mapped into each part's own numbering (small
+   lookup tables) and get weight 0 in the part that doesn't hold them, so the sum is the same as unsplit. A pick
+   that lives in the other part has to point somewhere:
+   - **On the CPU** (the RAM part, a few tokens at a time) it gets id -1, which the CPU skips (a small change to
+     ggml, see [GGML_CHANGES.md](GGML_CHANGES.md)), so the CPU computes only the experts that are in RAM.
+   - **On a GPU** (the VRAM part, and the RAM part for prompts, which ggml hands to the GPU from 32 tokens) GPU
+     kernels need valid ids, and CUDA's also need each token's ids to be different. So such picks go to distinct
+     experts of that part that the token didn't pick, with weight 0 (a small CPU op, `distinct_ids`). Each part
+     therefore holds at least as many experts as a token picks.
+
+   The lookups, the weights and the RAM part run on the CPU and the VRAM part on the GPU, so the work changes device
+   twice per layer, as before.
+4. **Choosing.** It is off by default: on an RTX 3070 laptop with Qwen3.6-35B-A3B the VRAM experts did 71% of the
+   expert work, but the plain split was still faster (33.3 against 29.7 tok/s), because the split adds copies and
+   bookkeeping per layer. **Find the fastest settings** measures both and turns it on only where it wins.
+   With the timing switch on (`TIERLM_PROFILE=1`) the server prints where each token's time goes.
+
+The tests run every MoE model with made-up usage counts at many VRAM sizes, so layers end up whole, split or absent,
+and compare with the reference (exact on the stand-in GPU).
 
 ## Several GPUs
 
@@ -176,19 +210,32 @@ experts in RAM, each layer's attention, router and KV cache go on a GPU first (a
 then the experts: on their layer's GPU if it has room, else another GPU, else RAM. The tests run every model split
 over two stand-in GPUs (ggml's RPC backend) and RAM at many memory sizes, and compare with the reference.
 
+## CUDA graphs
+
+ggml can record the GPU kernels of a graph once and replay them with a single launch, but its build option for this
+(`GGML_CUDA_GRAPHS`) is off unless turned on, and a recording is only replayed while the graph's shapes and data
+pointers stay the same. tierlm turns it on and keeps its graphs steady: the KV cache is written by index and read in
+steps of 256 positions (above), and one-token steps, several-token steps and the MTP draft head are built in separate
+memory so each keeps its own recording. Without it, a laptop RTX 3070 spent about 22 ms per token mostly launching
+small jobs; with it, Qwen3.6-35B-A3B with experts in RAM went from 21.7 to 33.3 tok/s, with the same results.
+Details: [GGML_CHANGES.md](GGML_CHANGES.md).
+
 ## Auto-tune
 
 `/api/autotune` measures what only changes speed, one setting at a time in the order that matters most: the split
 mode (a reload each), then CPU threads, then speculative decoding with 1 to 4 guesses. Each measurement generates
 the same text greedily (end-of-reply tokens skipped, so every run is equally long) after a short warm-up, and runs
-for about 5 seconds. Threads and speculation only win by a clear margin (2-3%), so noise doesn't pick them.
+for about 5 seconds. Threads and speculation only win by a clear margin (2-3%), so noise doesn't pick them. Hot
+experts are kept on only if they measured fastest. Measuring greedily on a fixed text is repeatable but flatters
+speculative decoding a little (guesses are kept more often than in a real chat); measuring with the chat's own
+sampling settings is next.
 
 ## CPU and GPU at the same time
 
-With today's placement there is little to overlap: in each layer the CPU's experts need the GPU's attention and
-router, and the GPU's next layer needs the experts' result. Overlap appears once a layer's experts are split between
-VRAM (the busy ones) and RAM, which is the hot-expert cache; ggml's scheduler also runs device splits one after
-another and waits at every hand-off, so it needs changes there too. Planned together.
+With plain experts in RAM there is little to overlap: in each layer the CPU's experts need the GPU's attention and
+router, and the GPU's next layer needs the experts' result. With hot experts, a split layer's VRAM experts (and the
+shared expert) could run on the GPU while the CPU computes the RAM experts. ggml's scheduler runs device splits one
+after another and waits at every hand-off, so this needs changes there.
 
 ## Verification
 
@@ -201,6 +248,7 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 | Model graph | Plain NumPy reference of each architecture on tiny random models (`tests/tiny_models.py`: Llama, Llama 3 with RoPE factors, Mixtral, Qwen2, Qwen3, Qwen3 MoE, OLMoE) | ~2e-6 relative with an f32 cache, including flash attention, grouped-query attention, the KV cache and 300-token batched prompts |
 | Hybrid Qwen3.5 | Plain NumPy implementation of Hugging Face's Qwen3_5 forward pass on a tiny random model written the way the converter writes it (`tests/tiny_qwen35.py`), also split between GPU and RAM | ~1e-5 relative with an f32 cache; deliberately wrong file conventions fail |
 | Tokenizers without models | Small tokenizers trained with Hugging Face `tokenizers` and `sentencepiece` (`tests/trained_tokenizers.py`) | Exact token IDs for GPT-2, Llama 3 and Qwen2 splitting and SentencePiece |
+| Splits | Every model split between one or two stand-in GPUs (ggml's RPC backend) and RAM at many VRAM sizes, by layers, by experts and with made-up hot-expert usage | Same results as unsplit (~1e-6 with an f32 cache) |
 | Real model | "The capital of France is" | " Paris" at 62–64% on CPU and GPU |
 
 ## Design decisions so far
@@ -216,13 +264,13 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 
 ## What's next
 
-1. **Adaptive tiering: a hot-expert cache with learned placement.** Keep the experts the router actually picks most
-   in VRAM (the routing statistics are already collected), remember them per model between runs, and let the GPU
-   and CPU work on the same layer at once (its VRAM experts and its RAM experts).
+1. **CPU and GPU on the same layer at once**: with hot experts, a split layer's VRAM experts and RAM experts could run
+   in parallel; ggml's scheduler runs them one after the other today. Also moving experts between VRAM and RAM while
+   the model is loaded, as usage shifts, instead of at the next load.
 2. **SSD tier**: rarely used experts read from an NVMe drive when the router picks them, for models bigger than VRAM
    and RAM together.
 3. **Usage-based precision** (rarely used experts stored at lower precision) and **expert-aware speculation** (guess
    further ahead only while the guesses reuse experts that are already loaded).
 4. **More families and real-model tests**: Gemma 4, Phi, DeepSeek, gpt-oss; Qwen3-Coder-Next, Mixtral and Qwen2.5 on
    real weights. Tool calling in the API.
-5. Prompt-lookup guessing for models without a draft layer, CUDA graphs, and the Zen 4 / AMX CPU engines on Windows.
+5. Prompt-lookup guessing for models without a draft layer, and the Zen 4 / AMX CPU engines on Windows.
