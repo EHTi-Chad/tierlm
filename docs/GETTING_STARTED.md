@@ -142,7 +142,41 @@ apps**: it shows the address to give them, the **Allow other devices** switch, a
 URL `http://host.docker.internal:8040/v1` if Open WebUI runs in Docker on this computer (turn on **Allow other
 devices**: Docker's traffic doesn't count as this computer), or tierlm's network address if it runs elsewhere,
 and the API key if you set one. tierlm's models appear in Open WebUI's model list; picking one that isn't loaded
-loads it.
+loads it. (In the Open WebUI desktop app, the **Connections** list on the left is for other Open WebUI servers, not
+for tierlm: choose **Get Started** to run Open WebUI on this computer, then add tierlm in its Admin Panel as above.)
+
+**opencode (coding agent).** Install it with `npm install -g opencode-ai` (needs Node.js), then save this as
+`opencode.json` in `%USERPROFILE%\.config\opencode\` (on Linux, `~/.config/opencode/`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "tierlm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "tierlm",
+      "options": { "baseURL": "http://127.0.0.1:8040/v1", "timeout": false },
+      "models": {
+        "qwen3.6": {
+          "name": "Qwen3.6 (tierlm)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  },
+  "model": "tierlm/qwen3.6"
+}
+```
+
+Start `opencode` in your project folder. The model name can be anything that isn't a file in tierlm's models
+folder: tierlm then uses the model that's loaded. Set `context` to the context you load the model with, at least
+32K: opencode's instructions and tools are about 11,000 tokens. The first message of a session reads them (after
+a short request that names the session), so it takes longer; later messages reuse them from tierlm's cache.
+`"timeout": false` stops opencode from giving up while a long prompt is read on a slower PC. For tierlm on
+another computer, turn on **Allow other devices** there and use its network address in `baseURL`. Cline and
+Continue's agent mode work the same way, through their OpenAI-compatible provider.
 
 **Continue (VS Code / JetBrains).** Add a model to Continue's `config.yaml`:
 
@@ -159,8 +193,7 @@ models:
 needs a public HTTPS address from a tunnel, such as Cloudflare's `cloudflared tunnel --url http://localhost:8040`.
 Turn on **Allow other devices** and **set an API key** first (anyone who finds the tunnel's address could
 otherwise use your GPU). In Cursor's **Settings → Models**, enter the API key, set **Override OpenAI Base URL**
-to the tunnel's address plus `/v1`, and add the model name. Chat works; Cursor's agent mode needs tool calling,
-which tierlm doesn't have yet.
+to the tunnel's address plus `/v1`, and add the model name.
 
 Details: [API.md](API.md#openai-compatible-api).
 

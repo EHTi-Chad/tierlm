@@ -140,7 +140,8 @@ full download on a PC without an NVIDIA card, the black window may say CUDA foun
 **Can other apps use tierlm, like they use LM Studio or Ollama?**
 Yes: tierlm has an OpenAI-compatible API at `http://127.0.0.1:8040/v1`. Open WebUI, Continue, LibreChat and
 scripts using the OpenAI library work with it. See [Connect other apps](GETTING_STARTED.md#connect-other-apps).
-Coding agents that need tool calling (Cursor's agent mode, Cline) don't work yet.
+Coding agents work too (opencode, Cline, Continue's agent mode, and Cursor through a tunnel): tierlm's API does
+tool calling since 0.5.2. See [opencode](GETTING_STARTED.md#connect-other-apps).
 
 **Another computer, my phone or Open WebUI in Docker can't connect**
 Turn on **Allow other devices** in **Connect other apps** on the setup screen, and use the network address it

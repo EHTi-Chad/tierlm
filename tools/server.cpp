@@ -26,7 +26,7 @@
 // OpenAI-compatible API, for apps such as Open WebUI, Continue or anything built on the OpenAI SDK
 // (base URL http://<this computer>:<port>/v1; see docs/API.md):
 //   GET  /v1/models            the loaded model and every supported model in the models folder
-//   POST /v1/chat/completions  chat, streamed or not; naming another model loads it first
+//   POST /v1/chat/completions  chat, streamed or not, with tool calling; naming another model loads it first
 #include "model.h"
 #include "speculate.h"
 #include "gguf_split.h"
@@ -35,6 +35,7 @@
 #include "ggml-backend.h"
 #include "httplib.h"
 #include "json.hpp"
+#include "agent.h"
 
 #include <climits>
 #include <algorithm>
@@ -125,6 +126,35 @@ ChatFmt detect_chat(const Tokenizer& tok) {
     if (tok.find("<|user|>") >= 0) return ChatFmt::Tulu;
     if (tok.find("[INST]") >= 0 || tok.spm()) return ChatFmt::Mistral;
     return ChatFmt::Plain;
+}
+
+// Tool calling in a conversation, made plain for format_chat: the tools go into the system message, an assistant
+// message's tool calls are written out the way the model writes them (unless its text already has them, as the
+// page sends it), and tool results become a user turn of <tool_response> blocks, as Qwen's chat templates do.
+json with_tools(const json& messages, const json& tools, agent::ToolFmt tf) {
+    json out = json::array();
+    const bool use = tools.is_array() && !tools.empty();
+    size_t i = 0;
+    std::string system;
+    if (!messages.empty() && messages[0].value("role", std::string()) == "system") { system = messages[0].value("content", std::string()); i = 1; }
+    if (use) out.push_back({{"role", "system"}, {"content", agent::system_with_tools(tf, system, tools)}});
+    else if (i == 1) out.push_back(messages[0]);
+    for (; i < messages.size(); ++i) {
+        const json& m = messages[i];
+        const std::string role = m.value("role", std::string("user"));
+        if (role == "tool") {
+            std::string c;
+            for (; i < messages.size() && messages[i].value("role", std::string()) == "tool"; ++i)
+                c += std::string(c.empty() ? "" : "\n") + "<tool_response>\n" + agent::trim(messages[i].value("content", std::string())) + "\n</tool_response>";
+            --i;
+            out.push_back({{"role", "user"}, {"content", c}});
+        } else if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
+            std::string c = m.value("content", std::string());
+            if (c.find(agent::kToolOpen) == std::string::npos) c += agent::render_tool_calls(tf, m["tool_calls"], !agent::trim(c).empty());
+            out.push_back({{"role", "assistant"}, {"content", c}});
+        } else out.push_back({{"role", role}, {"content", m.value("content", std::string())}});
+    }
+    return out;
 }
 
 std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok) {
@@ -376,6 +406,7 @@ struct Engine {
     std::unique_ptr<Model> model;
     Tokenizer tok;
     ChatFmt chat = ChatFmt::Plain;
+    agent::ToolFmt tool_fmt = agent::ToolFmt::Hermes;   // how this model writes tool calls
     std::vector<int32_t> cached;      // the tokens currently in the KV cache
     std::string path, name;
     int threads = 1, seed = -1;
@@ -487,7 +518,8 @@ json describe_model(const std::string& path) {
 
 // OpenAI messages to plain {role, content} ones. Content may be a string, a list of parts
 // ([{"type": "text", "text": ...}], images are skipped: no vision yet) or null. "developer" is OpenAI's newer
-// name for "system"; tool results become user turns so the model still sees them.
+// name for "system". Tool calls ({"function": {"name", "arguments": "<json>"}}) are kept as {"name", "arguments": {...}},
+// and tool results as role "tool".
 json normalize_messages(const json& in) {
     json out = json::array();
     for (const auto& m : in) {
@@ -501,9 +533,31 @@ json normalize_messages(const json& in) {
                 else if (part.is_object() && part.value("type", std::string()) == "text") text += part.value("text", std::string());
             }
         if (role == "developer") role = "system";
-        if (role == "tool" || role == "function") { role = "user"; text = "Tool result:\n" + text; }
-        if (role != "system" && role != "user" && role != "assistant") role = "user";
-        out.push_back({{"role", role}, {"content", text}});
+        if (role == "function") role = "tool";
+        if (role != "system" && role != "user" && role != "assistant" && role != "tool") role = "user";
+        // Thinking sent back separately (reasoning_content) goes back where the model wrote it.
+        if (role == "assistant" && m.contains("reasoning_content") && m["reasoning_content"].is_string() &&
+            !m["reasoning_content"].get<std::string>().empty() && text.find("<think>") == std::string::npos)
+            text = "<think>\n" + m["reasoning_content"].get<std::string>() + "\n</think>\n\n" + text;
+        json o = {{"role", role}, {"content", text}};
+        if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
+            json calls = json::array();
+            for (const auto& tc : m["tool_calls"]) {
+                const json f = agent::tool_function(tc);
+                if (!f.is_object()) continue;
+                json args = f.contains("arguments") ? f["arguments"] : json::object();
+                json call = {{"name", f.value("name", std::string())}};
+                if (args.is_string()) {                            // as sent: keeps the order the model wrote them in
+                    call["arguments_json"] = args;
+                    json p = json::parse(args.get<std::string>(), nullptr, false);
+                    args = p.is_object() ? p : json::object();
+                }
+                call["arguments"] = args.is_object() ? args : json::object();
+                calls.push_back(call);
+            }
+            if (!calls.empty()) o["tool_calls"] = calls;
+        }
+        out.push_back(o);
     }
     return out;
 }
@@ -695,6 +749,7 @@ int main(int argc, char** argv) {
         if (eng.draft_max <= 0) eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
         if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max);
         eng.chat = detect_chat(eng.tok);
+        eng.tool_fmt = agent::detect_tool_fmt(eng.tok.chat_template());
         eng.path = path;
         eng.name = gguf_string(path, "general.name");
         eng.threads = threads > 0 ? threads : a.threads;
@@ -991,18 +1046,24 @@ int main(int argc, char** argv) {
     //   on_token   for each piece of new text (with the experts each layer picked); return false to stop
     // `stops` are strings that end the reply (OpenAI's "stop"); text that might be the start of one is held back.
     struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0, drafted = 0, accepted = 0, checks = 0; double prompt_s = 0, gen_s = 0;
-                 std::string stop = "length", text; };
-    auto generate = [&](const json& messages, const Sampling& sp, int max_tokens, const std::vector<std::string>& stops,
+                 std::string stop = "length", text, full; };
+    // With `tools`, the model is told about them, and a tool call it writes is kept out of the streamed text (it is
+    // in `full`, the whole reply as the model wrote it, for agent::parse_tool_calls).
+    auto generate = [&](const json& messages, const Sampling& sp, int max_tokens, const std::vector<std::string>& stops_in,
                         const std::function<void(const json&)>& on_prompt,
-                        const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token) {
+                        const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token,
+                        const json& tools = json()) {
         Gen r;
+        const bool use_tools = tools.is_array() && !tools.empty();
+        std::vector<std::string> stops = stops_in;
+        if (use_tools) stops.push_back("<tool_response>");     // the model must not write the tool's answer itself
         if (max_tokens <= 0) max_tokens = INT_MAX;    // no limit: until the model finishes or the context is full
         if (eng.seed >= 0) eng.rng.seed((uint32_t)eng.seed);    // same seed, same reply
         auto& model = eng.model; auto& tok = eng.tok; auto& cached = eng.cached;
         const auto& hp = model->hparams();
         const int L = hp.n_layer, E = hp.n_expert, K = hp.n_expert_used;
 
-        std::vector<int32_t> toks = tok.encode(format_chat(messages, eng.chat, tok), true);
+        std::vector<int32_t> toks = tok.encode(format_chat(with_tools(messages, tools, eng.tool_fmt), eng.chat, tok), true);
         if ((int)toks.size() + 1 >= model->max_ctx()) throw std::runtime_error("conversation is longer than the context window; start a new chat");
 
         // Reuse whatever part of the KV cache still matches this conversation.
@@ -1061,13 +1122,29 @@ int main(int argc, char** argv) {
             size_t cut = std::string::npos;
             for (const auto& st : stops)
                 if (!st.empty()) { size_t p = visible.find(st, shown > st.size() ? shown - st.size() : 0); if (p < cut) cut = p; }
-            if (cut != std::string::npos) { emit(visible, std::max(cut, shown)); r.stop = "stop"; return false; }
+            if (cut != std::string::npos) {
+                r.full = visible.substr(0, cut);
+                const size_t tc = use_tools ? agent::tool_call_pos(r.full) : std::string::npos;
+                emit(visible, std::max(std::min(cut, tc), shown));
+                r.stop = "stop";
+                return false;
+            }
             // Hold back text that could be the start of a stop string.
             size_t hold = 0;
             for (const auto& st : stops)
                 for (size_t k = st.empty() ? 0 : std::min(st.size() - 1, visible.size()); k > hold; --k)
                     if (visible.compare(visible.size() - k, k, st, 0, k) == 0) { hold = k; break; }
-            if (!emit(visible, visible.size() - hold)) { r.stop = "abort"; return false; }
+            size_t limit = visible.size() - hold;
+            if (use_tools) {                                       // a tool call isn't shown as text
+                const size_t tc = agent::tool_call_pos(visible);
+                if (tc != std::string::npos) limit = std::min(limit, tc);
+                else if (agent::answer_start(visible) != std::string::npos) {
+                    const std::string mk = agent::kToolOpen;
+                    for (size_t k = std::min(mk.size() - 1, visible.size()); k > 0; --k)
+                        if (visible.compare(visible.size() - k, k, mk, 0, k) == 0) { limit = std::min(limit, visible.size() - k); break; }
+                }
+            }
+            if (!emit(visible, limit)) { r.stop = "abort"; return false; }
             return true;
         };
         if (!eng.spec) {
@@ -1120,7 +1197,11 @@ int main(int argc, char** argv) {
             const SpecStats& st = eng.spec->stats();
             r.drafted = st.drafted; r.accepted = st.accepted; r.checks = st.steps;
         }
-        if (r.stop != "stop" && r.stop != "abort") emit(visible, visible.size());   // release held-back text
+        if (r.stop != "stop") r.full = visible;
+        if (r.stop != "stop" && r.stop != "abort") {                                  // release held-back text
+            const size_t tc = use_tools ? agent::tool_call_pos(visible) : std::string::npos;
+            emit(visible, tc == std::string::npos ? visible.size() : tc);
+        }
         r.n_gen = out.size();
         r.gen_s = since(g0);
         eng.save_usage();
@@ -1624,6 +1705,13 @@ int main(int argc, char** argv) {
         }
         if (body.contains("seed") && body["seed"].is_number_integer()) eng.rng.seed((uint32_t)body["seed"].get<long long>());
         const json messages = normalize_messages(body["messages"]);
+        // Tools (coding agents such as opencode, Cline or Cursor): the model may answer with tool calls, which the
+        // app runs and sends back as "tool" messages. tool_choice "none" leaves them out.
+        json tools = json::array();
+        if (body.contains("tools") && body["tools"].is_array())
+            for (const auto& t : body["tools"])
+                if (agent::tool_function(t).is_object() && agent::tool_function(t).contains("name")) tools.push_back(t);
+        if (body.contains("tool_choice") && body["tool_choice"].is_string() && body["tool_choice"].get<std::string>() == "none") tools = json::array();
         const bool stream = body.value("stream", false);
         const bool usage_in_stream = body.contains("stream_options") && body["stream_options"].is_object() &&
                                      body["stream_options"].value("include_usage", false);
@@ -1633,13 +1721,34 @@ int main(int argc, char** argv) {
         static std::atomic<unsigned> counter{0};
         const std::string id = "chatcmpl-tierlm-" + std::to_string(created) + "-" + std::to_string(++counter);
         auto finish = [](const std::string& stop) { return stop == "length" || stop == "context" ? "length" : "stop"; };
+        // The reply's tool calls in OpenAI's form: arguments as a JSON string, each with an id.
+        auto openai_calls = [id](const json& calls) {
+            json out = json::array();
+            for (size_t i = 0; i < calls.size(); ++i)
+                out.push_back({{"id", "call_" + id.substr(id.size() > 8 ? id.size() - 8 : 0) + "_" + std::to_string(i)}, {"type", "function"},
+                               {"function", {{"name", calls[i]["name"]}, {"arguments", calls[i].value("arguments_json", dump(calls[i]["arguments"]))}}}});
+            return out;
+        };
 
         if (!stream) {
             try {
-                Gen g = generate(messages, sp, max_tokens, stops, nullptr, nullptr);
+                Gen g = generate(messages, sp, max_tokens, stops, nullptr, nullptr, tools);
+                json msg = {{"role", "assistant"}, {"content", g.text}};
+                std::string fin = finish(g.stop);
+                if (!tools.empty()) {
+                    const agent::Parsed pc = agent::parse_tool_calls(g.full, tools);
+                    const auto [reasoning, answer] = agent::split_thinking(pc.calls.empty() ? g.text : pc.content);
+                    msg["content"] = answer;
+                    if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
+                    if (!pc.calls.empty()) {
+                        if (answer.empty()) msg["content"] = nullptr;
+                        msg["tool_calls"] = openai_calls(pc.calls);
+                        fin = "tool_calls";
+                    }
+                }
                 res.set_content(dump({{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", model_id},
-                    {"choices", json::array({{{"index", 0}, {"message", {{"role", "assistant"}, {"content", g.text}}},
-                                              {"logprobs", nullptr}, {"finish_reason", finish(g.stop)}}})},
+                    {"choices", json::array({{{"index", 0}, {"message", msg},
+                                              {"logprobs", nullptr}, {"finish_reason", fin}}})},
                     {"usage", {{"prompt_tokens", g.n_prompt}, {"completion_tokens", g.n_gen}, {"total_tokens", g.n_prompt + g.n_gen}}}}),
                     "application/json");
             } catch (const std::exception& e) {
@@ -1648,7 +1757,7 @@ int main(int argc, char** argv) {
             return;
         }
         res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider("text/event-stream", [&, messages, sp, max_tokens, stops, usage_in_stream, model_id, created, id, lock]
+        res.set_chunked_content_provider("text/event-stream", [&, messages, tools, openai_calls, sp, max_tokens, stops, usage_in_stream, model_id, created, id, lock]
                                                               (size_t, httplib::DataSink& sink) {
             auto send = [&](const json& j) { std::string s = "data: " + dump(j) + "\n\n"; return sink.write(s.data(), s.size()); };
             auto chunk = [&](const json& delta, const json& fin) {
@@ -1657,12 +1766,31 @@ int main(int argc, char** argv) {
             };
             try {
                 chunk({{"role", "assistant"}, {"content", ""}}, nullptr);
+                agent::ThinkSplit split;                            // with tools, thinking goes out as reasoning_content
+                auto send_parts = [&](const std::pair<std::string, std::string>& p) {
+                    bool ok = true;
+                    if (!p.first.empty()) ok = chunk({{"reasoning_content", p.first}}, nullptr);
+                    if (ok && !p.second.empty()) ok = chunk({{"content", p.second}}, nullptr);
+                    return ok;
+                };
                 Gen g = generate(messages, sp, max_tokens, stops, nullptr,
                                  [&](const std::string& delta, double, const std::vector<int32_t>&) {
-                                     return delta.empty() ? true : chunk({{"content", delta}}, nullptr);
-                                 });
+                                     if (delta.empty()) return true;
+                                     return tools.empty() ? chunk({{"content", delta}}, nullptr) : send_parts(split.feed(delta));
+                                 }, tools);
+                if (!tools.empty() && g.stop != "abort") send_parts(split.feed("", true));
                 if (g.stop != "abort") {
-                    chunk(json::object(), finish(g.stop));
+                    std::string fin = finish(g.stop);
+                    if (!tools.empty()) {
+                        const agent::Parsed pc = agent::parse_tool_calls(g.full, tools);
+                        if (!pc.calls.empty()) {
+                            json calls = openai_calls(pc.calls);
+                            for (size_t i = 0; i < calls.size(); ++i) calls[i]["index"] = (int)i;
+                            chunk({{"tool_calls", calls}}, nullptr);
+                            fin = "tool_calls";
+                        }
+                    }
+                    chunk(json::object(), fin);
                     if (usage_in_stream)
                         send({{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model_id},
                               {"choices", json::array()},

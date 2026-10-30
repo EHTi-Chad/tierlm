@@ -51,21 +51,39 @@ model's path inside the folder, e.g. `lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qw
 | Field | Notes |
 |---|---|
 | `model` | An `id` from `/v1/models` loads that model first (with the settings last used for it in tierlm), which takes as long as loading it on the setup screen. Any other name, such as `gpt-4o`, uses the loaded model. |
-| `messages` | `system`, `developer` (same as system), `user`, `assistant`. Content can be a string or a list of text parts; images are skipped (no vision yet). `tool` messages are passed to the model as user text. |
+| `messages` | `system`, `developer` (same as system), `user`, `assistant`. Content can be a string or a list of text parts; images are skipped (no vision yet). Also `tool` (a tool's result), and `assistant` messages with `tool_calls` and `reasoning_content`. |
+| `tools`, `tool_choice` | OpenAI function tools. The model may answer with `tool_calls` instead of text (see Tool calling below). `tool_choice: "none"` leaves the tools out. |
 | `stream` | `true` streams `chat.completion.chunk` events, ending with `data: [DONE]`. `stream_options: {"include_usage": true}` adds a final chunk with token counts. |
 | `max_tokens`, `max_completion_tokens` | Longest reply. Left out: no limit (until the model finishes or the context is full). |
 | `temperature`, `top_p`, `seed`, `stop` | As in OpenAI. `stop` is a string or a list of strings; the reply ends just before one. |
 | `top_k`, `min_p`, `repeat_penalty` | Extras, as in LM Studio and llama.cpp. `repeat_penalty` is off (1.0) unless given, because it harms code. |
 
 The reply includes `usage` (`prompt_tokens`, `completion_tokens`). `finish_reason` is `stop` (the model
-finished, or a stop string), or `length` (`max_tokens`, or the context window is full).
+finished, or a stop string), `tool_calls` (the model wants tools run), or `length` (`max_tokens`, or the context
+window is full).
+
+#### Tool calling
+
+For coding agents such as opencode, Cline, Continue's agent mode and Cursor. tierlm describes the tools to the model
+in the format it was trained on (Qwen3.5 / 3.6 and Qwen3-Coder write `<tool_call><function=...>` blocks; Qwen3,
+Qwen2.5 and other models the JSON form `<tool_call>{"name": ..., "arguments": ...}</tool_call>`) and reads its calls
+back out as OpenAI `tool_calls`, with `arguments` as a JSON string, and `finish_reason: "tool_calls"`. Several calls
+in one reply are returned together. tierlm never runs a tool itself: the app does, and sends the result back as a
+`tool` message.
+
+When a request has tools, a thinking model's reasoning (`<think>...</think>`) is sent apart from the answer, as
+`reasoning_content` (in the message, or in the stream's deltas), the way llama.cpp and DeepSeek do; an app that
+sends it back keeps the model's memory of the conversation exact. Streamed, the answer text arrives as it is
+written and the tool calls arrive whole in one chunk at the end. Without tools, replies are as before.
+
+Coding agents send long prompts (opencode's instructions and tool list are about 11,000 tokens): load the model
+with a context of at least 32K. The first request reads all of it; later ones reuse it from the cache.
 
 One reply is generated at a time. Requests from apps wait their turn; while one is running, the web page's
 own chat answers "busy". Requests share the model's memory of the conversation, so an app that resends a
 growing conversation only pays for the new part.
 
-Not yet: tool (function) calling, which coding agents such as Cursor's agent mode, Cline and Continue's agent
-mode need; `logprobs`; `n` > 1; embeddings; images.
+Not yet: `logprobs`; `n` > 1; embeddings; images.
 
 Errors use OpenAI's format: `{"error": {"message": "...", "type": "...", "code": ...}}`.
 

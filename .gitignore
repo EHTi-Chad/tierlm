@@ -4,3 +4,4 @@ dist/
 *.gguf
 tierlm-settings.json
 scripts/dev-test*
+scripts/dev-update*

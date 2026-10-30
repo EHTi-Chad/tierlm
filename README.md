@@ -106,9 +106,9 @@ decoding helps most.
   files, or a separate `mtp-*.gguf` next to the model): the model checks several guessed tokens in one pass, so
   each read of its weights from RAM produces more than one token. Same answers, faster replies; most useful when the
   model doesn't fit in VRAM. Plus **8-bit and 4-bit context memory** (KV cache) to fit more of the model in VRAM.
-- **OpenAI-compatible API** (`/v1/models`, `/v1/chat/completions`, streamed or not): Open WebUI, Continue, LibreChat
-  and anything built on the OpenAI SDK can use tierlm. An **Allow other devices** switch and an optional API key
-  control who can connect. See [docs/API.md](docs/API.md) and [Connect other apps](docs/GETTING_STARTED.md#connect-other-apps).
+- **OpenAI-compatible API** (`/v1/models`, `/v1/chat/completions`, streamed or not, with tool calling): Open WebUI,
+  Continue, LibreChat, coding agents such as opencode and Cline, and anything built on the OpenAI SDK can use tierlm.
+  An **Allow other devices** switch and an optional API key control who can connect. See [docs/API.md](docs/API.md) and [Connect other apps](docs/GETTING_STARTED.md#connect-other-apps).
 
 ## Benchmarks
 
@@ -338,13 +338,13 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [ ] SSD tier (stream rarely used weights from disk)
 - [ ] Search and download GGUF models from Hugging Face inside tierlm
 - [x] OpenAI-compatible API, with an Allow other devices switch and optional API key
-- [ ] Tool (function) calling in the API, for coding agents (Cursor agent mode, Cline, Continue agent)
+- [x] Tool (function) calling in the API, for coding agents (opencode, Cline, Continue agent, Cursor agent mode)
 - [x] NVIDIA (CUDA) testing on an RTX 5090
 - [ ] AMD GPU testing via Vulkan/ROCm
 - [x] Several GPUs as VRAM tiers; auto-tuning of the speed settings; new chat layout with console, chats and benchmark
 - [x] Hot experts: per-model expert usage learned from use, the busiest experts kept in VRAM
 - [x] CUDA graphs: each token's GPU work replayed with one launch (about 50% faster generation than 0.4.0 on a laptop RTX 3070)
-- [ ] Find the fastest settings measured like a real chat (your sampling settings, longer replies)
+- [x] Find the fastest settings measured like a real chat (your sampling settings, longer replies)
 - [ ] CPU and GPU working on the same layer at once (the VRAM and RAM experts of a layer in parallel; needs changes to ggml's scheduler)
 - [x] Speculative decoding with the built-in MTP draft layer; 8-bit and 4-bit KV cache
 - [ ] Prompt-lookup drafting (free guesses for code and edits); activation sparsity for dense models

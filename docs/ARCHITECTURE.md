@@ -274,5 +274,5 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 3. **Usage-based precision** (rarely used experts stored at lower precision) and **expert-aware speculation** (guess
    further ahead only while the guesses reuse experts that are already loaded).
 4. **More families and real-model tests**: Gemma 4, Phi, DeepSeek, gpt-oss; Qwen3-Coder-Next, Mixtral and Qwen2.5 on
-   real weights. Tool calling in the API.
+   real weights.
 5. Prompt-lookup guessing for models without a draft layer, and the Zen 4 / AMX CPU engines on Windows.
