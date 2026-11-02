@@ -299,6 +299,10 @@ for variant in NAMES:
             plain, _ = gen("--gen")
             checks = [gen("--gen-spec")] + [gen("--gen-spec", {"TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k})
                                             for k in ("3", "5")]
+            # Long guesses, as prompt lookup makes: 8 at a time, wrong at different depths; and the lookup guesser itself.
+            checks += [gen("--gen-spec", {"TIERLM_DRAFT_N": "8", "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k})
+                       for k in ("2", "7", "9")]
+            checks += [gen("--gen-spec", {"TIERLM_LOOKUP": "8"})]
             same = all(c[0] == plain for c in checks)
             ok &= same
             print(f"{name + tag:16s}{'spec':7s}: greedy output with speculation {'identical' if same else 'DIFFERENT'} "

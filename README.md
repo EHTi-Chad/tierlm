@@ -10,7 +10,7 @@ in [docs/GGML_CHANGES.md](docs/GGML_CHANGES.md); the tokenizer, model graph, KV 
 server and dashboard are all tierlm's own. It does not use llama.cpp.
 
 It runs the common model families (**Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8
-dense and MoE, Qwen3-Next, OLMoE**) on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with
+dense and MoE, Qwen3-Next, gpt-oss, OLMoE**) on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with
 CUDA, on **Windows** (ready-to-run download) and **Linux** (build from source; a ready-made download is coming). **Models bigger than the GPU's memory are split between VRAM and RAM automatically**: on a laptop RTX 3070
 (8 GB), the 17 GB Qwen3.6-35B-A3B runs at about **33 tokens/second** (35 with speculative decoding), and on an
 RTX 5090 the 37 GB Qwen3.6-35B-A3B Q8_0 runs at about **94 tokens/second** in a normal chat. A web page lets you pick a model and chat, with a
@@ -106,6 +106,8 @@ decoding helps most.
   files, or a separate `mtp-*.gguf` next to the model): the model checks several guessed tokens in one pass, so
   each read of its weights from RAM produces more than one token. Same answers, faster replies; most useful when the
   model doesn't fit in VRAM. Plus **8-bit and 4-bit context memory** (KV cache) to fit more of the model in VRAM.
+- **Workspace**: let the model read, search and (with your approval of each diff) change the files of a project
+  folder, from tierlm's own chat.
 - **OpenAI-compatible API** (`/v1/models`, `/v1/chat/completions`, streamed or not, with tool calling): Open WebUI,
   Continue, LibreChat, coding agents such as opencode and Cline, and anything built on the OpenAI SDK can use tierlm.
   An **Allow other devices** switch and an optional API key control who can connect. See [docs/API.md](docs/API.md) and [Connect other apps](docs/GETTING_STARTED.md#connect-other-apps).
@@ -257,8 +259,9 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | Qwen3.5 / 3.6 / 3.8 dense (`qwen35`, hybrid Gated DeltaNet) | Qwen3.6-27B (Unsloth MTP Q4_K_M) on an RTX 3070 laptop, with speculative decoding |
 | Qwen3.5 / 3.6 MoE (`qwen35moe`, e.g. Qwen3.6-35B-A3B) | Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
 | Qwen3-Next / Qwen3-Coder-Next (`qwen3next`, 80B-A3B) | model math verified, real weights not yet tested |
+| gpt-oss (`gpt-oss`: gpt-oss-20b, gpt-oss-120b, HyperNova-60B, ...) | model math verified (including OpenAI's chat format and tools), real weights not yet tested |
 
-Not yet: Gemma, Phi, DeepSeek, gpt-oss and others. The setup screen says which
+Not yet: Gemma, Phi, DeepSeek, Nemotron and others. The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
 
 ## Build from source (Windows)
@@ -334,6 +337,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Qwen3.5 / 3.6 MoE: the same hybrid with routed experts and a gated shared expert
 - [ ] Real-model testing of the new families; more families (Gemma 3/4, Phi, DeepSeek, gpt-oss)
 - [x] Qwen3-Next / Qwen3-Coder-Next (both GGUF layouts), verified against a NumPy reference
+- [x] gpt-oss: attention sinks, sliding-window layers, exact YaRN, MXFP4 experts with biases, OpenAI's harmony chat format and tool calls
 - [x] Tier loader, first version: models bigger than VRAM split between VRAM and RAM (whole layers or experts), VRAM limit setting
 - [ ] SSD tier (stream rarely used weights from disk)
 - [ ] Search and download GGUF models from Hugging Face inside tierlm
@@ -347,7 +351,8 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Find the fastest settings measured like a real chat (your sampling settings, longer replies)
 - [ ] CPU and GPU working on the same layer at once (the VRAM and RAM experts of a layer in parallel; needs changes to ggml's scheduler)
 - [x] Speculative decoding with the built-in MTP draft layer; 8-bit and 4-bit KV cache
-- [ ] Prompt-lookup drafting (free guesses for code and edits); activation sparsity for dense models
+- [x] Prompt-lookup guessing (free guesses for code and edits, every model)
+- [ ] Activation sparsity for dense models
 
 ## Credits and licence
 

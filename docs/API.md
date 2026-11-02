@@ -66,7 +66,8 @@ window is full).
 
 For coding agents such as opencode, Cline, Continue's agent mode and Cursor. tierlm describes the tools to the model
 in the format it was trained on (Qwen3.5 / 3.6 and Qwen3-Coder write `<tool_call><function=...>` blocks; Qwen3,
-Qwen2.5 and other models the JSON form `<tool_call>{"name": ..., "arguments": ...}</tool_call>`) and reads its calls
+Qwen2.5 and other models the JSON form `<tool_call>{"name": ..., "arguments": ...}</tool_call>`; gpt-oss its harmony
+format, a message on the `commentary` channel addressed `to=functions.NAME`) and reads its calls
 back out as OpenAI `tool_calls`, with `arguments` as a JSON string, and `finish_reason: "tool_calls"`. Several calls
 in one reply are returned together. tierlm never runs a tool itself: the app does, and sends the result back as a
 `tool` message.
@@ -124,7 +125,7 @@ Example (values depend on the model and machine):
 It also reports where the model lives: `vram_weights` and `ram_weights` (bytes), `split_mode`, `gpus` (one entry per
 GPU in use: `name`, `weights`, `kv`, `layers`), `ffn_vram` (per layer: are its experts in VRAM), and
 `speculative`, `draft_max`, `has_draft_block` and `mtp_loaded` (the draft layer is in memory, so `/api/spec` can
-switch speculation on), `hot_experts` (experts placed in VRAM by usage), `hot` (per layer: those experts' numbers),
+switch speculation on), `lookup` (most tokens prompt lookup guesses now, 0 when off) and `lookup_setting` (as set: -1 automatic), `hot_experts` (experts placed in VRAM by usage), `hot` (per layer: those experts' numbers),
 `hot_share` (the share of the learned expert use those VRAM experts cover, 0 to 1) and `learned_tokens` (about how
 many tokens of use the expert counts come from).
 
@@ -207,6 +208,7 @@ requests from the same computer. Elsewhere it returns HTTP 501.
 | `seed` | -1 for random sampling; any other number makes replies repeatable |
 | `speculative` | `true` loads the model's MTP draft layer and uses speculative decoding (when the file, or an `mtp-*.gguf` next to it, has one: `"mtp": true` in `/api/models`) |
 | `draft_max` | Most tokens the draft layer guesses per check, 1 to 8 (default: 2 for MoE models, 3 for dense) |
+| `lookup` | Prompt lookup: most tokens guessed per check from earlier in the conversation, 1 to 16; `0` off; `-1` (default) chooses: 8 with the whole model in VRAM, 6 for hybrid models, 4 for MoE models with experts in RAM |
 | `device` | `auto` (default) or `gpu`: the best GPU, plus other GPUs of the same kind as further VRAM tiers; `cpu`; or one device by its `id` |
 | `hot_experts` | `true`: with experts in RAM, put this model's most-used experts in VRAM, from what tierlm has learned about it. Default `false`: whether it is faster depends on the PC, and `/api/autotune` saves `true` only where it measured fastest |
 | `split_mode` | When the model doesn't fit in VRAM: `auto` (default: `experts` for MoE models, `layers` for the rest), `layers` (whole layers in VRAM, the first ones in RAM) or `experts` (attention and context in VRAM, experts in RAM) |
@@ -236,7 +238,8 @@ Returns `{"prompt_tps": 143.0, "gen_tps": 22.3, "speculative": true, "draft_max"
 
 Turns speculative decoding on or off, or changes the guesses per check, without reloading:
 `{"speculative": true, "draft_max": 2}`. Only when the model was loaded with its draft layer (`mtp_loaded` in
-`/api/info`); otherwise it answers 409.
+`/api/info`); otherwise it answers 409. `{"lookup": 8}` (or `0`, or `-1` for automatic) changes prompt lookup, for
+any model, and keeps the conversation in the cache.
 
 ### POST /api/usage/reset
 
@@ -315,9 +318,10 @@ tokens.
 {"type": "done", "n_gen": 42, "gen_s": 0.7, "gen_tps": 60.0, "stop": "end", "n_past": 100}
 ```
 
-With speculative decoding, `done` also has `"spec": {"checks": 21, "drafted": 63, "accepted": 41}`: the model's
-checks, the tokens the draft layer guessed, and how many of them the model kept (each check also adds one token of
-its own, so tokens per check = `n_gen / checks`). Token events then carry no `routing`.
+With speculative decoding or prompt lookup, `done` also has
+`"spec": {"checks": 21, "drafted": 63, "accepted": 41, "looked": 30, "look_ok": 25}`: the model's checks, the tokens
+guessed, and how many of them the model kept (each check also adds one token of its own, so tokens per check =
+`n_gen / checks`); `looked` and `look_ok` are the part of those guesses that came from prompt lookup. Token events then carry no `routing`.
 
 `stop` is `end` (the model finished), `length` (hit `max_tokens`), `context` (the context window is full)
 or `abort` (the client disconnected).
@@ -334,6 +338,25 @@ Close the connection (for example, abort the `fetch`). The server notices on the
 curl -N http://127.0.0.1:8040/api/chat -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":20}'
 ```
+
+### The workspace (`/api/workspace`)
+
+For tierlm's own chat page on the computer running tierlm. Every request must come from this computer (not through a
+proxy or tunnel), be addressed to `127.0.0.1` / `localhost` / `[::1]` on tierlm's port, come from tierlm's page if the
+browser sends an `Origin`, and carry the header `X-Tierlm-Workspace: 1`. Anything else gets 403.
+
+- `GET /api/workspace`: `{"available": true, "folder": "C:\\code\\app", "exists": true, "picker": true}`.
+- `POST /api/workspace` `{"folder": "C:\\code\\app"}` chooses the folder (saved); `""` clears it.
+- `POST /api/workspace/pick` opens a folder picker on this computer (Windows) and returns `{"cancelled", "folder"}`.
+- `POST /api/workspace/tool` `{"name": "read_file", "arguments": {"path": "src/app.py"}}` runs one of the model's
+  tools: `list_files`, `read_file`, `search_files` return `{"result"}`. `write_file` and `edit_file` return
+  `{"diff", "hash", "path", "created"}` and change nothing; sent again with `"apply": true, "hash": "<hash>"` they make
+  the change (if the file still matches the hash) and add `"result"`. Problems come back as `{"error"}`.
+
+`POST /api/chat` with `"workspace": true` gives the model these tools and tells it about the folder; its `done`
+event then also has `raw` (the reply as the model wrote it, to send back as the assistant message), `text` (as
+shown) and `tool_calls` (`[{"name", "arguments", "arguments_json"}]`). The page runs the calls through
+`/api/workspace/tool`, adds `{"role": "tool", "name", "content"}` messages and asks again.
 
 ### POST /api/reset
 

@@ -13,9 +13,12 @@ numbers = ranges(lambda cp: cat(cp).startswith("N"))
 WS = {0x09,0x0A,0x0B,0x0C,0x0D,0x20,0x85,0xA0,0x1680,0x2028,0x2029,0x202F,0x205F,0x3000} | set(range(0x2000, 0x200B))
 spaces = ranges(lambda cp: cp in WS)
 marks = ranges(lambda cp: cat(cp).startswith("M"))   # combining marks (Qwen3.5 splitting)
+# Letter case, for OpenAI's o200k splitting (gpt-oss): words split where lower case turns to upper case
+upper = ranges(lambda cp: cat(cp) in ("Lu", "Lt"))
+lower = ranges(lambda cp: cat(cp) == "Ll")
 with open("src/unicode_tables.h", "w") as f:
     f.write("#pragma once\n#include <cstdint>\n\nnamespace tierlm::uni {\n\nstruct Range { uint32_t lo, hi; };\n\n")
-    for name, rs in (("kLetter", letters), ("kNumber", numbers), ("kSpace", spaces), ("kMark", marks)):
+    for name, rs in (("kLetter", letters), ("kNumber", numbers), ("kSpace", spaces), ("kMark", marks), ("kUpper", upper), ("kLower", lower)):
         f.write("inline constexpr Range %s[] = {\n" % name)
         for i in range(0, len(rs), 6):
             f.write("    " + " ".join("{0x%X,0x%X}," % r for r in rs[i:i+6]) + "\n")

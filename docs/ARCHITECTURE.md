@@ -53,7 +53,7 @@ attention kernels, and backends for CPU, Vulkan and CUDA. Everything that decide
 ## How one token is produced
 
 1. **Tokenizer.** Text is split into words, numbers, punctuation and whitespace (a hand-written version of
-   the GPT-2 split pattern, using generated Unicode tables), each piece's bytes are mapped to GPT-2's byte
+   the model's split pattern: GPT-2, Llama 3, Qwen2/3.5 or o200k, using generated Unicode tables), each piece's bytes are mapped to GPT-2's byte
    alphabet, and BPE merges join them into vocabulary tokens. Added tokens (such as OLMoE's dedicated
    whitespace-run tokens, or `<|user|>` in chat mode) are matched first, longest match wins.
 2. **Embedding.** Each token ID becomes a 2,048-number vector.
@@ -103,6 +103,36 @@ the same math stored differently: its value heads stay grouped by key head (tier
 place instead of relying on ggml's tiled broadcast), beta and alpha come as one tensor interleaved per key head
 (`ssm_ba`), and older files keep q, k, v and z interleaved per key head in one tensor (`ssm_in`).
 
+## gpt-oss
+
+OpenAI's gpt-oss models (and models built on them, such as HyperNova-60B) differ from the other families in a few
+places, each checked against a NumPy reference written from Hugging Face's `modeling_gpt_oss.py`:
+
+- **Attention sinks**: each head has one learned extra score that takes part in the softmax but points at nothing,
+  so a head can attend "nowhere". ggml supports them in flash attention and in its softmax (`*_add_sinks`).
+- **Sliding window**: every other layer (the even ones) sees only the last 128 tokens; those layers get their own
+  mask. Their KV cache is still full length for now.
+- **Biases** on Q, K, V and the output projection, on the router, and on every expert (`ggml_add_id` adds each
+  pick's own expert's bias).
+- **Routing**: the top 4 experts by score, then a softmax over just those four.
+- **Experts**: a clamped SwiGLU, `(clamp(up, -7, 7) + 1) * g * sigmoid(1.702 g)` with `g = min(gate, 7)`
+  (`ggml_swiglu_oai`), on MXFP4 weights.
+- **YaRN, exactly**: gpt-oss stretches its 4,096-position training to 131,072 with YaRN. ggml's built-in YaRN rounds
+  the band of dimensions that are blended to whole dimensions; gpt-oss is configured without that rounding
+  (`"truncate": false`), and so is Hugging Face's reference. tierlm computes the blended frequencies itself, as
+  Hugging Face does, and gives them to ggml's rope as per-dimension frequency factors (the mechanism Llama 3.1 uses),
+  with the cos/sin scale `0.1 ln(factor) + 1`. The test model's band edges fall between whole dimensions, so the
+  rounded version would fail it.
+- **Tokenizer**: OpenAI's o200k split pattern, which also splits words where lower case turns to upper case
+  (hand-written like the others; the tests compare it with the pattern itself on 3,000 strings).
+- **Chat format ("harmony")**: a reply is several messages, the reasoning on the `analysis` channel and the answer on
+  the `final` channel, or a tool call on `commentary` addressed `to=functions.NAME`. tierlm builds the prompt exactly
+  as OpenAI's chat template does (tools as a TypeScript namespace; `tests/harmony_test.py` compares them byte for
+  byte), stops only at `<|return|>` or `<|call|>`, and shows the reasoning as the usual collapsible "Thinking".
+
+Not yet for gpt-oss: hot experts (the split doesn't divide the expert biases yet; whole expert layers go to VRAM
+or RAM instead) and a shorter KV cache for the sliding-window layers.
+
 ## Speculative decoding
 
 When a model doesn't fit in VRAM, generating a token is limited by how fast its weights in RAM can be read: a dense
@@ -134,6 +164,33 @@ NumPy version of Hugging Face's MTP block.
 3.0 tok/s without speculation; 3.9, **5.3** and 4.1 tok/s with 2, 3 and 4 guesses per check. At 3 guesses a check
 produced 2.6 tokens on average and 53% of guesses were kept. More guesses stop paying once the later ones are rarely
 kept but still cost a position in the check, so 3 is the default.
+
+**Prompt lookup.** A second source of guesses, for every model, with or without a draft layer: when the last 3 to
+6 tokens also appear earlier in the conversation, the tokens that followed them there are the guess
+(`Speculator::lookup_guesses`, searched from the most recent place back). Replies often repeat what's already in the
+conversation: a file being rewritten with a small change, code being quoted, names and paths. Those guesses go
+through the same check and undo as the draft layer's, so the reply is the same. Lookup guesses are used when there is
+a match, the draft layer's otherwise. The guess length adapts: after a guess the model rejected at once, the next
+lookup guess is a single token (cheap to check); after a fully kept one, twice as long, up to the maximum, which
+depends on where the model lives: 8 with everything in VRAM, 6 for hybrid models (each guessed token needs an undo
+copy of the DeltaNet memory, about 60 MB for Qwen3.6-35B-A3B), 4 for MoE models with experts in RAM (each guessed
+token picks its own experts, which the CPU has to read). The tests check long guesses (8 at a time, wrong at
+different depths) on every hybrid variant.
+
+Lookup also checks that it pays for itself. A checked guess is not free: on a MoE model each guessed token reads its
+own experts, so a wide check can take much longer than one token, and a miss gets nothing for it. Reasoning text
+matches earlier text often (the question's numbers, the model's own markers) but continues differently, so on a fast
+GPU those misses added up: gpt-oss-20b on an RTX 5090 wrote a short worked answer at 135 tok/s with lookup and 234
+without. So the speculator times every step: plain steps (no guess) keep a running average, and lookup checks are
+added up in rounds of four. When a round gave fewer tokens per second than plain steps would have, lookup pauses (16
+steps, then twice as long each time it loses again, back to 16 when it wins) and tries again later, in case the reply
+starts repeating text. After the change: 270 tok/s on the same question, while rewrites keep their gain (Qwen3-0.6B
+on 2 CPU threads, a rename in 1.6 KB of code: 12.5 → 18.6 tok/s; a short maths answer: 15.5 → 15.0, within noise).
+The timing decides only whether to guess, never what the reply says.
+
+**Measured** (Qwen3-0.6B Q8_0 on 8 CPU threads, temperature 0, same reply with and without): rewriting 2.6 KB of
+code with one word renamed, 10.5 → **27.7 tok/s** (6.6 tokens per check, 203 of 212 guesses kept); writing new
+code, 12.1 → 12.1 tok/s (lookup found few matches and the adaptive length kept misses cheap).
 
 **KV cache precision.** The cache can be stored at 8 bits (`q8_0`, about 1% from exact) or 4 bits (`q4_0`), which
 leaves VRAM for more of the model's layers. Quantized caches are read by flash attention, which turns on with them.
@@ -275,4 +332,4 @@ There is no llama.cpp to compare against, so every piece is checked against an i
    further ahead only while the guesses reuse experts that are already loaded).
 4. **More families and real-model tests**: Gemma 4, Phi, DeepSeek, gpt-oss; Qwen3-Coder-Next, Mixtral and Qwen2.5 on
    real weights.
-5. Prompt-lookup guessing for models without a draft layer, and the Zen 4 / AMX CPU engines on Windows.
+5. The Zen 4 / AMX CPU engines on Windows.

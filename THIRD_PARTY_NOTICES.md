@@ -9,6 +9,8 @@ keep these notices and licence files with it.
 | [ggml](https://github.com/ggml-org/ggml), **modified** | Tensor math kernels, quantized formats, device backends (CPU, Vulkan, CUDA), GGUF file reader | MIT, Copyright (c) 2023-2026 The ggml authors | `third_party/ggml/LICENSE` (git submodule: the `tierlm` branch of [EHTi-Chad/ggml](https://github.com/EHTi-Chad/ggml)) |
 | [cpp-httplib](https://github.com/yhirose/cpp-httplib) v0.63.0 | Embedded HTTP server in `tierlm-server` | MIT, Copyright (c) 2017 yhirose | `third_party/httplib/LICENSE` |
 | [nlohmann/json](https://github.com/nlohmann/json) v3.12.0 | JSON parsing and output in `tierlm-server` | MIT, Copyright (c) 2013-2025 Niels Lohmann | `third_party/json/LICENSE.MIT` |
+| [KaTeX](https://github.com/KaTeX/KaTeX) v0.19.0 (`dist/katex.min.js`, unmodified) | Drawing maths in the chat page (as MathML, no fonts needed) | MIT, Copyright (c) 2013-2020 Khan Academy and other contributors | `web/vendor/katex-LICENSE.txt` |
+| OpenAI's gpt-oss chat template, as copied in [llama.cpp](https://github.com/ggml-org/llama.cpp) (`models/templates/openai-gpt-oss-120b.jinja`) | Tests only: `tests/harmony_test.py` checks tierlm's harmony prompts against it | Apache-2.0 (gpt-oss), MIT (llama.cpp) | `tests/openai-gpt-oss.jinja` |
 
 ### Changes to ggml
 

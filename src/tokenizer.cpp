@@ -159,6 +159,95 @@ std::vector<std::pair<size_t, size_t>> pretokenize_llama3(const std::string& s, 
     return out;
 }
 
+// OpenAI's o200k split pattern (gpt-oss, GPT-4o; "gpt-4o" in GGUF files), hand-compiled:
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//  |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//  |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// Words split where lower case turns to upper case ("HelloWorld" -> "Hello", "World"), and a word may carry its
+// contraction. "U" below is the first class (upper case, plus letters without case, plus marks), "L" the second
+// (lower case, plus the same caseless letters and marks).
+std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s) {
+    const auto cps = utf8_decode(s);
+    const size_t n = cps.size();
+    std::vector<std::pair<size_t, size_t>> out;
+    auto C = [&](size_t k) { return cps[k].cp; };
+    auto lowerc = [](uint32_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
+    auto nl = [](uint32_t c) { return c == '\r' || c == '\n'; };
+    auto up = [&](uint32_t c) { return (is_letter(c) && !in(uni::kLower, c)) || is_mark(c); };      // Lu Lt Lm Lo M
+    auto lo = [&](uint32_t c) { return (is_letter(c) && !in(uni::kUpper, c)) || is_mark(c); };      // Ll Lm Lo M
+    auto prefix_ok = [&](uint32_t c) { return !nl(c) && !is_letter(c) && !is_number(c); };          // [^\r\n\p{L}\p{N}]
+    auto emit = [&](size_t a, size_t b) {
+        size_t off = cps[a].off, end = cps[b - 1].off + cps[b - 1].len;
+        out.push_back({off, end - off});
+    };
+    auto contraction = [&](size_t k) -> size_t {           // length of (?i:'s|'t|'re|'ve|'m|'ll|'d) at k, or 0
+        if (k >= n || C(k) != '\'' || k + 1 >= n) return 0;
+        const uint32_t a = lowerc(C(k + 1)), b = k + 2 < n ? lowerc(C(k + 2)) : 0;
+        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return 3;
+        if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+        return 0;
+    };
+    // U*L+ from j (with the regex's backtracking): the end of the match, or 0 if none.
+    auto first_branch = [&](size_t j) -> size_t {
+        size_t a = j;
+        while (a < n && up(C(a))) ++a;                     // U* greedy
+        if (a < n && lo(C(a))) {                            // L+ right after
+            size_t e = a + 1;
+            while (e < n && lo(C(e))) ++e;
+            return e;
+        }
+        for (size_t t = a; t > j; --t)                      // give back U chars until one of them can start L+
+            if (lo(C(t - 1))) return t;                     // (it's the last such; the ones after it aren't L)
+        return 0;
+    };
+    // U+L* from j: the end of the match, or 0.
+    auto second_branch = [&](size_t j) -> size_t {
+        if (j >= n || !up(C(j))) return 0;
+        size_t a = j + 1;
+        while (a < n && up(C(a))) ++a;
+        while (a < n && lo(C(a))) ++a;
+        return a;
+    };
+    size_t i = 0;
+    while (i < n) {
+        // 1 and 2: words, each with an optional leading character, tried with it first (the ? is greedy)
+        size_t e = 0;
+        for (int br = 0; br < 2 && !e; ++br)
+            for (int pre = 1; pre >= 0 && !e; --pre) {
+                if (pre && !(prefix_ok(C(i)) && i + 1 < n)) continue;
+                e = br == 0 ? first_branch(i + pre) : second_branch(i + pre);
+            }
+        if (e) { e += contraction(e); emit(i, e); i = e; continue; }
+        // 3. digits, up to three
+        if (is_number(C(i))) {
+            size_t k = i + 1;
+            while (k < n && k - i < 3 && is_number(C(k))) ++k;
+            emit(i, k); i = k; continue;
+        }
+        // 4. optional space, a run of punctuation/symbols, then any newlines or slashes
+        {
+            auto other = [&](uint32_t c) { return !is_space(c) && !is_letter(c) && !is_number(c); };
+            size_t j = (C(i) == ' ' && i + 1 < n && other(C(i + 1))) ? i + 1 : i;
+            if (other(C(j))) {
+                size_t k = j + 1;
+                while (k < n && other(C(k))) ++k;
+                while (k < n && (nl(C(k)) || C(k) == '/')) ++k;
+                emit(i, k); i = k; continue;
+            }
+        }
+        // 5-7. whitespace
+        size_t k = i;
+        while (k < n && is_space(C(k))) ++k;
+        size_t last_nl = n;
+        for (size_t m = i; m < k; ++m) if (nl(C(m))) last_nl = m;
+        if (last_nl != n)          { emit(i, last_nl + 1); i = last_nl + 1; }   // \s*[\r\n]+
+        else if (k == n)           { emit(i, k); i = k; }                       // \s+ at the end
+        else if (k - i >= 2)       { emit(i, k - 1); i = k - 1; }               // \s+(?!\S): leave one for the next word
+        else                       { emit(i, k); i = k; }                       // \s+
+    }
+    return out;
+}
+
 }  // namespace
 
 Tokenizer Tokenizer::from_gguf(const std::string& path) {
@@ -182,6 +271,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         if (pre == "llama-bpe" || pre == "llama3" || pre == "smaug-bpe" || pre == "dbrx") t.pre_ = Pre::Llama3;
         else if (pre == "qwen2" || pre == "deepseek-r1-qwen" || pre == "megrez") t.pre_ = Pre::Qwen2;
         else if (pre == "qwen35") t.pre_ = Pre::Qwen35;
+        else if (pre == "gpt-4o" || pre == "o200k") t.pre_ = Pre::O200k;
         else if (pre.empty() || pre == "default" || pre == "gpt-2" || pre == "olmo" || pre == "gpt2") t.pre_ = Pre::Gpt2;
         else {
             // Unknown splitter: most recent BPE models use the Llama 3 pattern or something close to it.
@@ -280,6 +370,7 @@ void Tokenizer::bpe(const std::string& chunk, std::vector<int32_t>& out) const {
 void Tokenizer::encode_plain(const std::string& text, std::vector<int32_t>& out, bool first) const {
     if (kind_ == Kind::Spm) { spm(text, out, first); return; }
     const auto parts = pre_ == Pre::Gpt2 ? pretokenize_gpt2(text)
+                     : pre_ == Pre::O200k ? pretokenize_o200k(text)
                      : pretokenize_llama3(text, pre_ == Pre::Llama3 ? 3 : 1, pre_ == Pre::Qwen35);
     for (const auto& [off, len] : parts) bpe(text.substr(off, len), out);
 }

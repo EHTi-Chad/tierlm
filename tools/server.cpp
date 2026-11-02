@@ -6,6 +6,7 @@
 //
 // Endpoints
 //   GET  /             the web page (web/index.html, re-read on every load so it can be edited live)
+//   GET  /vendor/katex.min.js  the maths renderer the page uses (KaTeX, MIT licence, web/vendor)
 //   GET  /api/info     model, device and memory details ({"loaded": false} before a model is loaded)
 //   GET  /api/devices  GPUs and CPU the engine can use, with memory
 //   GET  /api/models   .gguf files in the models folder (and its subfolders), and whether each is supported
@@ -36,6 +37,8 @@
 #include "httplib.h"
 #include "json.hpp"
 #include "agent.h"
+#include "harmony.h"
+#include "workspace.h"
 
 #include <climits>
 #include <algorithm>
@@ -105,22 +108,25 @@ std::string gguf_string(const std::string& path, const char* key) {
 
 // Chat formats. Each model family wraps a conversation in its own markers; the GGUF's chat template (and
 // failing that, its vocabulary) says which one. Control tokens are matched when encoding with parse_special.
-enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Plain };
+enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, Plain };
 
 const char* chat_fmt_name(ChatFmt f) {
     switch (f) {
         case ChatFmt::Tulu: return "tulu"; case ChatFmt::ChatML: return "chatml";
-        case ChatFmt::Llama3: return "llama3"; case ChatFmt::Mistral: return "mistral"; default: return "plain";
+        case ChatFmt::Llama3: return "llama3"; case ChatFmt::Mistral: return "mistral"; case ChatFmt::Harmony: return "harmony";
+        default: return "plain";
     }
 }
 
 ChatFmt detect_chat(const Tokenizer& tok) {
     const std::string& t = tok.chat_template();
     auto has = [&](const char* s) { return t.find(s) != std::string::npos; };
+    if (has("<|channel|>")) return ChatFmt::Harmony;                 // gpt-oss (OpenAI's harmony format)
     if (has("<|im_start|>")) return ChatFmt::ChatML;
     if (has("<|start_header_id|>")) return ChatFmt::Llama3;
     if (has("<|user|>")) return ChatFmt::Tulu;
     if (has("[INST]")) return ChatFmt::Mistral;
+    if (tok.find("<|channel|>") >= 0 && tok.find("<|return|>") >= 0) return ChatFmt::Harmony;
     if (tok.find("<|im_start|>") >= 0) return ChatFmt::ChatML;
     if (tok.find("<|start_header_id|>") >= 0) return ChatFmt::Llama3;
     if (tok.find("<|user|>") >= 0) return ChatFmt::Tulu;
@@ -131,7 +137,7 @@ ChatFmt detect_chat(const Tokenizer& tok) {
 // Tool calling in a conversation, made plain for format_chat: the tools go into the system message, an assistant
 // message's tool calls are written out the way the model writes them (unless its text already has them, as the
 // page sends it), and tool results become a user turn of <tool_response> blocks, as Qwen's chat templates do.
-json with_tools(const json& messages, const json& tools, agent::ToolFmt tf) {
+json with_tools(const json& messages, const agent::ojson& tools, agent::ToolFmt tf) {
     json out = json::array();
     const bool use = tools.is_array() && !tools.empty();
     size_t i = 0;
@@ -210,26 +216,43 @@ struct Sampling {
 
 // Repetition penalty, then temperature with top-k, top-p (nucleus) and min-p filtering.
 // temperature <= 0 means always take the most likely token (after the penalty).
-int32_t sample(std::vector<float> lg, const Sampling& s, const std::vector<int32_t>& recent, std::mt19937& rng) {
+// Only the top-k candidates matter, so one pass over the vocabulary keeps the best ones in a small heap, without
+// copying the logits or computing every probability (gpt-oss has 201,088 tokens: that pass is most of the cost).
+int32_t sample(const float* lg, size_t nv, const Sampling& s, const std::vector<int32_t>& recent, std::mt19937& rng) {
+    // Tokens used in the last repeat_last_n positions, with their penalised logits (each token once).
+    std::vector<std::pair<int32_t, float>> pen;
     if (s.repeat_penalty > 0.0f && s.repeat_penalty != 1.0f) {
-        // Make tokens used in the last repeat_last_n positions less likely (each token once).
-        std::vector<int32_t> seen;
         const size_t n = std::min<size_t>(recent.size(), (size_t)std::max(0, s.repeat_last_n));
         for (size_t i = recent.size() - n; i < recent.size(); ++i) {
             const int32_t t = recent[i];
-            if (t < 0 || (size_t)t >= lg.size() || std::find(seen.begin(), seen.end(), t) != seen.end()) continue;
-            seen.push_back(t);
-            lg[t] = lg[t] > 0 ? lg[t] / s.repeat_penalty : lg[t] * s.repeat_penalty;
+            if (t < 0 || (size_t)t >= nv || std::any_of(pen.begin(), pen.end(), [t](auto& q) { return q.first == t; })) continue;
+            pen.push_back({t, lg[t] > 0 ? lg[t] / s.repeat_penalty : lg[t] * s.repeat_penalty});
         }
     }
-    const int32_t best = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
-    if (s.temperature <= 0.0f) return best;
-    const float mx = lg[best];
-    std::vector<std::pair<float, int32_t>> p(lg.size());
-    for (size_t i = 0; i < lg.size(); ++i) p[i] = {std::exp((lg[i] - mx) / s.temperature), (int32_t)i};
-    size_t keep = s.top_k > 0 ? std::min<size_t>((size_t)s.top_k, p.size()) : std::min<size_t>(1024, p.size());
-    std::partial_sort(p.begin(), p.begin() + keep, p.end(), [](auto& a, auto& b) { return a.first > b.first; });
-    p.resize(keep);
+    const bool greedy = s.temperature <= 0.0f;
+    const size_t keep = greedy ? 1 : std::min<size_t>(s.top_k > 0 ? (size_t)s.top_k : 1024, nv);
+    // The best keep + |pen| tokens by their logits before the penalty: after it, the best `keep` are among these plus
+    // the penalised ones (a token outside them is beaten by at least `keep` tokens the penalty didn't touch).
+    using C = std::pair<float, int32_t>;
+    auto better = [](const C& a, const C& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); };
+    const size_t want = std::min(nv, keep + pen.size());
+    std::vector<C> h;
+    h.reserve(want + pen.size());
+    for (size_t i = 0; i < nv; ++i) {                 // h is a heap with its worst candidate first
+        const float v = lg[i];
+        if (h.size() < want) { h.push_back({v, (int32_t)i}); std::push_heap(h.begin(), h.end(), better); }
+        else if (v > h.front().first) { std::pop_heap(h.begin(), h.end(), better); h.back() = {v, (int32_t)i}; std::push_heap(h.begin(), h.end(), better); }
+    }
+    for (const auto& [t, v] : pen) {
+        auto it = std::find_if(h.begin(), h.end(), [t = t](const C& c) { return c.second == t; });
+        if (it != h.end()) it->first = v; else h.push_back({v, t});
+    }
+    std::sort(h.begin(), h.end(), better);            // best first; equal logits: the lower token id, like max_element
+    if (greedy) return h[0].second;
+    if (h.size() > keep) h.resize(keep);
+    const float mx = h[0].first;
+    std::vector<std::pair<float, int32_t>> p(h.size());
+    for (size_t i = 0; i < h.size(); ++i) p[i] = {std::exp((h[i].first - mx) / s.temperature), h[i].second};
     // min-p: drop tokens less than min_p times as likely as the best one (p[0].first is 1 after scaling).
     if (s.min_p > 0.0f) while (p.size() > 1 && p.back().first < s.min_p * p[0].first) p.pop_back();
     double total = 0;
@@ -403,11 +426,36 @@ std::string pick_folder_windows(const std::string& start, bool& cancelled) {
 struct Engine {
     std::unique_ptr<Speculator> spec;   // speculative decoding with the model's MTP draft block, when turned on
     int draft_max = 0;                  // most tokens the draft block guesses per check (0: 2 for MoE models, 3 for dense)
+    // Prompt lookup (guesses copied from earlier in the conversation): most tokens guessed per check; -1 chooses
+    // for the model and how it's placed, 0 turns it off. `look` does it alone when the draft block is off.
+    int lookup = -1;
+    std::unique_ptr<Speculator> look;
     std::unique_ptr<Model> model;
     Tokenizer tok;
     ChatFmt chat = ChatFmt::Plain;
     agent::ToolFmt tool_fmt = agent::ToolFmt::Hermes;   // how this model writes tool calls
+    std::string identity;                                // harmony models: the model identity line of their template
     std::vector<int32_t> cached;      // the tokens currently in the KV cache
+
+    // How many tokens prompt lookup guesses at most. Checking guesses costs memory for the undo copies (hybrid
+    // models keep one copy of their running memory per guess) and, with experts in RAM, reading more experts:
+    // each guessed token picks its own. So shorter there, longer when everything is in VRAM.
+    int lookup_len() const {
+        if (!model || lookup == 0) return 0;
+        if (lookup > 0) return std::min(lookup, 16);
+        if (model->hparams().is_moe() && model->placement().cpu_weights > 0) return 4;
+        if (model->hparams().hybrid) return 6;
+        return 8;
+    }
+    // The speculator replies use: the draft block's (which also does prompt lookup), or prompt lookup alone.
+    Speculator* active_spec() { return spec ? spec.get() : look.get(); }
+    // Call after `spec` or `lookup` changes.
+    void spec_changed() {
+        const int L = lookup_len();
+        if (spec) spec->set_lookup(L);
+        look.reset();
+        if (!spec && L > 0 && model) { look = std::make_unique<Speculator>(*model, 0); look->set_lookup(L); }
+    }
     std::string path, name;
     int threads = 1, seed = -1;
     double load_s = 0;
@@ -725,6 +773,7 @@ int main(int argc, char** argv) {
         if (!info.value("supported", false)) throw std::runtime_error(info.value("reason", std::string("unsupported model")));
         eng.save_usage(true);            // what the previous model learned
         eng.spec.reset();
+        eng.look.reset();
         eng.model.reset();               // free the old model (and its GPU memory) first
         eng.cached.clear();
         auto t0 = Clock::now();
@@ -748,8 +797,10 @@ int main(int argc, char** argv) {
         // (Qwen3.6-35B-A3B, RTX 3070 laptop: 35 tok/s with 1 or 2, 28 with 3); dense models do best with 3.
         if (eng.draft_max <= 0) eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
         if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max);
+        eng.spec_changed();
         eng.chat = detect_chat(eng.tok);
         eng.tool_fmt = agent::detect_tool_fmt(eng.tok.chat_template());
+        eng.identity = harmony::identity_of(eng.tok.chat_template());
         eng.path = path;
         eng.name = gguf_string(path, "general.name");
         eng.threads = threads > 0 ? threads : a.threads;
@@ -807,6 +858,14 @@ int main(int argc, char** argv) {
         }
         res.set_content(page, "text/html; charset=utf-8");
     });
+    // The one script the page loads besides itself (bundled, so maths shows without the internet). A fixed name:
+    // nothing else in the folder is served.
+    svr.Get("/vendor/katex.min.js", [&](const httplib::Request&, httplib::Response& res) {
+        std::string js = read_file(a.web + "/vendor/katex.min.js");
+        if (js.empty()) { res.status = 404; return; }
+        res.set_header("Cache-Control", "max-age=86400");
+        res.set_content(js, "text/javascript; charset=utf-8");
+    });
 
     json last_info = {{"loaded", false}, {"version", TIERLM_VERSION}};
     svr.Get("/api/info", [&](const httplib::Request&, httplib::Response& res) {
@@ -835,7 +894,7 @@ int main(int argc, char** argv) {
             {"split_mode", eng.model->placement().mode},
             {"gpus", [&] { json g = json::array(); for (const auto& x : eng.model->placement().gpus)
                                g.push_back({{"name", x.name}, {"weights", x.weights}, {"kv", x.kv}, {"layers", x.layers}}); return g; }()},
-            {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"has_draft_block", hp.n_nextn > 0},
+            {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}, {"lookup_setting", eng.lookup}, {"has_draft_block", hp.n_nextn > 0},
             {"mtp_loaded", eng.model->has_mtp()}, {"ffn_vram", eng.model->placement().ffn_vram},
             {"hot_experts", eng.model->placement().hot_experts}, {"hot_share", eng.hot_share}, {"hot", eng.model->placement().hot},
             {"learned_tokens", [&] { double t = 0; for (float v : eng.usage) t += v; return hp.n_layer * hp.n_expert_used > 0 ? (long long)(t / (hp.n_layer * hp.n_expert_used)) : 0LL; }()},
@@ -1005,6 +1064,7 @@ int main(int argc, char** argv) {
         try {
             const LoadOptions o = load_options(body);
             eng.draft_max = std::min(8, std::max(0, body.value("draft_max", 0)));
+            eng.lookup = std::max(-1, std::min(16, body.value("lookup", -1)));
             const int threads = body.value("threads", a.threads), seed = body.value("seed", -1);
             load(file.u8string(), o, threads, seed, body.value("hot_experts", false));
             // Remember these settings for this model, like LM Studio does.
@@ -1017,6 +1077,7 @@ int main(int argc, char** argv) {
             res.set_content(dump({{"ok", true}, {"device", eng.model->device_name()}, {"load_s", eng.load_s}}), "application/json");
         } catch (const std::exception& e) {
             eng.spec.reset();
+            eng.look.reset();
             eng.model.reset();
             eng.path.clear();
             res.status = 500;
@@ -1028,6 +1089,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::timed_mutex> lk(mu);
         eng.save_usage(true);
         eng.spec.reset();
+        eng.look.reset();
         eng.model.reset();
         eng.cached.clear();
         eng.path.clear();
@@ -1045,25 +1107,33 @@ int main(int argc, char** argv) {
     //   on_prompt  once, after the conversation has been read
     //   on_token   for each piece of new text (with the experts each layer picked); return false to stop
     // `stops` are strings that end the reply (OpenAI's "stop"); text that might be the start of one is held back.
-    struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0, drafted = 0, accepted = 0, checks = 0; double prompt_s = 0, gen_s = 0;
+    struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0, drafted = 0, accepted = 0, checks = 0, looked = 0, look_ok = 0; double prompt_s = 0, gen_s = 0;
                  std::string stop = "length", text, full; };
+    // The tool calls in a reply, in the model's own format.
+    auto parse_calls = [&](const std::string& full, const agent::ojson& tools) {
+        return eng.chat == ChatFmt::Harmony ? harmony::parse(full, tools) : agent::parse_tool_calls(full, tools);
+    };
     // With `tools`, the model is told about them, and a tool call it writes is kept out of the streamed text (it is
     // in `full`, the whole reply as the model wrote it, for agent::parse_tool_calls).
     auto generate = [&](const json& messages, const Sampling& sp, int max_tokens, const std::vector<std::string>& stops_in,
                         const std::function<void(const json&)>& on_prompt,
                         const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token,
-                        const json& tools = json()) {
+                        const agent::ojson& tools = agent::ojson()) {
         Gen r;
+        // harmony (gpt-oss): a reply is several messages (reasoning, then the answer or a tool call) separated by
+        // special tokens; it ends only at <|return|> or <|call|>, and is shown as <think>reasoning</think>answer.
+        const bool harm = eng.chat == ChatFmt::Harmony;
         const bool use_tools = tools.is_array() && !tools.empty();
         std::vector<std::string> stops = stops_in;
-        if (use_tools) stops.push_back("<tool_response>");     // the model must not write the tool's answer itself
+        if (use_tools && !harm) stops.push_back("<tool_response>");     // the model must not write the tool's answer itself
         if (max_tokens <= 0) max_tokens = INT_MAX;    // no limit: until the model finishes or the context is full
         if (eng.seed >= 0) eng.rng.seed((uint32_t)eng.seed);    // same seed, same reply
         auto& model = eng.model; auto& tok = eng.tok; auto& cached = eng.cached;
         const auto& hp = model->hparams();
         const int L = hp.n_layer, E = hp.n_expert, K = hp.n_expert_used;
 
-        std::vector<int32_t> toks = tok.encode(format_chat(with_tools(messages, tools, eng.tool_fmt), eng.chat, tok), true);
+        std::vector<int32_t> toks = tok.encode(harm ? harmony::prompt(messages, tools, eng.identity)
+                                                    : format_chat(with_tools(messages, tools, eng.tool_fmt), eng.chat, tok), true);
         if ((int)toks.size() + 1 >= model->max_ctx()) throw std::runtime_error("conversation is longer than the context window; start a new chat");
 
         // Reuse whatever part of the KV cache still matches this conversation.
@@ -1077,7 +1147,8 @@ int main(int argc, char** argv) {
         std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;
         auto p0 = Clock::now();
         std::vector<float> lg;
-        if (eng.spec) { lg = eng.spec->prompt(toks, eng.threads, &routing); eng.spec->reset_stats(); }   // also feeds the draft block
+        Speculator* const spx = eng.active_spec();
+        if (spx) { lg = spx->prompt(toks, eng.threads, &routing); spx->reset_stats(); }   // also feeds the draft block
         else lg = model->eval(suffix, eng.threads, &routing);
         r.prompt_s = since(p0);
         std::fprintf(stderr, "chat: %zu prompt tokens, %zu reused from the cache, %zu read at %.0f tok/s\n", toks.size(), (size_t)common,
@@ -1103,28 +1174,34 @@ int main(int argc, char** argv) {
             r.text += delta;
             return on_token ? on_token(delta, out.size() / std::max(since(g0), 1e-9), routing) : true;
         };
-        std::string visible;
-        auto is_end = [&](int32_t t) { return t == tok.eos() || t == tok.eot() || tok.is_control(t); };
+        std::string visible, raw;                                 // raw: the reply as the model wrote it (harmony: before display)
+        const int32_t h_return = tok.find("<|return|>"), h_call = tok.find("<|call|>"), h_end = tok.find("<|end|>"), h_eot = tok.find("<|endoftext|>");
+        auto is_end = [&](int32_t t) {
+            if (harm) return t == h_return || t == h_call || t == h_eot || (t == tok.eos() && t != h_end);
+            return t == tok.eos() || t == tok.eot() || tok.is_control(t);
+        };
         // Recent tokens for the repetition penalty (the cache, then `extra`), leaving out control tokens such as the
         // end-of-reply marker: penalising those would stop the model from finishing.
         auto recent_with = [&](const std::vector<int32_t>& extra) {
             std::vector<int32_t> rc;
-            for (size_t j = extra.size(); j > 0 && (int)rc.size() < sp.repeat_last_n; --j) if (!is_end(extra[j - 1])) rc.push_back(extra[j - 1]);
-            for (size_t j = cached.size(); j > 0 && (int)rc.size() < sp.repeat_last_n; --j) if (!is_end(cached[j - 1])) rc.push_back(cached[j - 1]);
+            auto skip = [&](int32_t t) { return is_end(t) || tok.is_control(t); };
+            for (size_t j = extra.size(); j > 0 && (int)rc.size() < sp.repeat_last_n; --j) if (!skip(extra[j - 1])) rc.push_back(extra[j - 1]);
+            for (size_t j = cached.size(); j > 0 && (int)rc.size() < sp.repeat_last_n; --j) if (!skip(cached[j - 1])) rc.push_back(cached[j - 1]);
             return rc;
         };
         // Adds a chosen token to the reply and streams its text. False when the reply must end here.
         auto add = [&](int32_t id) {
             out.push_back(id);
             const std::string text = tok.decode(out);
-            visible = text.substr(0, utf8_complete(text));
+            raw = text.substr(0, utf8_complete(text));
+            visible = harm ? harmony::display(raw) : raw;
             // A stop string: end the reply just before it.
             size_t cut = std::string::npos;
             for (const auto& st : stops)
                 if (!st.empty()) { size_t p = visible.find(st, shown > st.size() ? shown - st.size() : 0); if (p < cut) cut = p; }
             if (cut != std::string::npos) {
-                r.full = visible.substr(0, cut);
-                const size_t tc = use_tools ? agent::tool_call_pos(r.full) : std::string::npos;
+                r.full = harm ? raw : visible.substr(0, cut);
+                const size_t tc = use_tools && !harm ? agent::tool_call_pos(r.full) : std::string::npos;
                 emit(visible, std::max(std::min(cut, tc), shown));
                 r.stop = "stop";
                 return false;
@@ -1135,7 +1212,7 @@ int main(int argc, char** argv) {
                 for (size_t k = st.empty() ? 0 : std::min(st.size() - 1, visible.size()); k > hold; --k)
                     if (visible.compare(visible.size() - k, k, st, 0, k) == 0) { hold = k; break; }
             size_t limit = visible.size() - hold;
-            if (use_tools) {                                       // a tool call isn't shown as text
+            if (use_tools && !harm) {                              // a tool call isn't shown as text
                 const size_t tc = agent::tool_call_pos(visible);
                 if (tc != std::string::npos) limit = std::min(limit, tc);
                 else if (agent::answer_start(visible) != std::string::npos) {
@@ -1147,10 +1224,10 @@ int main(int argc, char** argv) {
             if (!emit(visible, limit)) { r.stop = "abort"; return false; }
             return true;
         };
-        if (!eng.spec) {
+        if (!spx) {
             for (;;) {
                 if ((int)out.size() >= max_tokens) { r.stop = "length"; break; }
-                const int32_t id = sample(lg, sp, recent_with({}), eng.rng);
+                const int32_t id = sample(lg.data(), lg.size(), sp, recent_with({}), eng.rng);
                 if (is_end(id)) { r.stop = "end"; break; }
                 if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
                 lg = model->eval({id}, eng.threads, &routing);            // also tells us which experts it used
@@ -1171,7 +1248,7 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> extra;
                 if (cur >= 0) extra.push_back(cur);
                 extra.insert(extra.end(), acc.begin(), acc.end());
-                return sample(std::vector<float>(row, row + hp.n_vocab), sp, recent_with(extra), eng.rng);
+                return sample(row, (size_t)hp.n_vocab, sp, recent_with(extra), eng.rng);
             };
             int32_t x = pick(lg.data(), {});
             for (;;) {
@@ -1179,7 +1256,7 @@ int main(int argc, char** argv) {
                 if (is_end(x)) { r.stop = "end"; break; }
                 if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
                 cur = x;
-                const std::vector<int32_t> prod = eng.spec->step(x, eng.threads, pick, is_end, K > 0 ? &kept : nullptr);
+                const std::vector<int32_t> prod = spx->step(x, eng.threads, pick, is_end, K > 0 ? &kept : nullptr);
                 eng.add_usage(kept, K);
                 cur = -1;
                 cached.push_back(x);                                      // x and the accepted guesses are now cached
@@ -1194,20 +1271,21 @@ int main(int argc, char** argv) {
                 if (!go) break;
                 x = prod.back();
             }
-            const SpecStats& st = eng.spec->stats();
-            r.drafted = st.drafted; r.accepted = st.accepted; r.checks = st.steps;
+            const SpecStats& st = spx->stats();
+            r.drafted = st.drafted; r.accepted = st.accepted; r.checks = st.steps; r.looked = st.looked; r.look_ok = st.look_ok;
         }
-        if (r.stop != "stop") r.full = visible;
+        if (r.stop != "stop") r.full = harm ? raw : visible;
         if (r.stop != "stop" && r.stop != "abort") {                                  // release held-back text
-            const size_t tc = use_tools ? agent::tool_call_pos(visible) : std::string::npos;
+            const size_t tc = use_tools && !harm ? agent::tool_call_pos(visible) : std::string::npos;
             emit(visible, tc == std::string::npos ? visible.size() : tc);
         }
         r.n_gen = out.size();
         r.gen_s = since(g0);
         eng.save_usage();
-        if (r.checks > 0)
-            std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s); speculative: %.1f tokens per check, %zu of %zu guesses kept\n", r.n_gen,
-                         r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str(), (double)r.n_gen / r.checks, r.accepted, r.drafted);
+        if (r.checks > 0 && r.drafted > 0)
+            std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s); speculative: %.1f tokens per check, %zu of %zu guesses kept"
+                         " (prompt lookup: %zu of %zu)\n", r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str(),
+                         (double)r.n_gen / r.checks, r.accepted, r.drafted, r.look_ok, r.looked);
         else
             std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s)\n", r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str());
         return r;
@@ -1248,7 +1326,19 @@ int main(int argc, char** argv) {
                 // finishes or the context window is full. Thinking models (Qwen3.x) need thousands of tokens.
                 const int max_tokens = body.value("max_tokens", -1);
                 const int L = eng.model->hparams().n_layer, K = eng.model->hparams().n_expert_used;
-                Gen g = generate(body["messages"], sp, max_tokens, {},
+                // The workspace (tierlm's own page): the model gets the folder's tools and is told about them. The
+                // tools only describe; running them is /api/workspace/tool, which only this computer's page can use.
+                json messages = body["messages"];
+                agent::ojson tools = agent::ojson::array();
+                const std::string ws = settings.value("workspace_folder", std::string());
+                if (body.value("workspace", false) && !ws.empty()) {
+                    tools = workspace::tools();
+                    const std::string note = workspace::instructions(ws);
+                    if (!messages.empty() && messages[0].value("role", std::string()) == "system")
+                        messages[0]["content"] = messages[0].value("content", std::string()) + "\n\n" + note;
+                    else messages.insert(messages.begin(), json{{"role", "system"}, {"content", note}});
+                }
+                Gen g = generate(messages, sp, max_tokens, {},
                     [&](const json& p) { json j = p; j["type"] = "prompt"; send(j); },
                     [&](const std::string& delta, double tps, const std::vector<int32_t>& routing) {
                         json picks = json::array();
@@ -1256,10 +1346,17 @@ int main(int argc, char** argv) {
                             for (int l = 0; l < L; ++l)
                                 picks.push_back(std::vector<int32_t>(routing.begin() + (size_t)l * K, routing.begin() + (size_t)(l + 1) * K));
                         return send({{"type", "token"}, {"text", delta}, {"tps", tps}, {"n_past", eng.model->n_past()}, {"routing", picks}});
-                    });
+                    }, tools);
                 json done = {{"type", "done"}, {"n_gen", g.n_gen}, {"gen_s", g.gen_s},
                              {"gen_tps", g.n_gen / std::max(g.gen_s, 1e-9)}, {"stop", g.stop}, {"n_past", eng.model->n_past()}};
-                if (g.checks > 0) done["spec"] = {{"checks", g.checks}, {"drafted", g.drafted}, {"accepted", g.accepted}};
+                if (!tools.empty()) {                          // the reply as written (the next request sends it back) and its calls
+                    const agent::Parsed pc = parse_calls(g.full, tools);
+                    done["raw"] = g.full;
+                    done["text"] = pc.content;
+                    if (!pc.calls.empty()) done["tool_calls"] = pc.calls;
+                }
+                if (g.checks > 0) done["spec"] = {{"checks", g.checks}, {"drafted", g.drafted}, {"accepted", g.accepted},
+                                                  {"looked", g.looked}, {"look_ok", g.look_ok}};
                 send(done);
             } catch (const std::exception& e) {
                 send({{"type", "error"}, {"message", e.what()}});
@@ -1284,7 +1381,7 @@ int main(int argc, char** argv) {
     };
     // Generation speed (tokens/second) the way a chat really runs: the same generate() a chat uses (chat format,
     // sampling with these settings, the experts recorded for the dashboard and for learning, speculative decoding
-    // with `draft` guesses per check or none), over two different questions, n tokens each. A fixed seed makes every
+    // with `draft` guesses per check or none, and prompt lookup as set), over three different questions, n tokens each. A fixed seed makes every
     // setting answer the same way, so the settings are compared fairly. Only the reply is timed, not reading the
     // question. This is what the chat shows, minus the browser drawing it.
     Sampling meas_sp;                                                   // set by /api/autotune and /api/bench
@@ -1292,10 +1389,14 @@ int main(int argc, char** argv) {
         static const char* questions[] = {
             "Explain step by step how a refrigerator keeps food cold, for someone with no science background.",
             "Write a Python function that finds the longest palindrome in a string, with comments, then explain how it works.",
+            // A short worked answer: reasoning that repeats the question's numbers is where prompt lookup guesses
+            // most often, so its cost (or gain) shows here as it does in a chat.
+            "What is 17 x 23? Explain briefly.",
         };
         std::unique_ptr<Speculator> saved = std::move(eng.spec);
         const int saved_seed = eng.seed;
         if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft);
+        eng.spec_changed();
         eng.seed = 4242;
         double toks = 0, secs = 0;
         try {
@@ -1307,8 +1408,9 @@ int main(int argc, char** argv) {
                 toks += (double)g.n_gen;
                 secs += g.gen_s;
             }
-        } catch (...) { eng.spec = std::move(saved); eng.seed = saved_seed; throw; }
+        } catch (...) { eng.spec = std::move(saved); eng.spec_changed(); eng.seed = saved_seed; throw; }
         eng.spec = std::move(saved);
+        eng.spec_changed();
         eng.seed = saved_seed;
         eng.model->reset();
         eng.cached.clear();
@@ -1346,7 +1448,7 @@ int main(int argc, char** argv) {
     // them. Streams {"type":"status"|"result"|"done"|"error"} events; the winner is saved for the model and stays
     // loaded.
     //
-    // Each measurement answers two questions the way a chat does, with the chat's sampling settings and a fixed seed
+    // Each measurement answers three questions the way a chat does, with the chat's sampling settings and a fixed seed
     // (see measure), and times only the replies. Searched one setting at a time, in the order that matters most:
     // split mode (a reload each), then threads, then guesses per check.
     svr.Post("/api/autotune", [&](const httplib::Request& req, httplib::Response& res) {
@@ -1451,7 +1553,8 @@ int main(int argc, char** argv) {
                 double best = 0;
                 if (split) {
                     const std::string modes[] = {"layers", "experts", "hot"};
-                    const int n_modes = eng.model->hparams().is_moe() ? 3 : 2;
+                    // (hot experts: MoE models, and not yet for experts with biases, gpt-oss)
+                    const int n_modes = eng.model->hparams().is_moe() && !eng.model->hparams().expert_bias ? 3 : 2;
                     for (int i = 0; i < n_modes; ++i) {
                         if (i == 2 && learned() <= 0) {
                             if (!status("Learning which experts this model uses")) throw std::runtime_error("cancelled");
@@ -1521,6 +1624,7 @@ int main(int argc, char** argv) {
                 eng.spec.reset();
                 if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft);
                 else eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
+                eng.spec_changed();
                 eng.model->reset();
                 eng.cached.clear();
                 const std::string id = body.value("model", std::string());
@@ -1556,7 +1660,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
         if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
         try {
-            std::fprintf(stderr, "benchmark: reading 512 tokens, then answering two questions like a chat\n");
+            std::fprintf(stderr, "benchmark: reading 512 tokens, then answering three questions like a chat\n");
             const json bb = json::parse(req.body.empty() ? std::string("{}") : req.body, nullptr, false);
             meas_sp = sampling_of(bb.is_object() ? bb : json::object());
             const double p = measure_prompt(512);
@@ -1581,6 +1685,14 @@ int main(int argc, char** argv) {
         if (!mu.try_lock_for(std::chrono::seconds(3))) { res.status = 409; res.set_content("{\"error\":\"busy\"}", "application/json"); return; }
         std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
         if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
+        // Prompt lookup alone changes nothing in the model's cache: no need to start over.
+        if (body.contains("lookup") && body["lookup"].is_number_integer()) eng.lookup = std::max(-1, std::min(16, body["lookup"].get<int>()));
+        if (!body.contains("speculative") && !body.contains("draft_max")) {
+            eng.spec_changed();                                 // the next reply brings lookup up to date with the cache
+            std::fprintf(stderr, "prompt lookup: %s\n", eng.lookup_len() > 0 ? ("up to " + std::to_string(eng.lookup_len()) + " tokens per check").c_str() : "off");
+            res.set_content(dump({{"ok", true}, {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}}), "application/json");
+            return;
+        }
         const bool on = body.value("speculative", eng.spec != nullptr);
         const int d = std::min(8, std::max(1, body.value("draft_max", eng.draft_max > 0 ? eng.draft_max : 2)));
         if (on && !eng.model->has_mtp()) {
@@ -1591,10 +1703,12 @@ int main(int argc, char** argv) {
         eng.draft_max = d;
         eng.spec.reset();
         if (on) eng.spec = std::make_unique<Speculator>(*eng.model, d);
+        eng.spec_changed();
         eng.cached.clear();                                     // the draft block's cache starts over with the next reply
         eng.model->reset();
         std::fprintf(stderr, "speculative decoding %s%s\n", on ? "on, " : "off", on ? (std::to_string(d) + (d == 1 ? " guess per check" : " guesses per check")).c_str() : "");
-        res.set_content(dump({{"ok", true}, {"speculative", on}, {"draft_max", d}}), "application/json");
+        if (eng.lookup_len() > 0) std::fprintf(stderr, "prompt lookup: up to %d tokens per check\n", eng.lookup_len());
+        res.set_content(dump({{"ok", true}, {"speculative", on}, {"draft_max", d}, {"lookup", eng.lookup_len()}}), "application/json");
     });
 
     // ---------------- Forget what was learned about the loaded model's experts ----------------
@@ -1680,7 +1794,7 @@ int main(int argc, char** argv) {
                     settings["last_model"] = rel.generic_u8string();
                     write_settings(a.settings, settings);
                 } catch (const std::exception& e) {
-                    eng.spec.reset(); eng.model.reset(); eng.path.clear();
+                    eng.spec.reset(); eng.look.reset(); eng.model.reset(); eng.path.clear();
                     return oai_error(res, 500, std::string("could not load ") + want + ": " + e.what(), "server_error");
                 }
             }
@@ -1707,11 +1821,14 @@ int main(int argc, char** argv) {
         const json messages = normalize_messages(body["messages"]);
         // Tools (coding agents such as opencode, Cline or Cursor): the model may answer with tool calls, which the
         // app runs and sends back as "tool" messages. tool_choice "none" leaves them out.
-        json tools = json::array();
-        if (body.contains("tools") && body["tools"].is_array())
-            for (const auto& t : body["tools"])
-                if (agent::tool_function(t).is_object() && agent::tool_function(t).contains("name")) tools.push_back(t);
-        if (body.contains("tool_choice") && body["tool_choice"].is_string() && body["tool_choice"].get<std::string>() == "none") tools = json::array();
+        agent::ojson tools = agent::ojson::array();                 // in the order the app wrote them
+        {
+            const agent::ojson ob = agent::ojson::parse(req.body, nullptr, false);
+            if (ob.is_object() && ob.contains("tools") && ob["tools"].is_array())
+                for (const auto& t : ob["tools"])
+                    if (agent::tool_function(t).is_object() && agent::tool_function(t).contains("name")) tools.push_back(t);
+        }
+        if (body.contains("tool_choice") && body["tool_choice"].is_string() && body["tool_choice"].get<std::string>() == "none") tools = agent::ojson::array();
         const bool stream = body.value("stream", false);
         const bool usage_in_stream = body.contains("stream_options") && body["stream_options"].is_object() &&
                                      body["stream_options"].value("include_usage", false);
@@ -1736,7 +1853,7 @@ int main(int argc, char** argv) {
                 json msg = {{"role", "assistant"}, {"content", g.text}};
                 std::string fin = finish(g.stop);
                 if (!tools.empty()) {
-                    const agent::Parsed pc = agent::parse_tool_calls(g.full, tools);
+                    const agent::Parsed pc = parse_calls(g.full, tools);
                     const auto [reasoning, answer] = agent::split_thinking(pc.calls.empty() ? g.text : pc.content);
                     msg["content"] = answer;
                     if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
@@ -1782,7 +1899,7 @@ int main(int argc, char** argv) {
                 if (g.stop != "abort") {
                     std::string fin = finish(g.stop);
                     if (!tools.empty()) {
-                        const agent::Parsed pc = agent::parse_tool_calls(g.full, tools);
+                        const agent::Parsed pc = parse_calls(g.full, tools);
                         if (!pc.calls.empty()) {
                             json calls = openai_calls(pc.calls);
                             for (size_t i = 0; i < calls.size(); ++i) calls[i]["index"] = (int)i;
@@ -1877,6 +1994,90 @@ int main(int argc, char** argv) {
             std::thread([&] { std::this_thread::sleep_for(std::chrono::milliseconds(300)); svr.stop(); }).detach();
         }
         res.set_content(dump(network_info(true)), "application/json");
+    });
+
+    // ---------------- the workspace (tierlm's own chat page only) ----------------
+    // A folder the model can read and, with the user's approval of each change, write. Only for the page on the
+    // computer running tierlm: the request must come from this computer (not through a tunnel), be addressed to
+    // 127.0.0.1 / localhost (so another website that points its own name at 127.0.0.1 can't use it), come from
+    // tierlm's own page if a browser says where from (Origin), and carry a header other websites can't send
+    // without asking first (X-Tierlm-Workspace).
+    auto ws_check = [&](const httplib::Request& req, bool need_header) -> std::string {
+        if (!is_local(req)) return "the workspace can only be used on the computer running tierlm";
+        const std::string port = std::to_string(a.port), host = req.get_header_value("Host");
+        if (host != "127.0.0.1:" + port && host != "localhost:" + port && host != "[::1]:" + port)
+            return "the workspace can only be used from http://127.0.0.1:" + port;
+        if (req.has_header("Origin")) {
+            const std::string o = req.get_header_value("Origin");
+            if (o != "http://127.0.0.1:" + port && o != "http://localhost:" + port && o != "http://[::1]:" + port)
+                return "the workspace can only be used from tierlm's own page";
+        }
+        if (need_header && req.get_header_value("X-Tierlm-Workspace") != "1") return "missing X-Tierlm-Workspace header";
+        return "";
+    };
+    auto ws_info = [&](const httplib::Request& req) {
+        const std::string folder = settings.value("workspace_folder", std::string());
+        std::error_code ec;
+        return json{{"available", ws_check(req, false).empty()}, {"folder", folder},
+                    {"exists", !folder.empty() && fs::is_directory(fs::u8path(folder), ec)},
+                    {"picker", (bool)
+#ifdef _WIN32
+                                true
+#else
+                                false
+#endif
+                    }};
+    };
+    svr.Get("/api/workspace", [&](const httplib::Request& req, httplib::Response& res) {
+        res.set_content(dump(ws_info(req)), "application/json");
+    });
+    svr.Post("/api/workspace", [&](const httplib::Request& req, httplib::Response& res) {    // {"folder": "C:\\code\\project"}
+        if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) return oai_error(res, 400, "bad request");
+        std::string folder = agent::trim(body.value("folder", std::string()));
+        std::error_code ec;
+        if (!folder.empty()) {
+            const fs::path p = fs::weakly_canonical(fs::u8path(folder), ec);
+            if (ec || !fs::is_directory(p, ec)) return oai_error(res, 400, "not a folder: " + folder);
+            folder = p.u8string();
+        }
+        settings["workspace_folder"] = folder;
+        write_settings(a.settings, settings);
+        std::fprintf(stderr, "workspace: %s\n", folder.empty() ? "none" : folder.c_str());
+        res.set_content(dump(ws_info(req)), "application/json");
+    });
+    svr.Post("/api/workspace/pick", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
+#ifdef _WIN32
+        bool cancelled = true;
+        const std::string f = pick_folder_windows(settings.value("workspace_folder", std::string()), cancelled);
+        res.set_content(dump({{"cancelled", cancelled}, {"folder", f}}), "application/json");
+#else
+        oai_error(res, 501, "type the folder path instead (the picker is Windows only)");
+#endif
+    });
+    // Runs a tool the model asked for: {"name", "arguments": {...}, "apply": false, "hash": ""}. A change (write_file,
+    // edit_file) comes back as a diff unless apply is true. Failures come back as {"error"}: the page passes them to
+    // the model, which can try again.
+    svr.Post("/api/workspace/tool", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) return oai_error(res, 400, "bad request");
+        const std::string folder = settings.value("workspace_folder", std::string());
+        try {
+            if (folder.empty()) throw workspace::Error("no workspace folder is chosen");
+            json args = body.contains("arguments") ? body["arguments"] : json::object();
+            if (args.is_string()) args = json::parse(args.get<std::string>(), nullptr, false);
+            if (!args.is_object()) throw workspace::Error("the tool's arguments are not a JSON object");
+            const std::string name = body.value("name", std::string());
+            json r = workspace::run(fs::u8path(folder), name, args, body.value("apply", false), body.value("hash", std::string()));
+            if (r.contains("result") && (body.value("apply", false) || !workspace::changes_files(name)))
+                std::fprintf(stderr, "workspace: %s %s\n", name.c_str(), args.value("path", std::string()).c_str());
+            res.set_content(dump(r), "application/json");
+        } catch (const std::exception& e) {
+            res.set_content(dump({{"error", e.what()}}), "application/json");
+        }
     });
 
     std::fprintf(stderr, "\n  tierlm is ready: open http://127.0.0.1:%d in your browser\n  %s\n  OpenAI-compatible API: http://127.0.0.1:%d/v1\n  (Ctrl+C to stop)\n\n",

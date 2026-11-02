@@ -21,7 +21,10 @@ CASES = {
     "qwen3":     ("qwen3",    dict(E=48, H=4, KV=2, HD=16, FF=40, qkn="head")),              # head_dim != E/H
     "qwen3moe":  ("qwen3moe", dict(E=48, H=4, KV=2, HD=16, FFX=24, NE=8, NU=2, qkn="head", renorm=True)),
     "olmoe":     ("olmoe",    dict(E=48, H=4, KV=4, HD=12, FFX=24, NE=8, NU=2, qkn="full")),
+    # gpt-oss: biases everywhere, attention sinks, a sliding window on every other layer, YaRN, clamped SwiGLU
+    "gpt-oss":   ("gpt-oss",  dict(E=48, H=4, KV=2, HD=16, FFX=24, NE=8, NU=2, oss=True)),
 }
+SWA, YARN_FACTOR, YARN_ORIG = 8, 32.0, 256   # window (tokens) and YaRN settings of the tiny gpt-oss
 
 def make(arch, s, seed, parts=1):
     rng = np.random.default_rng(seed)
@@ -35,7 +38,11 @@ def make(arch, s, seed, parts=1):
     for i in range(L):
         b = f"blk.{i}."
         W.update({b + "attn_norm.weight": nw(E), b + "attn_q.weight": r(H * HD, E), b + "attn_k.weight": r(KV * HD, E),
-                  b + "attn_v.weight": r(KV * HD, E), b + "attn_output.weight": r(E, H * HD), b + "ffn_norm.weight": nw(E)})
+                  b + "attn_v.weight": r(KV * HD, E), b + "attn_output.weight": r(E, H * HD),
+                  b + ("post_attention_norm.weight" if s.get("oss") else "ffn_norm.weight"): nw(E)})
+        if s.get("oss"):
+            W.update({b + "attn_q.bias": r(H * HD), b + "attn_k.bias": r(KV * HD), b + "attn_v.bias": r(KV * HD),
+                      b + "attn_output.bias": r(E), b + "attn_sinks.weight": (rng.standard_normal(H) * 2).astype(np.float32)})
         if s.get("bias"):
             W.update({b + "attn_q.bias": r(H * HD), b + "attn_k.bias": r(KV * HD), b + "attn_v.bias": r(KV * HD)})
         if s.get("qkn") == "full": W.update({b + "attn_q_norm.weight": nw(H * HD), b + "attn_k_norm.weight": nw(KV * HD)})
@@ -44,6 +51,9 @@ def make(arch, s, seed, parts=1):
             NE, F = s["NE"], s["FFX"]
             W.update({b + "ffn_gate_inp.weight": r(NE, E), b + "ffn_gate_exps.weight": r(NE, F, E),
                       b + "ffn_up_exps.weight": r(NE, F, E), b + "ffn_down_exps.weight": r(NE, E, F)})
+            if s.get("oss"):                    # big enough that the SwiGLU clamp at 7 is reached sometimes
+                W.update({b + "ffn_gate_inp.bias": r(NE), b + "ffn_gate_exps.bias": r(NE, F) * 30,
+                          b + "ffn_up_exps.bias": r(NE, F) * 30, b + "ffn_down_exps.bias": r(NE, E)})
         else:
             F = s["FF"]
             W.update({b + "ffn_gate.weight": r(F, E), b + "ffn_up.weight": r(F, E), b + "ffn_down.weight": r(E, F)})
@@ -54,6 +64,10 @@ def make(arch, s, seed, parts=1):
     w.add_block_count(L); w.add_embedding_length(E); w.add_head_count(H); w.add_head_count_kv(KV)
     w.add_key_length(HD); w.add_value_length(HD); w.add_rope_dimension_count(HD)
     w.add_context_length(CTX); w.add_rope_freq_base(BASE); w.add_layer_norm_rms_eps(EPS)
+    if s.get("oss"):
+        w.add_sliding_window(SWA)
+        w.add_rope_scaling_type(gguf.RopeScalingType.YARN); w.add_rope_scaling_factor(YARN_FACTOR)
+        w.add_rope_scaling_orig_ctx_len(YARN_ORIG)
     if "NE" in s:
         w.add_expert_count(s["NE"]); w.add_expert_used_count(s["NU"])
         if arch == "qwen3moe": w.add_expert_feed_forward_length(s["FFX"]); w.add_feed_forward_length(s["FFX"] * 4)
@@ -85,30 +99,64 @@ def rope(x, pos, neox, factors):       # x: [T, heads, HD]
     out[..., 1::2] = b * c + a * s
     return out
 
+def yarn(HD):
+    """YaRN as Hugging Face computes it for gpt-oss (transformers' _compute_yarn_parameters, truncate=False):
+    per-dimension divisors of the rotation frequencies, and the cos/sin scale."""
+    import math
+    corr = lambda rot: HD * math.log(YARN_ORIG / (rot * 2 * math.pi)) / (2 * math.log(BASE))
+    lo, hi = max(corr(32.0), 0), min(corr(1.0), HD - 1)
+    if lo == hi: hi += 0.001
+    ramp = np.clip((np.arange(HD // 2) - lo) / (hi - lo), 0, 1)
+    e = 1 - ramp
+    scale = (1 - e) / YARN_FACTOR + e                         # inv_freq = original inv_freq * scale
+    return 1 / scale, 0.1 * math.log(YARN_FACTOR) + 1
+
 def reference(arch, s, W, L, ids):
     E, H, KV, HD = s["E"], s["H"], s["KV"], s["HD"]
     T = len(ids); pos = np.arange(T, dtype=np.float64)
     neox = arch != "llama"
     factors = W.get("rope_freqs.weight")
+    mscale = 1.0
+    if s.get("oss"): factors, mscale = yarn(HD)
     x = W["token_embd.weight"][ids].astype(np.float64)
     mask = np.triu(np.full((T, T), -np.inf), 1)
+    qi, ki = np.arange(T)[:, None], np.arange(T)[None, :]
+    swa_mask = np.where(qi - ki >= SWA, -np.inf, mask)      # also nothing SWA or more tokens back
     for i in range(L):
         b = f"blk.{i}."
         h = rms(x, W[b + "attn_norm.weight"])
         q, k, v = h @ W[b + "attn_q.weight"].T, h @ W[b + "attn_k.weight"].T, h @ W[b + "attn_v.weight"].T
-        if s.get("bias"): q, k, v = q + W[b + "attn_q.bias"], k + W[b + "attn_k.bias"], v + W[b + "attn_v.bias"]
+        if s.get("bias") or s.get("oss"): q, k, v = q + W[b + "attn_q.bias"], k + W[b + "attn_k.bias"], v + W[b + "attn_v.bias"]
         if s.get("qkn") == "full": q, k = rms(q, W[b + "attn_q_norm.weight"]), rms(k, W[b + "attn_k_norm.weight"])
         q, k, v = q.reshape(T, H, HD), k.reshape(T, KV, HD), v.reshape(T, KV, HD)
         if s.get("qkn") == "head": q, k = rms(q, W[b + "attn_q_norm.weight"]), rms(k, W[b + "attn_k_norm.weight"])
-        q, k = rope(q, pos, neox, factors), rope(k, pos, neox, factors)
+        q, k = rope(q, pos, neox, factors) * mscale, rope(k, pos, neox, factors) * mscale
         k, v = np.repeat(k, H // KV, axis=1), np.repeat(v, H // KV, axis=1)   # grouped-query attention
-        att = softmax(np.einsum("qhd,khd->hqk", q, k) / np.sqrt(HD) + mask)
+        sc = np.einsum("qhd,khd->hqk", q, k) / np.sqrt(HD) + (swa_mask if s.get("oss") and i % 2 == 0 else mask)
+        if s.get("oss"):                    # sinks: one more logit per head in the softmax, then dropped
+            sink = np.broadcast_to(W[b + "attn_sinks.weight"].astype(np.float64)[:, None, None], (H, T, 1))
+            att = softmax(np.concatenate([sc, sink], -1))[..., :-1]
+        else:
+            att = softmax(sc)
         o = np.einsum("hqk,khd->qhd", att, v).reshape(T, H * HD)
         x = x + o @ W[b + "attn_output.weight"].T
-        h = rms(x, W[b + "ffn_norm.weight"])
+        if s.get("oss"): x = x + W[b + "attn_output.bias"]
+        h = rms(x, W[b + ("post_attention_norm.weight" if s.get("oss") else "ffn_norm.weight")])
         silu = lambda z: z / (1 + np.exp(-z))
         if "NE" not in s:
             x = x + (silu(h @ W[b + "ffn_gate.weight"].T) * (h @ W[b + "ffn_up.weight"].T)) @ W[b + "ffn_down.weight"].T
+            continue
+        if s.get("oss"):                    # top experts by score, softmax over those; biased, clamped SwiGLU experts
+            sig = lambda z: 1 / (1 + np.exp(-z))
+            logits = h @ W[b + "ffn_gate_inp.weight"].T + W[b + "ffn_gate_inp.bias"]
+            out = np.zeros_like(x)
+            for t in range(T):
+                top = np.argsort(-logits[t], kind="stable")[:s["NU"]]
+                for e, wt in zip(top, softmax(logits[t, top])):
+                    g = np.minimum(W[b + "ffn_gate_exps.weight"][e] @ h[t] + W[b + "ffn_gate_exps.bias"][e], 7.0)
+                    u = np.clip(W[b + "ffn_up_exps.weight"][e] @ h[t] + W[b + "ffn_up_exps.bias"][e], -7.0, 7.0)
+                    out[t] += wt * (W[b + "ffn_down_exps.weight"][e] @ ((u + 1) * g * sig(1.702 * g)) + W[b + "ffn_down_exps.bias"][e])
+            x = x + out
             continue
         p = softmax(h @ W[b + "ffn_gate_inp.weight"].T)
         out = np.zeros_like(x)

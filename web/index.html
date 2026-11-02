@@ -74,7 +74,16 @@
   .reloadnote button { display: block; margin-top: 8px; }
   .subhead { font-weight: 600; margin: 16px 0 6px; font-size: 12.5px; }
   #console { margin: 8px 0 0; max-height: 52vh; overflow: auto; background: #0e1116; color: #d5d9e2; border-radius: 8px; padding: 10px; font: 11.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; }
-  #console .v { color: #8a91a1; }
+  #console .v, #bigconsole pre .v { color: #8a91a1; }
+  #bigconsole { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px 14px 14px; gap: 8px; }
+  #bigconsole[hidden] { display: none; }
+  #bigconsole .row { display: flex; align-items: center; gap: 8px; }
+  #bigconsole .ttl { font-weight: 650; }
+  #bigconsole pre { flex: 1; min-height: 0; margin: 0; overflow: auto; background: #0e1116; color: #d5d9e2; border-radius: 8px;
+                    padding: 12px; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; }
+  #bigconsole pre .e { color: #ff9a7a; }
+  #bigconsole pre .s { color: #6ff0dc; }
+  #chat.consolewide #messages, #chat.consolewide #composer { display: none; }
   #console .e { color: #ff9a7a; }
   #console .s { color: #6ff0dc; }
   #chatlist { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
@@ -147,6 +156,22 @@
   .msg.assistant { align-self: flex-start; background: var(--panel-2); border-bottom-left-radius: 4px; }
   .msg.assistant.streaming::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
   .msg .meta { display: block; margin-top: 6px; font-size: 11.5px; color: var(--faint); white-space: normal; }
+  .msg.tool { align-self: flex-start; max-width: 92%; background: transparent; border: 1px solid var(--line); border-radius: 10px;
+              padding: 7px 10px; font-size: 13px; white-space: normal; }
+  .msg.tool .thead { font-weight: 600; color: var(--muted); }
+  .msg.tool .thead::before { content: "▸ "; color: var(--accent); }
+  .msg.tool.applied { border-color: var(--accent); }
+  .msg.tool.err { border-color: var(--danger); }
+  .msg.tool .terr { color: var(--danger); margin-top: 4px; }
+  .msg.tool .tnote { color: var(--muted); margin-top: 4px; font-size: 12.5px; }
+  .msg.tool details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .msg.tool pre { margin: 6px 0 2px; max-height: 320px; overflow: auto; background: var(--panel-2); border-radius: 6px; padding: 8px;
+                  font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; }
+  .msg.tool pre.diff .add { color: #1a7f37; background: rgba(46, 160, 67, .12); display: block; }
+  .msg.tool pre.diff .del { color: #cf222e; background: rgba(248, 81, 73, .12); display: block; }
+  .msg.tool pre.diff .hunk { color: var(--muted); display: block; }
+  .msg.tool .row { display: flex; gap: 8px; margin-top: 6px; }
+  .wsfolder { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); color: var(--muted); }
   .msg.error { align-self: center; background: transparent; color: var(--danger); font-size: 13px; }
   /* Markdown in replies */
   .msg.assistant { white-space: normal; }
@@ -157,6 +182,8 @@
   .md ul, .md ol { margin: 0 0 .7em; padding-left: 1.5em; } .md li { margin: .15em 0; } .md li > ul, .md li > ol { margin: .2em 0; }
   .md blockquote { margin: 0 0 .7em; padding: .2em .9em; border-left: 3px solid var(--accent); color: var(--muted); }
   .md hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+  .md math { font-size: 1.12em; }
+  .md math[display="block"] { margin: .5em 0; overflow-x: auto; overflow-y: hidden; }
   .md code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .9em; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
   .md .codeblock { position: relative; margin: 0 0 .8em; }
   .md pre { margin: 0; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; line-height: 1.45; }
@@ -196,8 +223,8 @@
   /* dashboard */
   #dash { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; align-content: start; overflow-y: auto; min-height: 0; }
   #dash .wide { grid-column: 1 / -1; }
-  .big { font-size: 34px; font-weight: 700; letter-spacing: -1px; line-height: 1.1; }
-  .big small { font-size: 14px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-left: 4px; }
+  .big { font-size: 24px; font-weight: 650; letter-spacing: -.5px; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .big small { font-size: 12.5px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-left: 4px; }
   .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; margin-top: 8px; }
   .kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
   .bar { height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; margin-top: 6px; }
@@ -307,6 +334,13 @@
   /* API and network card */
   .apirow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; font-size: 13px; }
   .apirow .lbl { color: var(--muted); min-width: 190px; }
+  .setuph { font-size: 13.5px; margin: 18px 0 4px; }
+  #appsetup select { font: inherit; font-size: 13px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+  #appsetup .codewrap { position: relative; }
+  #appcfg { margin: 6px 0; max-height: 340px; overflow: auto; background: #0e1116; color: #d5d9e2; border-radius: 8px; padding: 10px;
+            font: 12px/1.5 var(--mono); white-space: pre; }
+  #appsteps ol { margin: 4px 0; padding-left: 20px; }
+  #appsteps b { color: var(--ink); }
   .apirow code { background: var(--panel-2); color: var(--ink); padding: 3px 8px; border-radius: 6px; font-size: 12.5px; word-break: break-all; }
   #apikey { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; flex: 1; min-width: 220px; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
   #netcard label.chk { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13.5px; }
@@ -314,6 +348,7 @@
   #netmsg { color: var(--muted); }
   .warnline { color: var(--danger); font-size: 12.5px; margin-top: 6px; }
 </style>
+<script src="vendor/katex.min.js"></script>
 </head>
 <body>
 <header>
@@ -497,6 +532,32 @@
       <div class="help">When set, apps must send it as their API key, and the tierlm page asks for it on other devices. Needed if you
         open tierlm to the internet through a tunnel (Cursor works that way).</div>
       <div class="caption" id="netmsg"></div>
+      <div id="appsetup" hidden>
+        <h3 class="setuph">Set up an app</h3>
+        <div class="help">Ready-made settings for the loaded model: its name, context length, tool calling and this address.
+          Load the model with the settings you want first; this follows them.</div>
+        <div class="apirow">
+          <select id="appsel" aria-label="App">
+            <option value="opencode">opencode (coding agent)</option>
+            <option value="openwebui">Open WebUI</option>
+            <option value="continue">Continue (VS Code / JetBrains)</option>
+            <option value="cline">Cline (VS Code)</option>
+            <option value="python">Python (OpenAI library)</option>
+          </select>
+          <select id="appwhere" aria-label="Where the app runs">
+            <option value="local">App on this computer</option>
+            <option value="lan">App on another device</option>
+            <option value="docker">App in Docker on this computer</option>
+          </select>
+        </div>
+        <div class="help" id="appsteps"></div>
+        <div class="codewrap"><pre id="appcfg"></pre></div>
+        <div class="apirow">
+          <button class="tiny" id="appcopy">Copy</button>
+          <button class="tiny" id="appcopyps" hidden>Copy PowerShell command that saves it</button>
+          <span class="caption" id="appnote"></span>
+        </div>
+      </div>
     </div>
   </section>
 </main>
@@ -528,6 +589,18 @@
           <select id="lspecn" aria-label="Guesses per check"><option value="1">1 guess</option><option value="2">2 guesses</option><option value="3">3 guesses</option><option value="4">4 guesses</option><option value="6">6 guesses</option></select>
         </div>
         <div class="help" id="lspechelp"></div>
+        <div class="lrow2">
+          <label for="llook">Prompt lookup</label>
+          <select id="llook"><option value="-1">Automatic</option><option value="0">Off</option><option value="4">Up to 4 tokens</option><option value="8">Up to 8 tokens</option><option value="16">Up to 16 tokens</option></select>
+        </div>
+        <div class="lrow2" id="wsrow" hidden>
+          <label class="chk"><input type="checkbox" id="wson"> Workspace</label>
+          <span class="wsfolder" id="wsfolder"></span>
+          <button class="tiny" id="wspick">Choose…</button>
+        </div>
+        <div class="help" id="wshelp" hidden></div>
+        <div class="help" id="llookhelp">Same answers, faster when the reply repeats text from the conversation (editing a file, quoting
+          code): tierlm guesses the repeat and the model checks it in one pass. Works with every model.</div>
         <label class="lrow" for="sysprompt">System prompt</label>
         <textarea id="sysprompt" rows="3" placeholder="Optional: instructions the model follows in every reply"></textarea>
         <div class="reloadnote">Context length, split mode, context memory and the model itself need a reload.
@@ -546,6 +619,7 @@
           <button class="tiny" id="c-verbose">Verbose</button>
           <span class="grow"></span>
           <button class="tiny" id="c-copy">Copy log</button>
+          <button class="tiny" id="c-wide" title="Show the console in the chat area, full size">Expand</button>
         </div>
         <pre id="console" aria-live="polite"></pre>
       </div>
@@ -603,6 +677,17 @@
   </aside>
 
   <section class="card" id="chat">
+    <div id="bigconsole" hidden>
+      <div class="row">
+        <span class="ttl">Console</span>
+        <button class="tiny on" id="w-info">Info</button>
+        <button class="tiny" id="w-verbose">Verbose</button>
+        <span class="grow"></span>
+        <button class="tiny" id="w-copy">Copy log</button>
+        <button class="tiny" id="w-back">Back to chat</button>
+      </div>
+      <pre id="console2" aria-live="polite"></pre>
+    </div>
     <div id="messages">
       <div class="empty" id="empty">
         <b>Chat with your own engine.</b><br>
@@ -756,6 +841,7 @@ async function loadInfo() {
   $("hotforget").hidden = !(moe && learned > 0);
   renderMiniMem();
   syncLiveSpec();
+  if (typeof renderAppSetup === "function") renderAppSetup();
   $("devname").textContent = info.device;
   $("devdot").classList.toggle("on", info.on_gpu);
   $("modelname").textContent = info.name;
@@ -874,7 +960,43 @@ function mdBlocks(src) {
   }
   return out.join("");
 }
+// A reply as stored (the model's own text) without its tool calls, which show as cards instead.
+function stripCalls(text) {
+  const close = text.indexOf("</think>");
+  const at = text.indexOf("<tool_call>", close >= 0 ? close : 0);   // (also inside thinking that was never closed)
+  return at >= 0 ? text.slice(0, at) : text;
+}
+// ---------- Maths ----------
+// LaTeX the model writes, \( … \), \[ … \], $$ … $$ and $ … $, is drawn by KaTeX (bundled in web/vendor) as MathML,
+// which the browser lays out itself. Code is left as written, and $ … $ only counts as maths when the dollar signs hug
+// what's between them ("$5 and $10" stays text). Until KaTeX has loaded, or for LaTeX it can't read, the text shows
+// as the model wrote it. The maths is taken out before the Markdown rules run, so they can't change it.
+function takeMath(src) {
+  const maths = [];
+  if (!window.katex) return { text: src, maths };
+  const put = (tex, display, raw) => { maths.push({ tex, display, raw }); return "\u0001" + (maths.length - 1) + "\u0001"; };
+  const parts = src.split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/);
+  for (let i = 0; i < parts.length; i += 2)                                // even parts: text; odd parts: code
+    parts[i] = parts[i]
+      .replace(/\$\$([\s\S]+?)\$\$/g, (m, t) => put(t, true, m))
+      .replace(/\\\[([\s\S]+?)\\\]/g, (m, t) => put(t, true, m))
+      .replace(/\\\(([\s\S]+?)\\\)/g, (m, t) => put(t, false, m))
+      .replace(/(^|[^\\$\w])\$(?=\S)([^$\n]*?[^\s\\])\$(?!\d)/g, (m, pre, t) => pre + put(t, false, m.slice(pre.length)));
+  return { text: parts.join(""), maths };
+}
+function putMath(html, maths) {
+  if (!maths.length) return html;
+  return html.replace(/\u0001(\d+)\u0001/g, (_, i) => {
+    const m = maths[+i];
+    try { return katex.renderToString(m.tex, { output: "mathml", displayMode: m.display, throwOnError: true }); }
+    catch (e) { return esc(m.raw); }
+  });
+}
 function renderMd(text) {
+  const mx = takeMath(stripCalls(text));
+  return putMath(renderMdText(mx.text), mx.maths);
+}
+function renderMdText(text) {
   let t = esc(text);
   let think = "";
   const open = t.indexOf("&lt;think&gt;");
@@ -919,21 +1041,15 @@ function setBusy(b) {
   for (const id of ["benchbtn", "newchat", "newchat2"]) $(id).disabled = b;
   $("status").textContent = b ? "generating…" : "idle";
 }
-async function send(text) {
-  text = (text ?? $("input").value).trim();
-  if (!text || busy) return;
-  $("input").value = "";
-  addMsg("user", text);
-  history.push({ role: "user", content: text });
+// One reply from the model, streamed into a new bubble. Returns { reply, meta, done } (done: the "done" event).
+async function streamReply(useWs) {
   const bubble = addMsg("assistant", "");
   bubble.classList.add("streaming");
-  setBusy(true);
-  controller = new AbortController();
-  let reply = "", meta = "", drawPending = false;
+  let reply = "", meta = "", drawPending = false, doneEv = null;
   try {
     const res = await api("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
-      body: JSON.stringify({ messages: withSystem(history), temperature: +$("temp").value, max_tokens: maxTokens(),
+      body: JSON.stringify({ messages: withSystem(history), temperature: +$("temp").value, max_tokens: maxTokens(), workspace: useWs,
         top_p: +$("topp").value, top_k: +$("topk").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value }),
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
@@ -954,9 +1070,11 @@ async function send(text) {
           if (!drawPending) { drawPending = true; requestAnimationFrame(() => { drawPending = false; setReply(bubble, reply); $("messages").scrollTop = $("messages").scrollHeight; }); }
         }
         else if (ev.type === "done") {
+          doneEv = ev;
           meta = ev.n_gen + " tokens · " + ev.gen_tps.toFixed(1) + " tok/s" + (ev.stop === "length" ? " · hit the max reply length (raise Max reply below)" : ev.stop === "context" ? " · context full" : "");
-          if (ev.spec && ev.spec.checks) meta += " · speculative: " + (ev.n_gen / ev.spec.checks).toFixed(1) + " tokens per check, " +
-            Math.round(100 * ev.spec.accepted / Math.max(1, ev.spec.drafted)) + "% of guesses kept";
+          if (ev.spec && ev.spec.checks && ev.spec.drafted) meta += " · speculative: " + (ev.n_gen / ev.spec.checks).toFixed(1) + " tokens per check, " +
+            Math.round(100 * ev.spec.accepted / Math.max(1, ev.spec.drafted)) + "% of guesses kept" +
+            (ev.spec.looked ? " (prompt lookup: " + ev.spec.look_ok + " of " + ev.spec.looked + ")" : "");
           onDone(ev);
         }
         else if (ev.type === "error") throw new Error(ev.message);
@@ -968,10 +1086,46 @@ async function send(text) {
   }
   bubble.classList.remove("streaming");
   setReply(bubble, reply);
-  if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m); }
-  if (reply) history.push({ role: "assistant", content: reply, meta });
-  else if (!reply && history.at(-1)?.role === "user" && meta !== "stopped") history.pop();
-  saveChat();
+  const calls = doneEv?.tool_calls || [];
+  if (!reply.trim() && calls.length) bubble.remove();              // only a tool call: its card says it all
+  else if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m); }
+  return { reply, meta, done: doneEv };
+}
+async function send(text) {
+  text = (text ?? $("input").value).trim();
+  if (!text || busy) return;
+  if (consoleWide) setConsoleWide(false);
+  $("input").value = "";
+  addMsg("user", text);
+  history.push({ role: "user", content: text });
+  setBusy(true);
+  controller = new AbortController();
+  // With the workspace on, the model may ask for its tools: they run (reading at once, changes after Apply), their
+  // results go back, and the model carries on, until it answers without a tool call.
+  const useWs = wsOn();
+  for (let round = 0; ; ++round) {
+    const r = await streamReply(useWs);
+    const calls = r.done?.tool_calls || [];
+    if (r.reply || calls.length) {
+      // Sent back as the model wrote it (call included), so tierlm reuses its cache; harmony models get the calls
+      // separately and their template writes them.
+      const raw = calls.length && info.chat_format !== "harmony" && r.done.raw !== undefined ? r.done.raw : r.reply;
+      const m = { role: "assistant", content: raw, meta: r.meta };
+      if (calls.length) m.tool_calls = calls;
+      history.push(m);
+    } else if (history.at(-1)?.role === "user" && r.meta !== "stopped") history.pop();
+    saveChat();
+    if (!calls.length || r.meta === "stopped" || !controller) break;
+    let stopped = false;
+    for (const c of calls) {
+      const result = stopped ? "Not run: the user stopped." : await runTool(c);
+      if (result === null) stopped = true;
+      history.push({ role: "tool", name: c.name, content: result ?? "Not run: the user stopped." });
+    }
+    saveChat();
+    if (stopped) break;
+    if (round >= 24) { addMsg("error", "⚠ Stopped after 25 rounds of tool use. Send a message to let the model continue."); break; }
+  }
   setBusy(false);
   controller = null;
 }
@@ -1283,6 +1437,7 @@ function applySaved() {
   $("specon").checked = canSpec && s.speculative !== false;     // on by default when the model has a draft layer
   // Each guess an MoE model checks pulls in its own experts from RAM, so 2 does best there; 3 for dense models.
   $("specn").value = String(s.draft_max || (E ? 2 : 3));
+  $("llook").value = String(s.lookup ?? -1);
   $("spechelp").textContent = canSpec
     ? "Faster replies with the same answers: the model's small built-in draft layer guesses the next few words, and the model checks them all in one pass. Helps most when the model doesn't fit in VRAM."
     : "Not available for this model: its file has no built-in draft layer (Qwen3.5, 3.6 and 3.8 files usually include one).";
@@ -1506,7 +1661,7 @@ function loadBody(p) {
   const exp = +$("experts").value;
   const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : (p.gpus || []).length > 1 ? "gpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
-                 speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value,
+                 speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value, lookup: +$("llook").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
                  force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, hot_experts: $("hotexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, temperature: +$("temp").value };
   if ($("forcecpu").checked) body.device = "cpu";
@@ -1640,6 +1795,8 @@ function syncLiveSpec() {
   $("lspec").disabled = $("lspecn").disabled = !can;
   $("lspec").checked = !!info.speculative;
   $("lspecn").value = String(info.draft_max || (info.experts ? 2 : 3));
+  $("llook").value = String(info.lookup_setting ?? -1);
+  $("llook").title = info.lookup ? "Now guessing up to " + info.lookup + " tokens per check" : "Off";
   $("lspechelp").textContent = can ? "Faster replies with the same answers. 2 guesses usually suit MoE models, 3 dense ones; the benchmark below shows which is faster here."
     : info.has_draft_block ? "This model has a draft layer, but it was loaded without it: turn on Speculative decoding on the setup screen and load it again." : "";
 }
@@ -1651,17 +1808,146 @@ async function setLiveSpec() {
   await loadInfo();
 }
 $("lspec").onchange = setLiveSpec;
+$("llook").onchange = async () => {
+  const r = await api("/api/spec", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lookup: +$("llook").value }) });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); addMsg("error", "⚠ " + (j.error || r.statusText)); }
+  await loadInfo();
+};
 $("lspecn").onchange = () => { if ($("lspec").checked) setLiveSpec(); };
+
+// ---------- workspace: a folder the model can read, and change with your approval ----------
+let ws = { available: false, folder: "", exists: false, picker: false };
+const wsHeaders = { "Content-Type": "application/json", "X-Tierlm-Workspace": "1" };
+const wsOn = () => ws.available && ws.exists && $("wson").checked;
+async function loadWorkspace() {
+  try { ws = await (await api("/api/workspace")).json(); } catch (e) { ws = { available: false }; }
+  $("wsrow").hidden = $("wshelp").hidden = !ws.available;
+  $("wsfolder").textContent = ws.folder || "No folder chosen";
+  $("wsfolder").title = ws.folder || "";
+  $("wson").disabled = !ws.folder || !ws.exists;
+  $("wson").checked = !$("wson").disabled && LS.get("tierlm.ws", false);
+  $("wshelp").textContent = !ws.folder ? "Choose a project folder to let the model read its files and suggest changes. You approve every change."
+    : !ws.exists ? "That folder doesn't exist any more: choose it again."
+    : "The model can list, read and search the files in this folder, and suggest changes that you see as a diff and approve. Nothing runs, nothing outside the folder.";
+}
+async function setWorkspace(folder) {
+  const r = await api("/api/workspace", { method: "POST", headers: wsHeaders, body: JSON.stringify({ folder }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) addMsg("error", "⚠ " + (j.error?.message || j.error || r.statusText));
+  else { LS.set("tierlm.ws", true); }
+  await loadWorkspace();
+}
+$("wspick").onclick = async () => {
+  if (ws.picker) {
+    const r = await api("/api/workspace/pick", { method: "POST", headers: wsHeaders });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && !j.cancelled && j.folder) await setWorkspace(j.folder);
+  } else {
+    const f = prompt("Workspace folder (the full path):", ws.folder || "");
+    if (f !== null) await setWorkspace(f.trim());
+  }
+};
+$("wson").onchange = () => LS.set("tierlm.ws", $("wson").checked);
+async function wsTool(name, args, apply = false, hash = "") {
+  try {
+    const r = await api("/api/workspace/tool", { method: "POST", headers: wsHeaders, body: JSON.stringify({ name, arguments: args, apply, hash }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return { error: j.error?.message || r.statusText };
+    return j;
+  } catch (e) { return { error: e.message }; }
+}
+const toolLabel = (name, a) => ({
+  list_files: "Listed " + (a.path ? a.path : "the workspace") + (a.recursive ? " (with subfolders)" : ""),
+  read_file: "Read " + (a.path || "?") + (a.start_line ? ", lines " + a.start_line + (a.end_line ? "–" + a.end_line : "") : ""),
+  search_files: "Searched for “" + (a.query || "") + "”" + (a.path ? " in " + a.path : ""),
+  write_file: "Write " + (a.path || "?"),
+  edit_file: "Edit " + (a.path || "?"),
+})[name] || name;
+// A tool card in the chat: what the model asked for, and what came back.
+function toolCard(name, args) {
+  $("empty")?.remove();
+  const d = document.createElement("div"); d.className = "msg tool";
+  const head = document.createElement("div"); head.className = "thead"; head.textContent = toolLabel(name, args || {});
+  d.append(head);
+  $("messages").appendChild(d); $("messages").scrollTop = $("messages").scrollHeight;
+  return d;
+}
+function cardOutput(card, text, open = false) {
+  const det = document.createElement("details"); if (open) det.open = true;
+  const sum = document.createElement("summary"); sum.textContent = text.split("\n").filter(Boolean).length + " lines";
+  const pre = document.createElement("pre"); pre.textContent = text.length > 20000 ? text.slice(0, 20000) + "\n…" : text;
+  det.append(sum, pre); card.append(det);
+}
+function cardDiff(card, diff) {
+  const pre = document.createElement("pre"); pre.className = "diff";
+  for (const line of diff.split("\n")) {
+    const span = document.createElement("span");
+    span.className = line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "del" : line.startsWith("@@") ? "hunk" : "";
+    span.textContent = line + "\n"; pre.append(span);
+  }
+  card.append(pre);
+}
+// Runs one tool call; returns its result for the model, or null if the user pressed Stop while it waited.
+async function runTool(call) {
+  const name = call.name, args = call.arguments || {};
+  const card = toolCard(name, args);
+  const changes = name === "write_file" || name === "edit_file";
+  const r = await wsTool(name, args);
+  if (r.error) {
+    card.classList.add("err");
+    const e = document.createElement("div"); e.className = "terr"; e.textContent = r.error; card.append(e);
+    return "Error: " + r.error;
+  }
+  if (!changes) { cardOutput(card, r.result || ""); return r.result || ""; }
+  // A change: show the diff, wait for Apply or Skip (or Stop)
+  cardDiff(card, r.diff || "");
+  const row = document.createElement("div"); row.className = "row";
+  const apply = document.createElement("button"); apply.className = "tiny primary"; apply.textContent = r.created ? "Create file" : "Apply change";
+  const skip = document.createElement("button"); skip.className = "tiny"; skip.textContent = "Skip";
+  row.append(apply, skip); card.append(row);
+  $("messages").scrollTop = $("messages").scrollHeight;
+  const choice = await new Promise(res => {
+    apply.onclick = () => res("apply"); skip.onclick = () => res("skip");
+    controller?.signal.addEventListener("abort", () => res("stop"), { once: true });
+  });
+  row.remove();
+  const note = document.createElement("div"); note.className = "tnote"; card.append(note);
+  if (choice === "stop") { note.textContent = "Not applied (stopped)"; return null; }
+  if (choice === "skip") { note.textContent = "Skipped"; return "The user chose not to make this change."; }
+  const done = await wsTool(name, args, true, r.hash);
+  if (done.error) { card.classList.add("err"); note.textContent = done.error; return "Error: " + done.error; }
+  note.textContent = done.result; card.classList.add("applied");
+  return done.result + " The user approved it.";
+}
+// A tool result in a saved chat
+function renderToolMsg(m, prevCall) {
+  const card = toolCard(m.name || prevCall?.name || "tool", prevCall?.arguments || {});
+  const t = m.content || "";
+  if (t.startsWith("Error:")) { card.classList.add("err"); const e = document.createElement("div"); e.className = "terr"; e.textContent = t.slice(7); card.append(e); }
+  else if (/^(Changed|Created) /.test(t) || t.startsWith("The user chose") || t.startsWith("Not run")) { const n = document.createElement("div"); n.className = "tnote"; n.textContent = t; card.append(n); }
+  else cardOutput(card, t);
+}
 
 // ---------- console ----------
 let logNext = -1, logLines = [], logVerbose = false, logTimer = null;
+let consoleWide = false;
 function renderLog() {
-  const el = $("console"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
-  el.innerHTML = logLines.filter(l => logVerbose || !l.v).map(l => {
+  const html = logLines.filter(l => logVerbose || !l.v).map(l => {
     const cls = l.v ? "v" : /error|failed|could not|not enough/i.test(l.text) ? "e" : /^(loaded|reply:|benchmark:|autotune:.*tok\/s)/.test(l.text) ? "s" : "";
     return `<div${cls ? ` class="${cls}"` : ""}>${esc(l.text) || "&nbsp;"}</div>`;
   }).join("");
-  if (atEnd) el.scrollTop = el.scrollHeight;
+  for (const el of [$("console"), $("console2")]) {
+    const atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+    el.innerHTML = html;
+    if (atEnd) el.scrollTop = el.scrollHeight;
+  }
+}
+// The console full size, in place of the chat (Expand), and back.
+function setConsoleWide(on) {
+  consoleWide = on;
+  $("chat").classList.toggle("consolewide", on);
+  $("bigconsole").hidden = !on;
+  if (on) { renderLog(); $("console2").scrollTop = $("console2").scrollHeight; pollLog(); }
 }
 async function pollLog() {
   clearTimeout(logTimer);
@@ -1670,11 +1956,20 @@ async function pollLog() {
     if (j.lines.length) { logLines.push(...j.lines); if (logLines.length > 3000) logLines.splice(0, logLines.length - 3000); renderLog(); }
     logNext = j.next - 1;
   } catch (e) {}
-  if (!$("app").hidden && railOpen && openSec === "console") logTimer = setTimeout(pollLog, 1000);
+  if (!$("app").hidden && ((railOpen && openSec === "console") || consoleWide)) logTimer = setTimeout(pollLog, 1000);
 }
-$("c-info").onclick = () => { logVerbose = false; $("c-info").classList.add("on"); $("c-verbose").classList.remove("on"); renderLog(); };
-$("c-verbose").onclick = () => { logVerbose = true; $("c-verbose").classList.add("on"); $("c-info").classList.remove("on"); renderLog(); };
-$("c-copy").onclick = () => navigator.clipboard?.writeText(logLines.filter(l => logVerbose || !l.v).map(l => l.text).join("\n"));
+function setVerbose(v) {
+  logVerbose = v;
+  for (const id of ["c-info", "w-info"]) $(id).classList.toggle("on", !v);
+  for (const id of ["c-verbose", "w-verbose"]) $(id).classList.toggle("on", v);
+  renderLog();
+}
+const copyLog = () => navigator.clipboard?.writeText(logLines.filter(l => logVerbose || !l.v).map(l => l.text).join("\n"));
+$("c-info").onclick = $("w-info").onclick = () => setVerbose(false);
+$("c-verbose").onclick = $("w-verbose").onclick = () => setVerbose(true);
+$("c-copy").onclick = $("w-copy").onclick = copyLog;
+$("c-wide").onclick = () => setConsoleWide(true);
+$("w-back").onclick = () => setConsoleWide(false);
 
 // ---------- chats and system prompt presets (kept in this browser) ----------
 const LS = {
@@ -1684,7 +1979,12 @@ const LS = {
 let chats = LS.get("tierlm.chats", []), curChat = null;
 function withSystem(h) {
   const sp = $("sysprompt").value.trim();
-  const msgs = h.map(m => ({ role: m.role, content: m.content }));
+  const msgs = h.map(m => {
+    const o = { role: m.role, content: m.content };
+    if (m.tool_calls) o.tool_calls = m.tool_calls;
+    if (m.role === "tool" && m.name) o.name = m.name;
+    return o;
+  });
   return sp ? [{ role: "system", content: sp }, ...msgs] : msgs;
 }
 function saveChat() {
@@ -1718,7 +2018,11 @@ function renderChats() {
 }
 function renderHistory() {
   $("messages").innerHTML = "";
+  let calls = [];
   for (const m of history) {
+    if (m.role === "tool") { renderToolMsg(m, calls.shift()); continue; }
+    calls = (m.tool_calls || []).slice();
+    if (m.role === "assistant" && m.tool_calls && !stripCalls(m.content).trim()) continue;
     const d = addMsg(m.role, m.content);
     if (m.meta) { const s = document.createElement("span"); s.className = "meta"; s.textContent = m.meta; d.appendChild(s); }
   }
@@ -1847,7 +2151,86 @@ $("allownet").onchange = () => setNetwork({ allow_network: $("allownet").checked
 $("keygen").onclick = () => { if (!$("apikey").value || confirm("Make a new API key? Apps using the old one will need the new key.")) setNetwork({ api_key: "generate" }); };
 $("keyclear").onclick = () => { if (confirm("Remove the API key? Apps won't need a key any more.")) setNetwork({ api_key: "" }); };
 $("keycopy").onclick = () => copyText($("apikey").value, $("keycopy"));
+
+// ---- Set up an app: ready-made settings for the loaded model ----
+let netInfo = null, loadedModelId = "";
+async function renderAppSetup() {
+  const box = $("appsetup");
+  if (!netInfo || !info) { box.hidden = true; return; }
+  try {                                                   // the loaded model's id, as /v1/models names it
+    const m = await (await api("/v1/models")).json();
+    loadedModelId = (m.data || []).find(x => x.loaded)?.id || loadedModelId;
+  } catch (e) {}
+  if (!loadedModelId) { box.hidden = true; return; }
+  box.hidden = false;
+  const app = $("appsel").value, where = $("appwhere").value;
+  const lan = (netInfo.urls || []).find(u => u.label !== "This computer");
+  const base = where === "local" ? `http://127.0.0.1:${netInfo.port}/v1`
+             : where === "docker" ? `http://host.docker.internal:${netInfo.port}/v1`
+             : lan ? lan.url : `http://<this computer's address>:${netInfo.port}/v1`;
+  const key = "api_key" in netInfo ? (netInfo.api_key || "") : "";
+  const keyShown = key || (netInfo.api_key_set ? "<your API key>" : "none");
+  const ctx = info.ctx, out = Math.min(16384, Math.max(1024, Math.floor(ctx / 4)));
+  const thinks = /^qwen3|^qwen35|qwen3next|gpt-oss/.test(info.arch) || info.chat_format === "harmony";
+  const name = info.name || loadedModelId;
+  let notes = [];
+  if (where !== "local" && !netInfo.allow_network) notes.push("Turn on <b>Allow other devices</b> above first: apps in Docker or on other devices can't reach tierlm otherwise.");
+  if (ctx < 32768 && (app === "opencode" || app === "cline" || app === "continue"))
+    notes.push(`The model is loaded with a ${ctx.toLocaleString()}-token context. Coding agents send about 11,000 tokens of instructions with every request: load it with 32K or more.`);
+  let cfg = "", steps = "", ps = "";
+  if (app === "opencode") {
+    const opts = { baseURL: base, timeout: false };
+    if (key) opts.apiKey = key;
+    const model = { name: name + " (tierlm)", tool_call: true, reasoning: thinks, limit: { context: ctx, output: out } };
+    cfg = JSON.stringify({ $schema: "https://opencode.ai/config.json",
+      provider: { tierlm: { npm: "@ai-sdk/openai-compatible", name: "tierlm", options: opts, models: { [loadedModelId]: model } } },
+      model: "tierlm/" + loadedModelId }, null, 2);
+    steps = "<ol><li>Install opencode: <code>npm install -g opencode-ai</code> (needs Node.js).</li>" +
+      "<li>Save this as <code>opencode.json</code> in <code>%USERPROFILE%\\.config\\opencode\\</code> (on Linux or a Mac: <code>~/.config/opencode/</code>), " +
+      "or click <b>Copy PowerShell command that saves it</b> and paste that into PowerShell. It replaces an existing opencode.json.</li>" +
+      "<li>Start <code>opencode</code> in your project folder, then type <code>/new</code>. The first message of a session takes longer: tierlm reads opencode's instructions once.</li></ol>";
+    ps = '$dir = "$env:USERPROFILE\\.config\\opencode"\nNew-Item -ItemType Directory -Force $dir | Out-Null\n$json = @\'\n' + cfg +
+         '\n\'@\n[IO.File]::WriteAllText("$dir\\opencode.json", $json)\nWrite-Host "Saved $dir\\opencode.json"';
+  } else if (app === "openwebui") {
+    cfg = `URL:      ${base}\nAPI key:  ${keyShown}\nModel:    ${loadedModelId}`;
+    steps = "<ol><li>In Open WebUI: your name or icon (bottom left) → <b>Admin Panel</b> → <b>Settings</b> → <b>Connections</b>.</li>" +
+      "<li>Under <b>OpenAI API</b>, click <b>+</b> and enter the URL and API key below, then <b>Save</b>.</li>" +
+      "<li>Pick the model in the chat's model list. (In the Open WebUI desktop app, the <b>Connections</b> list on the left is for other Open WebUI servers: " +
+      "choose <b>Get Started</b> to run Open WebUI on this computer, then do the steps above.)</li></ol>";
+  } else if (app === "continue") {
+    cfg = ["models:", `  - name: ${name} (tierlm)`, "    provider: openai", `    model: ${loadedModelId}`, `    apiBase: ${base}`,
+           `    apiKey: ${key || "none"}`, "    roles: [chat, edit, apply]", "    capabilities: [tool_use]",
+           "    defaultCompletionOptions:", `      contextLength: ${ctx}`, `      maxTokens: ${out}`].join("\n");
+    steps = "<ol><li>In Continue, open its settings (the gear) and choose <b>Open config file</b> (<code>config.yaml</code>).</li>" +
+      "<li>Add this under <code>models:</code> (or replace the <code>models:</code> list), and save. It shows up in Continue's model list.</li></ol>";
+  } else if (app === "cline") {
+    cfg = `API Provider:         OpenAI Compatible\nBase URL:             ${base}\nAPI Key:              ${keyShown}\nModel ID:             ${loadedModelId}\n` +
+          `Context Window Size:  ${ctx}\nMax Output Tokens:    ${out}\nSupports Images:      off`;
+    steps = "<ol><li>In Cline's settings (the gear), set <b>API Provider</b> to <b>OpenAI Compatible</b>.</li>" +
+      "<li>Fill in the fields below (the last ones are under <b>Model Configuration</b>), then <b>Done</b>.</li></ol>";
+  } else {
+    cfg = ["from openai import OpenAI", "", `client = OpenAI(base_url="${base}", api_key="${key || "none"}")`,
+           "reply = client.chat.completions.create(", `    model="${loadedModelId}",`,
+           '    messages=[{"role": "user", "content": "Hello!"}],', "    stream=True)", "for chunk in reply:",
+           '    print(chunk.choices[0].delta.content or "", end="", flush=True)'].join("\n");
+    steps = "<ol><li>Install the library: <code>pip install openai</code></li><li>Run this script. The model name loads that model if another one is loaded.</li></ol>";
+  }
+  $("appcfg").textContent = cfg;
+  $("appsteps").innerHTML = steps + notes.map(n => `<div class="warnline">${n}</div>`).join("");
+  $("appcopyps").hidden = !ps;
+  $("appcopy").onclick = () => copyText(cfg, $("appcopy"));
+  $("appcopyps").onclick = () => copyText(ps, $("appcopyps"));
+}
+$("appsel").onchange = $("appwhere").onchange = renderAppSetup;
+const _loadNetwork = loadNetwork;
+loadNetwork = async function () {
+  await _loadNetwork();
+  try { netInfo = await (await api("/api/network")).json(); } catch (e) { netInfo = null; }
+  if (netInfo && !netInfo.allow_network && $("appwhere").value !== "local") $("appwhere").value = "local";
+  renderAppSetup();
+};
 loadNetwork();
+loadWorkspace();
 </script>
 </body>
 </html>

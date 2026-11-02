@@ -77,7 +77,8 @@ int main(int argc, char** argv) {
                 lg = m->eval(ids, nt);
                 while ((int)out.size() < n_gen) { out.push_back(argmax(lg.data(), V)); lg = m->eval({out.back()}, nt); }
             } else {
-                Speculator sp(*m, 3);
+                Speculator sp(*m, std::getenv("TIERLM_DRAFT_N") ? std::atoi(std::getenv("TIERLM_DRAFT_N")) : 3);
+                if (const char* lk = std::getenv("TIERLM_LOOKUP")) sp.set_lookup(std::atoi(lk), 2);
                 if (const char* sc = std::getenv("TIERLM_DRAFT_SCRIPT")) {
                     std::vector<int32_t> script;
                     std::stringstream ss(sc);
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
                 }
                 out.resize(n_gen);
                 const auto& st = sp.stats();
-                std::fprintf(stderr, "steps %d, drafted %d, accepted %d\n", st.steps, st.drafted, st.accepted);
+                std::fprintf(stderr, "steps %d, drafted %d, accepted %d, lookup %d/%d\n", st.steps, st.drafted, st.accepted, st.look_ok, st.looked);
             }
             for (int32_t t : out) std::printf("%d\n", t);
             return 0;

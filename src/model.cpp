@@ -20,7 +20,7 @@
 
 namespace tierlm {
 
-static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next" };
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss" };
 bool arch_supported(const std::string& arch) {
     for (const char* a : kArchs) if (arch == a) return true;
     return false;
@@ -217,18 +217,60 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         const std::string type = str((arch + ".rope.scaling.type").c_str());
         const float factor = f32(arch + ".rope.scaling.factor", 1.0f);
         if (type == "linear" && factor > 0) hp.rope_scale = 1.0f / factor;
+        else if (type == "yarn" && factor > 1.0f) {
+            // YaRN, exactly as Hugging Face computes it (transformers' _compute_yarn_parameters): each rotation
+            // frequency is blended between its original value and value / factor along a ramp between two
+            // "correction" dimensions; cos and sin are scaled by 0.1 ln(factor) + 1. ggml's own YaRN rounds the
+            // ramp's ends to whole dimensions; gpt-oss is trained without that rounding ("truncate": false), so the
+            // frequencies are computed here and given to ggml as per-dimension factors instead.
+            const int dim = hp.n_rot > 0 ? hp.n_rot : (hp.head_dim > 0 ? hp.head_dim : hp.n_embd / hp.n_head);
+            const double base = hp.rope_base, orig = u32(arch + ".rope.scaling.original_context_length", false);
+            const double beta_fast = f32(arch + ".rope.scaling.yarn_beta_fast", 32.0f), beta_slow = f32(arch + ".rope.scaling.yarn_beta_slow", 1.0f);
+            const bool truncate = arch != "gpt-oss";
+            if (orig > 0 && dim > 0) {
+                auto corr = [&](double rot) { return dim * std::log(orig / (rot * 2 * 3.14159265358979323846)) / (2 * std::log(base)); };
+                double lo = corr(beta_fast), hi = corr(beta_slow);
+                if (truncate) { lo = std::floor(lo); hi = std::ceil(hi); }
+                lo = std::max(lo, 0.0); hi = std::min(hi, (double)dim - 1);
+                if (lo == hi) hi += 0.001;
+                hp.rope_ff.resize(dim / 2);
+                for (int i = 0; i < dim / 2; ++i) {
+                    const double ramp = std::min(1.0, std::max(0.0, (i - lo) / (hi - lo)));
+                    const double e = 1.0 - ramp;                         // share of the original (extrapolated) frequency
+                    hp.rope_ff[i] = (float)(1.0 / ((1.0 - e) / factor + e));
+                }
+                hp.rope_attn_factor = (float)(0.1 * std::log((double)factor) + 1.0);
+            }
+        }
         else if (!type.empty() && type != "none" && factor > 1.0f)
             std::fprintf(stderr, "warning: rope scaling '%s' is not supported yet; contexts beyond the original length will degrade\n", type.c_str());
     }
     // The variations
     hp.rope_neox     = arch != "llama";
     hp.qk_norm       = arch == "olmoe" ? Hparams::kFull : (arch == "qwen3" || arch == "qwen3moe") ? Hparams::kPerHead : Hparams::kNone;
-    hp.qkv_bias      = arch == "qwen2";
+    hp.qkv_bias      = arch == "qwen2" || arch == "gpt-oss";
     hp.expert_renorm = arch == "qwen3moe" || arch == "qwen35moe" || arch == "qwen3next" || arch == "llama";   // OLMoE doesn't renormalise
     hp.expert_scale  = f32(arch + ".expert_weights_scale", 0.0f);
     if (arch == "qwen3moe" || arch == "qwen35moe" || arch == "qwen3next") {
         int64_t id = gguf_find_key(g, (arch + ".expert_weights_norm").c_str());
         if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL) hp.expert_renorm = gguf_get_val_bool(g, id);
+    }
+    if (arch == "gpt-oss") {
+        // Router: pick the top experts by score, then softmax over just those. Every other layer (the even ones,
+        // from the first) attends only to the last n_swa tokens, unless the file lists the layers itself.
+        hp.expert_softmax_first = false;
+        hp.expert_renorm = false;
+        hp.swiglu_oai = true;
+        hp.n_swa = u32(arch + ".attention.sliding_window", false);
+        hp.swa.assign(hp.n_layer, false);
+        const int64_t pid = gguf_find_key(g, (arch + ".attention.sliding_window_pattern").c_str());
+        if (pid >= 0 && gguf_get_kv_type(g, pid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, pid) == GGUF_TYPE_BOOL) {
+            const bool* d = (const bool*)gguf_get_arr_data(g, pid);
+            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, pid); ++i) hp.swa[i] = d[i];
+        } else {
+            const int pattern = pid >= 0 ? (int)u32(arch + ".attention.sliding_window_pattern", false) : 2;
+            for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = pattern <= 0 || i % pattern < pattern - 1;
+        }
     }
     if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") {
         hp.hybrid = true;
@@ -405,7 +447,9 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         for (auto& u : usage_env) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; u = (float)(x % 1000) * (x % 3 == 0 ? 0.0f : 1.0f); }
     }
     const std::vector<float>& usage = opt.expert_usage.empty() ? usage_env : opt.expert_usage;
-    const bool use_hot = G == 1 && !by_layer && hp.is_moe() && usage.size() == (size_t)hp.n_layer * E;
+    // (Not yet for experts with biases, gpt-oss: the split doesn't divide the bias tensors; whole expert layers then.)
+    hp.expert_bias = ggml_get_tensor(m->wctx_, "blk.0.ffn_down_exps.bias") != nullptr;
+    const bool use_hot = G == 1 && !by_layer && hp.is_moe() && !hp.expert_bias && usage.size() == (size_t)hp.n_layer * E;
     std::vector<std::vector<int>> hot_ids(hp.n_layer);
     bool hot_decided = false;
     auto choose_hot = [&]() {
@@ -741,8 +785,12 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 L.q_norm = T(b + "attn_q_norm.weight");
                 L.k_norm = T(b + "attn_k_norm.weight");
             }
+            L.bo    = T(b + "attn_output.bias", false);
+            L.sinks = T(b + "attn_sinks.weight", false);
+            L.swa   = hp.is_swa(i);
         }
-        L.ffn_norm  = T(b + (hp.hybrid ? "post_attention_norm.weight" : "ffn_norm.weight"));
+        L.ffn_norm  = T(b + "ffn_norm.weight", false);                 // called post_attention_norm in some families
+        if (!L.ffn_norm) L.ffn_norm = T(b + "post_attention_norm.weight");
         if (hp.is_moe()) {
             L.router = T(b + "ffn_gate_inp.weight");
             L.gate_up_x = T(b + "ffn_gate_up_exps.weight", false);      // gate and up stored together (newer files)
@@ -752,6 +800,10 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 L.up_x   = T(b + "ffn_up_exps.weight");
             }
             L.down_x = T(b + "ffn_down_exps.weight");
+            L.router_b = T(b + "ffn_gate_inp.bias", false);               // gpt-oss: biases on the router and experts
+            L.gate_xb  = T(b + "ffn_gate_exps.bias", false);
+            L.up_xb    = T(b + "ffn_up_exps.bias", false);
+            L.down_xb  = T(b + "ffn_down_exps.bias", false);
             // Shared expert (Qwen3.5/3.6 MoE): runs on every token, scaled by its own sigmoid gate.
             L.up_s = T(b + "ffn_up_shexp.weight", false);
             if (L.up_s) {
@@ -919,8 +971,9 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
             k = ggml_mul(c, ggml_rms_norm(c, k, hp.rms_eps), L.k_norm);
         }
         const int mode = hp.rope_neox ? GGML_ROPE_TYPE_NEOX : 0;
-        q = ggml_rope_ext(c, q, g.pos, rope_freqs_, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
-        k = ggml_rope_ext(c, k, g.pos, rope_freqs_, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
+        ggml_tensor* ff = g.rope_ff ? g.rope_ff : rope_freqs_;           // YaRN (computed) or Llama 3.1 factors (file)
+        q = ggml_rope_ext(c, q, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+        k = ggml_rope_ext(c, k, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
 
         // Write this batch's keys/values into the cache at their positions (g.pos: n_past, n_past + 1, ...).
         // Written by index rather than into a view at n_past, so the graph is the same from one token to the
@@ -937,14 +990,21 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
         ggml_tensor* Q = ggml_permute(c, q, 0, 2, 1, 3);                     // [hd, n_tok, n_head]
         ggml_tensor* K = ggml_permute(c, kall, 0, 2, 1, 3);                  // [hd, n_kv, n_head_kv]
         ggml_tensor* o;
+        ggml_tensor* mask = L.swa ? g.mask_swa : g.mask;                     // sliding-window layers see the last n_swa tokens
         if (flash_attn_) {
             ggml_tensor* V = ggml_permute(c, vall, 0, 2, 1, 3);              // [hd, n_kv, n_head_kv], no copy
-            o = ggml_flash_attn_ext(c, Q, K, V, g.mask, scale, 0.0f, 0.0f);  // [hd, n_head, n_tok]
+            o = ggml_flash_attn_ext(c, Q, K, V, mask, scale, 0.0f, 0.0f);    // [hd, n_head, n_tok]
+            if (L.sinks) ggml_flash_attn_ext_add_sinks(o, L.sinks);          // gpt-oss: one more score per head, never attended to
         } else {
             ggml_tensor* kq = ggml_mul_mat(c, K, Q);                         // [n_kv, n_tok, n_head]
-            kq = ggml_scale(c, kq, scale);
-            kq = ggml_diag_mask_inf(c, kq, n_past);                          // causal: no peeking ahead
-            kq = ggml_soft_max(c, kq);
+            if (mask) {
+                kq = ggml_soft_max_ext(c, kq, mask, scale, 0.0f);            // mask: causal (and window)
+                if (L.sinks) ggml_soft_max_add_sinks(kq, L.sinks);
+            } else {
+                kq = ggml_scale(c, kq, scale);
+                kq = ggml_diag_mask_inf(c, kq, n_past);                      // causal: no peeking ahead
+                kq = ggml_soft_max(c, kq);
+            }
             ggml_tensor* V = ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3));   // [n_kv, hd, n_head_kv]
             o = ggml_mul_mat(c, V, kq);                                      // [hd, n_tok, n_head]
             o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));                // [hd, n_head, n_tok]
@@ -956,7 +1016,8 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
                                              hd * hp.n_head, n_tok);
             o = ggml_mul(c, o, ggml_sigmoid(c, gate));
         }
-        return ggml_mul_mat(c, L.wo, o);
+        o = ggml_mul_mat(c, L.wo, o);
+        return L.bo ? ggml_add(c, o, L.bo) : o;
 }
 
 // Feed-forward for one layer: dense SwiGLU, or mixture of experts (with an optional shared expert).
@@ -1008,7 +1069,11 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             return ggml_mul_mat(c, L.down, act);
         }
         // ---- mixture of experts ----
-        ggml_tensor* probs = ggml_soft_max(c, ggml_mul_mat(c, L.router, h)); // [n_expert, n_tok]
+        ggml_tensor* scores = ggml_mul_mat(c, L.router, h);                 // [n_expert, n_tok]
+        if (L.router_b) scores = ggml_add(c, scores, L.router_b);
+        // Most families: softmax over all experts, then the top ones' probabilities. gpt-oss: the top scores, then
+        // softmax over just those (same top experts either way: softmax keeps the order).
+        ggml_tensor* probs = hp.expert_softmax_first ? ggml_soft_max(c, scores) : scores;
         ggml_tensor* order = ggml_argsort(c, probs, GGML_SORT_ORDER_DESC);  // [n_expert, n_tok] best first
         ggml_tensor* sel   = ggml_view_2d(c, order, hp.n_expert_used, n_tok, order->nb[1], 0);   // top n_used
         // Routing for the dashboard and expert learning: just the chosen experts, copied out compactly. The rankings
@@ -1016,6 +1081,8 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         // read back in one go at the end (see build), instead of one GPU read per layer.
         if (want_routing) g.orders.push_back(ggml_cont(c, sel));         // [n_used, n_tok]
         ggml_tensor* w     = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, hp.n_expert, n_tok), sel); // [1, n_used, n_tok]
+        if (!hp.expert_softmax_first)
+            w = ggml_reshape_3d(c, ggml_soft_max(c, ggml_reshape_2d(c, w, hp.n_expert_used, n_tok)), 1, hp.n_expert_used, n_tok);
         if (hp.expert_renorm) {                                             // chosen weights sum to 1
             ggml_tensor* w2 = ggml_reshape_2d(c, w, hp.n_expert_used, n_tok);
             w2 = ggml_div(c, w2, ggml_sum_rows(c, w2));
@@ -1025,7 +1092,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         ggml_tensor* h3    = ggml_reshape_3d(c, h, hp.n_embd, 1, n_tok);
         // The chosen experts' outputs, weighted and summed: [n_embd, n_tok]. ids: [n_used, n_tok] into these tensors.
         auto experts = [&](ggml_tensor* gate_up_x, ggml_tensor* gate_x, ggml_tensor* up_x, ggml_tensor* down_x,
-                           ggml_tensor* ids, ggml_tensor* wt) {
+                           ggml_tensor* ids, ggml_tensor* wt, bool biases = false) {
             ggml_tensor *up, *gate;
             if (gate_up_x) {                                                 // [2*n_ff_exp, n_used, n_tok]: gate, then up
                 ggml_tensor* gu = ggml_mul_mat_id(c, gate_up_x, h3, ids);
@@ -1036,9 +1103,14 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                 up   = ggml_mul_mat_id(c, up_x, h3, ids);                    // [n_ff_exp, n_used, n_tok]
                 gate = ggml_mul_mat_id(c, gate_x, h3, ids);
             }
-            ggml_tensor* act  = gate_up_x ? ggml_swiglu_split(c, gate, up)  // works on the two halves in place
+            if (biases && L.up_xb)   up   = ggml_add_id(c, up, L.up_xb, ids);   // each pick gets its own expert's bias
+            if (biases && L.gate_xb) gate = ggml_add_id(c, gate, L.gate_xb, ids);
+            ggml_tensor* act  = hp.swiglu_oai ? ggml_swiglu_oai(c, gate_up_x ? ggml_cont(c, gate) : gate,
+                                                                gate_up_x ? ggml_cont(c, up) : up, 1.702f, 7.0f)
+                              : gate_up_x ? ggml_swiglu_split(c, gate, up)  // works on the two halves in place
                                           : ggml_mul(c, ggml_silu(c, gate), up);
             ggml_tensor* down = ggml_mul_mat_id(c, down_x, act, ids);        // [n_embd, n_used, n_tok]
+            if (biases && L.down_xb) down = ggml_add_id(c, down, L.down_xb, ids);
             down = ggml_mul(c, down, wt);                                    // weight each expert's output
             ggml_tensor* sum = nullptr;
             for (int e = 0; e < hp.n_expert_used; ++e) {
@@ -1095,7 +1167,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             ggml_tensor* hot  = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_hot);
             moe = ggml_add(c, cold, hot);                                   // cold first: the graph runs the RAM part, then the VRAM part
         } else {
-            moe = experts(L.gate_up_x, L.gate_x, L.up_x, L.down_x, sel, w);
+            moe = experts(L.gate_up_x, L.gate_x, L.up_x, L.down_x, sel, w, true);
         }
         if (L.up_s) {                                                        // shared expert
             ggml_tensor* sh = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, L.gate_s, h)), ggml_mul_mat(c, L.up_s, h));
@@ -1143,9 +1215,19 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing, int n_logits
     ggml_set_input(g.inp);
     g.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
     ggml_set_input(g.pos);
-    if (flash_attn_) {                                                     // causal mask: 0 = visible, -inf = future
+    // Causal mask (0 = visible, -inf = future): for flash attention, and for the window or sinks (gpt-oss)
+    const bool sinks = !layers_.empty() && layers_[0].sinks;
+    if (flash_attn_ || hp.n_swa > 0 || sinks) {
         g.mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok);
         ggml_set_input(g.mask);
+    }
+    if (hp.n_swa > 0) {                                                    // the same, limited to the last n_swa tokens
+        g.mask_swa = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok);
+        ggml_set_input(g.mask_swa);
+    }
+    if (!hp.rope_ff.empty()) {
+        g.rope_ff = ggml_new_tensor_1d(c, GGML_TYPE_F32, (int64_t)hp.rope_ff.size());
+        ggml_set_input(g.rope_ff);
     }
     const float scale = 1.0f / std::sqrt((float)hd);
 
@@ -1433,7 +1515,13 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
         for (int t = 0; t < n_tok; ++t)
             for (int j = 0; j < span; ++j) mask[(size_t)t * span + j] = j <= n_past + t ? zero : ninf;
         ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+        if (g.mask_swa) {                                           // and nothing more than n_swa - 1 tokens back
+            for (int t = 0; t < n_tok; ++t)
+                for (int j = 0; j < span; ++j) if (n_past + t - j >= hp.n_swa) mask[(size_t)t * span + j] = ninf;
+            ggml_backend_tensor_set(g.mask_swa, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+        }
     }
+    if (g.rope_ff) ggml_backend_tensor_set(g.rope_ff, hp.rope_ff.data(), 0, sizeof(float) * hp.rope_ff.size());
     set_n_threads(cpu_, n_threads);
     auto t3 = clk::now();
 

@@ -23,6 +23,7 @@
 namespace agent {
 
 using json = nlohmann::json;
+using ojson = nlohmann::ordered_json;   // tools keep the order the app wrote them in (templates show them that way)
 
 // ---------------------------------------------------------------- tool calling
 
@@ -54,10 +55,11 @@ inline std::string pyjson(const J& j) {
 }
 
 // An OpenAI tool ({"type": "function", "function": {...}}) or a bare function description: the function part.
-inline json tool_function(const json& t) { return t.is_object() && t.contains("function") ? t["function"] : t; }
+template <class J>
+inline J tool_function(const J& t) { return t.is_object() && t.contains("function") ? t["function"] : t; }
 
 // The part of the system prompt that describes the tools.
-inline std::string tools_prompt(ToolFmt f, const json& tools) {
+inline std::string tools_prompt(ToolFmt f, const ojson& tools) {
     std::string s;
     if (f == ToolFmt::QwenXML) {
         s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
@@ -82,7 +84,7 @@ inline std::string tools_prompt(ToolFmt f, const json& tools) {
 }
 
 // The system message with the tools added, where each model family expects them.
-inline std::string system_with_tools(ToolFmt f, const std::string& system, const json& tools) {
+inline std::string system_with_tools(ToolFmt f, const std::string& system, const ojson& tools) {
     const std::string tp = tools_prompt(f, tools);
     if (system.empty()) return tp;
     return f == ToolFmt::QwenXML ? tp + "\n\n" + system : system + "\n\n" + tp;
@@ -144,13 +146,13 @@ inline std::string trim(const std::string& s) {
 }
 
 // The JSON type a tool's parameter should have ("" if the tool or parameter is unknown).
-inline std::string param_type(const json& tools, const std::string& tool, const std::string& param) {
+inline std::string param_type(const ojson& tools, const std::string& tool, const std::string& param) {
     for (const auto& t : tools) {
-        const json f = tool_function(t);
+        const ojson f = tool_function(t);
         if (!f.is_object() || f.value("name", std::string()) != tool) continue;
-        const json p = f.value("parameters", json::object()).value("properties", json::object());
+        const ojson p = f.value("parameters", ojson::object()).value("properties", ojson::object());
         if (p.contains(param) && p[param].is_object()) {
-            const json& ty = p[param].contains("type") ? p[param]["type"] : json();
+            const ojson& ty = p[param].contains("type") ? p[param]["type"] : ojson();
             if (ty.is_string()) return ty.get<std::string>();
             if (ty.is_array() && !ty.empty() && ty[0].is_string()) return ty[0].get<std::string>();
         }
@@ -164,9 +166,11 @@ struct Parsed {
 };
 
 // Reads the tool calls out of a finished reply.
-inline Parsed parse_tool_calls(const std::string& text, const json& tools) {
+inline Parsed parse_tool_calls(const std::string& text, const ojson& tools) {
     Parsed r;
-    const size_t first = tool_call_pos(text);
+    size_t first = tool_call_pos(text);
+    // A finished reply whose thinking was never closed (small models do that): a tool call in it is meant as one.
+    if (first == std::string::npos && answer_start(text) == std::string::npos) first = text.find(kToolOpen, text.find("<think>"));
     if (first == std::string::npos) {
         r.content = text;
         // Some models answer with a bare {"name": ..., "arguments": ...} object instead.

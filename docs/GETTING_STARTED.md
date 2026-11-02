@@ -103,10 +103,13 @@ fold the menu away and give the chat more room.
 - **Settings**: **Temperature** (how adventurous replies are: 0 always picks the most likely word), **Repeat
   penalty**, **Max reply** (the default, **No limit**, lets the model finish; thinking models such as Qwen3.x often
   use thousands of tokens before they answer), **Speculative decoding** on or off and guesses per check (when the
-  draft layer is loaded), and a **System prompt**: instructions the model follows in every reply.
+  draft layer is loaded), **Prompt lookup** (faster replies when the model repeats text from the conversation, such
+  as a file it's rewriting; Automatic suits most PCs), the **Workspace** (below), and a **System prompt**:
+  instructions the model follows in every reply.
 - **API**: the addresses for other apps, the **Allow other devices** switch and the API key (see below).
 - **Console**: what the engine is doing, as in its black window: loading, where each part went, every request
   and its speed. **Verbose** adds the graphics driver's and ggml's own messages. **Copy log** helps with bug reports.
+  **Expand** shows it full size in place of the chat; **Back to chat** returns.
 - **Model info**: the model, where each part of it lives, and the hot experts: how many are in VRAM and the share of
   the expert work they did (**Forget** resets what tierlm has learned).
 - **Chats**: your past chats (kept in this browser), and system-prompt presets.
@@ -122,6 +125,18 @@ first, and the strip on the left shows whether that layer's experts are in VRAM 
 
 The **Auto / Light / Dark** switch at the top chooses the theme; Auto follows Windows. **Stop** ends a reply early.
 
+### The workspace: let the model work on a project folder
+
+In **Settings**, **Workspace** → **Choose…** picks a folder (a project, say), and the checkbox turns it on for your
+chats. The model can then **list, read and search** the files in that folder, and **suggest changes**: each one
+shows in the chat as a diff (red lines removed, green lines added) with **Apply change** and **Skip**, and nothing is
+written until you click Apply. If the file changed in the meantime, the change isn't made. Each step the model takes
+shows as a small card in the chat; the model keeps going after each one until it has answered.
+
+The model can't run anything, and can't read or write outside the folder. The workspace only works from the tierlm
+page on the computer running tierlm, not from other devices, so nobody on your network can reach your files through
+it. It works best with models that are good at tools: Qwen3.5 / 3.6, Qwen3-Coder, gpt-oss.
+
 ## Step 6: Stop it
 
 Close the black tierlm window, or press **Ctrl+C** in it.
@@ -129,7 +144,10 @@ Close the black tierlm window, or press **Ctrl+C** in it.
 ## Connect other apps
 
 tierlm speaks the same API as OpenAI, so apps made for OpenAI (or for LM Studio and Ollama) can use the model
-you've loaded. On the setup screen (**Change setup**, top right, from the chat), scroll to **Connect other
+you've loaded. The quickest way: in the chat's side menu, open **API** and use **Set up an app**: pick the app
+(opencode, Open WebUI, Continue, Cline or a Python script) and where it runs, and tierlm writes the settings for the
+model you've loaded, with its name, context length and the right address, ready to copy (for opencode, also as a
+PowerShell command that saves the file). The details for each app follow. On the setup screen (**Change setup**, top right, from the chat), scroll to **Connect other
 apps**: it shows the address to give them, the **Allow other devices** switch, and the **API key**.
 
 - **Apps on this computer** use `http://127.0.0.1:8040/v1` as the base URL, and any text as the API key unless
@@ -212,7 +230,8 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Qwen3.5 / 3.6 / 3.8 dense (hybrid) | `qwen35` | Qwen3.8-27B, Qwen3.5-9B | Tested: Qwen3.6-27B on an RTX 3070 laptop, with speculative decoding |
 | Qwen3.5 / 3.6 MoE (hybrid) | `qwen35moe` | Qwen3.6-35B-A3B, Qwen3.5-122B-A10B | Tested: Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
 | Qwen3-Next (hybrid MoE) | `qwen3next` | Qwen3-Coder-Next-80B-A3B, Qwen3-Next-80B-A3B | Model math verified, real-model test pending |
-| Gemma, Phi, DeepSeek, GLM, gpt-oss, ... | various | | Not yet |
+| gpt-oss | `gpt-oss` | gpt-oss-20b, gpt-oss-120b, HyperNova-60B | Model math and chat format verified, real-model test pending |
+| Gemma, Phi, DeepSeek, GLM, Nemotron, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision add-on** (for reading images). tierlm lists it but
 doesn't use it yet.

@@ -27,6 +27,8 @@ namespace tierlm {
 //   qwen35    Qwen3.5 / 3.6 / 3.8 dense: a hybrid. Three of every four layers use Gated DeltaNet linear
 //             attention (a fixed-size running memory instead of a KV cache); the rest use gated full
 //             attention with partial RoPE.
+//   gpt-oss   OpenAI gpt-oss (20B, 120B, and derivatives): MoE with biases everywhere, attention sinks, every
+//             other layer attending to the last 128 tokens only, YaRN positions, clamped SwiGLU experts.
 bool arch_supported(const std::string& arch);
 // A separate MTP draft file ("mtp-*.gguf") in the same folder that matches this model, or "".
 std::string mtp_companion(const std::string& model_path);
@@ -45,7 +47,16 @@ struct Hparams {
     bool qkv_bias = false;            // biases on Q/K/V projections
     bool expert_renorm = false;       // renormalise the chosen experts' weights to sum to 1
     float expert_scale = 0.0f;        // multiply the chosen experts' weights by this (0 or 1 = leave as is)
-    bool expert_softmax_first = true; // softmax over all experts, then pick (vs pick then softmax: same order)
+    bool expert_softmax_first = true; // softmax over all experts, then pick; false: pick, then softmax over the picked
+    bool swiglu_oai = false;
+    bool expert_bias = false;         // experts have biases (gpt-oss): no hot-expert split yet          // gpt-oss experts: clamped SwiGLU, out = (clamp(up) + 1) * g * sigmoid(1.702 g), g = min(gate, 7)
+    int n_swa = 0;                    // sliding-window attention: these layers see only the last n_swa tokens
+    std::vector<bool> swa;            // per layer: uses the window
+    bool is_swa(int il) const { return n_swa > 0 && il < (int)swa.size() && swa[il]; }
+    // YaRN context extension, computed as Hugging Face does: per-dimension frequency factors (ggml divides each
+    // rotation frequency by its factor) and the scale of cos/sin. Empty: no YaRN.
+    std::vector<float> rope_ff;
+    float rope_attn_factor = 1.0f;
     bool is_moe() const { return n_expert > 0; }
     // Hybrid (qwen35): Gated DeltaNet layers
     bool hybrid = false;
@@ -184,6 +195,8 @@ private:
         struct ggml_cgraph* gf = nullptr;
         ggml_tensor *inp = nullptr, *pos = nullptr, *mask = nullptr, *logits = nullptr;
         ggml_tensor *hidden = nullptr;           // final-norm hidden states of every position (for the MTP head)
+        ggml_tensor *mask_swa = nullptr;         // causal mask limited to the sliding window (models that use one)
+        ggml_tensor *rope_ff = nullptr;          // YaRN frequency factors (Hparams::rope_ff), as input
         ggml_tensor *h_in = nullptr;             // MTP head: the target model's hidden states, as input
         int n_tok = 0;
         // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
@@ -205,6 +218,9 @@ private:
     struct Layer {
         ggml_tensor *attn_norm = nullptr, *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
         ggml_tensor *bq = nullptr, *bk = nullptr, *bv = nullptr, *q_norm = nullptr, *k_norm = nullptr;
+        ggml_tensor *bo = nullptr, *sinks = nullptr;                          // gpt-oss: output bias, attention sinks
+        ggml_tensor *router_b = nullptr, *gate_xb = nullptr, *up_xb = nullptr, *down_xb = nullptr;   // gpt-oss: biases
+        bool swa = false;                                                     // sliding-window layer
         ggml_tensor *ffn_norm = nullptr;
         ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;          // dense FFN
         ggml_tensor *router = nullptr, *gate_x = nullptr, *up_x = nullptr, *down_x = nullptr;   // experts

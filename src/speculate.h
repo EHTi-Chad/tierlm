@@ -1,5 +1,5 @@
 #pragma once
-// Speculative decoding with a model's own MTP draft block (multi-token prediction).
+// Speculative decoding with a model's own MTP draft block (multi-token prediction), and prompt lookup.
 //
 // Each step: the small draft block guesses the next few tokens; the model then checks all of them in ONE pass,
 // reading its weights once for several tokens instead of once per token. Guesses the model agrees with are free
@@ -7,7 +7,15 @@
 // Every token that comes out is the one the model itself picks at that position, so with temperature 0 the reply
 // is the same as without speculation (up to floating-point rounding), and with sampling it follows the same
 // distribution.
+//
+// Prompt lookup: when the last few tokens also appear earlier in the conversation (a file being edited, code being
+// quoted, a name being repeated), the tokens that followed them there are a good guess for what comes next. Those
+// guesses are checked the same way, so they too only change how fast the reply comes, never what it says. It needs
+// no draft block, so it works for every model; with a draft block, lookup guesses are used when there is a match
+// and the draft block's otherwise. Lookup times its own checks and pauses while they are slower than plain steps.
 #include "model.h"
+#include <algorithm>
+#include <chrono>
 #include <functional>
 #include <vector>
 
@@ -17,6 +25,8 @@ struct SpecStats {
     int steps = 0;         // checks run
     int drafted = 0;       // tokens guessed by the draft block
     int accepted = 0;      // guesses the model agreed with
+    int looked = 0;        // of the guesses, those from prompt lookup
+    int look_ok = 0;       // prompt-lookup guesses the model agreed with
 };
 
 class Speculator {
@@ -44,6 +54,13 @@ public:
     using DraftSource = std::function<std::vector<int32_t>(int pos, int32_t x, int n)>;
     void set_draft_source(DraftSource f) { draft_src_ = std::move(f); }
 
+    // Prompt lookup: guess up to n tokens (0 = off) from an earlier place in the conversation where the last
+    // `min_match` or more tokens also appear.
+    void set_lookup(int n, int min_match = 3) { lookup_max_ = std::max(0, n); lookup_min_ = std::max(1, min_match); look_len_ = lookup_max_; }
+    int lookup() const { return lookup_max_; }
+    // The guesses prompt lookup makes after context `ctx` (exposed for testing).
+    std::vector<int32_t> lookup_guesses(const std::vector<int32_t>& ctx, int n) const;
+
     const SpecStats& stats() const { return st_; }
     void reset_stats() { st_ = SpecStats(); }
 
@@ -56,6 +73,16 @@ private:
     int mtp_valid_ = 0;           // the draft block's cache is right for positions [0, mtp_valid_)
     SpecStats st_;
     DraftSource draft_src_;
+    int lookup_max_ = 0, lookup_min_ = 3;
+    int look_len_ = 0;            // guesses to make next time: shrinks after misses, grows back after hits
+    std::vector<int32_t> hist_;   // the tokens in the model's cache, for prompt lookup
+    // Prompt lookup pays for itself only when its checks give more tokens per second than plain steps: a guessed
+    // token costs real time to check (on MoE models it reads its own experts), and a miss gets nothing for it. So
+    // it times both and pauses when guessing is losing, trying again later (twice as late each time it loses).
+    double t_plain_ = 0;          // seconds per step without guesses (running average)
+    double look_s_ = 0;           // this round of lookup checks: seconds, tokens produced, checks
+    int look_tok_ = 0, look_n_ = 0;
+    int pause_ = 0, pause_len_ = 16;   // steps left without lookup; how long the next pause is
 };
 
 }

@@ -15,7 +15,8 @@ std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_th
     // The draft block's entry at position p needs token p and the model's hidden state at p - 1. Entries before
     // c are still right. To redo the rest we need the hidden state at c - 1: kept from last time, or recomputed.
     const int c = std::min(mtp_valid_, n0);
-    const int s_req = c == 0 ? 0 : (h_pos_ == c - 1 ? c : c - 1);
+    // (Without a draft block nothing needs the hidden states: the cache is reused as it is.)
+    const int s_req = !m_.has_mtp() ? n0 : c == 0 ? 0 : (h_pos_ == c - 1 ? c : c - 1);
     if (n0 > s_req) m_.truncate(s_req);               // (hybrid models start over from 0 instead)
     int s = m_.n_past();
     if (s >= end) { m_.truncate(end - 1); s = m_.n_past(); }   // always evaluate at least one token
@@ -49,7 +50,29 @@ std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_th
     h_last_.assign(H.end() - E, H.end());
     h_pos_ = end - 1;
     mtp_valid_ = end;
+    hist_ = toks;
+    look_len_ = lookup_max_;                          // each reply starts with full-length guesses
+    look_s_ = 0; look_tok_ = look_n_ = pause_ = 0; pause_len_ = 16;   // and lookup on (t_plain_ stays: same model)
     return lg;
+}
+
+// The most recent earlier place where the last `len` tokens of ctx appear (len from longest to lookup_min_), and the
+// tokens that followed there.
+std::vector<int32_t> Speculator::lookup_guesses(const std::vector<int32_t>& ctx, int n) const {
+    std::vector<int32_t> out;
+    const int N = (int)ctx.size();
+    if (n <= 0 || N < lookup_min_ + 1) return out;
+    const int longest = std::min(lookup_min_ + 3, N - 1);
+    for (int len = longest; len >= lookup_min_ && out.empty(); --len) {
+        const int32_t* tail = ctx.data() + N - len;
+        // Candidate starts i: ctx[i, i+len) == tail, with at least one token after it, searched from the end.
+        for (int i = N - len - 1; i >= 0; --i) {
+            if (ctx[i] != tail[0] || !std::equal(tail, tail + len, ctx.data() + i)) continue;
+            for (int j = i + len; j < N && (int)out.size() < n; ++j) out.push_back(ctx[j]);
+            break;
+        }
+    }
+    return out;
 }
 
 std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop,
@@ -57,9 +80,23 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     const int P = m_.n_past(), E = m_.hparams().n_embd, V = m_.hparams().n_vocab;
     const int room = m_.max_ctx() - P - 1;            // positions left after x
     const int n_max = std::max(0, std::min(n_draft_, room));
+    const auto t0 = std::chrono::steady_clock::now();
 
     // ---- 1. guess ----
     std::vector<int32_t> drafts;
+    if (hist_.size() != (size_t)P) hist_.clear();     // out of step with the cache (it was changed elsewhere): no lookup
+    // Prompt lookup's guesses for after x (none if the conversation has no match).
+    std::vector<int32_t> look;
+    const int n_look = std::max(0, std::min(std::min(look_len_, lookup_max_), room));
+    const bool paused = pause_ > 0;
+    if (paused) --pause_;
+    if (!draft_src_ && n_look > 0 && !hist_.empty() && !paused) {
+        hist_.push_back(x);
+        look = lookup_guesses(hist_, n_look);
+        hist_.pop_back();
+        for (size_t i = 0; i < look.size(); ++i)
+            if (stop(look[i])) { look.resize(i + 1); break; }
+    }
     if (draft_src_) {
         drafts = draft_src_(P, x, n_max);
         if ((int)drafts.size() > n_max) drafts.resize(n_max);
@@ -79,6 +116,15 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
             tok = d;
             h.swap(hn);
         }
+    }
+    // With the draft block's guesses, lookup only extends them: when lookup's guess starts with all of the draft
+    // block's, two independent guessers agree and the longer guess is worth checking; when they differ, the draft block (usually the better
+    // guesser) is trusted. Without a draft block, lookup's guesses are the only ones.
+    int from_lookup = 0;
+    if (!look.empty()) {
+        const bool agree = drafts.empty() ? !m_.has_mtp() || h_pos_ != P - 1 || n_max == 0
+                                          : look.size() > drafts.size() && std::equal(drafts.begin(), drafts.end(), look.begin());
+        if (agree) { drafts = look; from_lookup = (int)look.size(); }
     }
     const int k = (int)drafts.size();
 
@@ -110,6 +156,24 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     h_pos_ = P + m;
     mtp_valid_ = P + m + 1;
     st_.steps++; st_.drafted += k; st_.accepted += m;
+    if (from_lookup > 0) {
+        st_.looked += k; st_.look_ok += m;
+        // A match that led nowhere costs a wider check for nothing: guess just one token after a miss (cheap to
+        // check), the number that were right plus one after a partial hit, and twice as many after a full one.
+        look_len_ = m == k ? std::min(lookup_max_, std::max(1, k) * 2) : std::max(1, m + 1);
+    }
+    // ---- 5. is lookup paying for itself? ----
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (k == 0) t_plain_ = t_plain_ > 0 ? 0.9 * t_plain_ + 0.1 * dt : dt;
+    else if (from_lookup > 0) {
+        look_s_ += dt; look_tok_ += m + 1; look_n_++;
+        if (look_n_ >= 4 && t_plain_ > 0) {           // a round of 4 checks: their tokens/s against plain steps'
+            if (look_tok_ / look_s_ < 1.0 / t_plain_) { pause_ = pause_len_; pause_len_ = std::min(pause_len_ * 2, 1024); }
+            else pause_len_ = 16;
+            look_s_ = 0; look_tok_ = look_n_ = 0;
+        }
+    }
+    if (!hist_.empty() || P == 0) { hist_.push_back(x); hist_.insert(hist_.end(), accepted.begin(), accepted.end()); }
     return produced;
 }
 
