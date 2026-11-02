@@ -114,6 +114,21 @@ decoding helps most.
 
 ## Benchmarks
 
+**gpt-oss-120b on one RTX 5090: a 59 GB model on a 32 GB card.** RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB
+DDR5-6000, Windows 11, tierlm 0.7 development build. gpt-oss-120b MXFP4 (2 files, 59.0 GiB), 64K context, CUDA:
+attention, routers and the context in VRAM (25.0 GiB of the model), the experts that don't fit in RAM (34.0 GiB),
+computed by the CPU. No second GPU.
+
+| | Speed |
+|---|---|
+| **A normal chat** (a 2,338-token reply in 60.8 s, temperature 0.7, prompt lookup on) | **38.5 tok/s** |
+| Find the fastest settings: experts in RAM, 16 CPU threads (the winner) | 40.3 tok/s |
+| Find the fastest settings: whole layers in VRAM, the rest in RAM | 32.1 tok/s |
+
+![gpt-oss-120b chatting at 38.5 tok/s on one RTX 5090](docs/images/gpt-oss-120b-rtx5090-chat.png)
+
+![The setup screen: where the 59 GB model goes, and Find the fastest settings](docs/images/gpt-oss-120b-rtx5090-setup.png)
+
 **RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB DDR5, Windows 11 (0.5.1):** Qwen3.6-35B-A3B Q8_0 (lmstudio-community,
 37 GB file, 34.4 GiB), 32K context, CUDA, attention in VRAM and experts split between VRAM and RAM:
 
@@ -259,7 +274,7 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | Qwen3.5 / 3.6 / 3.8 dense (`qwen35`, hybrid Gated DeltaNet) | Qwen3.6-27B (Unsloth MTP Q4_K_M) on an RTX 3070 laptop, with speculative decoding |
 | Qwen3.5 / 3.6 MoE (`qwen35moe`, e.g. Qwen3.6-35B-A3B) | Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
 | Qwen3-Next / Qwen3-Coder-Next (`qwen3next`, 80B-A3B) | model math verified, real weights not yet tested |
-| gpt-oss (`gpt-oss`: gpt-oss-20b, gpt-oss-120b, HyperNova-60B, ...) | model math verified (including OpenAI's chat format and tools), real weights not yet tested |
+| gpt-oss (`gpt-oss`: gpt-oss-20b, gpt-oss-120b, HyperNova-60B, ...) | gpt-oss-120b MXFP4 on one RTX 5090 with 34 GB of it in RAM (38.5 tok/s in a chat), gpt-oss-20b on an RTX 5090 (about 270 tok/s); model math verified, including OpenAI's chat format and tools |
 
 Not yet: Gemma, Phi, DeepSeek, Nemotron and others. The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
