@@ -349,6 +349,24 @@ std::vector<std::string> known_model_folders() {
     return out;
 }
 
+// LM Studio keeps the embedding model it comes with (nomic-embed-text-v1.5, shown there as
+// "text-embedding-nomic-embed-text-v1.5") apart from downloaded models, in .internal/bundled-models.
+std::vector<std::string> bundled_model_folders() {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    const std::string home = env("USERPROFILE");
+#else
+    const std::string home = env("HOME");
+#endif
+    if (home.empty()) return out;
+    for (const char* sub : { ".lmstudio/.internal/bundled-models", ".cache/lm-studio/.internal/bundled-models" }) {
+        std::error_code ec;
+        fs::path p = fs::u8path(home) / fs::u8path(sub);
+        if (fs::is_directory(p, ec)) out.push_back(p.make_preferred().u8string());
+    }
+    return out;
+}
+
 // Problems worth telling the user about before they wonder why their GPU is missing.
 json hardware_warnings(bool have_gpu) {
     json w = json::array();
@@ -1060,6 +1078,27 @@ int main(int argc, char** argv) {
     // Models in the models folder (and, if enabled, its subfolders, as LM Studio stores them), read from
     // their headers only (fast: no weights are loaded). "id" is the path relative to the folder.
     // Every .gguf in the models folder (subfolders too if enabled), described from its header.
+    // Embedding models LM Studio comes with, for the Embedding model list.
+    auto scan_bundled = [&]() {
+        json list = json::array();
+        const auto folders = bundled_model_folders();
+        for (size_t i = 0; i < folders.size(); i++) {
+            std::error_code ec;
+            const fs::path base = fs::u8path(folders[i]);
+            auto it = fs::recursive_directory_iterator(base, fs::directory_options::skip_permission_denied, ec);
+            for (; !ec && it != fs::recursive_directory_iterator() && list.size() < 50; it.increment(ec)) {
+                if (it.depth() > 4) { it.disable_recursion_pending(); continue; }
+                std::error_code e2;
+                if (!it->is_regular_file(e2) || it->path().extension() != ".gguf") continue;
+                json m = describe_model(it->path().u8string());
+                if (!m.value("embedding", false)) continue;
+                m["id"] = "@lmstudio/" + std::to_string(i) + "/" + it->path().lexically_relative(base).generic_u8string();
+                m["builtin"] = "LM Studio";
+                list.push_back(m);
+            }
+        }
+        return list;
+    };
     auto scan_models = [&](bool& exists) {
         json list = json::array();
         std::error_code ec;
@@ -1098,7 +1137,7 @@ int main(int argc, char** argv) {
         json per_model = settings.value("models", json::object());
         json j = {{"folder", fs::absolute(base, ec).make_preferred().u8string()}, {"exists", exists}, {"recursive", recursive},
                   {"models", list}, {"default_ctx", a.ctx}, {"current", eng.path}, {"suggestions", suggest},
-                  {"saved", per_model}, {"last_model", settings.value("last_model", std::string())},
+                  {"saved", per_model}, {"last_model", settings.value("last_model", std::string())}, {"bundled", scan_bundled()},
 #ifdef _WIN32
                   {"can_pick", true},
 #else
@@ -1152,6 +1191,23 @@ int main(int argc, char** argv) {
 
     // A model id from the page or the API, as a file inside the models folder (empty if it isn't one: only files
     // inside the models folder can be loaded).
+    // A built-in embedding model of LM Studio's: "@lmstudio/<folder number>/<path inside that folder>".
+    auto bundled_file = [&](const std::string& id) -> std::filesystem::path {
+        const std::string pre = "@lmstudio/";
+        if (id.rfind(pre, 0) != 0) return {};
+        const size_t slash = id.find('/', pre.size());
+        if (slash == std::string::npos) return {};
+        const auto folders = bundled_model_folders();
+        size_t i = 0;
+        try { i = std::stoul(id.substr(pre.size(), slash - pre.size())); } catch (...) { return {}; }
+        if (i >= folders.size()) return {};
+        std::error_code ec;
+        const auto base = std::filesystem::weakly_canonical(std::filesystem::u8path(folders[i]), ec);
+        const auto file = std::filesystem::weakly_canonical(std::filesystem::u8path(folders[i]) / std::filesystem::u8path(id.substr(slash + 1)), ec);
+        auto rel = file.lexically_relative(base);
+        if (ec || rel.empty() || rel.begin()->string() == ".." || !std::filesystem::is_regular_file(file, ec) || file.extension() != ".gguf") return {};
+        return file;
+    };
     auto model_file = [&](const std::string& id) -> std::filesystem::path {
         std::error_code ec;
         const auto base = std::filesystem::weakly_canonical(std::filesystem::u8path(a.models), ec);
@@ -2319,7 +2375,8 @@ int main(int argc, char** argv) {
     svr.Post("/api/embed/load", [&](const httplib::Request& req, httplib::Response& res) {
         const json body = json::parse(req.body, nullptr, false);
         const std::string id = body.is_object() ? body.value("model", std::string()) : std::string();
-        const auto file = model_file(id);
+        auto file = model_file(id);
+        if (file.empty()) file = bundled_file(id);
         if (file.empty()) { res.status = 400; res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json"); return; }
         const json d = describe_model(file.u8string());
         if (!d.value("embedding", false)) {
@@ -2413,7 +2470,8 @@ int main(int argc, char** argv) {
     // Load the embedding model chosen last time.
     if (settings.contains("embed_model") && settings["embed_model"].is_string()) {
         const std::string id = settings["embed_model"];
-        const auto file = model_file(id);
+        auto file = model_file(id);
+        if (file.empty()) file = bundled_file(id);
         if (!file.empty()) {
             try { std::lock_guard<std::mutex> lk(emb.mu); embed_load(file, id); }
             catch (const std::exception& e) { std::fprintf(stderr, "embedding model %s: %s\n", id.c_str(), e.what()); }

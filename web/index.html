@@ -41,7 +41,7 @@
   #status { color: var(--muted); font-size: 12.5px; }
 
   main { display: grid; grid-template-columns: minmax(340px, 1fr) minmax(420px, 1.15fr); gap: 16px; padding: 16px; height: calc(100% - 53px); }
-  /* Chat page: icon rail and menu panel on the left, the conversation in the middle, a thin live view on the right. */
+  /* Chat page: icon rail and menu panel on the left, the conversation in the middle, speed and context at the top of the menu. */
   main#app { display: flex; gap: 0; padding: 0; }
   #rail { width: 56px; flex: 0 0 56px; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 0; background: var(--panel); border-right: 1px solid var(--line); }
   #rail .grow { flex: 1; }
@@ -53,6 +53,13 @@
   .ricon.on svg .fillbg { fill: var(--accent-soft); }
   #panel { width: 330px; flex: 0 0 330px; background: var(--panel); border-right: 1px solid var(--line); overflow-y: auto; }
   #app.collapsed #panel { display: none; }
+  /* with the menu collapsed, a small speed number and context bar stay on the icon rail */
+  #railstat { display: none; width: 46px; text-align: center; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; cursor: pointer; }
+  #app.collapsed #railstat { display: block; }
+  #railstat b { display: block; font-size: 13px; color: var(--ink); }
+  #railstat small { display: block; font-size: 10px; }
+  #railstat .rbar { height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; margin: 6px 4px 2px; }
+  #railstat .rbar > div { height: 100%; width: 0; background: var(--accent); }
   .sec { border-bottom: 1px solid var(--line); }
   .sechead { width: 100%; display: flex; align-items: baseline; gap: 10px; padding: 13px 16px; border: 0; border-radius: 0; background: transparent; font-weight: 600; font-size: 13.5px; text-align: left; }
   .sechead:hover { background: var(--panel-2); }
@@ -102,8 +109,9 @@
   .bstat .bv { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .bstat .bv small { font-size: 12px; font-weight: 500; color: var(--muted); }
   #chat { flex: 1 1 auto; min-width: 0; border-radius: 0; border-width: 0 1px 0 0; }
-  #dash { width: 300px; flex: 0 0 300px; display: flex; flex-direction: column; gap: 10px; padding: 10px; overflow-y: auto; }
-  #dash .card .body { padding: 10px 12px 12px; }
+  #live { display: flex; flex-direction: column; gap: 8px; padding: 10px; border-bottom: 1px solid var(--line); }
+  #live .card .body { padding: 9px 12px 11px; }
+  #mapcard { margin-top: 14px; }
   .ctitle { font-size: 11px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; color: var(--muted); }
   .mid { font-size: 20px; font-weight: 700; letter-spacing: -.5px; margin-top: 2px; }
   .mid small { font-size: 12.5px; font-weight: 500; color: var(--muted); margin-left: 4px; letter-spacing: 0; }
@@ -120,7 +128,7 @@
   .swatch.v { background: var(--vram); } .swatch.r { background: var(--ram); }
   .maptools { margin: 8px 0 6px; gap: 6px; }
   #map { height: 220px; }
-  #mapcard.bigmap { position: fixed; inset: 24px; z-index: 30; overflow: auto; box-shadow: 0 10px 40px rgba(0,0,0,.35); }
+  #mapcard.bigmap { position: fixed; inset: 24px; z-index: 30; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,.35); }
   #mapcard.bigmap #map { height: calc(100vh - 230px); }
   #mapcard .legend { gap: 10px; font-size: 11.5px; }
   #mapcard .legend i { width: 16px; }
@@ -140,7 +148,6 @@
     #rail .grow { display: none; }
     #panel { width: 100%; flex: 1 1 100%; border-right: 0; }
     #chat { flex: 1 1 100%; height: 70vh; border-width: 0 0 1px 0; }
-    #dash { width: 100%; flex: 1 1 100%; }
   }
 
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
@@ -222,8 +229,6 @@
   button.on { background: var(--accent-soft); border-color: var(--accent); }
 
   /* dashboard */
-  #dash { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; align-content: start; overflow-y: auto; min-height: 0; }
-  #dash .wide { grid-column: 1 / -1; }
   .big { font-size: 24px; font-weight: 650; letter-spacing: -.5px; line-height: 1.15; font-variant-numeric: tabular-nums; }
   .big small { font-size: 12.5px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-left: 4px; }
   .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; margin-top: 8px; }
@@ -604,10 +609,31 @@
     <button class="ricon" data-sec="chats" aria-label="Chats" title="Chats and presets"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></svg></button>
     <button class="ricon" data-sec="bench" aria-label="Benchmark" title="Benchmark"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="16" y2="11"/></svg></button>
     <span class="grow"></span>
+    <div id="railstat" title="Speed and context"><b id="rtps">–</b><small>tok/s</small><div class="rbar"><div id="rctx"></div></div><small id="rctxt">ctx</small></div>
     <button class="ricon" id="railtoggle" aria-label="Collapse menu" title="Collapse menu"><svg aria-hidden="true" viewBox="0 0 24 24"><path id="railarrow" d="M15 6l-6 6 6 6"/></svg></button>
   </nav>
 
   <aside id="panel" aria-label="Menu">
+    <div id="live" aria-label="Live view">
+    <div class="card">
+      <div class="body">
+        <div class="chead"><div class="ctitle">Speed</div><div class="big sm" id="tps">–<small>tok/s</small></div></div>
+        <canvas id="spark"></canvas>
+        <dl class="kv">
+          <dt>Prompt reading</dt><dd id="ptps">–</dd>
+          <dt>Last reply</dt><dd id="lastreply">–</dd>
+          <dt>Reused from cache</dt><dd id="reused">–</dd>
+        </dl>
+      </div>
+    </div>
+    <div class="card">
+      <div class="body">
+        <div class="ctitle">Context</div>
+        <div class="mid" id="ctxbig">0<small id="ctxof">/ – tokens</small></div>
+        <div class="bar"><div id="ctxbar"></div></div>
+      </div>
+    </div>
+    </div>
     <div class="sec" data-sec="settings">
       <button class="sechead" aria-expanded="false"><span>Settings</span><small>sampling, speculation</small></button>
       <div class="secbody">
@@ -658,7 +684,7 @@
       </div>
     </div>
     <div class="sec" data-sec="model">
-      <button class="sechead" aria-expanded="false"><span>Model info</span><small>where it lives</small></button>
+      <button class="sechead" aria-expanded="false"><span>Model info</span><small>memory, experts</small></button>
       <div class="secbody">
         <div class="subhead" style="margin-top:4px">Embedding model</div>
         <div class="lrow2" style="margin-top:4px">
@@ -681,6 +707,33 @@
         <div class="note" id="hotnote" hidden></div>
         <button class="tiny ghost" id="hotforget" hidden>Forget what tierlm learned about this model</button>
         <div class="note" id="densenote" hidden></div>
+        <div class="subhead">Memory right now</div>
+        <div id="minimem"></div>
+        <div id="mapcard">
+        <div class="maphead">
+          <span class="ctitle">Which experts are working</span>
+          <button class="qbtn" id="maphelpbtn" aria-label="What is this map?" aria-expanded="false" title="What is this map?">?</button>
+          <button class="qbtn" id="mapbig" aria-label="Enlarge the map" title="Enlarge">⤢</button>
+        </div>
+        <div class="maphelp" id="maphelp" hidden>
+          <p>This model is a <b>mixture of experts</b>: each of its <span class="hL">–</span> layers has <span class="hE">–</span> small specialist networks, and for every word a router picks just <span class="hK">–</span> of them.</p>
+          <p>Each <b>row</b> is a layer (top = first). In <b>Sorted</b> view each row lists its experts busiest first; <b>Brighter</b> = picked more often this session, and a <b>flash</b> = picked for the word just written. Hover for details.</p>
+          <p>The strip on the left shows where each layer's experts live: <span class="swatch v"></span> VRAM (fast) or <span class="swatch r"></span> RAM; a part-filled strip means only that layer's busiest experts are in VRAM, and those are <b>ringed</b>. When a few experts do most of the work, keeping those in VRAM makes the model faster, and tierlm learns which ones as you chat.</p>
+        </div>
+        <div class="row maptools">
+          <button class="tiny on" id="m-sorted">Sorted</button>
+          <button class="tiny" id="m-byid">By number</button>
+          <span class="grow"></span>
+          <button class="tiny" id="m-live" title="Show only the experts picked for the current word">Live only</button>
+          <button class="tiny ghost" id="m-reset">Reset</button>
+        </div>
+        <canvas id="map"></canvas>
+        <div class="legend">
+          <span><i style="background:linear-gradient(90deg,var(--heat-lo),#e0a043,#c2410c)"></i>more often</span>
+          <span><i style="background:var(--flash)"></i>this word</span>
+          <span id="picks">0 picks</span>
+        </div>
+        </div>
         <div id="hitcard">
           <div class="subhead">Hot-expert cache preview</div>
           <label class="small">If each layer kept only <input id="slots" type="range" min="0" max="64" step="1" value="16"> <b id="slotsv">16</b> experts in VRAM…</label>
@@ -731,7 +784,7 @@
     <div id="messages">
       <div class="empty" id="empty">
         <b>Chat with your own engine.</b><br>
-        Every reply runs through tierlm on this machine. Watch the expert map on the right as the router picks experts for each word.
+        Every reply runs through tierlm on this machine. Speed and context are at the top of the menu; the expert map is in Model info.
         <div class="suggest">
           <button class="ghost" data-q="What is the capital of France, and why is it famous?">Capital of France</button>
           <button class="ghost" data-q="Explain what a mixture-of-experts language model is, in simple terms.">Explain MoE</button>
@@ -762,62 +815,6 @@
     </div>
   </section>
 
-  <section id="dash" aria-label="Live view">
-    <div class="card">
-      <div class="body">
-        <div class="chead"><div class="ctitle">Speed</div><div class="big sm" id="tps">–<small>tok/s</small></div></div>
-        <canvas id="spark"></canvas>
-        <dl class="kv">
-          <dt>Prompt reading</dt><dd id="ptps">–</dd>
-          <dt>Last reply</dt><dd id="lastreply">–</dd>
-          <dt>Reused from cache</dt><dd id="reused">–</dd>
-        </dl>
-      </div>
-    </div>
-    <div class="card">
-      <div class="body">
-        <div class="ctitle">Context</div>
-        <div class="mid" id="ctxbig">0<small id="ctxof">/ – tokens</small></div>
-        <div class="bar"><div id="ctxbar"></div></div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="body">
-        <div class="ctitle">Memory</div>
-        <div id="minimem"></div>
-      </div>
-    </div>
-    <div class="card" id="mapcard">
-      <div class="body">
-        <div class="maphead">
-          <span class="ctitle">Which experts are working</span>
-          <button class="qbtn" id="maphelpbtn" aria-label="What is this map?" aria-expanded="false" title="What is this map?">?</button>
-          <button class="qbtn" id="mapbig" aria-label="Enlarge the map" title="Enlarge">⤢</button>
-        </div>
-        <div class="maphelp" id="maphelp" hidden>
-          <p>This model is a <b>mixture of experts</b>: each of its <span class="hL">–</span> layers has <span class="hE">–</span> small specialist networks, and for every word a router picks just <span class="hK">–</span> of them.</p>
-          <p>Each <b>row</b> is a layer (top = first). In <b>Sorted</b> view each row lists its experts busiest first; <b>Brighter</b> = picked more often this session, and a <b>flash</b> = picked for the word just written. Hover for details.</p>
-          <p>The strip on the left shows where each layer's experts live: <span class="swatch v"></span> VRAM (fast) or <span class="swatch r"></span> RAM; a part-filled strip means only that layer's busiest experts are in VRAM, and those are <b>ringed</b>. When a few experts do most of the work, keeping those in VRAM makes the model faster, and tierlm learns which ones as you chat.</p>
-        </div>
-        <div class="row maptools">
-          <button class="tiny on" id="m-sorted">Sorted</button>
-          <button class="tiny" id="m-byid">By number</button>
-          <span class="grow"></span>
-          <button class="tiny" id="m-live" title="Show only the experts picked for the current word">Live only</button>
-          <button class="tiny ghost" id="m-reset">Reset</button>
-        </div>
-        <canvas id="map"></canvas>
-        <div class="legend">
-          <span><i style="background:linear-gradient(90deg,var(--heat-lo),#e0a043,#c2410c)"></i>more often</span>
-          <span><i style="background:var(--flash)"></i>this word</span>
-          <span id="picks">0 picks</span>
-        </div>
-      </div>
-    </div>
-    <div class="card" id="densecard" hidden>
-      <div class="body"><div class="ctitle">Model type</div><div class="note" id="densenote2" style="margin:0"></div></div>
-    </div>
-  </section>
 </main>
 <div id="tip"></div>
 
@@ -858,18 +855,18 @@ let speedPts = [], tokTimes = [], tokCount = 0;   // speed vs. context
 // The embedding model: a second model loaded next to the chat one, for /v1/embeddings.
 async function loadEmbed() {
   let e = { loaded: false }, list = [];
-  try { [e, list] = await Promise.all([api("/api/embed").then(r => r.json()), api("/api/models").then(r => r.json()).then(m => m.models || [])]); } catch (x) { return; }
+  try { [e, list] = await Promise.all([api("/api/embed").then(r => r.json()), api("/api/models").then(r => r.json()).then(m => (m.models || []).concat(m.bundled || []))]); } catch (x) { return; }
   const sel = $("embsel"), opts = list.filter(m => m.embedding);
   sel.innerHTML = "";
   const add = (v, t) => { const o = document.createElement("option"); o.value = v; o.textContent = t; sel.appendChild(o); };
   add("", "None");
-  for (const m of opts) add(m.id, (m.name || m.id) + " · " + fmtSize(m.bytes || 0));
+  for (const m of opts) add(m.id, (m.name || m.id) + " · " + fmtSize(m.bytes || 0) + (m.builtin ? " · built into " + m.builtin : ""));
   if (e.loaded && !opts.some(m => m.id === e.id)) add(e.id, e.name || e.id);
   sel.value = e.loaded ? e.id : "";
   $("embnote").textContent = e.loaded
     ? `${e.name}: ${e.dims} numbers per text, up to ${e.max_tokens.toLocaleString()} tokens, on ${e.on_gpu ? e.device.replace(/ \(.*$/, "") : "the CPU"}. Apps use it through /v1/embeddings, while the chat model stays loaded.`
     : opts.length ? "A second, small model that turns text into numbers for search and document comparison. Choose one to load it next to the chat model; apps use it through /v1/embeddings."
-    : "No embedding models in your models folder. Download one in GGUF format, for example nomic-embed-text-v1.5 (Q8_0, about 140 MB), into the models folder, then choose it here.";
+    : "No embedding models in your models folder (or LM Studio's built-in one). Download one in GGUF format, for example nomic-embed-text-v1.5 (Q8_0, about 140 MB), into the models folder, then choose it here.";
 }
 $("embsel").onchange = async () => {
   const id = $("embsel").value, sel = $("embsel");
@@ -920,10 +917,10 @@ async function loadInfo() {
   counts = new Float64Array(L * E); flash = new Float64Array(L * E);
   $("slots").max = Math.max(1, E); $("slots").value = Math.max(1, Math.round(E / 4));
   const moe = E > 0;
-  $("mapcard").hidden = !moe; $("hitcard").hidden = !moe; $("densecard").hidden = moe; $("densenote").hidden = moe;
+  $("mapcard").hidden = !moe; $("hitcard").hidden = !moe; $("densenote").hidden = moe;
   const dn = moe ? "" : `${info.name} is a dense model: every word uses all of its ${L} layers, so there are no experts to map. ` +
     "When it doesn't fit in VRAM, tierlm splits it by whole layers between VRAM and RAM.";
-  $("densenote").textContent = dn; $("densenote2").textContent = dn;
+  $("densenote").textContent = dn;
   document.querySelectorAll(".hL").forEach(x => x.textContent = L);
   document.querySelectorAll(".hE").forEach(x => x.textContent = E);
   document.querySelectorAll(".hK").forEach(x => x.textContent = K);
@@ -974,6 +971,10 @@ async function loadInfo() {
 function setContext(n) {
   $("ctxbig").firstChild.nodeValue = n.toLocaleString();
   $("ctxbar").style.width = info ? Math.min(100, 100 * n / info.ctx) + "%" : "0";
+  const f = info ? n / info.ctx : 0;
+  $("rctx").style.width = Math.min(100, 100 * f) + "%";
+  $("rctxt").textContent = Math.round(100 * f) + "% ctx";
+  $("railstat").title = "Context: " + n.toLocaleString() + (info ? " of " + info.ctx.toLocaleString() : "") + " tokens";
 }
 
 // ---------- Markdown ----------
@@ -1249,7 +1250,7 @@ function onToken(ev) {
   for (let l = 0; l < ev.routing.length; l++)
     for (const e of ev.routing[l]) if (e >= 0) { counts[l * E + e] += 1; flash[l * E + e] = 1; }   // (-1: a layer without experts)
   totalPicks += L * K;
-  $("tps").firstChild.nodeValue = ev.tps.toFixed(1);
+  $("tps").firstChild.nodeValue = ev.tps.toFixed(1); $("rtps").textContent = ev.tps.toFixed(1);
   // Speed over the last 16 tokens. With speculative decoding tokens arrive in bursts (a check yields 2-3 at once),
   // so a per-token speed would jump between very fast and slow.
   const now = performance.now();
@@ -1260,7 +1261,7 @@ function onToken(ev) {
   if (tokCount % 4 === 0) updateHits();
 }
 function onDone(ev) {
-  $("tps").firstChild.nodeValue = ev.gen_tps.toFixed(1);
+  $("tps").firstChild.nodeValue = ev.gen_tps.toFixed(1); $("rtps").textContent = ev.gen_tps.toFixed(1);
   $("lastreply").textContent = ev.n_gen + " tokens in " + ev.gen_s.toFixed(1) + " s";
   setContext(ev.n_past);
   updateHits();
@@ -1879,6 +1880,7 @@ document.querySelectorAll(".sechead").forEach(h => h.onclick = () => {
   renderRail();
 });
 $("railtoggle").onclick = () => { railOpen = !railOpen; renderRail(); };
+$("railstat").onclick = () => { railOpen = true; renderRail(); };
 $("chgsetup2").onclick = () => { if (!busy) showSetup(); };
 renderRail();
 
@@ -1891,7 +1893,7 @@ function setTheme(t) {
 document.querySelectorAll(".themesw button").forEach(b => b.onclick = () => setTheme(b.dataset.theme));
 { let t = "auto"; try { t = localStorage.getItem("tierlm.theme") || "auto"; } catch (e) {} setTheme(t); }
 
-// ---------- memory at a glance (right side) ----------
+// ---------- memory at a glance (Model info) ----------
 function renderMiniMem() {
   if (!info) { $("minimem").innerHTML = ""; return; }
   const L_ = info.layers || 1, kvG = (info.kv_bytes || 0) * (info.kv_gpu_layers || 0) / L_;

@@ -116,10 +116,11 @@ fold the menu away and give the chat more room.
 - **Benchmark**: one click measures prompt reading and generation speed with the current settings, with a line to
   copy and share.
 
-**The live view** on the right: **Speed** (tokens per second; a token is roughly ¾ of a word) with a chart of speed
-as the conversation grows, **Context** (how much of the model's memory of this conversation is used; **New chat**
-clears it), **Memory** (what's in VRAM and RAM), and for mixture-of-experts models **Which experts are working**.
-That map has a **?** that explains it: each row is a layer, each square one of its experts, brighter means picked
+**Speed and Context** sit at the top of the menu: **Speed** (tokens per second; a token is roughly ¾ of a word) with
+a chart of speed as the conversation grows, and **Context** (how much of the model's memory of this conversation is
+used; **New chat** clears it). With the menu collapsed, the icon strip still shows the speed and a small context bar
+(click it to open the menu). **Model info** has **Memory right now** (what's in VRAM and RAM) and, for
+mixture-of-experts models, **Which experts are working**. That map has a **?** that explains it: each row is a layer, each square one of its experts, brighter means picked
 more often and a flash means picked for the word just written. In **Sorted** view each row shows its busiest experts
 first, and the strip on the left shows whether that layer's experts are in VRAM or RAM. **⤢** opens it full size.
 
@@ -149,8 +150,9 @@ remove it. Images, PDFs and Word files aren't supported yet.
 Search, document comparison and retrieval (RAG) tools need an **embedding model**: a small model that turns a text
 into a list of numbers, so similar texts get similar numbers. tierlm can keep one loaded next to the chat model, as
 LM Studio does: put one in your models folder (for example **nomic-embed-text-v1.5**, about 140 MB at Q8_0), then in
-the side menu open **Model info** and choose it under **Embedding model**. tierlm remembers it and loads it again next
-time. Apps reach it at `/v1/embeddings` on the same address as the chat model ([API](API.md#post-v1embeddings)).
+the side menu open **Model info** and choose it under **Embedding model**. If you have LM Studio, the one built into it
+("text-embedding-nomic-embed-text-v1.5") is listed there too, marked **built into LM Studio**, with nothing to download.
+tierlm remembers your choice and loads it again next time. Apps reach it at `/v1/embeddings` on the same address as the chat model ([API](API.md#post-v1embeddings)).
 
 ## Step 6: Stop it
 

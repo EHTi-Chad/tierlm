@@ -111,9 +111,9 @@ decoding helps most.
   (split mode, CPU threads, speculative decoding and how far ahead to guess), then keeps the fastest. It measures
   exactly the way a chat runs, with your sampling settings, so its numbers are the speed you get in chats.
 - **Web interface**: streaming chat with a collapsible side menu (live settings and system prompt, API, a console
-  showing what the engine is doing, model info, saved chats and system-prompt presets, a one-click benchmark), a
-  thin live view (speed, context, memory and an explained expert map that shows which experts work and where they
-  live), and a light/dark/automatic theme.
+  showing what the engine is doing, model info with memory and an explained expert map that shows which experts work and where they live, saved
+  chats and system-prompt presets, a one-click benchmark), speed and context at the top of the menu (still shown on
+  the icon strip when the menu is collapsed), and a light/dark/automatic theme.
 - **Speculative decoding** with the model's own built-in draft layer (MTP, in Qwen3.5 / 3.6 / 3.8 and Qwen3-Next
   files, or a separate `mtp-*.gguf` next to the model): the model checks several guessed tokens in one pass, so
   each read of its weights from RAM produces more than one token. Same answers, faster replies; most useful when the
