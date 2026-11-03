@@ -137,6 +137,21 @@ The model can't run anything, and can't read or write outside the folder. The wo
 page on the computer running tierlm, not from other devices, so nobody on your network can reach your files through
 it. It works best with models that are good at tools: Qwen3.5 / 3.6, Qwen3-Coder, gpt-oss.
 
+### Attaching files and folders: the **+** button
+
+The **+** under the message box adds things to your message. **Attach files** puts the text of one or more text or
+code files into your message (up to 2 MB each); you can also drag files onto the chat or paste them into the box.
+**Work in a folder…** turns the workspace on or off. What's attached shows as chips above the box, each with an ✕ to
+remove it. Images, PDFs and Word files aren't supported yet.
+
+### Two models at once: an embedding model
+
+Search, document comparison and retrieval (RAG) tools need an **embedding model**: a small model that turns a text
+into a list of numbers, so similar texts get similar numbers. tierlm can keep one loaded next to the chat model, as
+LM Studio does: put one in your models folder (for example **nomic-embed-text-v1.5**, about 140 MB at Q8_0), then in
+the side menu open **Model info** and choose it under **Embedding model**. tierlm remembers it and loads it again next
+time. Apps reach it at `/v1/embeddings` on the same address as the chat model ([API](API.md#post-v1embeddings)).
+
 ## Step 6: Stop it
 
 Close the black tierlm window, or press **Ctrl+C** in it.
@@ -231,6 +246,8 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Qwen3.5 / 3.6 MoE (hybrid) | `qwen35moe` | Qwen3.6-35B-A3B, Qwen3.5-122B-A10B | Tested: Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
 | Qwen3-Next (hybrid MoE) | `qwen3next` | Qwen3-Coder-Next-80B-A3B, Qwen3-Next-80B-A3B | Model math verified, real-model test pending |
 | gpt-oss | `gpt-oss` | gpt-oss-20b, gpt-oss-120b, HyperNova-60B | Model math and chat format verified, real-model test pending |
+| Embedding models: BERT-style | `bert` | bge-small/base/large, all-MiniLM-L6-v2, e5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
+| Embedding models: Nomic | `nomic-bert` | nomic-embed-text v1, v1.5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
 | Gemma, Phi, DeepSeek, GLM, Nemotron, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision add-on** (for reading images). tierlm lists it but

@@ -28,12 +28,15 @@
 // (base URL http://<this computer>:<port>/v1; see docs/API.md):
 //   GET  /v1/models            the loaded model and every supported model in the models folder
 //   POST /v1/chat/completions  chat, streamed or not, with tool calling; naming another model loads it first
+//   POST /v1/embeddings        embeddings from the embedding model loaded next to the chat model (/api/embed)
 #include "model.h"
 #include "speculate.h"
 #include "gguf_split.h"
 #include "tokenizer.h"
+#include "encoder.h"
 #include "gguf.h"
 #include "ggml-backend.h"
+#include <list>
 #include "httplib.h"
 #include "json.hpp"
 #include "agent.h"
@@ -61,6 +64,7 @@
 
 #include "backends.h"
 #include <deque>
+#include <condition_variable>
 #ifdef _WIN32
 #include <windows.h>
 #include <shobjidl.h>
@@ -436,6 +440,45 @@ struct Engine {
     agent::ToolFmt tool_fmt = agent::ToolFmt::Hermes;   // how this model writes tool calls
     std::string identity;                                // harmony models: the model identity line of their template
     std::vector<int32_t> cached;      // the tokens currently in the KV cache
+    // Other conversations, saved to RAM when a request for a different one needed the cache, so they come back
+    // without being read again. A coding agent's side requests (opencode titling a session, say) would otherwise
+    // throw away its long instructions each time. Most recently used first.
+    struct SavedConv {
+        std::vector<int32_t> tokens;
+        Model::Snapshot snap;
+        bool has_spec = false;
+        Speculator::State spec;
+    };
+    std::list<SavedConv> saved;
+    size_t saved_bytes() const { size_t n = 0; for (const auto& c : saved) n += c.snap.bytes; return n; }
+    // Room for saved conversations: up to 4 GB, and never more than a quarter of the RAM that is free now.
+    size_t saved_budget() const {
+        size_t budget = (size_t)4 << 30;
+        if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(cpu, &free, &total);
+            if (free > 0) budget = std::min(budget, free / 4 + saved_bytes());
+        }
+        return budget;
+    }
+    // Saves the conversation in the cache (when it's long enough to be worth it), replacing saved ones it extends.
+    void save_current() {
+        if (!model || cached.size() < 256 || model->n_past() != (int)cached.size()) return;
+        for (auto it = saved.begin(); it != saved.end();) {
+            const bool prefix = it->tokens.size() <= cached.size() && std::equal(it->tokens.begin(), it->tokens.end(), cached.begin());
+            it = prefix ? saved.erase(it) : std::next(it);
+        }
+        SavedConv c;
+        c.tokens = cached;
+        c.snap = model->save();
+        if (spec) { c.has_spec = true; c.spec = spec->state(); }
+        saved.push_front(std::move(c));
+        const size_t budget = saved_budget();
+        while (saved.size() > 8 || (saved.size() > 1 && saved_bytes() > budget)) saved.pop_back();
+        if (saved.size() == 1 && saved_bytes() > budget) saved.clear();
+        std::fprintf(stderr, "cache: saved a %zu-token conversation to RAM (%.0f MB; %zu kept)\n", cached.size(),
+                     saved.empty() ? 0.0 : saved.front().snap.bytes / 1048576.0, saved.size());
+    }
 
     // How many tokens prompt lookup guesses at most. Checking guesses costs memory for the undo copies (hybrid
     // models keep one copy of their running memory per guess) and, with experts in RAM, reading more experts:
@@ -550,6 +593,15 @@ json describe_model(const std::string& path) {
     }
     if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * kv_layers * (kv_heads ? kv_heads : heads) * head_dim * 2;
     const std::string tk = str("tokenizer.ggml.model");
+    if (is_encoder_arch(arch)) {
+        // An embedding model: it turns text into vectors for search and comparison, alongside a chat model.
+        j["kind"] = "embedding";
+        j["dims"] = embd;
+        if (tk == "bert") { j["embedding"] = true; j["reason"] = "Embedding model: load it next to a chat model (side menu, Model info, Embedding model)"; }
+        else j["reason"] = "embedding model with the " + (tk.empty() ? std::string("unknown") : tk) + " tokenizer, not supported yet";
+        gguf_free(g);
+        return j;
+    }
     if (arch_supported(arch) && (tk == "gpt2" || tk == "llama")) j["supported"] = true;
     else if (arch_supported(arch)) j["reason"] = "the " + (tk.empty() ? std::string("unknown") : tk) + " tokenizer is not supported yet";
     else if (arch == "clip") {
@@ -606,6 +658,20 @@ json normalize_messages(const json& in) {
             if (!calls.empty()) o["tool_calls"] = calls;
         }
         out.push_back(o);
+    }
+    return out;
+}
+
+// Standard base64 (for embeddings sent as "encoding_format": "base64": little-endian float32s).
+std::string base64_encode(const unsigned char* p, size_t n) {
+    static const char* k = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((n + 2) / 3 * 4);
+    for (size_t i = 0; i < n; i += 3) {
+        const uint32_t v = (uint32_t)p[i] << 16 | (i + 1 < n ? (uint32_t)p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+        out += k[v >> 18 & 63]; out += k[v >> 12 & 63];
+        out += i + 1 < n ? k[v >> 6 & 63] : '=';
+        out += i + 2 < n ? k[v & 63] : '=';
     }
     return out;
 }
@@ -753,7 +819,39 @@ int main(int argc, char** argv) {
     if (const char* ep = std::getenv("TIERLM_RPC")) add_rpc_server(ep);
     Engine eng;
     eng.threads = a.threads;
-    std::timed_mutex mu;                 // one load or generation at a time (a new request waits up to 3 s for the last one to finish)
+    std::timed_mutex mu;                 // one load or generation at a time
+    // Requests for a reply or a load wait their turn in line, first come first served (a mutex alone lets any
+    // waiter in next, so a request could wait forever behind newer ones). Only replies and loads queue; Find the
+    // fastest settings, the benchmark and setting changes still answer "busy" at once.
+    struct Line {
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<uint64_t> q;
+        uint64_t next = 0;
+        size_t waiting() { std::lock_guard<std::mutex> l(m); return q.size(); }
+        // Waits until this request is first in line and the engine is free, then holds `mu` (the caller adopts
+        // it). on_wait(ahead) is called whenever the number of requests ahead changes (0: only the one running).
+        // Gives up (false) when gone() says the client left, or after max_wait.
+        bool enter(std::timed_mutex& mu, const std::function<bool()>& gone, const std::function<void(int)>& on_wait = nullptr,
+                   std::chrono::seconds max_wait = std::chrono::seconds(1800)) {
+            std::unique_lock<std::mutex> l(m);
+            const uint64_t me = next++;
+            q.push_back(me);
+            const auto until = std::chrono::steady_clock::now() + max_wait;
+            int shown = -1;
+            for (;;) {
+                if (q.front() == me && mu.try_lock()) { q.pop_front(); cv.notify_all(); return true; }
+                const int ahead = (int)(std::find(q.begin(), q.end(), me) - q.begin());
+                if (on_wait && ahead != shown) { shown = ahead; l.unlock(); on_wait(ahead); l.lock(); }
+                if ((gone && gone()) || std::chrono::steady_clock::now() > until) {
+                    q.erase(std::find(q.begin(), q.end(), me));
+                    cv.notify_all();
+                    return false;
+                }
+                cv.wait_for(l, std::chrono::milliseconds(50));   // also polls: mu is freed without telling the line
+            }
+        }
+    } line;
     std::atomic<bool> loading{false};    // a model is being loaded (for the page's progress bar)
     std::atomic<float> load_progress{0.0f};
 
@@ -776,6 +874,7 @@ int main(int argc, char** argv) {
         eng.look.reset();
         eng.model.reset();               // free the old model (and its GPU memory) first
         eng.cached.clear();
+        eng.saved.clear();
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
         LoadOptions o = opt;
@@ -785,7 +884,11 @@ int main(int argc, char** argv) {
             eng.usage_path = usage_file(a.settings, path);
             if (!read_usage(eng.usage_path, uL, uE, eng.usage)) eng.usage.assign((size_t)uL * uE, 0.0f);
             double tot = 0; for (float v : eng.usage) tot += v;
-            if (hot && tot > 0) o.expert_usage = eng.usage;
+            if ((hot || o.live_hot) && tot > 0) o.expert_usage = eng.usage;
+            else if (o.live_hot) {       // nothing learned yet: an even start (each layer the same share), the conversation does the rest
+                o.expert_usage.assign((size_t)uL * uE, 0.0f);
+                for (int l = 0; l < uL; ++l) for (int e = 0; e < uE; ++e) o.expert_usage[(size_t)l * uE + e] = 1.0f - 1e-4f * e;
+            }
             eng.usage_saved = Clock::now();
         }
         o.progress = [&](float f) { load_progress = f; };
@@ -839,6 +942,7 @@ int main(int argc, char** argv) {
         o.split_mode = body.value("split_mode", std::string("auto"));
         o.mtp = body.value("speculative", false);      // load the MTP draft block for speculative decoding
         o.multi_gpu = body.value("multi_gpu", true);
+        o.live_hot = body.value("live_experts", false);  // VRAM experts follow the conversation (see LoadOptions::live_hot)
         return o;
     };
     if (!a.model.empty()) {
@@ -848,6 +952,9 @@ int main(int argc, char** argv) {
     }
 
     httplib::Server svr;
+    // Requests waiting in line each hold a thread, so the pool is bigger than httplib's default (the CPU count):
+    // with 8 apps waiting, the page and status requests must still get through.
+    svr.new_task_queue = [] { return new httplib::ThreadPool(32, 256); };
 
     svr.Get("/", [&](const httplib::Request&, httplib::Response& res) {
         std::string page = read_file(a.web + "/index.html");
@@ -871,7 +978,7 @@ int main(int argc, char** argv) {
     svr.Get("/api/info", [&](const httplib::Request&, httplib::Response& res) {
         // While a reply is streaming or a model is loading, answer from the last snapshot instead of waiting.
         std::unique_lock<std::timed_mutex> lk(mu, std::try_to_lock);
-        if (!lk.owns_lock()) { json j = last_info; j["busy"] = true; res.set_content(dump(j), "application/json"); return; }
+        if (!lk.owns_lock()) { json j = last_info; j["busy"] = true; j["waiting"] = line.waiting(); res.set_content(dump(j), "application/json"); return; }
         if (!eng.model) { last_info = {{"loaded", false}, {"version", TIERLM_VERSION}}; res.set_content(dump(last_info), "application/json"); return; }
         const auto& hp = eng.model->hparams();
         size_t free = 0, total = 0;
@@ -897,8 +1004,20 @@ int main(int argc, char** argv) {
             {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}, {"lookup_setting", eng.lookup}, {"has_draft_block", hp.n_nextn > 0},
             {"mtp_loaded", eng.model->has_mtp()}, {"ffn_vram", eng.model->placement().ffn_vram},
             {"hot_experts", eng.model->placement().hot_experts}, {"hot_share", eng.hot_share}, {"hot", eng.model->placement().hot},
+            {"live_experts", eng.model->live_hot()},
+            {"live", [&] { const auto& s = eng.model->live_stats();
+                           return json{{"picks", s.picks}, {"hits", s.hits}, {"swaps", s.swaps}, {"swap_ms", std::round(s.swap_ms)}}; }()},
             {"learned_tokens", [&] { double t = 0; for (float v : eng.usage) t += v; return hp.n_layer * hp.n_expert_used > 0 ? (long long)(t / (hp.n_layer * hp.n_expert_used)) : 0LL; }()},
             {"version", TIERLM_VERSION},
+            // For "slower than expected" hints: system RAM now, and what Find the fastest settings measured here.
+            {"ram_free", [&] { size_t f = 0, t = 0; if (auto d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(d, &f, &t); return f; }()},
+            {"tuned_tps", [&] {
+                std::error_code ec;
+                const std::string id = fs::u8path(eng.path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec)).generic_u8string();
+                const json& ms = settings.contains("models") ? settings["models"] : json::object();
+                if (!ms.contains(id) || !ms[id].contains("tuned")) return 0.0;
+                return ms[id]["tuned"].value("tps", 0.0);
+            }()},
         };
         last_info = j;
         res.set_content(dump(j), "application/json");
@@ -1049,9 +1168,9 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"expected {\\\"model\\\": \\\"...\\\"}\"}", "application/json");
             return;
         }
-        if (!mu.try_lock_for(std::chrono::seconds(3))) {
-            res.status = 409;
-            res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
+        if (!line.enter(mu, req.is_connection_closed)) {             // waits for replies already in line
+            res.status = 503;
+            res.set_content("{\"error\":\"busy: waited too long for earlier replies to finish\"}", "application/json");
             return;
         }
         std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
@@ -1098,6 +1217,7 @@ int main(int argc, char** argv) {
 
     svr.Post("/api/reset", [&](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::timed_mutex> lk(mu);
+        eng.save_current();                                      // a new chat: the old one may be opened again
         if (eng.model) eng.model->reset();
         eng.cached.clear();
         res.set_content("{\"ok\":true}", "application/json");
@@ -1137,8 +1257,37 @@ int main(int argc, char** argv) {
         if ((int)toks.size() + 1 >= model->max_ctx()) throw std::runtime_error("conversation is longer than the context window; start a new chat");
 
         // Reuse whatever part of the KV cache still matches this conversation.
-        size_t common = 0;
-        while (common < cached.size() && common < toks.size() && cached[common] == toks[common]) ++common;
+        auto prefix = [&](const std::vector<int32_t>& a) {
+            size_t n = 0;
+            while (n < a.size() && n < toks.size() && a[n] == toks[n]) ++n;
+            return n;
+        };
+        size_t common = prefix(cached);
+        {
+            // A saved conversation that this request continues further than the cache does: swap it in (saving the
+            // cache's own conversation first). Hybrid models can't rewind, so for them it must continue all of it.
+            auto best = eng.saved.end();
+            size_t best_n = common;
+            for (auto it = eng.saved.begin(); it != eng.saved.end(); ++it) {
+                size_t n = prefix(it->tokens);
+                if (hp.hybrid && n < it->tokens.size()) n = 0;
+                if (n > best_n + 64) { best = it; best_n = n; }
+            }
+            if (best != eng.saved.end()) {
+                auto c = std::move(*best);
+                eng.saved.erase(best);
+                eng.save_current();
+                const auto t0 = Clock::now();
+                model->restore(c.snap);
+                if (eng.spec) eng.spec->set_state(c.has_spec ? c.spec : Speculator::State{});
+                cached = c.tokens;
+                common = prefix(cached);
+                std::fprintf(stderr, "cache: brought back a saved %zu-token conversation in %.2f s\n", cached.size(), since(t0));
+                eng.saved.push_front(std::move(c));                    // (kept: the conversation may branch here again)
+            } else if (cached.size() >= common + 256) {
+                eng.save_current();                                      // about to be overwritten: keep it
+            }
+        }
         if (common == toks.size()) common = toks.size() - 1;      // must evaluate at least one token
         model->truncate((int)common);
         common = (size_t)model->n_past();     // hybrid models start over rather than rewind
@@ -1158,7 +1307,7 @@ int main(int argc, char** argv) {
         cached = toks;
 
         std::vector<int> counts((size_t)L * E, 0);                // experts used while reading the prompt
-        if (K > 0) for (size_t i = 0; i < routing.size(); ++i) counts[((i / K) % L) * E + routing[i]]++;
+        if (K > 0) for (size_t i = 0; i < routing.size(); ++i) if (routing[i] >= 0) counts[((i / K) % L) * E + routing[i]]++;   // (-1: a layer without experts)
         eng.add_usage(routing, K);
         if (on_prompt)
             on_prompt({{"n_prompt", toks.size()}, {"n_new", suffix.size()}, {"reused", common}, {"prompt_s", r.prompt_s},
@@ -1298,22 +1447,25 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"expected {\\\"messages\\\": [...]}\"}", "application/json");
             return;
         }
-        if (!mu.try_lock_for(std::chrono::seconds(3))) {
-            res.status = 409;
-            res.set_content("{\"error\":\"busy: a reply is being generated or a model is loading\"}", "application/json");
-            return;
-        }
-        if (!eng.model) {
-            mu.unlock();
-            res.status = 409;
-            res.set_content("{\"error\":\"no model loaded: choose one on the setup screen\"}", "application/json");
-            return;
-        }
-        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>(mu, std::adopt_lock);   // released when the stream ends
+        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>();   // held until the stream ends
         res.set_header("Cache-Control", "no-cache");
 
         res.set_chunked_content_provider("text/event-stream", [&, body, lock](size_t, httplib::DataSink& sink) {
             auto send = [&](const json& j) { std::string s = "data: " + dump(j) + "\n\n"; return sink.write(s.data(), s.size()); };
+            // Wait in line, telling the page how many requests are ahead ("queue" events), so it can say so.
+            bool gone = false;
+            if (!line.enter(mu, [&] { return gone || !sink.is_writable(); },
+                            [&](int ahead) { if (!send({{"type", "queue"}, {"ahead", ahead}})) gone = true; })) {
+                if (!gone) send({{"type", "error"}, {"message", "waited too long for earlier replies to finish"}});
+                sink.done();
+                return true;
+            }
+            *lock = std::unique_lock<std::timed_mutex>(mu, std::adopt_lock);
+            if (!eng.model) {
+                send({{"type", "error"}, {"message", "no model loaded: choose one on the setup screen"}});
+                sink.done();
+                return true;
+            }
             try {
                 Sampling sp;
                 sp.temperature = body.value("temperature", sp.temperature);
@@ -1505,13 +1657,21 @@ int main(int argc, char** argv) {
                 std::string mode = "auto";
                 std::string loaded_mode;
                 // Split modes: "layers", "experts" (whole expert layers in VRAM), "hot" (experts in RAM, with the
-                // busiest experts in VRAM, from what tierlm has learned about this model).
-                auto load_mode = [&](const std::string& m) {
+                // busiest experts in VRAM, from what tierlm has learned about this model), "live" (as hot, then the
+                // VRAM experts follow the conversation).
+                // A mode ending in "@1" uses only the first GPU (several GPUs: hot experts work with one GPU, and
+                // a much slower second card can cost more than its VRAM brings, so both are measured).
+                auto load_mode = [&](const std::string& mm) {
                     LoadOptions o = base;
-                    o.split_mode = m == "hot" ? "experts" : m;
+                    const bool one = mm.size() > 2 && mm.compare(mm.size() - 2, 2, "@1") == 0;
+                    const std::string m = one ? mm.substr(0, mm.size() - 2) : mm;
+                    const bool hot = m == "hot" || m == "live";
+                    o.split_mode = hot ? "experts" : m;
+                    o.live_hot = m == "live";
+                    if (one) o.multi_gpu = false;
                     eng.draft_max = 0;
-                    load(file.u8string(), o, t0, seed, m == "hot");
-                    loaded_mode = m;
+                    load(file.u8string(), o, t0, seed, hot);
+                    loaded_mode = mm;
                 };
                 auto learned = [&] { double t = 0; for (float v : eng.usage) t += v; return t; };
                 // Learns which experts this model uses from a mix of everyday text, code and maths, when nothing has
@@ -1540,7 +1700,8 @@ int main(int argc, char** argv) {
                     eng.cached.clear();
                     eng.save_usage(true);
                 };
-                const char* mode_label[] = {"whole layers", "experts in RAM", "experts in RAM, busiest experts in VRAM"};
+                const char* mode_label[] = {"whole layers", "experts in RAM", "experts in RAM, busiest experts in VRAM",
+                                            "experts in RAM, VRAM experts following the conversation"};
                 if (!status("Loading the model")) throw std::runtime_error("cancelled");
                 load_mode("layers");
                 const Placement& pl = eng.model->placement();
@@ -1552,26 +1713,45 @@ int main(int argc, char** argv) {
                 }
                 double best = 0;
                 if (split) {
-                    const std::string modes[] = {"layers", "experts", "hot"};
-                    // (hot experts: MoE models, and not yet for experts with biases, gpt-oss)
-                    const int n_modes = eng.model->hparams().is_moe() && !eng.model->hparams().expert_bias ? 3 : 2;
-                    for (int i = 0; i < n_modes; ++i) {
-                        if (i == 2 && learned() <= 0) {
+                    // (hot experts: MoE models, and not yet for experts with biases, gpt-oss, or Flint's dense first layers)
+                    const auto& hp_ = eng.model->hparams();
+                    const bool can_hot = hp_.is_moe() && !hp_.expert_bias && hp_.n_dense_lead == 0;
+                    const size_t n_gpus = eng.model->placement().gpus.size();
+                    std::string gpu0 = n_gpus ? eng.model->placement().gpus[0].name : std::string();   // "CUDA0"...
+                    if (ggml_backend_dev_t d = n_gpus ? ggml_backend_dev_by_name(gpu0.c_str()) : nullptr)
+                        gpu0 = ggml_backend_dev_description(d);                                        // ...as people know it
+                    struct M { std::string mode; int label; };
+                    std::vector<M> modes = {{"layers", 0}, {"experts", 1}};
+                    if (can_hot && n_gpus <= 1) { modes.push_back({"hot", 2}); modes.push_back({"live", 3}); }   // (hot experts: one GPU)
+                    if (n_gpus > 1) {                                // the same on the first GPU alone
+                        modes.push_back({"experts@1", 1});
+                        if (can_hot) { modes.push_back({"hot@1", 2}); modes.push_back({"live@1", 3}); }
+                    }
+                    bool no_hot = false;                             // hot experts had no VRAM left: skip live
+                    for (const M& md : modes) {
+                        const std::string& m = md.mode;
+                        const bool one = m.size() > 2 && m.compare(m.size() - 2, 2, "@1") == 0;
+                        const std::string base_m = one ? m.substr(0, m.size() - 2) : m;
+                        const std::string label = std::string(mode_label[md.label]) + (one ? ", only the " + gpu0 : "");
+                        if (base_m == "experts" && one) no_hot = false;
+                        if (base_m == "live" && no_hot) continue;
+                        if (base_m == "hot" && learned() <= 0) {
                             if (!status("Learning which experts this model uses")) throw std::runtime_error("cancelled");
                             calibrate();
                         }
-                        if (loaded_mode != modes[i]) {
-                            if (!status(std::string("Loading with ") + mode_label[i])) throw std::runtime_error("cancelled");
-                            load_mode(modes[i]);
+                        if (loaded_mode != m) {
+                            if (!status("Loading with " + label)) throw std::runtime_error("cancelled");
+                            load_mode(m);
                         }
-                        if (i == 2 && eng.model->placement().hot_experts == 0) {   // nothing to gain: no VRAM left for experts
-                            loaded_mode = "experts";
+                        if (base_m == "live" && !eng.model->live_hot()) continue;   // not enough RAM to spare: loaded as hot
+                        if ((base_m == "hot" || base_m == "live") && eng.model->placement().hot_experts == 0) {
+                            no_hot = true;                           // nothing to gain: no VRAM left (or several GPUs)
                             continue;
                         }
-                        if (!status(std::string("Measuring ") + mode_label[i])) throw std::runtime_error("cancelled");
+                        if (!status("Measuring " + label)) throw std::runtime_error("cancelled");
                         const double t = measure(n_gen, 0);
-                        if (!record(std::string("Split: ") + mode_label[i], {{"split_mode", modes[i]}}, t)) throw std::runtime_error("cancelled");
-                        if (t > best) { best = t; mode = modes[i]; }
+                        if (!record("Split: " + label, {{"split_mode", m}}, t)) throw std::runtime_error("cancelled");
+                        if (t > best) { best = t; mode = m; }
                     }
                     if (loaded_mode != mode) {
                         if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
@@ -1630,8 +1810,12 @@ int main(int argc, char** argv) {
                 const std::string id = body.value("model", std::string());
                 json saved = body;
                 saved.erase("model");
-                saved["split_mode"] = split ? (mode == "hot" ? "experts" : mode) : body.value("split_mode", std::string("auto"));
-                saved["hot_experts"] = mode == "hot";                          // on only where it measured fastest
+                const bool one_gpu = mode.size() > 2 && mode.compare(mode.size() - 2, 2, "@1") == 0;
+                const std::string mode0 = one_gpu ? mode.substr(0, mode.size() - 2) : mode;
+                saved["split_mode"] = split ? (mode0 == "hot" || mode0 == "live" ? "experts" : mode0) : body.value("split_mode", std::string("auto"));
+                saved["hot_experts"] = mode0 == "hot" || mode0 == "live";      // on only where it measured fastest
+                saved["live_experts"] = mode0 == "live";
+                saved["multi_gpu"] = !one_gpu;                                 // several GPUs: whether using them all won
                 saved["threads"] = threads;
                 saved["speculative"] = draft > 0;
                 if (draft > 0) saved["draft_max"] = draft;
@@ -1682,7 +1866,8 @@ int main(int argc, char** argv) {
     svr.Post("/api/spec", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded()) { res.status = 400; res.set_content("{\"error\":\"bad request\"}", "application/json"); return; }
-        if (!mu.try_lock_for(std::chrono::seconds(3))) { res.status = 409; res.set_content("{\"error\":\"busy\"}", "application/json"); return; }
+        // A quick change: waits in line behind a running reply instead of answering "busy".
+        if (!line.enter(mu, req.is_connection_closed)) { res.status = 503; res.set_content("{\"error\":\"busy\"}", "application/json"); return; }
         std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
         if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
         // Prompt lookup alone changes nothing in the model's cache: no need to start over.
@@ -1740,6 +1925,38 @@ int main(int argc, char** argv) {
         res.set_content(dump({{"lines", lines}, {"next", next}}), "application/json");
     });
 
+    // ---------------- The embedding model (a second model, next to the chat model) ----------------
+    // Embedding models are small and run on their own: requests for embeddings don't wait for a chat reply to
+    // finish. The two models take turns on the GPU between steps (device_mutex), so neither stalls for long.
+    struct EmbedSlot {
+        std::mutex mu;                       // guards the slot; held while embedding
+        std::unique_ptr<Encoder> enc;
+        Tokenizer tok;
+        std::string id, path, name;
+        double load_s = 0;
+    } emb;
+    auto embed_info = [&]() -> json {        // (emb.mu held)
+        if (!emb.enc) return {{"loaded", false}};
+        return {{"loaded", true}, {"id", emb.id}, {"name", emb.name}, {"arch", emb.enc->arch()}, {"dims", emb.enc->n_embd()},
+                {"max_tokens", emb.enc->max_tokens()}, {"device", emb.enc->device_name()}, {"on_gpu", emb.enc->on_gpu()},
+                {"bytes", emb.enc->weight_bytes()}, {"load_s", emb.load_s},
+                {"pooling", emb.enc->pooling() == Encoder::Pooling::Cls ? "cls" : emb.enc->pooling() == Encoder::Pooling::Last ? "last" : "mean"}};
+    };
+    auto embed_load = [&](const fs::path& file, const std::string& id) {      // (emb.mu held)
+        const auto t0 = Clock::now();
+        emb.enc.reset();
+        auto enc = Encoder::load(file.u8string(), "auto");
+        emb.tok = Tokenizer::from_gguf(file.u8string());
+        if (!emb.tok.wordpiece()) throw std::runtime_error("this embedding model's tokenizer is not supported yet");
+        emb.enc = std::move(enc);
+        emb.id = id; emb.path = file.u8string();
+        const json d = describe_model(emb.path);
+        emb.name = d.value("name", std::string()).empty() ? file.stem().u8string() : d.value("name", std::string());
+        emb.load_s = since(t0);
+        std::fprintf(stderr, "embedding model: %s (%s, %d numbers per text, up to %d tokens) on %s, loaded in %.1f s\n", emb.name.c_str(),
+                     emb.enc->arch().c_str(), emb.enc->n_embd(), emb.enc->max_tokens(), emb.enc->device_name().c_str(), emb.load_s);
+    };
+
     // ---------------- OpenAI-compatible API ----------------
     const long long started = (long long)std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1760,7 +1977,11 @@ int main(int argc, char** argv) {
             cur = lk.owns_lock() ? loaded_id() : last_info.value("path", std::string());
             if (!lk.owns_lock() && !cur.empty()) cur = fs::u8path(cur).filename().u8string();
         }
-        if (!cur.empty()) data.push_back({{"id", cur}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}});
+        if (!cur.empty()) data.push_back({{"id", cur}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}, {"type", "llm"}});
+        {
+            std::lock_guard<std::mutex> lk(emb.mu);
+            if (emb.enc) data.push_back({{"id", emb.id}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}, {"type", "embeddings"}});
+        }
         bool exists = false;
         for (const auto& m : scan_models(exists)) {
             if (!m.value("supported", false) || m.value("id", std::string()) == cur) continue;
@@ -1774,8 +1995,10 @@ int main(int argc, char** argv) {
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array())
             return oai_error(res, 400, "expected a JSON body with a \"messages\" array");
         if (body.value("n", 1) != 1) return oai_error(res, 400, "only n = 1 is supported");
-        // Wait for any reply (from the web page or another app) to finish: one at a time.
-        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>(mu);
+        // Wait in line for replies already asked for (from the web page or other apps) to finish: one at a time.
+        if (!line.enter(mu, req.is_connection_closed))
+            return oai_error(res, 503, "busy: waited too long for earlier replies to finish");
+        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>(mu, std::adopt_lock);
         // The model asked for: the loaded one if the name matches it, or is unknown (many apps send a fixed
         // name such as "gpt-4o"); a different model in the models folder is loaded first, with its saved settings.
         const std::string want = body.value("model", std::string());
@@ -2079,6 +2302,123 @@ int main(int argc, char** argv) {
             res.set_content(dump({{"error", e.what()}}), "application/json");
         }
     });
+
+    // ---------------- Embeddings ----------------
+    // GET /api/embed: the loaded embedding model. POST /api/embed/load {"model": id}, POST /api/embed/unload.
+    // The choice is saved, and the model loads again when tierlm starts.
+    auto save_embed_choice = [&](const std::string& id) {
+        std::unique_lock<std::timed_mutex> lk(mu, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::seconds(10))) return;               // settings are written under mu
+        if (id.empty()) settings.erase("embed_model"); else settings["embed_model"] = id;
+        write_settings(a.settings, settings);
+    };
+    svr.Get("/api/embed", [&](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lk(emb.mu);
+        res.set_content(dump(embed_info()), "application/json");
+    });
+    svr.Post("/api/embed/load", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        const std::string id = body.is_object() ? body.value("model", std::string()) : std::string();
+        const auto file = model_file(id);
+        if (file.empty()) { res.status = 400; res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json"); return; }
+        const json d = describe_model(file.u8string());
+        if (!d.value("embedding", false)) {
+            res.status = 400;
+            res.set_content(dump({{"error", d.value("kind", std::string()) == "embedding" ? d.value("reason", std::string()) : "that is not an embedding model"}}), "application/json");
+            return;
+        }
+        json info;
+        try {
+            std::lock_guard<std::mutex> lk(emb.mu);
+            embed_load(file, id);
+            info = embed_info();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "embedding model: %s\n", e.what());
+            res.status = 500; res.set_content(dump({{"error", e.what()}}), "application/json"); return;
+        }
+        save_embed_choice(id);
+        res.set_content(dump(info), "application/json");
+    });
+    svr.Post("/api/embed/unload", [&](const httplib::Request&, httplib::Response& res) {
+        { std::lock_guard<std::mutex> lk(emb.mu); emb.enc.reset(); emb.id.clear(); emb.path.clear(); emb.name.clear(); }
+        save_embed_choice("");
+        std::fprintf(stderr, "embedding model: unloaded\n");
+        res.set_content(dump({{"loaded", false}}), "application/json");
+    });
+
+    // POST /v1/embeddings, as OpenAI's: {"input": "text" | ["text", ...] | [token ids] | [[token ids], ...],
+    // "encoding_format": "float" | "base64", "dimensions": n}. Each vector is normalised to length 1, as OpenAI's
+    // are; "dimensions" keeps the first n numbers (for models trained for it, such as nomic-embed-text v1.5) and
+    // normalises again. Texts longer than the model takes are cut to fit (as sentence-transformers does).
+    svr.Post("/v1/embeddings", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object() || !body.contains("input")) return oai_error(res, 400, "expected a JSON body with \"input\"");
+        std::vector<std::vector<int32_t>> inputs;
+        std::vector<std::string> texts;
+        const json& in = body["input"];
+        auto is_ids = [](const json& v) { return v.is_array() && !v.empty() && std::all_of(v.begin(), v.end(), [](const json& x) { return x.is_number_integer(); }); };
+        std::lock_guard<std::mutex> lk(emb.mu);
+        if (!emb.enc) return oai_error(res, 400, "no embedding model is loaded: in tierlm's side menu, open Model info and choose an Embedding model");
+        try {
+            if (in.is_string()) texts.push_back(in.get<std::string>());
+            else if (is_ids(in)) inputs.push_back(in.get<std::vector<int32_t>>());
+            else if (in.is_array()) {
+                for (const auto& x : in) {
+                    if (x.is_string()) texts.push_back(x.get<std::string>());
+                    else if (is_ids(x)) inputs.push_back(x.get<std::vector<int32_t>>());
+                    else return oai_error(res, 400, "\"input\" must be a string, a list of strings, or token ids");
+                }
+            } else return oai_error(res, 400, "\"input\" must be a string, a list of strings, or token ids");
+            if (!texts.empty() && !inputs.empty()) return oai_error(res, 400, "\"input\" mixes texts and token ids");
+            if (texts.empty() && inputs.empty()) return oai_error(res, 400, "\"input\" is empty");
+            const int maxn = emb.enc->max_tokens();
+            for (const std::string& t : texts) {                              // [CLS] text [SEP], cut to fit
+                std::vector<int32_t> ids, body_ids = emb.tok.encode(t);
+                const int room = maxn - (emb.tok.cls() >= 0) - (emb.tok.sep() >= 0);
+                if ((int)body_ids.size() > room) body_ids.resize(std::max(0, room));
+                if (emb.tok.cls() >= 0) ids.push_back(emb.tok.cls());
+                ids.insert(ids.end(), body_ids.begin(), body_ids.end());
+                if (emb.tok.sep() >= 0) ids.push_back(emb.tok.sep());
+                inputs.push_back(std::move(ids));
+            }
+            const int dims = body.value("dimensions", 0);
+            const bool b64 = body.value("encoding_format", std::string("float")) == "base64";
+            const int vocab = (int)emb.tok.vocab_size();
+            json data = json::array();
+            size_t n_tok = 0;
+            const auto t0 = Clock::now();
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                auto& ids = inputs[i];
+                if (ids.empty()) return oai_error(res, 400, "input " + std::to_string(i) + " is empty");
+                for (int32_t t : ids) if (t < 0 || t >= vocab) return oai_error(res, 400, "token id out of range in input " + std::to_string(i));
+                if ((int)ids.size() > maxn) ids.resize(maxn);
+                n_tok += ids.size();
+                std::vector<float> v = emb.enc->embed(ids, eng.threads);
+                if (dims > 0 && dims < (int)v.size()) v.resize(dims);
+                double norm = 0; for (float x : v) norm += (double)x * x;
+                norm = std::sqrt(norm);
+                if (norm > 0) for (float& x : v) x = (float)(x / norm);
+                json item = {{"object", "embedding"}, {"index", i}};
+                if (b64) item["embedding"] = base64_encode(reinterpret_cast<const unsigned char*>(v.data()), v.size() * sizeof(float));
+                else item["embedding"] = v;
+                data.push_back(std::move(item));
+            }
+            std::fprintf(stderr, "embeddings: %zu input%s, %zu tokens in %.2f s\n", inputs.size(), inputs.size() == 1 ? "" : "s", n_tok, since(t0));
+            res.set_content(dump({{"object", "list"}, {"data", data}, {"model", emb.id},
+                                  {"usage", {{"prompt_tokens", n_tok}, {"total_tokens", n_tok}}}}), "application/json");
+        } catch (const std::exception& e) {
+            return oai_error(res, 500, e.what(), "server_error");
+        }
+    });
+    // Load the embedding model chosen last time.
+    if (settings.contains("embed_model") && settings["embed_model"].is_string()) {
+        const std::string id = settings["embed_model"];
+        const auto file = model_file(id);
+        if (!file.empty()) {
+            try { std::lock_guard<std::mutex> lk(emb.mu); embed_load(file, id); }
+            catch (const std::exception& e) { std::fprintf(stderr, "embedding model %s: %s\n", id.c_str(), e.what()); }
+        }
+    }
 
     std::fprintf(stderr, "\n  tierlm is ready: open http://127.0.0.1:%d in your browser\n  %s\n  OpenAI-compatible API: http://127.0.0.1:%d/v1\n  (Ctrl+C to stop)\n\n",
                  a.port, eng.model ? "" : "No model loaded yet: the page will show the setup screen.", a.port);

@@ -48,6 +48,9 @@ struct Hparams {
     bool expert_renorm = false;       // renormalise the chosen experts' weights to sum to 1
     float expert_scale = 0.0f;        // multiply the chosen experts' weights by this (0 or 1 = leave as is)
     bool expert_softmax_first = true; // softmax over all experts, then pick; false: pick, then softmax over the picked
+    bool expert_sigmoid = false;      // Flint: each expert scored by a sigmoid (no softmax), then the top ones picked
+    int n_dense_lead = 0;             // Flint: the first layers have a dense feed-forward block instead of experts
+    std::vector<bool> rope_layer;     // per layer: rotates positions (empty: all do). Flint: only sliding-window layers
     bool swiglu_oai = false;
     bool expert_bias = false;         // experts have biases (gpt-oss): no hot-expert split yet          // gpt-oss experts: clamped SwiGLU, out = (clamp(up) + 1) * g * sigmoid(1.702 g), g = min(gate, 7)
     int n_swa = 0;                    // sliding-window attention: these layers see only the last n_swa tokens
@@ -99,6 +102,11 @@ struct LoadOptions {
     // experts in RAM, the most-used experts of each layer then go in VRAM ahead of whole expert layers, so most
     // picks are served from fast memory. Empty: whole expert layers, as before.
     std::vector<float> expert_usage;
+    // Live hot experts: start from the busiest experts as above, then keep adjusting while the model runs: an
+    // expert a conversation keeps picking moves into VRAM in place of one it stopped using (copied from
+    // RAM between steps, a few per step). Needs expert_usage. The RAM part keeps a copy of every expert (more RAM:
+    // the VRAM experts are in both), so any expert can come or go without reading the file again.
+    bool live_hot = false;
 };
 
 // Where the time goes, accumulated over every eval_batch call (for profiling).
@@ -166,6 +174,18 @@ public:
     // Keep only the first n tokens. Hybrid models can't rewind their running memory, so for them anything
     // short of the whole conversation means starting over (n_past() tells the caller where it stands).
     void truncate(int n);
+
+    // A conversation's memory, copied out to system RAM so another conversation can use the cache meanwhile and
+    // this one can come back without being read again: the keys and values of its n_past positions in every
+    // attention layer (and the MTP draft block), and the running memories of DeltaNet layers.
+    struct Snapshot { int n_past = 0; std::vector<std::vector<uint8_t>> parts; size_t bytes = 0; };
+    Snapshot save() const;
+    // Live hot experts (LoadOptions::live_hot): how well VRAM is serving the router's picks.
+    struct LiveStats { long long picks = 0, hits = 0, swaps = 0; double swap_ms = 0; };
+    const LiveStats& live_stats() const { return live_stats_; }
+    void reset_live_stats() { live_stats_ = LiveStats(); }
+    bool live_hot() const { return !live_.empty(); }
+    void restore(const Snapshot& s);          // the cache becomes exactly the saved conversation
     int n_past() const { return n_past_; }
     int max_ctx() const { return max_ctx_; }
     const std::string& device_name() const { return device_name_; }
@@ -202,6 +222,7 @@ private:
         // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
         std::vector<ggml_tensor*> orders;        // each layer's chosen experts (when routing is wanted)
+        std::vector<int> order_layers;           // the layer each of orders belongs to
         ggml_tensor* routing = nullptr;          // all of them joined: [n_used, n_tok * n_layer], one read
         std::vector<std::pair<ggml_tensor*, int>> owner;   // every op tensor of each layer, with its layer
         std::vector<ggml_tensor*> cpu_ops;       // small ops that must run on the CPU (hot-expert bookkeeping)
@@ -215,11 +236,25 @@ private:
     void release_pending();
     Graph build_mtp(int n_tok, int n_past);
     void* pending_ = nullptr;                    // Graph of the last undoable batch, until accept()
+    // Live hot experts: per split layer, which expert each VRAM slot holds and how much each is wanted.
+    struct LivePart { ggml_tensor *hot, *cold; };   // an expert tensor's VRAM part and its RAM part (all experts)
+    struct LiveLayer {
+        int layer = 0, H = 0;
+        std::vector<int> slot_of, in_slot;       // expert -> VRAM slot (-1: not there); slot -> expert
+        std::vector<float> score;                // learned use, then recent picks (fading)
+        std::vector<LivePart> parts;
+        ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *mask = nullptr;
+    };
+    std::vector<LiveLayer> live_;
+    mutable LiveStats live_stats_;
+    void adapt_hot(const std::vector<int32_t>& routing, int n_tok);
     struct Layer {
         ggml_tensor *attn_norm = nullptr, *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
         ggml_tensor *bq = nullptr, *bk = nullptr, *bv = nullptr, *q_norm = nullptr, *k_norm = nullptr;
         ggml_tensor *bo = nullptr, *sinks = nullptr;                          // gpt-oss: output bias, attention sinks
         ggml_tensor *router_b = nullptr, *gate_xb = nullptr, *up_xb = nullptr, *down_xb = nullptr;   // gpt-oss: biases
+        bool rope = true;                        // rotates positions (see Hparams::rope_layer)
+        int index = 0;                           // the layer's number
         bool swa = false;                                                     // sliding-window layer
         ggml_tensor *ffn_norm = nullptr;
         ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;          // dense FFN

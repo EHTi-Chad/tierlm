@@ -188,4 +188,6 @@ bool add_rpc_server(const char* endpoints) {
     return true;
 }
 
+std::recursive_mutex& device_mutex() { static std::recursive_mutex m; return m; }
+
 }

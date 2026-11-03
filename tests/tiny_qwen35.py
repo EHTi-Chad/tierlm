@@ -252,12 +252,12 @@ for variant in NAMES:
         for label, env, tol, need_top in PASSES(split_env):
             worst_mode = {}
             all_top = True
-            for mode in ([], ["--step"]):
+            for mode in ([], ["--step"], ["snapshot"]):   # snapshot: saved half way, restored after another conversation
                 worst = 0.0
                 for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55], long_ids):
                     want = reference(np.array(ids), variant)
-                    run = subprocess.run([sys.argv[1], path, *mode, *map(str, ids)], capture_output=True, text=True,
-                                         encoding="utf-8", errors="replace", env={**os.environ, **env})
+                    run = subprocess.run([sys.argv[1], path, *[m for m in mode if m != "snapshot"], *map(str, ids)], capture_output=True, text=True,
+                                         encoding="utf-8", errors="replace", env={**os.environ, **env, **({"TIERLM_SNAPSHOT": "1"} if mode == ["snapshot"] else {})})
                     if run.returncode != 0:
                         sys.exit(f"tierlm-logits failed: {run.stderr.strip()}")
                     got = np.array([float(x) for x in run.stdout.split()])
@@ -266,7 +266,7 @@ for variant in NAMES:
                         print(f"   {'step ' if mode else 'whole'} {len(ids):3d} tokens: {err:.1e}")
                     worst = max(worst, err)
                     all_top &= bool(got.argmax() == want.argmax())
-                worst_mode["one token at a time" if mode else "whole prompt"] = worst
+                worst_mode["one token at a time" if mode == ["--step"] else "saved and restored" if mode else "whole prompt"] = worst
             worst = max(worst_mode.values())
             passed = worst < tol and (all_top or not need_top)
             ok &= passed
@@ -279,8 +279,8 @@ for variant in NAMES:
             for mode in (["--mtp"], ["--mtp-step"]):
                 for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55], long_ids):
                     want = mtp_reference(np.array(ids), variant)
-                    run = subprocess.run([sys.argv[1], path, *mode, *map(str, ids)], capture_output=True, text=True,
-                                         encoding="utf-8", errors="replace", env={**os.environ, **env})
+                    run = subprocess.run([sys.argv[1], path, *[m for m in mode if m != "snapshot"], *map(str, ids)], capture_output=True, text=True,
+                                         encoding="utf-8", errors="replace", env={**os.environ, **env, **({"TIERLM_SNAPSHOT": "1"} if mode == ["snapshot"] else {})})
                     if run.returncode != 0:
                         sys.exit(f"tierlm-logits failed: {run.stderr.strip()}")
                     got = np.array([float(x) for x in run.stdout.split()])

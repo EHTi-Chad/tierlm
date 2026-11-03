@@ -3,6 +3,7 @@
 // builds, shipped as separate files that are loaded when tierlm starts. Release builds include one CPU engine per
 // x86 generation (plain x86-64, SSE4.2, AVX, AVX2, AVX-VNNI, AVX-512, Zen 4, AMX...) and ggml loads the best one
 // this computer supports; a GPU engine whose driver is missing (CUDA on a PC without an NVIDIA card) is skipped.
+#include <mutex>
 #include <string>
 
 struct ggml_backend;
@@ -19,6 +20,10 @@ void set_n_threads(ggml_backend* backend, int n_threads);   // for engines that 
 
 // The CPU engine in use and the instruction sets it uses, e.g. "AVX2 FMA F16C" or "AVX512 AVX512_VNNI ...".
 std::string cpu_features();
+
+// With two models loaded (a chat model and an embedding model), one computes at a time: each step holds this
+// lock, so the two take turns between steps instead of competing for the GPU.
+std::recursive_mutex& device_mutex();
 
 // Testing: adds a tierlm-rpc-server at host:port (or several, comma-separated) as devices (stand-in GPUs).
 // False if RPC isn't built.

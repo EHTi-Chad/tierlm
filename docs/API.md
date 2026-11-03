@@ -43,8 +43,34 @@ for chunk in reply:
 
 ### GET /v1/models
 
-The loaded model first (`"loaded": true`), then every supported model in the models folder. `id` is the
+The loaded model first (`"loaded": true`), then the loaded embedding model if there is one (`"type": "embeddings"`),
+then every supported model in the models folder. `id` is the
 model's path inside the folder, e.g. `lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q8_0.gguf`.
+
+### POST /v1/embeddings
+
+Embeddings from the **embedding model**, a second model loaded next to the chat model (side menu → **Model info** →
+**Embedding model**, or `POST /api/embed/load`). Embedding requests don't wait for a chat reply to finish: the two
+models take turns on the GPU one step at a time.
+
+```json
+{"model": "any", "input": ["first text", "second text"], "encoding_format": "float", "dimensions": 256}
+```
+
+- `input`: a string, a list of strings, a list of token ids, or a list of such lists.
+- `encoding_format`: `"float"` (default) or `"base64"` (little-endian float32, which the OpenAI SDKs ask for by default).
+- `dimensions` (optional): keep the first n numbers, then normalise again, for models trained for it (nomic-embed-text v1.5:
+  64 to 768).
+
+Each vector is normalised to length 1, as OpenAI's are, so a dot product is the cosine similarity. Texts longer than
+the model takes (2,048 tokens for nomic-embed-text, 512 for most BERT models) are cut to fit. The reply:
+`{"object": "list", "data": [{"object": "embedding", "index": 0, "embedding": [...]}], "model": "...",
+"usage": {"prompt_tokens": n, "total_tokens": n}}`. Without an embedding model loaded, the answer is a 400 error
+saying how to load one.
+
+Supported: BERT-style models (`bert`: bge, all-MiniLM, e5, ...) and Nomic's (`nomic-bert`: nomic-embed-text v1, v1.5).
+nomic-embed-text expects a task prefix on each text, as its model card describes: `search_document: ` for what you
+store and `search_query: ` for what you search with.
 
 ### POST /v1/chat/completions
 
@@ -80,9 +106,10 @@ written and the tool calls arrive whole in one chunk at the end. Without tools, 
 Coding agents send long prompts (opencode's instructions and tool list are about 11,000 tokens): load the model
 with a context of at least 32K. The first request reads all of it; later ones reuse it from the cache.
 
-One reply is generated at a time. Requests from apps wait their turn; while one is running, the web page's
-own chat answers "busy". Requests share the model's memory of the conversation, so an app that resends a
-growing conversation only pays for the new part.
+One reply is generated at a time. Requests (from apps and from the web page) wait their turn in line, first come
+first served, and a request whose app disconnects while waiting leaves the line. A request gives up after waiting 30
+minutes (`503`). Requests share the model's memory of the conversation, and up to 8 conversations are kept aside, so
+an app that resends a growing conversation only pays for the new part, even when others took turns in between.
 
 Not yet: `logprobs`; `n` > 1; embeddings; images.
 
@@ -125,12 +152,15 @@ Example (values depend on the model and machine):
 It also reports where the model lives: `vram_weights` and `ram_weights` (bytes), `split_mode`, `gpus` (one entry per
 GPU in use: `name`, `weights`, `kv`, `layers`), `ffn_vram` (per layer: are its experts in VRAM), and
 `speculative`, `draft_max`, `has_draft_block` and `mtp_loaded` (the draft layer is in memory, so `/api/spec` can
-switch speculation on), `lookup` (most tokens prompt lookup guesses now, 0 when off) and `lookup_setting` (as set: -1 automatic), `hot_experts` (experts placed in VRAM by usage), `hot` (per layer: those experts' numbers),
+switch speculation on), `lookup` (most tokens prompt lookup guesses now, 0 when off) and `lookup_setting` (as set: -1 automatic), `hot_experts` (experts placed in VRAM by usage), `hot` (per layer: those experts' numbers, which change as you chat with
+live hot experts), `live_experts` (on or off) and `live` (`picks`, `hits`: picks served from VRAM, `swaps`, `swap_ms`),
 `hot_share` (the share of the learned expert use those VRAM experts cover, 0 to 1) and `learned_tokens` (about how
 many tokens of use the expert counts come from).
 
 While a reply is streaming or a model is loading, `/api/info` returns the last known details with
-`"busy": true` instead of waiting.
+`"busy": true` and `waiting` (requests in line) instead of waiting. It also gives `ram_free` (system RAM free, bytes) and `tuned_tps`
+(what **Find the fastest settings** measured for this model on this PC, 0 if never run): the page uses them to say
+when a reply was much slower than that, and why it probably was.
 
 ### GET /api/devices
 
@@ -211,6 +241,7 @@ requests from the same computer. Elsewhere it returns HTTP 501.
 | `lookup` | Prompt lookup: most tokens guessed per check from earlier in the conversation, 1 to 16; `0` off; `-1` (default) chooses: 8 with the whole model in VRAM, 6 for hybrid models, 4 for MoE models with experts in RAM |
 | `device` | `auto` (default) or `gpu`: the best GPU, plus other GPUs of the same kind as further VRAM tiers; `cpu`; or one device by its `id` |
 | `hot_experts` | `true`: with experts in RAM, put this model's most-used experts in VRAM, from what tierlm has learned about it. Default `false`: whether it is faster depends on the PC, and `/api/autotune` saves `true` only where it measured fastest |
+| `live_experts` | `true`: as `hot_experts`, then while the model runs, experts the conversation keeps using move into VRAM in place of ones it stopped using (uses more RAM: the VRAM experts stay in RAM too). Works before anything is learned. Default `false`; `/api/autotune` measures it as a fourth split mode |
 | `split_mode` | When the model doesn't fit in VRAM: `auto` (default: `experts` for MoE models, `layers` for the rest), `layers` (whole layers in VRAM, the first ones in RAM) or `experts` (attention and context in VRAM, experts in RAM) |
 | `vram_limit_mb` | Use at most this much VRAM; 0 (default) uses what's free |
 
@@ -225,7 +256,7 @@ questions exactly as `/api/chat` would. The reply is a stream of
 server-sent events: `{"type":"status","text":"Measuring experts in RAM"}` while it works,
 `{"type":"result","label":"Split: experts in RAM","tps":17.0}` for each measurement, then
 `{"type":"done","tps":22.3,"settings":{...},"results":[...]}` with the settings it saved for the model (`split_mode`,
-`threads`, `speculative`, `draft_max`, `hot_experts`), or `{"type":"error","message":"..."}`. The model stays loaded with the winner.
+`threads`, `speculative`, `draft_max`, `hot_experts`, `live_experts`), or `{"type":"error","message":"..."}`. The model stays loaded with the winner.
 
 ### POST /api/bench
 
@@ -283,12 +314,19 @@ Request:
 - Whatever part of the conversation is already in the KV cache is reused, so follow-up messages only process
   the new text.
 
-Errors before streaming starts: `400` for a malformed body, `409` if a reply is already being generated, a
-model is loading, or no model is loaded.
+Errors before streaming starts: `400` for a malformed body. If a reply is already being generated or a model is
+loading, the request waits in line and the stream starts with `queue` events (below). No model loaded, or waiting
+more than 30 minutes, gives an `error` event.
 
 #### Response stream
 
 The response is `text/event-stream`: lines of `data: {json}` separated by blank lines.
+
+**0. `queue`**, only while waiting in line, each time the number ahead changes (`0`: just the reply running now):
+
+```json
+{"type": "queue", "ahead": 2}
+```
 
 **1. `prompt`**, once, after the conversation has been read:
 
@@ -357,6 +395,17 @@ browser sends an `Origin`, and carry the header `X-Tierlm-Workspace: 1`. Anythin
 event then also has `raw` (the reply as the model wrote it, to send back as the assistant message), `text` (as
 shown) and `tool_calls` (`[{"name", "arguments", "arguments_json"}]`). The page runs the calls through
 `/api/workspace/tool`, adds `{"role": "tool", "name", "content"}` messages and asks again.
+
+### The embedding model (`/api/embed`)
+
+- `GET /api/embed`: the loaded embedding model: `{"loaded": true, "id", "name", "arch", "dims", "max_tokens", "device",
+  "on_gpu", "bytes", "pooling"}`, or `{"loaded": false}`.
+- `POST /api/embed/load` `{"model": "<id from /api/models>"}`: loads it (replacing the one loaded), on the GPU when
+  there's room to spare after the chat model, else on the CPU. The choice is saved and loads again when tierlm starts.
+- `POST /api/embed/unload`.
+
+In `/api/models`, embedding models have `"kind": "embedding"`, `"embedding": true` when tierlm can load them, and
+`"dims"`. `/v1/models` lists the loaded embedding model with `"type": "embeddings"` (the chat model has `"type": "llm"`).
 
 ### POST /api/reset
 

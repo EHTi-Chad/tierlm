@@ -30,6 +30,11 @@ off, 3.9 with 2, 5.3 with 3, 4.1 with 4); try 2 or 4 for your model and PC. For 
 Yes, when they're the same kind (two NVIDIA cards with CUDA, say): the model fills the first card, then the second,
 then system RAM. The setup screen shows a VRAM bar for each card. Different kinds (an NVIDIA and an AMD card) aren't
 combined yet: tierlm uses the bigger one.
+More cards isn't always faster. Keeping the busiest experts in VRAM works with one card for now, and a much slower
+second card can cost more than its memory brings: on an RTX 5090 with an RTX 2070 Super added, Qwen3-Coder-Next ran at
+46.6 tok/s on both cards and 66.7 on the 5090 alone (with its busiest experts in VRAM). **Find the fastest settings**
+measures both ways and keeps the faster; **Use every graphics card** under **Advanced** on the setup screen sets it
+yourself.
 
 **What does "Find the fastest settings" do?**
 It loads the model and measures, on your PC, the settings that only change speed: how to split a model that doesn't
@@ -47,7 +52,8 @@ map rings them. It's off by default, because whether it's faster depends on the 
 experts in VRAM did 71% of the expert work, but the plain split was still a little faster. **Find the fastest
 settings** learns the experts right away, measures both, and turns it on only if it wins on your PC. You can also tick
 **Keep the busiest experts in VRAM** under **Advanced** on the setup screen yourself, and reset what it learned in
-**Model info**.
+**Model info**. With **Let the VRAM experts follow the conversation** also on, the experts in VRAM keep changing while
+you chat: ones the conversation keeps using move in, ones it stopped using move out (it uses a bit more RAM).
 
 **Why is 0.5.0 so much faster on NVIDIA cards?**
 It uses **CUDA graphs**: each token's GPU work is recorded once and then replayed with a single launch, instead of
@@ -69,6 +75,12 @@ tierlm doesn't collect or send anything.
 **Can other computers on my network use it?**
 Only if you start the server with `--host 0.0.0.0`. There's no password or login, so only do that on a
 network you trust.
+
+**Can several people or apps use it at the same time?**
+Yes, they take turns: one reply is written at a time, and other requests wait in line, first come first served (the
+chat shows "Waiting in line: 2 requests ahead of this one…"). Nothing fails with "busy". Switching between
+conversations is quick, because tierlm keeps up to 8 recent conversations aside instead of reading them again.
+Writing several replies at once, sized to what your PC can handle, is planned next.
 
 **Why do replies get slower in long conversations?**
 Every new word has to look back over the whole conversation so far. tierlm uses flash attention to keep this

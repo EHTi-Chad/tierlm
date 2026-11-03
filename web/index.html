@@ -173,6 +173,7 @@
   .msg.tool .row { display: flex; gap: 8px; margin-top: 6px; }
   .wsfolder { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); color: var(--muted); }
   .msg.error { align-self: center; background: transparent; color: var(--danger); font-size: 13px; }
+  .msg.note { align-self: center; background: var(--panel-2); color: var(--muted); font-size: 13px; max-width: 720px; }
   /* Markdown in replies */
   .msg.assistant { white-space: normal; }
   .md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
@@ -230,7 +231,11 @@
   .bar { height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; margin-top: 6px; }
   .bar > div { height: 100%; background: var(--accent); width: 0; transition: width .25s; }
   canvas { display: block; width: 100%; }
-  #spark { height: 84px; margin-top: 8px; }
+  #spark { height: 58px; margin-top: 6px; }
+  .chead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .big.sm { font-size: 19px; line-height: 1.1; }
+  .big.sm small { font-size: 11.5px; }
+  .kv dd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
   .caption { font-size: 11.5px; color: var(--faint); margin-top: 2px; }
   .tiers { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
   .tier { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
@@ -320,6 +325,26 @@
   .menu button:hover, .menu a:hover, .menu .mi:hover { background: var(--panel-2); }
   .menu .mi input { accent-color: var(--accent); margin-right: 6px; }
   .menu hr { border: 0; border-top: 1px solid var(--line); margin: 5px 4px; }
+  .menu.up { left: 0; right: auto; top: auto; bottom: calc(100% + 6px); min-width: 260px; }
+  .menu .mi2 { display: flex; gap: 10px; align-items: flex-start; }
+  .menu .mi2 svg { flex: none; width: 18px; height: 18px; margin-top: 1px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; opacity: .8; }
+  .menu .mi2 b { font-weight: 600; display: block; }
+  .menu button:disabled { opacity: .55; cursor: default; background: transparent; }
+  .iconbtn { width: 34px; height: 34px; padding: 0; display: inline-grid; place-items: center; border-radius: 50%; background: transparent; }
+  .iconbtn svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; }
+  .iconbtn[aria-expanded="true"] { background: var(--panel-2); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 4px 3px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel-2); font-size: 12.5px; }
+  .chip .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+  .chip .sz { color: var(--faint); }
+  .chip.folder { border-color: var(--accent); background: var(--accent-soft); }
+  .chip button { border: 0; background: transparent; padding: 0 6px; line-height: 18px; border-radius: 999px; color: var(--muted); font-size: 14px; }
+  .chip button:hover { color: var(--ink); background: var(--line); }
+  .msg .chips { margin-top: 6px; }
+  .msg .chip { padding-right: 10px; }
+  .msg.user .chip { background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.32); color: inherit; }
+  .msg.user .chip .sz { color: inherit; opacity: .72; }
+  #chat.dropping #composer { outline: 2px dashed var(--accent); outline-offset: -4px; border-radius: 10px; }
   .menu .sub { font-size: 11.5px; color: var(--faint); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
   .folderrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
   .folderrow code { background: var(--panel-2); color: var(--ink); padding: 3px 8px; border-radius: 6px; font-size: 12.5px; word-break: break-all; }
@@ -473,9 +498,17 @@
             <select id="splitsel"><option value="auto">Automatic (recommended)</option><option value="layers">Split by whole layers</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
             <div class="help">Automatic uses experts in RAM for mixture-of-experts models and whole layers for the rest. Experts in RAM: the GPU does all the attention and the CPU only the few experts each word picks, much faster for MoE models (Qwen3.6-35B-A3B on an RTX 3070 laptop: 33 against 13 tok/s). Whole layers: the GPU and CPU hand over once per word; best for dense models.</div>
           </div>
+          <div id="allgpusrow" hidden>
+            <label class="chk"><input type="checkbox" id="allgpus" checked> Use every graphics card</label>
+            <div class="help">With several cards of the same kind, tierlm fills the best one, then the next, then RAM. Off: only the best card (and RAM). A much slower second card can cost more than its memory brings, and keeping the busiest experts in VRAM works with one card for now; <b>Find the fastest settings</b> measures both ways and keeps the faster.</div>
+          </div>
           <div>
             <label class="chk"><input type="checkbox" id="hotexp"> Keep the busiest experts in VRAM</label>
             <div class="help">Mixture-of-experts models split with experts in RAM: tierlm learns which experts this model uses most as you chat, and the next time it loads, puts those in VRAM instead of whole expert layers. Off by default: whether it beats the plain split depends on the PC. <b>Find the fastest settings</b> learns the experts straight away, measures both and turns this on only if it wins.</div>
+          </div>
+          <div>
+            <label class="chk"><input type="checkbox" id="liveexp"> Let the VRAM experts follow the conversation</label>
+            <div class="help">Goes with the setting above: while you chat, experts the conversation keeps using move into VRAM in place of ones it stopped using (a few per word, copied from RAM). Helps when a chat is about something different from what the model learned, such as code after a lot of plain text. Uses more RAM: the experts in VRAM are kept in RAM as well. Works even before tierlm has learned anything about the model.</div>
           </div>
           <div>
             <label for="vramlim">VRAM limit (GiB)</label>
@@ -627,6 +660,13 @@
     <div class="sec" data-sec="model">
       <button class="sechead" aria-expanded="false"><span>Model info</span><small>where it lives</small></button>
       <div class="secbody">
+        <div class="subhead" style="margin-top:4px">Embedding model</div>
+        <div class="lrow2" style="margin-top:4px">
+          <select id="embsel" aria-label="Embedding model" style="flex:1;min-width:0"><option value="">None</option></select>
+        </div>
+        <div class="help" id="embnote">A second, small model that turns text into numbers for search and document comparison. Apps use it
+          through <code>/v1/embeddings</code>, while the chat model stays loaded.</div>
+        <div class="subhead">Chat model</div>
         <dl class="kv">
           <dt>Model</dt><dd id="arch">–</dd>
           <dt>Layers × experts</dt><dd id="lx">–</dd>
@@ -701,9 +741,18 @@
       </div>
     </div>
     <div id="composer">
+      <div class="chips" id="chips" hidden></div>
       <label for="input" class="sr">Message</label>
       <textarea id="input" rows="2" placeholder="Message the model… (Enter to send, Shift+Enter for a new line)"></textarea>
       <div class="row">
+        <div class="menuwrap">
+          <button class="iconbtn" id="plus" aria-label="Add files or a folder" title="Add files or a folder" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
+          <div class="menu up" id="plusmenu" role="menu" hidden>
+            <button class="mi2" role="menuitem" id="m-attach"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></svg><span><b>Attach files</b><span class="sub">Text and code files go into your message</span></span></button>
+            <button class="mi2" role="menuitem" id="m-folder"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span><b id="m-folder-t">Work in a folder…</b><span class="sub" id="m-folder-s">The model reads your project; you approve each change</span></span></button>
+          </div>
+        </div>
+        <input type="file" id="filepick" multiple hidden>
         <span class="caption" id="sysbadge" hidden>System prompt on</span>
         <span class="grow"></span>
         <button class="ghost" id="newchat">New chat</button>
@@ -716,8 +765,7 @@
   <section id="dash" aria-label="Live view">
     <div class="card">
       <div class="body">
-        <div class="ctitle">Speed</div>
-        <div class="big" id="tps">–<small>tok/s</small></div>
+        <div class="chead"><div class="ctitle">Speed</div><div class="big sm" id="tps">–<small>tok/s</small></div></div>
         <canvas id="spark"></canvas>
         <dl class="kv">
           <dt>Prompt reading</dt><dd id="ptps">–</dd>
@@ -807,6 +855,59 @@ let mapMode = "heat", mapSorted = true, ffnVram = [], hotSets = [], history = []
 let speedPts = [], tokTimes = [], tokCount = 0;   // speed vs. context
 
 // ---------- info ----------
+// The embedding model: a second model loaded next to the chat one, for /v1/embeddings.
+async function loadEmbed() {
+  let e = { loaded: false }, list = [];
+  try { [e, list] = await Promise.all([api("/api/embed").then(r => r.json()), api("/api/models").then(r => r.json()).then(m => m.models || [])]); } catch (x) { return; }
+  const sel = $("embsel"), opts = list.filter(m => m.embedding);
+  sel.innerHTML = "";
+  const add = (v, t) => { const o = document.createElement("option"); o.value = v; o.textContent = t; sel.appendChild(o); };
+  add("", "None");
+  for (const m of opts) add(m.id, (m.name || m.id) + " · " + fmtSize(m.bytes || 0));
+  if (e.loaded && !opts.some(m => m.id === e.id)) add(e.id, e.name || e.id);
+  sel.value = e.loaded ? e.id : "";
+  $("embnote").textContent = e.loaded
+    ? `${e.name}: ${e.dims} numbers per text, up to ${e.max_tokens.toLocaleString()} tokens, on ${e.on_gpu ? e.device.replace(/ \(.*$/, "") : "the CPU"}. Apps use it through /v1/embeddings, while the chat model stays loaded.`
+    : opts.length ? "A second, small model that turns text into numbers for search and document comparison. Choose one to load it next to the chat model; apps use it through /v1/embeddings."
+    : "No embedding models in your models folder. Download one in GGUF format, for example nomic-embed-text-v1.5 (Q8_0, about 140 MB), into the models folder, then choose it here.";
+}
+$("embsel").onchange = async () => {
+  const id = $("embsel").value, sel = $("embsel");
+  sel.disabled = true;
+  $("embnote").textContent = id ? "Loading…" : "Unloading…";
+  try {
+    const r = await api(id ? "/api/embed/load" : "/api/embed/unload", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: id }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) addMsg("error", "⚠ Embedding model: " + (j.error || r.statusText));
+  } finally { sel.disabled = false; await loadEmbed(); }
+};
+function renderHot() {   // the hot-expert note and the map's VRAM rings (again after each reply with live experts)
+  const moe = E > 0;
+  hotSets = (info.hot || []).map(a => new Set(a));
+  const hn = $("hotnote"), learned = info.learned_tokens || 0;
+  if (moe && info.hot_experts > 0) {
+    hn.hidden = false;
+    hn.innerHTML = `<b>${info.hot_experts.toLocaleString()} of ${(L * E).toLocaleString()} experts</b> are in VRAM: ` +
+      (learned > 0 ? `the ones this model has used most, learned from about ${learned.toLocaleString()} words so far` : "an even share of each layer to start with") +
+      (info.hot_share > 0 ? `; they did ${Math.round(info.hot_share * 100)}% of the expert work` : "") +
+      `. They're ringed on the expert map. It keeps learning as you chat; the next load uses what it learned.` +
+      (info.live_experts ? (info.live && info.live.picks > 0
+        ? ` They follow the conversation: ${Math.round(100 * info.live.hits / info.live.picks)}% of picks served from VRAM so far, ${info.live.swaps.toLocaleString()} moved in.`
+        : " They follow the conversation: experts it keeps using move into VRAM as you chat.") : "");
+  } else if (moe && info.ram_weights > 0 && info.split_mode === "experts") {
+    hn.hidden = false;
+    hn.textContent = learned > 0 ? `tierlm has learned this model's busiest experts from about ${learned.toLocaleString()} words. Turn on "Keep the busiest experts in VRAM" and load again to put them in VRAM; Find the fastest settings checks whether that's faster on this PC.`
+      : "tierlm learns which experts this model uses as you chat. With \"Keep the busiest experts in VRAM\" on, the busiest go in VRAM at the next load; Find the fastest settings learns them straight away and checks whether that's faster.";
+  } else hn.hidden = true;
+}
+async function refreshLive() {
+  try {
+    const j = await (await api("/api/info")).json();
+    if (!info || !j.loaded || j.path !== info.path) return;
+    info.hot = j.hot; info.live = j.live; info.hot_experts = j.hot_experts;
+    renderHot();
+  } catch (e) {}
+}
 async function loadInfo() {
   try {
     info = await (await api("/api/info")).json();
@@ -814,6 +915,7 @@ async function loadInfo() {
   if (info.version) $("ver").textContent = "v" + info.version;
   if (!info.loaded) { info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "setup"; showSetup(); return; }
   showApp();
+  loadEmbed();
   L = info.layers; E = info.experts || 0; K = info.experts_used || 0;
   counts = new Float64Array(L * E); flash = new Float64Array(L * E);
   $("slots").max = Math.max(1, E); $("slots").value = Math.max(1, Math.round(E / 4));
@@ -826,18 +928,8 @@ async function loadInfo() {
   document.querySelectorAll(".hE").forEach(x => x.textContent = E);
   document.querySelectorAll(".hK").forEach(x => x.textContent = K);
   ffnVram = info.ffn_vram || [];
-  hotSets = (info.hot || []).map(a => new Set(a));
-  const hn = $("hotnote"), learned = info.learned_tokens || 0;
-  if (moe && info.hot_experts > 0) {
-    hn.hidden = false;
-    hn.innerHTML = `<b>${info.hot_experts.toLocaleString()} of ${(L * E).toLocaleString()} experts</b> are in VRAM: the ones this model has used most, ` +
-      `learned from about ${learned.toLocaleString()} words so far` + (info.hot_share > 0 ? `; they did ${Math.round(info.hot_share * 100)}% of the expert work` : "") +
-      `. They're ringed on the expert map. It keeps learning as you chat; the next load uses what it learned.`;
-  } else if (moe && info.ram_weights > 0 && info.split_mode === "experts") {
-    hn.hidden = false;
-    hn.textContent = learned > 0 ? `tierlm has learned this model's busiest experts from about ${learned.toLocaleString()} words. Turn on "Keep the busiest experts in VRAM" and load again to put them in VRAM; Find the fastest settings checks whether that's faster on this PC.`
-      : "tierlm learns which experts this model uses as you chat. With \"Keep the busiest experts in VRAM\" on, the busiest go in VRAM at the next load; Find the fastest settings learns them straight away and checks whether that's faster.";
-  } else hn.hidden = true;
+  renderHot();
+  const learned = info.learned_tokens || 0;
   $("hotforget").hidden = !(moe && learned > 0);
   renderMiniMem();
   syncLiveSpec();
@@ -1026,11 +1118,17 @@ document.addEventListener("click", e => {
 });
 
 // ---------- chat ----------
-function addMsg(role, text) {
+function addMsg(role, text, files) {
   $("empty")?.remove();
   const d = document.createElement("div");
   d.className = "msg " + role;
   if (role === "assistant") setReply(d, text); else d.textContent = text;
+  if (files?.length) {                                                // attached files show as chips, not their text
+    const c = document.createElement("div"); c.className = "chips";
+    for (const f of files) { const s = document.createElement("span"); s.className = "chip"; s.innerHTML = `<span class="nm"></span><span class="sz"></span>`;
+      s.querySelector(".nm").textContent = f.name; s.querySelector(".sz").textContent = fmtSize(f.size); c.appendChild(s); }
+    d.appendChild(c);
+  }
   $("messages").appendChild(d);
   $("messages").scrollTop = $("messages").scrollHeight;
   return d;
@@ -1064,7 +1162,11 @@ async function streamReply(useWs) {
         const line = buf.slice(0, i); buf = buf.slice(i + 2);
         if (!line.startsWith("data: ")) continue;
         const ev = JSON.parse(line.slice(6));
-        if (ev.type === "prompt") onPrompt(ev);
+        if (ev.type === "queue") {                                   // waiting in line behind other replies
+          bubble.textContent = ev.ahead > 0 ? `Waiting in line: ${ev.ahead} ${ev.ahead === 1 ? "request" : "requests"} ahead of this one…`
+                                            : "Waiting for another reply to finish…";
+        }
+        else if (ev.type === "prompt") { if (!reply) bubble.textContent = ""; onPrompt(ev); }
         else if (ev.type === "token") {
           reply += ev.text; onToken(ev);
           if (!drawPending) { drawPending = true; requestAnimationFrame(() => { drawPending = false; setReply(bubble, reply); $("messages").scrollTop = $("messages").scrollHeight; }); }
@@ -1093,11 +1195,14 @@ async function streamReply(useWs) {
 }
 async function send(text) {
   text = (text ?? $("input").value).trim();
-  if (!text || busy) return;
+  if ((!text && !attached.length) || busy) return;
   if (consoleWide) setConsoleWide(false);
   $("input").value = "";
-  addMsg("user", text);
-  history.push({ role: "user", content: text });
+  const files = attached.map(f => ({ name: f.name, size: f.size }));
+  const content = withFiles(text, attached);                          // the model gets the files' text with the message
+  attached = []; renderChips();
+  addMsg("user", text, files);
+  history.push(files.length ? { role: "user", content, shown: text, files } : { role: "user", content: text });
   setBusy(true);
   controller = new AbortController();
   // With the workspace on, the model may ask for its tools: they run (reading at once, changes after Apply), their
@@ -1128,19 +1233,21 @@ async function send(text) {
   }
   setBusy(false);
   controller = null;
+  if (info && info.live_experts) refreshLive();
 }
 function onPrompt(ev) {
   for (let i = 0; i < ev.counts.length; i++) counts[i] += ev.counts[i];
   totalPicks += ev.n_new * L * K;
-  $("ptps").textContent = ev.n_new + " new tokens at " + ev.prompt_tps.toFixed(0) + " tok/s";
-  $("reused").textContent = ev.reused + " of " + ev.n_prompt + " tokens";
+  $("ptps").textContent = Math.round(ev.prompt_tps).toLocaleString() + " tok/s (" + ev.n_new.toLocaleString() + " new)";
+  $("ptps").title = ev.n_new.toLocaleString() + " new tokens read at " + ev.prompt_tps.toFixed(0) + " tok/s";
+  $("reused").textContent = ev.reused.toLocaleString() + " of " + ev.n_prompt.toLocaleString();
   setContext(ev.n_past);
   tokTimes = [performance.now()];
   updateHits();
 }
 function onToken(ev) {
   for (let l = 0; l < ev.routing.length; l++)
-    for (const e of ev.routing[l]) { counts[l * E + e] += 1; flash[l * E + e] = 1; }
+    for (const e of ev.routing[l]) if (e >= 0) { counts[l * E + e] += 1; flash[l * E + e] = 1; }   // (-1: a layer without experts)
   totalPicks += L * K;
   $("tps").firstChild.nodeValue = ev.tps.toFixed(1);
   // Speed over the last 16 tokens. With speculative decoding tokens arrive in bursts (a check yields 2-3 at once),
@@ -1157,6 +1264,21 @@ function onDone(ev) {
   $("lastreply").textContent = ev.n_gen + " tokens in " + ev.gen_s.toFixed(1) + " s";
   setContext(ev.n_past);
   updateHits();
+  checkSpeed(ev);
+}
+// A reply much slower than Find the fastest settings measured on this PC: say so once per load, with the likely
+// cause (usually Windows running out of memory, or another program using the GPU).
+let slowNoted = "";
+async function checkSpeed(ev) {
+  const tuned = info?.tuned_tps || 0;
+  if (!tuned || ev.n_gen < 64 || ev.gen_tps >= 0.6 * tuned || slowNoted === info.path) return;
+  slowNoted = info.path;
+  let free = 0;
+  try { free = (await (await api("/api/info")).json()).ram_free || 0; } catch (e) {}
+  const gb = free / 1073741824;
+  addMsg("note", `This reply ran at ${ev.gen_tps.toFixed(1)} tok/s, but Find the fastest settings measured ${tuned.toFixed(1)} tok/s on this PC. ` +
+    (free && gb < 4 ? `Windows is nearly out of memory (${gb.toFixed(1)} GB free), so it's moving things to disk: close other programs, or restart tierlm.`
+                    : "Something may be slowing it down: another program using the graphics card, or memory still taken by an earlier load. Restarting tierlm usually brings the speed back."));
 }
 
 // ---------- expert map ----------
@@ -1176,7 +1298,7 @@ function hexToRgb(h) { h = h.replace("#", ""); return [0, 2, 4].map(i => parseIn
 let last = performance.now();
 function draw(now) {
   const dt = (now - last) / 1000; last = now;
-  if (!E || !L) { requestAnimationFrame(draw); return; }
+  if (!E || !L) { if (L) drawSpeed(); requestAnimationFrame(draw); return; }   // dense models: no expert map, but the speed graph
   const dpr = window.devicePixelRatio || 1, strip = 7 * dpr;     // left strip: where each layer's experts live
   const W = map.width - strip, H = map.height, cw = W / E, ch = H / L, gap = Math.max(cw > 3 ? 1 : 0, Math.round(Math.min(cw, ch) * 0.12));
   mctx.clearRect(0, 0, map.width, H);
@@ -1354,7 +1476,7 @@ function plan() {
   if ($("forcecpu").checked || !gpu)
     return { ...base, dev: cpu, wv: 0, kvv: 0, wr: W, kvr: KV, why: $("forcecpu").checked ? "forced" : "nogpu" };
   const lim = +$("vramlim").value > 0 ? +$("vramlim").value * 1073741824 : Infinity;
-  const group = gpuGroup(gpu);
+  const group = $("allgpus").checked ? gpuGroup(gpu) : [gpu];
   const rooms = group.map((g, i) => Math.max(0, Math.min(g.free + (i === 0 ? held.vram : 0), lim) - WORK));
   const room = rooms.reduce((t, r) => t + r, 0);
   let wv, kvv;
@@ -1432,6 +1554,8 @@ function applySaved() {
   // Settings saved before "Automatic" existed (no settings_v) had whole layers as the default: treat as Automatic.
   $("splitsel").value = (s.settings_v >= 2 || s.split_mode === "experts") && s.split_mode ? s.split_mode : "auto";
   $("hotexp").checked = s.hot_experts === true;   // opt-in: Find the fastest settings turns it on where it wins
+  $("allgpus").checked = s.multi_gpu !== false;
+  $("liveexp").checked = s.live_experts === true;
   const canSpec = !!(selModel && selModel.mtp);
   $("specon").disabled = !canSpec; $("specn").disabled = !canSpec;
   $("specon").checked = canSpec && s.speculative !== false;     // on by default when the model has a draft layer
@@ -1477,6 +1601,7 @@ function tagger(el) { return (t, c) => { const s = document.createElement("span"
 function renderSetup() {
   const ctx = +$("ctxsel").value || defCtx;
   const p = plan();
+  $("allgpusrow").hidden = !(p.gpu && gpuGroup(p.gpu).length > 1);
   // hardware (read-only)
   const dl = $("devlist"); dl.innerHTML = "";
   const order = [...devices].sort((a, b) => ({ gpu: 0, igpu: 1, cpu: 2 }[a.type] ?? 3) - ({ gpu: 0, igpu: 1, cpu: 2 }[b.type] ?? 3));
@@ -1615,7 +1740,7 @@ $("pathok").onclick = async () => {
 };
 $("pathin").onkeydown = e => { if (e.key === "Enter") $("pathok").click(); if (e.key === "Escape") $("pathcancel").click(); };
 $("rescanhw").onclick = e => { e.preventDefault(); loadSetup(); };
-for (const id of ["ctxsel", "forcecpu", "splitsel"]) $(id).onchange = renderSetup;
+for (const id of ["ctxsel", "forcecpu", "splitsel", "allgpus"]) $(id).onchange = renderSetup;
 $("vramlim").oninput = renderSetup;
 function syncFa() {                       // a quantized cache needs flash attention
   const q = $("kvsel").value.startsWith("q");
@@ -1663,7 +1788,7 @@ function loadBody(p) {
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value, lookup: +$("llook").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, hot_experts: $("hotexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, temperature: +$("temp").value };
+                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, multi_gpu: $("allgpus").checked, hot_experts: $("hotexp").checked || $("liveexp").checked, live_experts: $("liveexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, temperature: +$("temp").value };
   if ($("forcecpu").checked) body.device = "cpu";
   return body;
 }
@@ -1705,7 +1830,8 @@ $("tunebtn").onclick = async () => {
     if (!fin) throw new Error("the measurement stopped early");
     const st = fin.settings;
     const parts = [];
-    if (st.split_mode === "experts") parts.push(st.hot_experts ? "experts in RAM, busiest experts in VRAM" : "experts in RAM"); else if (st.split_mode === "layers") parts.push("whole layers");
+    if (st.multi_gpu === false) parts.push("only the first graphics card");
+    if (st.split_mode === "experts") parts.push(st.live_experts ? "experts in RAM, VRAM experts following the conversation" : st.hot_experts ? "experts in RAM, busiest experts in VRAM" : "experts in RAM"); else if (st.split_mode === "layers") parts.push("whole layers");
     parts.push(st.threads + " CPU threads");
     parts.push(st.speculative ? "speculative decoding, " + st.draft_max + (st.draft_max === 1 ? " guess" : " guesses") + " per check" : "no speculative decoding");
     for (const li of rows) if (Math.abs(+li.dataset.tps - fin.tps) < 0.05) { li.classList.add("best"); break; }
@@ -1829,6 +1955,7 @@ async function loadWorkspace() {
   $("wshelp").textContent = !ws.folder ? "Choose a project folder to let the model read its files and suggest changes. You approve every change."
     : !ws.exists ? "That folder doesn't exist any more: choose it again."
     : "The model can list, read and search the files in this folder, and suggest changes that you see as a diff and approve. Nothing runs, nothing outside the folder.";
+  renderChips();
 }
 async function setWorkspace(folder) {
   const r = await api("/api/workspace", { method: "POST", headers: wsHeaders, body: JSON.stringify({ folder }) });
@@ -1847,7 +1974,104 @@ $("wspick").onclick = async () => {
     if (f !== null) await setWorkspace(f.trim());
   }
 };
-$("wson").onchange = () => LS.set("tierlm.ws", $("wson").checked);
+$("wson").onchange = () => { LS.set("tierlm.ws", $("wson").checked); renderChips(); };
+
+// ---------- the + menu: attach files, work in a folder ----------
+// Attached files are read here, in the browser, and their text goes into the message (so it works with every model
+// and through the API's normal messages). Only text: images, PDFs and Word files need support that isn't in tierlm yet.
+let attached = [];                                                    // [{name, size, text}]
+const fmtSize = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB" : (n / 1048576).toFixed(1) + " MB";
+const kMaxFile = 2 * 1048576;
+function withFiles(text, files) {
+  if (!files.length) return text;
+  const parts = files.map(f => {
+    const ext = (f.name.match(/\.([\w+-]+)$/) || [])[1] || "";
+    const run = Math.max(2, ...(f.text.match(/`+/g) || []).map(r => r.length)) + 1;   // a fence longer than any inside
+    const fence = "`".repeat(run);
+    return `File: ${f.name}\n${fence}${ext}\n${f.text.replace(/\n$/, "")}\n${fence}`;
+  });
+  return (text ? text + "\n\n" : "") + parts.join("\n\n");
+}
+async function addFiles(list) {
+  const problems = [];
+  for (const f of list) {
+    if (attached.some(a => a.name === f.name && a.size === f.size)) continue;
+    if (f.size > kMaxFile) { problems.push(f.name + " is bigger than 2 MB"); continue; }
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let txt = null;
+    if (!buf.subarray(0, 8192).includes(0)) { try { txt = new TextDecoder("utf-8", { fatal: true }).decode(buf); } catch (e) { txt = null; } }
+    if (txt === null) { problems.push(f.name + " isn't a text file (images, PDFs and Word files come in a later update)"); continue; }
+    attached.push({ name: f.name, size: f.size, text: txt.replace(/^\uFEFF/, "") });
+  }
+  // Keep the attachments within the context window, with room for the reply (about 3.5 characters per token).
+  const ctx = info?.ctx || 0, est = Math.round(attached.reduce((n, a) => n + a.text.length, 0) / 3.5);
+  if (ctx && est > ctx * 0.75) {
+    const drop = attached.pop();
+    problems.push(`${drop.name} doesn't fit: the files would take about ${est.toLocaleString()} tokens of the ${ctx.toLocaleString()}-token context`);
+  }
+  renderChips();
+  if (problems.length) addMsg("error", "⚠ Not attached: " + problems.join("; ") + ".");
+  $("input").focus();
+}
+function renderChips() {
+  const box = $("chips");
+  box.innerHTML = "";
+  const chip = (cls, name, size, title, onRemove) => {
+    const c = document.createElement("span"); c.className = "chip" + (cls ? " " + cls : "");
+    c.innerHTML = `<span class="nm"></span>${size ? `<span class="sz"></span>` : ""}<button type="button"></button>`;
+    c.querySelector(".nm").textContent = name; if (size) c.querySelector(".sz").textContent = size;
+    const b = c.querySelector("button"); b.textContent = "✕"; b.title = title; b.setAttribute("aria-label", title); b.onclick = onRemove;
+    box.appendChild(c);
+  };
+  if (wsOn()) chip("folder", "Folder: " + ws.folder.split(/[\\/]/).filter(Boolean).pop(), "", "Stop working in this folder",
+                   () => { $("wson").checked = false; $("wson").onchange(); });
+  attached.forEach((a, i) => chip("", a.name, fmtSize(a.size), "Remove " + a.name, () => { attached.splice(i, 1); renderChips(); }));
+  box.hidden = !box.children.length;
+}
+function setPlusMenu(open) {
+  $("plusmenu").hidden = !open; $("plus").setAttribute("aria-expanded", String(open));
+  if (!open) return;
+  // The folder item: choose one, or switch it on and off; only on the computer running tierlm.
+  const t = $("m-folder-t"), sub = $("m-folder-s"), b = $("m-folder");
+  b.disabled = !ws.available;
+  if (!ws.available) { t.textContent = "Work in a folder…"; sub.textContent = "Open tierlm on the PC running it to use a folder"; }
+  else if (ws.folder && ws.exists) {
+    const name = ws.folder.split(/[\\/]/).filter(Boolean).pop();
+    t.textContent = wsOn() ? "Stop working in " + name : "Work in " + name;
+    sub.textContent = wsOn() ? "The model won't see the folder" : "Or choose another folder in Settings";
+  } else { t.textContent = "Work in a folder…"; sub.textContent = "The model reads your project; you approve each change"; }
+  b.focus();
+}
+$("plus").onclick = e => { e.stopPropagation(); setPlusMenu($("plusmenu").hidden); };
+document.addEventListener("click", e => { if (!$("plusmenu").hidden && !e.target.closest("#plusmenu")) setPlusMenu(false); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("plusmenu").hidden) { setPlusMenu(false); $("plus").focus(); } });
+// Ctrl+A (Cmd+A) after clicking in the conversation selects just the conversation, not the whole page.
+let lastClickInChat = false;
+document.addEventListener("pointerdown", e => { lastClickInChat = !!e.target.closest("#messages"); }, true);
+document.addEventListener("keydown", e => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.key.toLowerCase() !== "a" || !lastClickInChat) return;
+  const a = document.activeElement;
+  if (a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA" || a.isContentEditable)) return;   // the box keeps its own Ctrl+A
+  e.preventDefault();
+  const r = document.createRange();
+  r.selectNodeContents($("messages"));
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+});
+$("m-attach").onclick = () => { setPlusMenu(false); $("filepick").click(); };
+$("filepick").onchange = () => { addFiles([...$("filepick").files]); $("filepick").value = ""; };
+$("m-folder").onclick = async () => {
+  setPlusMenu(false);
+  if (ws.folder && ws.exists) { $("wson").checked = !wsOn(); $("wson").onchange(); return; }
+  await $("wspick").onclick();
+  if (ws.folder && ws.exists) { $("wson").checked = true; $("wson").onchange(); }
+};
+// Drag files onto the chat, or paste them into the message box.
+$("chat").addEventListener("dragover", e => { if ([...e.dataTransfer.types].includes("Files")) { e.preventDefault(); $("chat").classList.add("dropping"); } });
+$("chat").addEventListener("dragleave", e => { if (!e.relatedTarget || !$("chat").contains(e.relatedTarget)) $("chat").classList.remove("dropping"); });
+$("chat").addEventListener("drop", e => { if (!e.dataTransfer.files.length) return; e.preventDefault(); $("chat").classList.remove("dropping"); addFiles([...e.dataTransfer.files]); });
+$("input").addEventListener("paste", e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); addFiles(fs); } });
 async function wsTool(name, args, apply = false, hash = "") {
   try {
     const r = await api("/api/workspace/tool", { method: "POST", headers: wsHeaders, body: JSON.stringify({ name, arguments: args, apply, hash }) });
@@ -1991,7 +2215,7 @@ function saveChat() {
   if (!history.length) return;
   if (!curChat) { curChat = { id: Date.now().toString(36), created: Date.now() }; chats.unshift(curChat); }
   curChat.messages = history;
-  curChat.title = curChat.title || (history.find(m => m.role === "user")?.content || "Chat").slice(0, 60);
+  curChat.title = curChat.title || (() => { const u = history.find(m => m.role === "user"); return (u?.shown || u?.files?.[0]?.name || u?.content || "Chat"); })().slice(0, 60);
   curChat.updated = Date.now();
   curChat.model = info ? info.name : "";
   if (chats.length > 100) chats.length = 100;
@@ -2023,7 +2247,7 @@ function renderHistory() {
     if (m.role === "tool") { renderToolMsg(m, calls.shift()); continue; }
     calls = (m.tool_calls || []).slice();
     if (m.role === "assistant" && m.tool_calls && !stripCalls(m.content).trim()) continue;
-    const d = addMsg(m.role, m.content);
+    const d = addMsg(m.role, m.role === "user" && m.shown !== undefined ? m.shown : m.content, m.files);
     if (m.meta) { const s = document.createElement("span"); s.className = "meta"; s.textContent = m.meta; d.appendChild(s); }
   }
 }

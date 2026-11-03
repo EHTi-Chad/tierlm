@@ -133,6 +133,64 @@ places, each checked against a NumPy reference written from Hugging Face's `mode
 Not yet for gpt-oss: hot experts (the split doesn't divide the expert biases yet; whole expert layers go to VRAM
 or RAM instead) and a shorter KV cache for the sliding-window layers.
 
+## Several conversations in the cache
+
+A chat's whole conversation is sent with every request, and tierlm only reads the part that differs from what is
+already in the KV cache. With one cache, any request for a different conversation throws the first one away: a
+coding agent's side request (opencode titling a session, with its own short instructions) used to cost the next real
+request a full re-read of the agent's 10,000+ tokens of instructions, about two minutes on a laptop.
+
+So when a request would overwrite at least 256 tokens of the cached conversation, tierlm first copies that
+conversation to system RAM (`Model::save`: the keys and values of its positions in every attention layer, which are
+one contiguous block per layer, plus the DeltaNet layers' running memories and the MTP draft block's state). When a
+later request continues a saved conversation further than the cache does, the saved one is copied back
+(`Model::restore`) and only the new tokens are read. Up to 8 conversations are kept, within 4 GB and never more
+than a quarter of the RAM that is free, least recently used dropped first. Hybrid models (Qwen3.5 / 3.6) can't
+rewind their running memory, so for them a saved conversation is used only when the request continues all of it.
+
+Measured on Qwen3-0.6B on 2 CPU threads: a 2,500-token agent prompt, a side request, then the next turn: 4.5 s
+instead of about 45 s, the saved conversation copied back in 0.05 s, and the reply word for word the same as without
+the side request. The tests save every model family half way through a conversation, read a different one, restore
+the first and finish it, and compare with reading it straight through (identical, hybrid models included).
+The idea of keeping several conversations' prompt caches comes from other engines: llama.cpp's server keeps several
+slots, and Magnitude shares cached prompts between concurrent agent sessions.
+
+## Embedding models (a second model)
+
+Search and document-comparison tools need an embedding model next to the chat model. These are encoders (BERT-style:
+`bert`, `nomic-bert`), small enough to live whole on one device, so they get their own small engine
+(`src/encoder.cpp`) instead of the tier loader:
+
+- **The graph**: token embeddings (plus learned position embeddings for BERT; Nomic rotates Q and K instead, NeoX
+  layout), a LayerNorm, then per layer attention in **both directions** (no causal mask, no KV cache: the whole text
+  is read in one pass), a residual and LayerNorm, the feed-forward block (BERT: exact erf GELU with biases; Nomic:
+  SwiGLU without biases), a residual and LayerNorm. The last layer's states are pooled as the file says: averaged
+  (`mean`), or the first token's (`cls`).
+- **The tokenizer**: WordPiece, written for tierlm like the others. Text is cleaned (control characters dropped,
+  spaces normalised, CJK ideographs spaced out), uncased models fold each character to lower case without accents
+  (Unicode NFD minus combining marks; tables generated from the Unicode database, Hangul computed), punctuation is
+  split off, and each word is cut into the longest vocabulary pieces from the left.
+- **Placement**: on the GPU when the model fits with plenty to spare after the chat model, else on the CPU.
+- **Sharing the GPU**: the chat model and the embedding model take one lock per step (`device_mutex`), so an
+  embedding request waits for at most one token of a chat reply, not the whole reply. Measured on the CPU with a
+  13-second reply streaming: each embedding request answered in about 0.06 s.
+
+Checked like everything else: `tests/tiny_encoders.py` compares tiny random `bert` (CLS and mean pooling) and
+`nomic-bert` models with a NumPy forward pass (worst difference 4e-7), and the WordPiece tokenizer with Hugging Face's
+own BERT tokenizer, uncased and cased, on strings with accents, CJK, Korean, Turkish, control characters and words too
+long for the vocabulary (all identical).
+
+## Flint
+
+Recursive's Flint (40B-A2.5B, a coding model) mixes pieces tierlm already had: attention sinks and sliding-window
+layers (as gpt-oss, a 513-token window), per-head QK-norm (as Qwen3), and a shared expert (as Qwen3.5 MoE, but added
+in full, without a gate). What's new: each expert is scored by its own **sigmoid** (not a softmax over all of them),
+the top 6 of 256 are picked and their scores renormalised; the **first layers are dense** (an ordinary feed-forward
+block, no experts); and only the sliding-window layers **rotate positions**: the full-attention layers use none.
+Checked against a NumPy version of Hugging Face's `modeling_flint.py` (a dense layer, a sliding MoE layer and a full
+MoE layer; 2e-6), also split between a stand-in GPU and RAM. Its tokenizer's word splitting and its chat format
+(GLM-style, `<|user|>`) still need the real model files to check against.
+
 ## Speculative decoding
 
 When a model doesn't fit in VRAM, generating a token is limited by how fast its weights in RAM can be read: a dense
@@ -257,6 +315,44 @@ used to hold whole expert layers. Now it holds the **most-used experts of any la
 
 The tests run every MoE model with made-up usage counts at many VRAM sizes, so layers end up whole, split or absent,
 and compare with the reference (exact on the stand-in GPU).
+
+### Live hot experts (following the conversation)
+
+The learned set describes the model's average use, but a conversation has its own: a coding session leans on
+different experts than an email. With **Let the VRAM experts follow the conversation** (`live_experts` in
+`/api/load`, also tried by **Find the fastest settings** as a fourth split mode), the VRAM experts keep changing
+while the model runs:
+
+- **Everything stays in RAM too.** A split layer's RAM part keeps every expert at its own index, plus the zero
+  expert, instead of only the ones not in VRAM. This costs RAM (the VRAM experts are held twice), but any expert can
+  move into VRAM, or leave it, by one copy from RAM, without reading the model file again. The lookup tables just
+  change: an expert in VRAM points at its VRAM slot and at the RAM part's zero expert.
+- **Kept in the file's layout, and only if RAM has room.** The RAM part stays in the model file's layout (not
+  ggml's repacked one, which can't be read back), so each expert is one slice to copy. If RAM can't hold the second
+  copy with plenty to spare (8 GB, or 15% of RAM if more), the model loads with the fixed set instead and says so:
+  near full, Windows starts moving memory to disk and everything slows down (on a 64 GB RTX 5090 PC,
+  Qwen3-Coder-Next went from 67 to 19 tok/s that way, and stayed slow until tierlm was restarted).
+- **Scores.** Each split layer keeps one score per expert. It starts from the learned counts (scaled so the busiest
+  counts as about 3 recent picks; with nothing learned yet, every expert starts even, so live mode works from the
+  first load). After every step each pick adds 1, and all scores fade by 3% per token, so the last few dozen tokens
+  matter most.
+- **Swapping.** After each step, the best-scoring expert in RAM replaces the worst-scoring one in VRAM if it
+  clearly beats it (more than 1.3x its score + 0.5). Without that margin, two experts of about equal use would
+  keep trading places. At most 2 swaps per layer and 32 MB of copying per step (`TIERLM_LIVE_PER_LAYER`,
+  `TIERLM_LIVE_MB`); each step starts at a different layer, so every layer gets its turn. The copy happens after the
+  step's work has finished and under the device lock, so no running graph is reading the slot.
+- **Same answers.** Each pick is still computed in whichever part holds it, so the result equals the unsplit
+  model, whichever experts are in VRAM at the time. The tests run every MoE model (and Qwen3.5/Qwen3-Next with
+  speculation and saved conversations) with `TIERLM_LIVE_EAGER=1`, which swaps at every chance, and compare with the
+  reference.
+- **Watching it.** `/api/info` reports `live`: picks, picks served from VRAM, swaps and time spent copying. Model
+  info shows the share served from VRAM, and the expert map's rings move as experts come and go.
+
+This is our own design, inspired by the expert VRAM cache that landed in llama.cpp this autumn (`--moe-cache-mib`,
+off by default there). The difference: theirs starts empty and fills from what's picked. Ours starts from what
+tierlm learned about the model, adds a fading score with a swap margin, and keeps the whole model in RAM so an
+expert can leave VRAM without any bookkeeping on the CPU side. Not done yet: having the CPU compute a step's RAM picks
+while the GPU computes its VRAM picks (see "CPU and GPU on the same layer at once" below).
 
 ## Several GPUs
 

@@ -23,6 +23,9 @@ CASES = {
     "olmoe":     ("olmoe",    dict(E=48, H=4, KV=4, HD=12, FFX=24, NE=8, NU=2, qkn="full")),
     # gpt-oss: biases everywhere, attention sinks, a sliding window on every other layer, YaRN, clamped SwiGLU
     "gpt-oss":   ("gpt-oss",  dict(E=48, H=4, KV=2, HD=16, FFX=24, NE=8, NU=2, oss=True)),
+    # Flint: a dense first layer, then experts scored by a sigmoid (renormalised) plus an ungated shared expert;
+    # attention sinks everywhere, per-head QK-norm, and only the sliding-window layer rotates positions
+    "flint":     ("flint",    dict(E=48, H=4, KV=2, HD=16, FF=40, FFX=24, FS=32, NE=8, NU=2, qkn="head", renorm=True, flint=True, L=3)),
 }
 SWA, YARN_FACTOR, YARN_ORIG = 8, 32.0, 256   # window (tokens) and YaRN settings of the tiny gpt-oss
 
@@ -31,7 +34,7 @@ def make(arch, s, seed, parts=1):
     E, H, KV, HD = s["E"], s["H"], s["KV"], s["HD"]
     r = lambda *sh: (rng.standard_normal(sh) * 0.2).astype(np.float32)
     nw = lambda n: (1.0 + rng.standard_normal(n) * 0.1).astype(np.float32)
-    L = 2
+    L = s.get("L", 2)
     W = {"token_embd.weight": r(V, E), "output_norm.weight": nw(E)}
     if not s.get("tied"): W["output.weight"] = r(V, E)
     if s.get("freqs"): W["rope_freqs.weight"] = (1.0 + rng.random(HD // 2) * 3).astype(np.float32)
@@ -43,12 +46,16 @@ def make(arch, s, seed, parts=1):
         if s.get("oss"):
             W.update({b + "attn_q.bias": r(H * HD), b + "attn_k.bias": r(KV * HD), b + "attn_v.bias": r(KV * HD),
                       b + "attn_output.bias": r(E), b + "attn_sinks.weight": (rng.standard_normal(H) * 2).astype(np.float32)})
+        if s.get("flint"): W[b + "attn_sinks.weight"] = (rng.standard_normal(H) * 2).astype(np.float32)
         if s.get("bias"):
             W.update({b + "attn_q.bias": r(H * HD), b + "attn_k.bias": r(KV * HD), b + "attn_v.bias": r(KV * HD)})
         if s.get("qkn") == "full": W.update({b + "attn_q_norm.weight": nw(H * HD), b + "attn_k_norm.weight": nw(KV * HD)})
         if s.get("qkn") == "head": W.update({b + "attn_q_norm.weight": nw(HD), b + "attn_k_norm.weight": nw(HD)})
-        if "NE" in s:
+        if "NE" in s and not (s.get("flint") and i == 0):
             NE, F = s["NE"], s["FFX"]
+            if s.get("flint"):
+                FS = s["FS"]
+                W.update({b + "ffn_gate_shexp.weight": r(FS, E), b + "ffn_up_shexp.weight": r(FS, E), b + "ffn_down_shexp.weight": r(E, FS)})
             W.update({b + "ffn_gate_inp.weight": r(NE, E), b + "ffn_gate_exps.weight": r(NE, F, E),
                       b + "ffn_up_exps.weight": r(NE, F, E), b + "ffn_down_exps.weight": r(NE, E, F)})
             if s.get("oss"):                    # big enough that the SwiGLU clamp at 7 is reached sometimes
@@ -64,13 +71,20 @@ def make(arch, s, seed, parts=1):
     w.add_block_count(L); w.add_embedding_length(E); w.add_head_count(H); w.add_head_count_kv(KV)
     w.add_key_length(HD); w.add_value_length(HD); w.add_rope_dimension_count(HD)
     w.add_context_length(CTX); w.add_rope_freq_base(BASE); w.add_layer_norm_rms_eps(EPS)
+    if s.get("flint"):
+        w.add_uint32(f"{arch}.leading_dense_block_count", 1)
+        w.add_uint32(f"{arch}.attention.sliding_window", SWA)
+        w.add_array(f"{arch}.attention.sliding_window_pattern", [False, True, False])
+        w.add_array(f"{arch}.attention.rope_pattern", [False, True, False])
+        w.add_bool(f"{arch}.expert_weights_norm", True)
+        w.add_uint32(f"{arch}.expert_shared_feed_forward_length", s["FS"])
     if s.get("oss"):
         w.add_sliding_window(SWA)
         w.add_rope_scaling_type(gguf.RopeScalingType.YARN); w.add_rope_scaling_factor(YARN_FACTOR)
         w.add_rope_scaling_orig_ctx_len(YARN_ORIG)
     if "NE" in s:
         w.add_expert_count(s["NE"]); w.add_expert_used_count(s["NU"])
-        if arch == "qwen3moe": w.add_expert_feed_forward_length(s["FFX"]); w.add_feed_forward_length(s["FFX"] * 4)
+        if arch in ("qwen3moe", "flint"): w.add_expert_feed_forward_length(s["FFX"]); w.add_feed_forward_length(s.get("FF", s["FFX"] * 4))
         else: w.add_feed_forward_length(s["FFX"])
     else:
         w.add_feed_forward_length(s["FF"])
@@ -130,10 +144,12 @@ def reference(arch, s, W, L, ids):
         if s.get("qkn") == "full": q, k = rms(q, W[b + "attn_q_norm.weight"]), rms(k, W[b + "attn_k_norm.weight"])
         q, k, v = q.reshape(T, H, HD), k.reshape(T, KV, HD), v.reshape(T, KV, HD)
         if s.get("qkn") == "head": q, k = rms(q, W[b + "attn_q_norm.weight"]), rms(k, W[b + "attn_k_norm.weight"])
-        q, k = rope(q, pos, neox, factors) * mscale, rope(k, pos, neox, factors) * mscale
+        sliding = (s.get("oss") and i % 2 == 0) or (s.get("flint") and i == 1)
+        if not s.get("flint") or sliding:   # Flint: only its sliding-window layers rotate positions
+            q, k = rope(q, pos, neox, factors) * mscale, rope(k, pos, neox, factors) * mscale
         k, v = np.repeat(k, H // KV, axis=1), np.repeat(v, H // KV, axis=1)   # grouped-query attention
-        sc = np.einsum("qhd,khd->hqk", q, k) / np.sqrt(HD) + (swa_mask if s.get("oss") and i % 2 == 0 else mask)
-        if s.get("oss"):                    # sinks: one more logit per head in the softmax, then dropped
+        sc = np.einsum("qhd,khd->hqk", q, k) / np.sqrt(HD) + (swa_mask if sliding else mask)
+        if s.get("oss") or s.get("flint"):  # sinks: one more logit per head in the softmax, then dropped
             sink = np.broadcast_to(W[b + "attn_sinks.weight"].astype(np.float64)[:, None, None], (H, T, 1))
             att = softmax(np.concatenate([sc, sink], -1))[..., :-1]
         else:
@@ -143,8 +159,18 @@ def reference(arch, s, W, L, ids):
         if s.get("oss"): x = x + W[b + "attn_output.bias"]
         h = rms(x, W[b + ("post_attention_norm.weight" if s.get("oss") else "ffn_norm.weight")])
         silu = lambda z: z / (1 + np.exp(-z))
-        if "NE" not in s:
+        if "NE" not in s or (s.get("flint") and i == 0):
             x = x + (silu(h @ W[b + "ffn_gate.weight"].T) * (h @ W[b + "ffn_up.weight"].T)) @ W[b + "ffn_down.weight"].T
+            continue
+        if s.get("flint"):                  # sigmoid scores, top ones renormalised; plus the shared expert, ungated
+            p = 1 / (1 + np.exp(-(h @ W[b + "ffn_gate_inp.weight"].T)))
+            out = np.zeros_like(x)
+            for t in range(T):
+                top = np.argsort(-p[t], kind="stable")[:s["NU"]]
+                for e, wt in zip(top, p[t, top] / p[t, top].sum()):
+                    out[t] += wt * (W[b + "ffn_down_exps.weight"][e] @ (silu(W[b + "ffn_gate_exps.weight"][e] @ h[t]) * (W[b + "ffn_up_exps.weight"][e] @ h[t])))
+            sh = (silu(h @ W[b + "ffn_gate_shexp.weight"].T) * (h @ W[b + "ffn_up_shexp.weight"].T)) @ W[b + "ffn_down_shexp.weight"].T
+            x = x + out + sh
             continue
         if s.get("oss"):                    # top experts by score, softmax over those; biased, clamped SwiGLU experts
             sig = lambda z: 1 / (1 + np.exp(-z))
@@ -175,7 +201,7 @@ def reference(arch, s, W, L, ids):
 names = sys.argv[2:] or list(CASES)
 # With TIERLM_RPC set (a tierlm-rpc-server standing in for a GPU), every case also runs split between the
 # device and RAM at several VRAM budgets (fractions of the model size), and must give the same results.
-SPLITS = [(mode, f) for mode in ("layers", "experts") for f in (0.0, 0.15, 0.4, 0.7, 2.0)] if os.environ.get("TIERLM_RPC") else [None]
+SPLITS = [(mode, f) for mode in ("layers", "experts") for f in [float(x) for x in os.environ.get("TIERLM_TEST_FRACS", "0 0.15 0.4 0.7 2").split()]] if os.environ.get("TIERLM_RPC") else [None]
 
 # Two passes:
 #   exact   on the CPU with an f32 KV cache: the math itself, which must match the reference to ~1e-5.
@@ -200,11 +226,11 @@ for idx, name in enumerate(names):
       for label, env, tol in PASSES(split_env):
         worst, all_top = 0.0, True
         placement = ""
-        for mode in ([], ["--step"]):
+        for mode in ([], ["--step"], ["snapshot"]):   # snapshot: saved half way, restored after another conversation
             for ids in ([5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55], long_ids):
                 want = reference(arch, s, W, L, np.array(ids))
-                run = subprocess.run([sys.argv[1], path, *mode, *map(str, ids)], capture_output=True, text=True,
-                                     env={**os.environ, **env, "TIERLM_SHOW_PLACEMENT": "1"})
+                run = subprocess.run([sys.argv[1], path, *[m for m in mode if m != "snapshot"], *map(str, ids)], capture_output=True, text=True,
+                                     env={**os.environ, **env, "TIERLM_SHOW_PLACEMENT": "1", **({"TIERLM_SNAPSHOT": "1"} if mode == ["snapshot"] else {})})
                 if run.returncode != 0:
                     sys.exit(f"{name}: tierlm-logits failed: {run.stderr.strip()}")
                 placement = next((l for l in run.stderr.splitlines() if "VRAM" in l), "")

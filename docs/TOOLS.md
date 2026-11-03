@@ -130,6 +130,17 @@ RAM, then SSD. It prints GiB per role and tier, experts in VRAM per layer, and t
 token from each tier assuming even routing. This is a plan only: the tier loader that acts on it is not built
 yet.
 
+## tierlm-embed
+
+The embedding of a text from an embedding model (`bert`, `nomic-bert`), for scripts and tests:
+
+```
+tierlm-embed nomic-embed-text-v1.5.Q8_0.gguf "search_query: what is tierlm?"   # token ids, then the vector
+tierlm-embed model.gguf --ids 101,2023,102 -d auto                            # exactly these token ids, on the GPU if it fits
+```
+
+It prints the token ids and the pooled embedding (not normalised; `/v1/embeddings` normalises).
+
 ## tierlm-kv
 
 Dumps all metadata keys in a GGUF file (architecture settings, tokenizer type, vocabulary sizes, chat
@@ -166,7 +177,11 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_VRAM_MB=N` / `TIERLM_VRAM_BYTES=n[,n...]` | Tests: VRAM budget for `tierlm-logits`, in MiB, or in bytes per GPU |
 | `TIERLM_SPLIT=layers\|experts` | Tests: split mode for `tierlm-logits` |
 | `TIERLM_EXPERT_USAGE=seed` | Tests: made-up expert usage counts, so models load with hot experts (some layers whole, some split) |
-| `TIERLM_SHOW_PLACEMENT=1` | `tierlm-logits`: print where the model was placed (per GPU, and the hot-expert count) |
+| `TIERLM_SHOW_PLACEMENT=1` | `tierlm-logits`: print where the model was placed (per GPU, and the hot-expert count), and with live hot experts the picks served from VRAM and the swaps |
+| `TIERLM_LIVE_EXPERTS=1` | Load with live hot experts (as `live_experts` in `/api/load`); needs hot experts (usage counts) |
+| `TIERLM_LIVE_MB=32` / `TIERLM_LIVE_PER_LAYER=2` | Live hot experts: most MB copied into VRAM per step, most swaps per layer per step |
+| `TIERLM_LIVE_EAGER=1` | Tests: live hot experts swap at every chance (no margin), to exercise swapping |
+| `TIERLM_TEST_FRACS="0.4 0.6"` | `tests/tiny_models.py`: the VRAM sizes (fractions of the model) for split tests |
 | `GGML_VK_VISIBLE_DEVICES=0` | Choose which Vulkan GPU(s) ggml uses |
 | `VK_LOADER_DEBUG=error,warn` | Make the Vulkan loader explain driver problems |
 

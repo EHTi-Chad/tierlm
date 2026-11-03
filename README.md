@@ -16,8 +16,13 @@ CUDA, on **Windows** (ready-to-run download) and **Linux** (build from source; a
 RTX 5090 the 37 GB Qwen3.6-35B-A3B Q8_0 runs at about **94 tokens/second** in a normal chat. A web page lets you pick a model and chat, with a
 live dashboard showing speed, where the model lives, and the router picking experts.
 
-**New user? Read the [tierlm 0.5.0 guide (PDF)](docs/tierlm-0.5.0-guide.pdf)**: what tierlm is, step-by-step
-setup, every setting, how it works, and all test results, with diagrams.
+**New in 0.7.0:** an embedding model beside the chat model (for search and document comparison), conversations that
+stay cached for coding agents, a **+** button for files and folders, a fair queue when several people or apps use one
+tierlm, experts in VRAM that can follow the conversation, and Find the fastest settings choosing between all your
+GPUs and the best one alone. On one RTX 5090, the 59 GB gpt-oss-120b runs at 38.5 tok/s ([benchmarks](#benchmarks)).
+**[Inside the engine (PDF)](docs/tierlm-0.6.0-inside-the-engine.pdf)**
+walks through what tierlm's C++ does, step by step, with diagrams, code and an honest comparison with llama.cpp. New
+user? The [setup guide (PDF)](docs/tierlm-0.5.0-guide.pdf) covers installing, every setting and the test results.
 
 > **Status: early.** VRAM and RAM tiering works, down to individual experts; the SSD tier is next. Not every model
 > family is supported yet. See [Supported models](#supported-models) and the [roadmap](#roadmap).
@@ -94,7 +99,14 @@ decoding helps most.
   are served from fast memory. Whether that beats the plain split depends on the PC, so it is off by default and
   **Find the fastest settings** turns it on where it measures faster.
 - **Several GPUs**: with more than one card of the same kind (two NVIDIA cards with CUDA, say), the model fills the
-  first GPU, then the next, then RAM.
+  first GPU, then the next, then RAM. **Find the fastest settings** also measures the best card alone and keeps the
+  faster, since a much slower second card can cost more than its memory brings.
+- **Experts that follow the conversation** (optional): the experts in VRAM keep changing while you chat, a few per
+  word, copied from RAM, when RAM has plenty to spare. **Find the fastest settings** tries it.
+- **Requests wait in line**: several people or apps can share one tierlm; replies are written one at a time,
+  first come first served, and the chat shows your place in line.
+- **Conversations stay cached**: up to 8 recent conversations are kept in RAM, so a coding agent's side requests
+  don't make it read its long instructions again (45 s down to 4.5 s in an opencode-like test).
 - **Find the fastest settings**: one click loads the model and measures the settings that affect speed on this PC
   (split mode, CPU threads, speculative decoding and how far ahead to guess), then keeps the fastest. It measures
   exactly the way a chat runs, with your sampling settings, so its numbers are the speed you get in chats.
@@ -107,15 +119,19 @@ decoding helps most.
   each read of its weights from RAM produces more than one token. Same answers, faster replies; most useful when the
   model doesn't fit in VRAM. Plus **8-bit and 4-bit context memory** (KV cache) to fit more of the model in VRAM.
 - **Workspace**: let the model read, search and (with your approval of each diff) change the files of a project
-  folder, from tierlm's own chat.
-- **OpenAI-compatible API** (`/v1/models`, `/v1/chat/completions`, streamed or not, with tool calling): Open WebUI,
+  folder, from tierlm's own chat. The **+** under the message box attaches text and code files to a message, or
+  turns the workspace on.
+- **Two models at once**: an **embedding model** (nomic-embed-text, bge, all-MiniLM) stays loaded next to the chat
+  model, for search and document comparison through `/v1/embeddings`, as in LM Studio. The two take turns on the GPU
+  one step at a time, so embedding requests don't wait for a chat reply to finish.
+- **OpenAI-compatible API** (`/v1/models`, `/v1/chat/completions`, streamed or not, with tool calling, and `/v1/embeddings`): Open WebUI,
   Continue, LibreChat, coding agents such as opencode and Cline, and anything built on the OpenAI SDK can use tierlm.
   An **Allow other devices** switch and an optional API key control who can connect. See [docs/API.md](docs/API.md) and [Connect other apps](docs/GETTING_STARTED.md#connect-other-apps).
 
 ## Benchmarks
 
 **gpt-oss-120b on one RTX 5090: a 59 GB model on a 32 GB card.** RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB
-DDR5-6000, Windows 11, tierlm 0.7 development build. gpt-oss-120b MXFP4 (2 files, 59.0 GiB), 64K context, CUDA:
+DDR5-6000, Windows 11, tierlm 0.7.0. gpt-oss-120b MXFP4 (2 files, 59.0 GiB), 64K context, CUDA:
 attention, routers and the context in VRAM (25.0 GiB of the model), the experts that don't fit in RAM (34.0 GiB),
 computed by the CPU. No second GPU.
 
@@ -128,6 +144,21 @@ computed by the CPU. No second GPU.
 ![gpt-oss-120b chatting at 38.5 tok/s on one RTX 5090](docs/images/gpt-oss-120b-rtx5090-chat.png)
 
 ![The setup screen: where the 59 GB model goes, and Find the fastest settings](docs/images/gpt-oss-120b-rtx5090-setup.png)
+
+**Qwen3-Coder-Next 80B-A3B (Q4_K_M, 45 GB) on the same PC (0.7.0)**, 256K context, measured by **Find the fastest
+settings**, with an RTX 2070 Super (8 GB) added as a second card:
+
+| Split mode | Generation |
+|---|---|
+| Whole layers, both cards | 32.4 tok/s |
+| Experts in RAM, both cards | 44.4 tok/s |
+| Experts in RAM, RTX 5090 alone | 60.5 tok/s |
+| **Experts in RAM, busiest experts in VRAM, RTX 5090 alone** | **63.8 tok/s** |
+| Experts in RAM, VRAM experts following the conversation, RTX 5090 alone | 57.0 tok/s |
+
+The much slower second card cost more than its 8 GB brought, and keeping the busiest experts in VRAM (which works with
+one card for now) is what wins here, so tierlm picks the 5090 alone. With 128K context (3 GB less KV cache, more VRAM
+for experts) it measured 66.7 tok/s.
 
 **RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB DDR5, Windows 11 (0.5.1):** Qwen3.6-35B-A3B Q8_0 (lmstudio-community,
 37 GB file, 34.4 GiB), 32K context, CUDA, attention in VRAM and experts split between VRAM and RAM:
@@ -274,7 +305,11 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | Qwen3.5 / 3.6 / 3.8 dense (`qwen35`, hybrid Gated DeltaNet) | Qwen3.6-27B (Unsloth MTP Q4_K_M) on an RTX 3070 laptop, with speculative decoding |
 | Qwen3.5 / 3.6 MoE (`qwen35moe`, e.g. Qwen3.6-35B-A3B) | Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
 | Qwen3-Next / Qwen3-Coder-Next (`qwen3next`, 80B-A3B) | model math verified, real weights not yet tested |
+| Flint (`flint`: Flint 40B-A2.5B) | model math verified (sigmoid router, dense first layers, sinks, rotation only on sliding layers); tokenizer splitting and chat format pending the real files |
 | gpt-oss (`gpt-oss`: gpt-oss-20b, gpt-oss-120b, HyperNova-60B, ...) | gpt-oss-120b MXFP4 on one RTX 5090 with 34 GB of it in RAM (38.5 tok/s in a chat), gpt-oss-20b on an RTX 5090 (about 270 tok/s); model math verified, including OpenAI's chat format and tools |
+
+Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-MiniLM, e5) and Nomic
+(`nomic-bert`: nomic-embed-text v1, v1.5), model math and tokenizer verified, real-model test pending.
 
 Not yet: Gemma, Phi, DeepSeek, Nemotron and others. The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
@@ -329,7 +364,8 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 
 ## Documentation
 
-- **[docs/tierlm-0.5.0-guide.pdf](docs/tierlm-0.5.0-guide.pdf)**: the full guide with diagrams and test results
+- **[docs/tierlm-0.6.0-inside-the-engine.pdf](docs/tierlm-0.6.0-inside-the-engine.pdf)**: what the engine does, part by part, with diagrams, code and a comparison with llama.cpp
+- [docs/tierlm-0.5.0-guide.pdf](docs/tierlm-0.5.0-guide.pdf): the setup guide with every setting and test results
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): download, run, and use tierlm (no programming needed)
 - [docs/FAQ.md](docs/FAQ.md): questions and troubleshooting
 - [docs/BUILD.md](docs/BUILD.md): building on Windows and Linux, GPU backends, making a release
@@ -368,11 +404,17 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Speculative decoding with the built-in MTP draft layer; 8-bit and 4-bit KV cache
 - [x] Prompt-lookup guessing (free guesses for code and edits, every model)
 - [ ] Activation sparsity for dense models
+- [x] Embedding models beside the chat model (nomic-embed-text, bge, all-MiniLM, e5) with `/v1/embeddings`
+- [x] Saved conversations for coding agents; a fair queue for several users; experts that follow the conversation
+- [ ] Several replies written at once, sized to the hardware (a Connections setting with a recommendation)
+- [ ] Image input (vision), so scanned documents can be read; speech to text
+- [ ] The busiest experts in VRAM across two different GPUs (a fast card and a slower one each doing what suits it)
+- [ ] Flint 40B-A2.5B: tokenizer and chat format (the model itself is in and checked)
 
 ## Credits and licence
 
 - Code: written by Claude (Anthropic), directed and tested by Chad Jameson (EHTi).
 - tierlm is released under the [MIT License](LICENSE). Copyright (c) 2026 Chad Jameson (EHTi).
-- Third-party components (ggml, cpp-httplib, nlohmann/json) keep their own MIT licences; see
+- Third-party components (ggml, cpp-httplib, nlohmann/json, KaTeX) keep their own MIT licences; see
   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - Model weights are not included and have their own licences.

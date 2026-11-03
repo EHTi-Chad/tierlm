@@ -127,8 +127,22 @@ int main(int argc, char** argv) {
             m->eval_ex(ids.data() + np, nb, nt, nb, true, nb);
             m->accept(keep);
             lg = m->eval({ids.back()}, nt);
+        } else if (!step && std::getenv("TIERLM_SNAPSHOT")) {
+            // Save the conversation half way, read a different one, bring the first back and finish it: the result
+            // must be the same as reading it straight through.
+            const size_t h = ids.size() / 2;
+            m->eval(std::vector<int32_t>(ids.begin(), ids.begin() + h), nt);
+            Model::Snapshot snap = m->save();
+            m->reset();
+            m->eval(std::vector<int32_t>(ids.rbegin(), ids.rend()), nt);
+            m->restore(snap);
+            lg = m->eval(std::vector<int32_t>(ids.begin() + h, ids.end()), nt);
         } else if (!step) lg = m->eval(ids, nt);
         else for (int32_t id : ids) lg = m->eval({id}, nt);
+        if (m->live_hot() && std::getenv("TIERLM_SHOW_PLACEMENT")) {
+            const auto& ls = m->live_stats();
+            std::fprintf(stderr, "live experts: %lld picks, %lld served from VRAM, %lld swaps\n", ls.picks, ls.hits, ls.swaps);
+        }
         for (float v : lg) std::printf("%.6g\n", v);
         return 0;
     } catch (const std::exception& e) {

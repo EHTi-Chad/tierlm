@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
             for (int32_t x; ss >> x;) want.push_back(x);
 
             auto got = tok.encode(text);
-            bool round = tok.decode(got) == text;
+            bool round = tok.wordpiece() || tok.decode(got) == text;   // WordPiece lower-cases: no exact round trip
             if (got == want && round) { ++pass; continue; }
             ++fail;
             std::printf("FAIL \"%s\"\n  want: %s\n  got:  %s\n  round-trip: %s\n",

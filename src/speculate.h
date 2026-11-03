@@ -61,6 +61,11 @@ public:
     // The guesses prompt lookup makes after context `ctx` (exposed for testing).
     std::vector<int32_t> lookup_guesses(const std::vector<int32_t>& ctx, int n) const;
 
+    // The draft block's view of the conversation, saved and restored with the model's (Model::Snapshot).
+    struct State { std::vector<float> h_last; int h_pos = -1, mtp_valid = 0; };
+    State state() const { return {h_last_, h_pos_, mtp_valid_}; }
+    void set_state(const State& s) { h_last_ = s.h_last; h_pos_ = s.h_pos; mtp_valid_ = s.mtp_valid; }
+
     const SpecStats& stats() const { return st_; }
     void reset_stats() { st_ = SpecStats(); }
 

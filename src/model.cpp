@@ -20,7 +20,7 @@
 
 namespace tierlm {
 
-static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss" };
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint" };
 bool arch_supported(const std::string& arch) {
     for (const char* a : kArchs) if (arch == a) return true;
     return false;
@@ -247,11 +247,11 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     }
     // The variations
     hp.rope_neox     = arch != "llama";
-    hp.qk_norm       = arch == "olmoe" ? Hparams::kFull : (arch == "qwen3" || arch == "qwen3moe") ? Hparams::kPerHead : Hparams::kNone;
+    hp.qk_norm       = arch == "olmoe" ? Hparams::kFull : (arch == "qwen3" || arch == "qwen3moe" || arch == "flint") ? Hparams::kPerHead : Hparams::kNone;
     hp.qkv_bias      = arch == "qwen2" || arch == "gpt-oss";
     hp.expert_renorm = arch == "qwen3moe" || arch == "qwen35moe" || arch == "qwen3next" || arch == "llama";   // OLMoE doesn't renormalise
     hp.expert_scale  = f32(arch + ".expert_weights_scale", 0.0f);
-    if (arch == "qwen3moe" || arch == "qwen35moe" || arch == "qwen3next") {
+    if (arch == "qwen3moe" || arch == "qwen35moe" || arch == "qwen3next" || arch == "flint") {
         int64_t id = gguf_find_key(g, (arch + ".expert_weights_norm").c_str());
         if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL) hp.expert_renorm = gguf_get_val_bool(g, id);
     }
@@ -271,6 +271,30 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             const int pattern = pid >= 0 ? (int)u32(arch + ".attention.sliding_window_pattern", false) : 2;
             for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = pattern <= 0 || i % pattern < pattern - 1;
         }
+    }
+    if (arch == "flint") {
+        // Flint (Recursive): experts scored by a sigmoid, the top ones' scores renormalised; the first layers dense;
+        // sliding-window layers (with attention sinks, as gpt-oss) and full-attention layers, and only the sliding
+        // ones rotate positions: the full-attention layers use none.
+        hp.expert_sigmoid = true;
+        if (gguf_find_key(g, (arch + ".expert_gating_func").c_str()) >= 0 && u32(arch + ".expert_gating_func", false) == 1)
+            hp.expert_sigmoid = false;                                // (1 = softmax)
+        hp.n_dense_lead = (int)u32(arch + ".leading_dense_block_count", false);
+        hp.n_swa = u32(arch + ".attention.sliding_window", false);
+        auto bools = [&](const std::string& key, std::vector<bool>& out) {
+            const int64_t id = gguf_find_key(g, key.c_str());
+            if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(g, id) != GGUF_TYPE_BOOL) return false;
+            const bool* d = (const bool*)gguf_get_arr_data(g, id);
+            out.assign(hp.n_layer, false);
+            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, id); ++i) out[i] = d[i];
+            return true;
+        };
+        if (!bools(arch + ".attention.sliding_window_pattern", hp.swa)) {   // Hugging Face's default layout
+            hp.swa.assign(hp.n_layer, false);
+            for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = !(i < 2 || i % 4 == 1 || i == hp.n_layer - 1);
+        }
+        if (!bools(arch + ".attention.rope_pattern", hp.rope_layer)) hp.rope_layer = hp.swa;
+        if (hp.n_swa <= 0) hp.swa.assign(hp.n_layer, false);
     }
     if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") {
         hp.hybrid = true;
@@ -449,7 +473,9 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     const std::vector<float>& usage = opt.expert_usage.empty() ? usage_env : opt.expert_usage;
     // (Not yet for experts with biases, gpt-oss: the split doesn't divide the bias tensors; whole expert layers then.)
     hp.expert_bias = ggml_get_tensor(m->wctx_, "blk.0.ffn_down_exps.bias") != nullptr;
-    const bool use_hot = G == 1 && !by_layer && hp.is_moe() && !hp.expert_bias && usage.size() == (size_t)hp.n_layer * E;
+    const bool use_hot = G == 1 && !by_layer && hp.is_moe() && !hp.expert_bias && hp.n_dense_lead == 0 && usage.size() == (size_t)hp.n_layer * E;
+    bool live = use_hot && (opt.live_hot || std::getenv("TIERLM_LIVE_EXPERTS"));
+    const size_t budget0 = budget;                                    // VRAM for weights before anything is placed
     std::vector<std::vector<int>> hot_ids(hp.n_layer);
     bool hot_decided = false;
     auto choose_hot = [&]() {
@@ -501,7 +527,32 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 kv_decided = true;
             }
             if (use_hot && gr.prio == 4 && gr.layer >= 0 && gr.layer < hp.n_layer) {
-                if (!hot_decided) { choose_hot(); hot_decided = true; }
+                if (!hot_decided) {
+                    choose_hot();
+                    hot_decided = true;
+                    // Live: the RAM part keeps a second copy of every VRAM expert. Only if RAM has room for it with
+                    // plenty to spare (8 GB, or 15% of RAM if more): close to full, Windows starts moving memory to
+                    // disk and everything slows down (an RTX 5090 PC with 64 GB went from 67 to 19 tok/s, and stayed
+                    // slow until restarted). Otherwise the fixed set, which is just as fast as hot experts.
+                    if (live) {
+                        size_t all = 0, extra = 0, free_ram = 0, total_ram = 0;
+                        for (const Group& g2 : groups) all += g2.bytes;
+                        for (const Group& g2 : groups)
+                            if (g2.prio == 4 && g2.layer >= 0 && g2.layer < hp.n_layer) {
+                                const size_t H2 = hot_ids[g2.layer].size();
+                                if (H2 > 0 && (int)H2 < E) extra += g2.bytes / E * H2;
+                            }
+                        if (ggml_backend_dev_t cd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))
+                            ggml_backend_dev_memory(cd, &free_ram, &total_ram);
+                        const size_t spare = std::max((size_t)8 << 30, (size_t)(total_ram * 0.15));
+                        const size_t need = (all > budget0 ? all - budget0 : 0) + extra + spare;
+                        if (free_ram && need > free_ram) {
+                            std::fprintf(stderr, "live hot experts: off, RAM is too small for the second copy of the VRAM experts "
+                                         "(needs about %.1f GB, %.1f GB free); using the fixed set\n", need / 1e9, free_ram / 1e9);
+                            live = false;
+                        }
+                    }
+                }
                 const int H = (int)hot_ids[gr.layer].size();
                 if (H == E || H == 0) { for (ggml_tensor* t : gr.t) (H ? on_gpu : on_cpu).push_back(t); continue; }
                 HotLayer& hl = hot_layers[gr.layer];
@@ -509,7 +560,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 for (ggml_tensor* t : gr.t) {
                     const std::string nm = ggml_get_name(t);
                     ggml_tensor* th = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], H + 1);
-                    ggml_tensor* tc = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], E - H + 1);
+                    ggml_tensor* tc = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], live ? E + 1 : E - H + 1);
                     ggml_set_name(th, (nm + ".hot").c_str());
                     ggml_set_name(tc, (nm + ".cold").c_str());
                     on_gpu.push_back(th);
@@ -609,7 +660,10 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 const std::string n = ggml_get_name(t);
                 const bool matmul = ggml_n_dims(t) >= 2 && t->ne[1] > 1 && n.find("embd") == std::string::npos &&
                                     n.find("embed") == std::string::npos && n.find("norm") == std::string::npos &&
-                                    n.find("conv1d") == std::string::npos && n.find("tier_") == std::string::npos;
+                                    n.find("conv1d") == std::string::npos && n.find("tier_") == std::string::npos &&
+                                    // live hot experts copy experts out of the RAM part into VRAM, which needs the
+                                    // file's layout (a repacked tensor can't be read back)
+                                    !(live && n.size() > 5 && n.compare(n.size() - 5, 5, ".cold") == 0);
                 bool ok = false;
                 if (matmul) {                             // would the CPU engine run a multiply with it repacked?
                     ggml_reset(tc);
@@ -686,6 +740,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         std::vector<char> is_hot(E, 0);
         for (int k = 0; k < H; ++k) { mh[hl.ids[k]] = k; mk[hl.ids[k]] = 1.0f; is_hot[hl.ids[k]] = 1; }
         for (int e = 0; e < E; ++e) if (!is_hot[e]) mc[e] = ci++;
+        if (live) for (int e = 0; e < E; ++e) mc[e] = is_hot[e] ? E : e;   // live: the RAM part holds every expert at its own index
         ggml_backend_tensor_set(hl.map_hot, mh.data(), 0, ggml_nbytes(hl.map_hot));
         ggml_backend_tensor_set(hl.map_cold, mc.data(), 0, ggml_nbytes(hl.map_cold));
         ggml_backend_tensor_set(hl.mask, mk.data(), 0, ggml_nbytes(hl.mask));
@@ -705,7 +760,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             std::vector<char> hb(ggml_nbytes(sp.hot), 0), cb(ggml_nbytes(sp.cold), 0);   // the last expert of each stays zero
             std::vector<char> is_hot(E, 0);
             for (int k = 0; k < (int)hl.ids.size(); ++k) { std::memcpy(hb.data() + (size_t)k * per, chunk.data() + (size_t)hl.ids[k] * per, per); is_hot[hl.ids[k]] = 1; }
-            for (int e = 0, ci = 0; e < E; ++e)
+            if (live) std::memcpy(cb.data(), chunk.data(), (size_t)E * per);
+            else for (int e = 0, ci = 0; e < E; ++e)
                 if (!is_hot[e]) std::memcpy(cb.data() + (size_t)ci++ * per, chunk.data() + (size_t)e * per, per);
             ggml_backend_tensor_set(sp.hot, hb.data(), 0, hb.size());
             ggml_backend_tensor_set(sp.cold, cb.data(), 0, cb.size());
@@ -750,10 +806,28 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             else if (nm.find("ffn_down_exps") != std::string::npos) { L.down_xh = sp.hot; L.down_xc = sp.cold; }
         }
         L.map_hot = it->second.map_hot; L.map_cold = it->second.map_cold; L.hot_mask = it->second.mask;
+        if (live) {                                                   // the starting set; adapt_hot moves experts from here
+            LiveLayer ll;
+            ll.layer = i;
+            ll.H = (int)it->second.ids.size();
+            ll.slot_of.assign((size_t)std::max(E, 0), -1);
+            ll.in_slot = it->second.ids;
+            for (int k = 0; k < ll.H; ++k) ll.slot_of[ll.in_slot[k]] = k;
+            // Learned use as the starting score, scaled so the busiest expert counts as a few recent picks: the
+            // conversation takes over within a few dozen tokens.
+            float mx = 0;
+            for (int e = 0; e < E; ++e) mx = std::max(mx, usage[(size_t)i * E + e]);
+            ll.score.assign((size_t)std::max(E, 0), 0.0f);
+            for (int e = 0; e < E; ++e) ll.score[e] = mx > 0 ? 3.0f * usage[(size_t)i * E + e] / mx : 0.0f;
+            for (const HotSplit& sp : it->second.parts) ll.parts.push_back({sp.hot, sp.cold});
+            ll.map_hot = it->second.map_hot; ll.map_cold = it->second.map_cold; ll.mask = it->second.mask;
+            m->live_.push_back(std::move(ll));
+        }
     };
     auto bind_layer = [&](int i) {
         const std::string b = "blk." + std::to_string(i) + ".";
         Layer L;
+        L.index = i;
         L.attn_norm = T(b + "attn_norm.weight");
         L.recurrent = hp.is_recurrent(i);
         if (L.recurrent) {                                            // Gated DeltaNet layer
@@ -791,7 +865,10 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         }
         L.ffn_norm  = T(b + "ffn_norm.weight", false);                 // called post_attention_norm in some families
         if (!L.ffn_norm) L.ffn_norm = T(b + "post_attention_norm.weight");
-        if (hp.is_moe()) {
+        if (i < (int)hp.rope_layer.size()) L.rope = hp.rope_layer[i];
+        if (hp.is_moe() && i >= hp.n_dense_lead) {
+            if (T(b + "exp_probs_b.bias", false))
+                throw std::runtime_error("this model's router has expert biases, which tierlm doesn't support yet");
             L.router = T(b + "ffn_gate_inp.weight");
             L.gate_up_x = T(b + "ffn_gate_up_exps.weight", false);      // gate and up stored together (newer files)
             if (!L.gate_up_x) {
@@ -804,12 +881,12 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             L.gate_xb  = T(b + "ffn_gate_exps.bias", false);
             L.up_xb    = T(b + "ffn_up_exps.bias", false);
             L.down_xb  = T(b + "ffn_down_exps.bias", false);
-            // Shared expert (Qwen3.5/3.6 MoE): runs on every token, scaled by its own sigmoid gate.
+            // Shared expert: runs on every token, scaled by its own sigmoid gate (Qwen3.5/3.6 MoE) or added in full (Flint).
             L.up_s = T(b + "ffn_up_shexp.weight", false);
             if (L.up_s) {
                 L.gate_s     = T(b + "ffn_gate_shexp.weight");
                 L.down_s     = T(b + "ffn_down_shexp.weight");
-                L.gate_inp_s = T(b + "ffn_gate_inp_shexp.weight");
+                L.gate_inp_s = T(b + "ffn_gate_inp_shexp.weight", false);
             }
         } else {
             L.gate = T(b + "ffn_gate.weight");
@@ -933,6 +1010,46 @@ void Model::truncate(int n) {
     n_past_ = n < 0 ? 0 : n;
 }
 
+// The KV cache keeps position p at offset p * nb[2] in each K and V tensor, so the first n_past positions are one
+// contiguous block; DeltaNet layers' memories are small and copied whole.
+Model::Snapshot Model::save() const {
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    Snapshot s;
+    s.n_past = n_past_;
+    auto grab = [&](ggml_tensor* t, size_t n) {
+        s.parts.emplace_back(n);
+        if (n) ggml_backend_tensor_get(t, s.parts.back().data(), 0, n);
+        s.bytes += n;
+    };
+    auto layer = [&](const Layer& L) {
+        if (L.conv_state) { grab(L.conv_state, ggml_nbytes(L.conv_state)); grab(L.ssm_state_t, ggml_nbytes(L.ssm_state_t)); }
+        if (L.k_cache) { grab(L.k_cache, (size_t)n_past_ * L.k_cache->nb[2]); grab(L.v_cache, (size_t)n_past_ * L.v_cache->nb[2]); }
+    };
+    for (const auto& L : layers_) layer(L);
+    if (mtp_) layer(*mtp_);
+    return s;
+}
+
+void Model::restore(const Snapshot& s) {
+    release_pending();
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    size_t i = 0;
+    auto put = [&](ggml_tensor* t) {
+        if (i >= s.parts.size()) throw std::runtime_error("saved conversation doesn't match this model");
+        const auto& p = s.parts[i++];
+        if (p.size() > ggml_nbytes(t)) throw std::runtime_error("saved conversation doesn't match this model");
+        if (!p.empty()) ggml_backend_tensor_set(t, p.data(), 0, p.size());
+    };
+    auto layer = [&](const Layer& L) {
+        if (L.conv_state) { put(L.conv_state); put(L.ssm_state_t); }
+        if (L.k_cache) { put(L.k_cache); put(L.v_cache); }
+    };
+    for (const auto& L : layers_) layer(L);
+    if (mtp_) layer(*mtp_);
+    if (i != s.parts.size()) throw std::runtime_error("saved conversation doesn't match this model");
+    n_past_ = s.n_past;
+}
+
 const char* Model::kv_type() const { return ggml_type_name((ggml_type)kv_t_); }
 
 bool Model::integrated_gpu() const {
@@ -972,8 +1089,10 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
         }
         const int mode = hp.rope_neox ? GGML_ROPE_TYPE_NEOX : 0;
         ggml_tensor* ff = g.rope_ff ? g.rope_ff : rope_freqs_;           // YaRN (computed) or Llama 3.1 factors (file)
-        q = ggml_rope_ext(c, q, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
-        k = ggml_rope_ext(c, k, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+        if (L.rope) {                                                        // (Flint's full-attention layers: no positions)
+            q = ggml_rope_ext(c, q, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+            k = ggml_rope_ext(c, k, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+        }
 
         // Write this batch's keys/values into the cache at their positions (g.pos: n_past, n_past + 1, ...).
         // Written by index rather than into a view at n_past, so the graph is the same from one token to the
@@ -1063,8 +1182,8 @@ static void skip_zero_ids(ggml_tensor* dst, const ggml_tensor* a, int ith, int n
 
 ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing) {
     const Hparams& hp = hp_;
-        if (!hp.is_moe()) {
-            // ---- dense SwiGLU feed-forward ----
+        if (!L.router) {
+            // ---- dense SwiGLU feed-forward (dense models, and Flint's first layers) ----
             ggml_tensor* act = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, L.gate, h)), ggml_mul_mat(c, L.up, h));
             return ggml_mul_mat(c, L.down, act);
         }
@@ -1073,13 +1192,14 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         if (L.router_b) scores = ggml_add(c, scores, L.router_b);
         // Most families: softmax over all experts, then the top ones' probabilities. gpt-oss: the top scores, then
         // softmax over just those (same top experts either way: softmax keeps the order).
-        ggml_tensor* probs = hp.expert_softmax_first ? ggml_soft_max(c, scores) : scores;
+        ggml_tensor* probs = hp.expert_sigmoid ? ggml_sigmoid(c, scores)          // Flint: each expert's own sigmoid
+                           : hp.expert_softmax_first ? ggml_soft_max(c, scores) : scores;
         ggml_tensor* order = ggml_argsort(c, probs, GGML_SORT_ORDER_DESC);  // [n_expert, n_tok] best first
         ggml_tensor* sel   = ggml_view_2d(c, order, hp.n_expert_used, n_tok, order->nb[1], 0);   // top n_used
         // Routing for the dashboard and expert learning: just the chosen experts, copied out compactly. The rankings
         // themselves are not made outputs, so the GPU can still fuse the router's steps; all layers are joined and
         // read back in one go at the end (see build), instead of one GPU read per layer.
-        if (want_routing) g.orders.push_back(ggml_cont(c, sel));         // [n_used, n_tok]
+        if (want_routing) { g.orders.push_back(ggml_cont(c, sel)); g.order_layers.push_back(L.index); }   // [n_used, n_tok]
         ggml_tensor* w     = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, hp.n_expert, n_tok), sel); // [1, n_used, n_tok]
         if (!hp.expert_softmax_first)
             w = ggml_reshape_3d(c, ggml_soft_max(c, ggml_reshape_2d(c, w, hp.n_expert_used, n_tok)), 1, hp.n_expert_used, n_tok);
@@ -1172,8 +1292,8 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         if (L.up_s) {                                                        // shared expert
             ggml_tensor* sh = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, L.gate_s, h)), ggml_mul_mat(c, L.up_s, h));
             sh = ggml_mul_mat(c, L.down_s, sh);                              // [n_embd, n_tok]
-            ggml_tensor* sg = ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h));   // [1, n_tok]
-            moe = ggml_add(c, moe, ggml_mul(c, sh, sg));
+            if (L.gate_inp_s) sh = ggml_mul(c, sh, ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h)));   // gate: [1, n_tok]
+            moe = ggml_add(c, moe, sh);
         }
         return moe;
 }
@@ -1395,6 +1515,7 @@ Model::Graph Model::build_mtp(int n_tok, int n_past) {
 
 std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok, int pos0, int n_threads, std::vector<float>* h_out) {
     if (!mtp_) throw std::runtime_error("this model has no MTP draft block loaded");
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // another loaded model waits for this step
     if (pos0 + n_tok > max_ctx_) throw std::runtime_error("MTP: past the end of the context");
     release_pending();
     const Hparams& hp = hp_;
@@ -1468,12 +1589,15 @@ void Model::accept(int n_keep) {
 
 Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
                               std::vector<int32_t>* routing) {
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // another loaded model waits for this step
     release_pending();                                            // an unanswered check counts as fully accepted
     const Hparams& hp = hp_;
     const int n_past = n_past_, n_kv = n_past + n_tok;
     using clk = std::chrono::steady_clock;
     auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     auto t0 = clk::now();
+    std::vector<int32_t> live_routing;                            // live hot experts need the picks even if the caller doesn't
+    if (!routing && !live_.empty()) routing = &live_routing;
     Graph g = build(n_tok, n_past, routing != nullptr, n_logits, want_hidden, snapshots);
     g.n_tok = n_tok;
     auto t1 = clk::now();
@@ -1538,17 +1662,21 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
         ggml_backend_tensor_get(g.hidden, res.hidden.data(), 0, sizeof(float) * res.hidden.size());
     }
     if (routing) {
-        const int L = (int)g.orders.size(), K = hp.n_expert_used;
-        routing->assign((size_t)n_tok * L * K, 0);
-        if (g.routing) {                                                  // laid out [layer][token][pick]
-            std::vector<int32_t> buf((size_t)K * n_tok * L);
+        // [token][layer][pick] for every layer; layers without experts (Flint's dense first layers) get -1
+        const int L = hp.is_moe() ? hp.n_layer : 0, K = hp.n_expert_used, R = (int)g.orders.size();
+        routing->assign((size_t)n_tok * L * K, -1);
+        if (g.routing) {                                                  // laid out [moe layer][token][pick]
+            std::vector<int32_t> buf((size_t)K * n_tok * R);
             ggml_backend_tensor_get(g.routing, buf.data(), 0, sizeof(int32_t) * buf.size());
-            for (int l = 0; l < L; ++l)
+            for (int r = 0; r < R; ++r) {
+                const int l = g.order_layers[r];
                 for (int t = 0; t < n_tok; ++t)
                     for (int k = 0; k < K; ++k)
-                        (*routing)[((size_t)t * L + l) * K + k] = buf[((size_t)l * n_tok + t) * K + k];
+                        (*routing)[((size_t)t * L + l) * K + k] = buf[((size_t)r * n_tok + t) * K + k];
+            }
         }
     }
+    if (routing && !live_.empty()) adapt_hot(*routing, n_tok);
     if (snapshots > 1) { pending_ = new Graph(g); }              // kept for accept()
     else ggml_free(g.ctx);
     auto t5 = clk::now();
@@ -1559,6 +1687,84 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
     n_past_ = n_kv;
     if (std::getenv("TIERLM_PROFILE")) profile_step(n_tok, ms(t0, t3), ms(t3, t4), ms(t4, t5));
     return res;
+}
+
+
+// Live hot experts: after each step, count which experts the router picked in each split layer, and move the most
+// wanted ones that sit in RAM into VRAM in place of the least wanted ones there. Scores fade by 3% a token, so a
+// conversation's current topic counts most; a newcomer must beat the expert it replaces clearly (x1.3 + 0.5),
+// so two experts of about equal use don't keep swapping. Each step copies at most TIERLM_LIVE_MB (default 32 MB)
+// and two experts per layer, starting at a different layer each step so all get their turn. The copy is from the
+// RAM part (which holds every expert) into the VRAM slot; then the three small maps change. Results don't change:
+// each pick is computed in whichever part holds it, as with a fixed set. Called with the device lock held, after
+// the step's work is done, so no graph is using the slot.
+void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
+    const Hparams& hp = hp_;
+    const int E = hp.n_expert, K = hp.n_expert_used, NL = hp.n_layer;
+    static const size_t budget_bytes = [] { const char* e = std::getenv("TIERLM_LIVE_MB"); return (size_t)(e ? std::atof(e) : 32.0) * 1024 * 1024; }();
+    static const int per_layer = [] { const char* e = std::getenv("TIERLM_LIVE_PER_LAYER"); return e ? std::max(0, std::atoi(e)) : 2; }();
+    static const bool eager = std::getenv("TIERLM_LIVE_EAGER") != nullptr;   // tests: swap at every chance
+    if ((int)routing.size() < n_tok * NL * K) return;
+    // The RAM parts are kept in the file's layout in plain host memory (see the repack choice in load), so an expert
+    // is one contiguous slice to copy. Anything else is never read back (a repacked buffer can't be).
+    for (const LiveLayer& ll : live_)
+        for (const LivePart& p : ll.parts)
+            if (!ggml_backend_buffer_is_host(p.cold->buffer)) return;
+    const float decay = std::pow(0.97f, (float)n_tok);
+    for (LiveLayer& ll : live_) {
+        for (float& s : ll.score) s *= decay;
+        for (int t = 0; t < n_tok; ++t)
+            for (int k = 0; k < K; ++k) {
+                const int e = routing[((size_t)t * NL + ll.layer) * K + k];
+                if (e < 0 || e >= E) continue;
+                ll.score[e] += 1.0f;
+                live_stats_.picks++;
+                if (ll.slot_of[e] >= 0) live_stats_.hits++;
+            }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t spent = 0;
+    const int n = (int)live_.size();
+    static int start = 0;
+    start = n ? (start + 1) % n : 0;
+    bool any = false;
+    for (int j = 0; j < n && spent < budget_bytes; ++j) {
+        LiveLayer& ll = live_[(start + j) % n];
+        size_t per_expert = 0;
+        for (const LivePart& p : ll.parts) per_expert += p.hot->nb[2];
+        for (int s = 0; s < per_layer && spent + per_expert <= budget_bytes; ++s) {
+            int in = -1, out = -1;                               // the best expert in RAM, the worst in VRAM
+            for (int e = 0; e < E; ++e) {
+                if (ll.slot_of[e] < 0) { if (in < 0 || ll.score[e] > ll.score[in]) in = e; }
+                else if (out < 0 || ll.score[e] < ll.score[out]) out = e;
+            }
+            if (in < 0 || out < 0 || ll.score[in] <= (eager ? ll.score[out] : ll.score[out] * 1.3f + 0.5f)) break;
+            const int slot = ll.slot_of[out];
+            for (const LivePart& p : ll.parts) {
+                const size_t per = p.hot->nb[2];
+                const char* src = (const char*)p.cold->data + (size_t)in * per;
+                ggml_backend_tensor_set(p.hot, src, (size_t)slot * per, per);
+            }
+            const int32_t h_in = slot, h_out = ll.H, c_in = E, c_out = out;
+            const float m_in = 1.0f, m_out = 0.0f;
+            ggml_backend_tensor_set(ll.map_hot, &h_in, sizeof(int32_t) * in, sizeof(int32_t));
+            ggml_backend_tensor_set(ll.map_hot, &h_out, sizeof(int32_t) * out, sizeof(int32_t));
+            ggml_backend_tensor_set(ll.map_cold, &c_in, sizeof(int32_t) * in, sizeof(int32_t));
+            ggml_backend_tensor_set(ll.map_cold, &c_out, sizeof(int32_t) * out, sizeof(int32_t));
+            ggml_backend_tensor_set(ll.mask, &m_in, sizeof(float) * in, sizeof(float));
+            ggml_backend_tensor_set(ll.mask, &m_out, sizeof(float) * out, sizeof(float));
+            ll.slot_of[in] = slot; ll.slot_of[out] = -1; ll.in_slot[slot] = in;
+            spent += per_expert;
+            live_stats_.swaps++;
+            any = true;
+            if (ll.layer < (int)place_.hot.size()) {             // the dashboard's map of VRAM experts
+                auto& v = place_.hot[ll.layer];
+                v = ll.in_slot;
+                std::sort(v.begin(), v.end());
+            }
+        }
+    }
+    if (any) live_stats_.swap_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 }

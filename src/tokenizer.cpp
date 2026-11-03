@@ -2,6 +2,7 @@
 #include "unicode_tables.h"
 #include "gguf.h"
 #include <algorithm>
+#include <iterator>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -28,6 +29,9 @@ bool is_letter(uint32_t c) { return in(uni::kLetter, c); }
 bool is_number(uint32_t c) { return in(uni::kNumber, c); }
 bool is_space(uint32_t c)  { return in(uni::kSpace, c); }
 bool is_mark(uint32_t c)   { return in(uni::kMark, c); }
+bool is_punct(uint32_t c)  { return in(uni::kPunct, c); }
+bool is_ctrl_char(uint32_t c) { return in(uni::kControl, c); }
+bool is_zspace(uint32_t c) { return in(uni::kZSpace, c); }
 bool is_other(uint32_t c)  { return !is_letter(c) && !is_number(c) && !is_space(c); }
 
 struct Cp { uint32_t cp; size_t off, len; };   // code point + its byte span in the input
@@ -278,6 +282,8 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
             std::fprintf(stderr, "warning: tokenizer pre-splitter '%s' is not known yet; using the Llama 3 one\n", pre.c_str());
             t.pre_ = Pre::Llama3;
         }
+    } else if (model == "bert") {
+        t.kind_ = Kind::Wpm;                          // WordPiece (BERT-style embedding models)
     } else if (model == "llama") {
         t.kind_ = Kind::Spm;                          // SentencePiece (Llama 2, Mistral 7B, Mixtral, ...)
         t.add_space_prefix_ = bval("tokenizer.ggml.add_space_prefix", true);
@@ -328,6 +334,20 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
     t.eot_ = u32("tokenizer.ggml.eot_token_id");
     t.unk_ = u32("tokenizer.ggml.unknown_token_id");
     t.add_bos_ = bval("tokenizer.ggml.add_bos_token", t.kind_ == Kind::Spm) && t.bos_ >= 0;
+    if (t.kind_ == Kind::Wpm) {
+        t.cls_ = u32("tokenizer.ggml.cls_token_id");
+        t.sep_ = u32("tokenizer.ggml.seperator_token_id");              // (the key is spelled this way in GGUF)
+        if (t.cls_ < 0) t.cls_ = t.find("[CLS]");
+        if (t.sep_ < 0) t.sep_ = t.find("[SEP]");
+        if (t.unk_ < 0) t.unk_ = t.find("[UNK]");
+        // An uncased vocabulary (bert-base-uncased, bge, MiniLM, nomic) has no capital letters in its words; a cased
+        // one does, and then text keeps its case and accents.
+        t.lowercase_ = true;
+        for (size_t i = 0; i < nt && t.lowercase_; ++i) {
+            if (t.token_type_[i] == 3) continue;
+            for (const auto& c : utf8_decode(t.id_to_token_[i])) if (in(uni::kUpper, c.cp)) { t.lowercase_ = false; break; }
+        }
+    }
     t.chat_template_ = sval("tokenizer.chat_template");
     gguf_free(g);
 
@@ -369,6 +389,7 @@ void Tokenizer::bpe(const std::string& chunk, std::vector<int32_t>& out) const {
 
 void Tokenizer::encode_plain(const std::string& text, std::vector<int32_t>& out, bool first) const {
     if (kind_ == Kind::Spm) { spm(text, out, first); return; }
+    if (kind_ == Kind::Wpm) { wpm(text, out); return; }
     const auto parts = pre_ == Pre::Gpt2 ? pretokenize_gpt2(text)
                      : pre_ == Pre::O200k ? pretokenize_o200k(text)
                      : pretokenize_llama3(text, pre_ == Pre::Llama3 ? 3 : 1, pre_ == Pre::Qwen35);
@@ -423,6 +444,71 @@ void Tokenizer::spm(const std::string& raw, std::vector<int32_t>& out, bool pref
 
 // Added tokens are split out first (leftmost-longest), like Hugging Face does;
 // only the text between them goes through the pre-tokenizer and BPE.
+// WordPiece, as BERT's tokenizer does it. First the text is cleaned: control characters dropped, every kind of space
+// made a plain space, CJK ideographs given spaces around them, and (uncased models) each character folded to lower
+// case without accents. Then it is split at spaces, and every punctuation character becomes a word of its own. Each
+// word is cut into the longest pieces in the vocabulary from the left; a word that can't be cut that way (or is
+// longer than 100 characters) becomes [UNK]. In GGUF, a piece that starts a word is stored with a leading "▁";
+// a piece that continues one (BERT's "##ing") is stored bare.
+void Tokenizer::wpm(const std::string& text, std::vector<int32_t>& out) const {
+    static const std::string kStart = "\xE2\x96\x81";
+    auto is_cjk = [](uint32_t c) {
+        return (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x20000 && c <= 0x2A6DF) ||
+               (c >= 0x2A700 && c <= 0x2B73F) || (c >= 0x2B740 && c <= 0x2B81F) || (c >= 0x2B820 && c <= 0x2CEAF) ||
+               (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x2F800 && c <= 0x2FA1F);
+    };
+    auto fold = [&](uint32_t c, std::string& s) {                  // lower case, accents dropped (NFD minus marks)
+        if (c >= 0xAC00 && c <= 0xD7A3) {                           // Hangul syllable: its jamo
+            const uint32_t S = c - 0xAC00;
+            s += utf8_encode(0x1100 + S / 588); s += utf8_encode(0x1161 + (S % 588) / 28);
+            if (S % 28) s += utf8_encode(0x11A7 + S % 28);
+            return;
+        }
+        size_t lo = 0, hi = std::size(uni::kFold);
+        while (lo < hi) { const size_t m = (lo + hi) / 2; if (uni::kFold[m].cp < c) lo = m + 1; else hi = m; }
+        if (lo < std::size(uni::kFold) && uni::kFold[lo].cp == c) s += uni::kFold[lo].to; else s += utf8_encode(c);
+    };
+    // 1. clean and split into words (each a list of code points as UTF-8 pieces)
+    std::vector<std::string> words;
+    std::string cur;
+    auto flush = [&] { if (!cur.empty()) { words.push_back(cur); cur.clear(); } };
+    for (const auto& ch : utf8_decode(text)) {
+        const uint32_t c = ch.cp;
+        if (c == 0 || c == 0xFFFD || is_ctrl_char(c)) continue;
+        if (is_zspace(c)) { flush(); continue; }
+        if (is_cjk(c)) { flush(); words.push_back(utf8_encode(c)); continue; }
+        std::string f;
+        if (lowercase_) fold(c, f); else f = utf8_encode(c);
+        for (const auto& fc : utf8_decode(f)) {                     // (a fold can give several characters)
+            if (is_punct(fc.cp)) { flush(); words.push_back(f.substr(fc.off, fc.len)); }
+            else cur += f.substr(fc.off, fc.len);
+        }
+    }
+    flush();
+    // 2. WordPiece each word
+    for (const std::string& w : words) {
+        const auto cps = utf8_decode(w);
+        if (cps.size() > 100) { if (unk_ >= 0) out.push_back(unk_); continue; }
+        std::vector<int32_t> pieces;
+        size_t start = 0;
+        bool bad = false;
+        while (start < cps.size()) {
+            int32_t hit = -1;
+            size_t end = cps.size();
+            for (; end > start; --end) {
+                const size_t b = cps[start].off, e = cps[end - 1].off + cps[end - 1].len;
+                auto it = token_to_id_.find(start == 0 ? kStart + w.substr(b, e - b) : w.substr(b, e - b));
+                if (it != token_to_id_.end() && token_type_[it->second] != 3) { hit = it->second; break; }
+            }
+            if (hit < 0) { bad = true; break; }
+            pieces.push_back(hit);
+            start = end;
+        }
+        if (bad) { if (unk_ >= 0) out.push_back(unk_); }
+        else out.insert(out.end(), pieces.begin(), pieces.end());
+    }
+}
+
 std::vector<int32_t> Tokenizer::encode(const std::string& text, bool parse_special) const {
     std::vector<int32_t> ids;
     size_t start = 0, i = 0;
@@ -450,6 +536,11 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool strip_prefix
         if (id < 0 || (size_t)id >= id_to_token_.size()) continue;
         const std::string& tok = id_to_token_[id];
         if (token_type_[id] == 3 || token_type_[id] == 4) { out += tok; continue; }   // added tokens are raw text
+        if (kind_ == Kind::Wpm) {                                   // "▁word" starts a word, "ing" continues one
+            if (tok.compare(0, 3, "\xE2\x96\x81") == 0) { if (!out.empty()) out += ' '; out += tok.substr(3); }
+            else out += tok;
+            continue;
+        }
         if (kind_ == Kind::Spm) {
             if (token_type_[id] == 6 && tok.size() == 6 && tok.compare(0, 3, "<0x") == 0) {   // byte token <0xAB>
                 out += (char)std::strtol(tok.substr(3, 2).c_str(), nullptr, 16);
