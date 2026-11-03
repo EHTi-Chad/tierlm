@@ -2352,7 +2352,7 @@ int main(int argc, char** argv) {
             const std::string name = body.value("name", std::string());
             json r = workspace::run(fs::u8path(folder), name, args, body.value("apply", false), body.value("hash", std::string()));
             if (r.contains("result") && (body.value("apply", false) || !workspace::changes_files(name)))
-                std::fprintf(stderr, "workspace: %s %s\n", name.c_str(), args.value("path", std::string()).c_str());
+                std::fprintf(stderr, "workspace: %s %s\n", name.c_str(), workspace::arg_str(args, "path").c_str());
             res.set_content(dump(r), "application/json");
         } catch (const std::exception& e) {
             res.set_content(dump({{"error", e.what()}}), "application/json");

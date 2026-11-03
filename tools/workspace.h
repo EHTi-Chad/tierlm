@@ -7,6 +7,8 @@
 // the computer running tierlm (see the checks in server.cpp).
 #pragma once
 
+#include <cctype>
+#include <cstdlib>
 #include "agent.h"
 
 #include <algorithm>
@@ -130,12 +132,44 @@ inline std::string size_text(uintmax_t sz) {
     return sz < 1024 ? std::to_string(sz) + " B" : sz < 1048576 ? std::to_string(sz / 1024) + " KB" : std::to_string(sz / 1048576) + " MB";
 }
 
+// Tool arguments as models send them. Small models often quote booleans and numbers ("recursive": "true",
+// "start_line": "12"); read those as meant rather than fail.
+inline std::string arg_str(const json& a, const char* k) {
+    if (!a.is_object() || !a.contains(k) || a[k].is_null()) return std::string();
+    return a[k].is_string() ? a[k].get<std::string>() : a[k].dump();
+}
+inline bool arg_bool(const json& a, const char* k, bool def) {
+    if (!a.is_object() || !a.contains(k)) return def;
+    const json& v = a[k];
+    if (v.is_boolean()) return v.get<bool>();
+    if (v.is_number()) return v.get<double>() != 0;
+    if (v.is_string()) {
+        std::string t = v.get<std::string>();
+        for (char& ch : t) ch = (char)std::tolower((unsigned char)ch);
+        if (t == "true" || t == "yes" || t == "1" || t == "on") return true;
+        if (t == "false" || t == "no" || t == "0" || t == "off" || t.empty()) return false;
+    }
+    return def;
+}
+inline bool arg_int(const json& a, const char* k, int& out) {
+    if (!a.is_object() || !a.contains(k)) return false;
+    const json& v = a[k];
+    if (v.is_number()) { out = (int)v.get<double>(); return true; }
+    if (v.is_string()) {
+        const std::string t = v.get<std::string>();
+        char* end = nullptr;
+        const long n = std::strtol(t.c_str(), &end, 10);
+        if (end && end != t.c_str()) { out = (int)n; return true; }
+    }
+    return false;
+}
+
 inline std::string list_files(const fs::path& root, const json& a) {
-    const std::string rel = a.value("path", std::string());
+    const std::string rel = arg_str(a, "path");
     const fs::path dir = inside(root, rel);
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) throw Error((rel.empty() ? "the workspace" : rel) + " is not a folder");
-    const bool rec = a.value("recursive", false);
+    const bool rec = arg_bool(a, "recursive", false);
     std::string out;
     int count = 0;
     const int cap = 400;
@@ -178,14 +212,14 @@ inline std::string read_text(const fs::path& f, const std::string& name) {
 }
 
 inline std::string read_file(const fs::path& root, const json& a) {
-    const std::string name = a.value("path", std::string());
+    const std::string name = arg_str(a, "path");
     const std::string s = read_text(inside(root, name), name);
     const auto lines = lines_of(s);
     const int total = (int)lines.size();
     if (total == 0) return "(" + name + " is empty)\n";
     const bool ranged = a.contains("start_line") || a.contains("end_line");
-    int from = a.contains("start_line") && a["start_line"].is_number_integer() ? a["start_line"].get<int>() : 1;
-    int to = a.contains("end_line") && a["end_line"].is_number_integer() ? a["end_line"].get<int>() : total;
+    int from = 1; arg_int(a, "start_line", from);
+    int to = total; arg_int(a, "end_line", to);
     from = std::max(1, std::min(from, total));
     to = std::max(from, std::min(total, to));
     std::string out;
@@ -205,9 +239,9 @@ inline std::string read_file(const fs::path& root, const json& a) {
 inline std::string lower(std::string s) { for (auto& c : s) c = (char)std::tolower((unsigned char)c); return s; }
 
 inline std::string search_files(const fs::path& root, const json& a) {
-    const std::string q = lower(a.value("query", std::string()));
+    const std::string q = lower(arg_str(a, "query"));
     if (q.empty()) throw Error("search_files needs some text to look for");
-    const fs::path where = inside(root, a.value("path", std::string()));
+    const fs::path where = inside(root, arg_str(a, "path"));
     std::string out;
     int hits = 0, files = 0;
     auto look = [&](const fs::path& f) {
@@ -235,7 +269,7 @@ inline std::string search_files(const fs::path& root, const json& a) {
             if (it->is_regular_file(e2)) look(it->path());
         }
     }
-    if (hits == 0) return "no lines contain \"" + a.value("query", std::string()) + "\"\n";
+    if (hits == 0) return "no lines contain \"" + arg_str(a, "query") + "\"\n";
     if (hits >= 100) out += "(stopped after 100 matches)\n";
     return out;
 }
@@ -305,7 +339,7 @@ inline std::string crlf(const std::string& s) {
 
 inline Change plan(const fs::path& root, const std::string& tool, const json& a) {
     Change c;
-    c.name = a.value("path", std::string());
+    c.name = arg_str(a, "path");
     if (agent::trim(c.name).empty()) throw Error(tool + " needs a path");
     c.file = inside(root, c.name);
     c.name = shown(root, c.file);                            // relative to the workspace, however the model wrote it
@@ -320,7 +354,7 @@ inline Change plan(const fs::path& root, const std::string& tool, const json& a)
         if (windows_lines) c.after = crlf(c.after);
     } else if (tool == "edit_file") {
         if (!c.exists) throw Error(c.name + " doesn't exist; use write_file to create it");
-        std::string from = a.value("old_text", std::string()), to = a.value("new_text", std::string());
+        std::string from = arg_str(a, "old_text"), to = arg_str(a, "new_text");
         if (from.empty()) throw Error("edit_file needs old_text: the exact text to replace");
         if (windows_lines) { from = crlf(from); to = crlf(to); }
         const size_t at = c.before.find(from);

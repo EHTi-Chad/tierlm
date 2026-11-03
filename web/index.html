@@ -2083,7 +2083,7 @@ async function wsTool(name, args, apply = false, hash = "") {
   } catch (e) { return { error: e.message }; }
 }
 const toolLabel = (name, a) => ({
-  list_files: "Listed " + (a.path ? a.path : "the workspace") + (a.recursive ? " (with subfolders)" : ""),
+  list_files: "Listed " + (a.path ? a.path : "the workspace") + (a.recursive === true || /^(true|yes|1|on)$/i.test(String(a.recursive ?? "")) ? " (with subfolders)" : ""),
   read_file: "Read " + (a.path || "?") + (a.start_line ? ", lines " + a.start_line + (a.end_line ? "–" + a.end_line : "") : ""),
   search_files: "Searched for “" + (a.query || "") + "”" + (a.path ? " in " + a.path : ""),
   write_file: "Write " + (a.path || "?"),
