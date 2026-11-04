@@ -91,7 +91,14 @@ first time on a GPU it can take a little longer while the graphics driver prepar
 settings that change speed on your PC (how to split the model, CPU threads, and speculative decoding with 1 to 4
 guesses), shows each result as it goes, then keeps the fastest and saves it for that model. It takes about a
 minute, longer for big models. Click **Start chatting** when it's done. tierlm remembers the folder, and your settings for each
-model, in `tierlm-settings.json`. **Change setup** (top right) brings this screen back.
+model, in `tierlm-settings.json`. **Change setup** (top right) brings this screen back. **Eject**, next to it,
+unloads the model (and the embedding model) and frees their VRAM and RAM, for when a game or another app needs the GPU.
+
+**Changing the context length while chatting:** **Change length…** under the Context card has a slider (and a box for any
+number). While you move it, it shows how much more (or less) VRAM and RAM the cache would take and whether it applies
+right away or needs a reload: right away when there's the free memory where the cache is now, a reload when there
+isn't (part of the model would then move to RAM). **Apply** changes it in about a second; the conversation is kept.
+On the setup screen, **Context length** now has more steps (12K, 24K, 48K, 96K...) and **Custom…** for any length.
 
 ## Step 5: Chat
 

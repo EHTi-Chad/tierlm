@@ -14,12 +14,15 @@ on **Allow other devices**; see [Other devices and API keys](#other-devices-and-
 | POST | `/api/pick-folder` | Open a folder picker on the computer running tierlm (Windows) |
 | POST | `/api/load` | Load a model, with load settings |
 | POST | `/api/unload` | Free the loaded model |
+| GET, POST | `/api/context` | What a different context length would take, and changing it without a reload |
 | POST | `/api/chat` | Generate a reply, streamed as Server-Sent Events |
 | POST | `/api/reset` | Clear the KV cache |
 | GET | `/api/network` | Network access, API key status, and the addresses apps should use |
 | POST | `/api/network` | Change network access or the API key (this computer only) |
 | GET | `/v1/models` | OpenAI-compatible: models |
 | POST | `/v1/chat/completions` | OpenAI-compatible: chat, streamed or not |
+| GET | `/api/v0/models`, `/api/v0/models/<id>` | LM Studio's REST API: models with their type (`llm`, `vlm`, `embeddings`) and state |
+| POST | `/api/v0/chat/completions`, `/api/v0/embeddings` | LM Studio's REST API: the same as the `/v1` ones |
 
 The first part of this page is the OpenAI-compatible API, for other apps. The rest documents tierlm's own
 `/api` endpoints, which the web page uses.
@@ -76,7 +79,7 @@ store and `search_query: ` for what you search with.
 
 | Field | Notes |
 |---|---|
-| `model` | An `id` from `/v1/models` loads that model first (with the settings last used for it in tierlm), which takes as long as loading it on the setup screen. Any other name, such as `gpt-4o`, uses the loaded model. |
+| `model` | From an app on this computer, an `id` from `/v1/models` loads that model first (with the settings last used for it in tierlm), which takes as long as loading it on the setup screen. Any other name, such as `gpt-4o`, uses the loaded model, and so does every name from another device (which model is loaded is a setting of the computer running tierlm). |
 | `messages` | `system`, `developer` (same as system), `user`, `assistant`. Content can be a string or a list of parts: text, and images (see [Images](#images)). Also `tool` (a tool's result), and `assistant` messages with `tool_calls` and `reasoning_content`. |
 | `tools`, `tool_choice` | OpenAI function tools. The model may answer with `tool_calls` instead of text (see Tool calling below). `tool_choice: "none"` leaves the tools out. |
 | `stream` | `true` streams `chat.completion.chunk` events, ending with `data: [DONE]`. `stream_options: {"include_usage": true}` adds a final chunk with token counts. |
@@ -98,10 +101,19 @@ back out as OpenAI `tool_calls`, with `arguments` as a JSON string, and `finish_
 in one reply are returned together. tierlm never runs a tool itself: the app does, and sends the result back as a
 `tool` message.
 
-When a request has tools, a thinking model's reasoning (`<think>...</think>`) is sent apart from the answer, as
-`reasoning_content` (in the message, or in the stream's deltas), the way llama.cpp and DeepSeek do; an app that
-sends it back keeps the model's memory of the conversation exact. Streamed, the answer text arrives as it is
-written and the tool calls arrive whole in one chunk at the end. Without tools, replies are as before.
+A thinking model's reasoning is sent apart from the answer, as `reasoning_content` (in the message, or in the
+stream's deltas), the way LM Studio, llama.cpp and DeepSeek do, so an app that shows `content` shows just the answer;
+a reply cut off by `max_tokens` while still thinking has an empty `content`. An app that sends the reasoning back keeps
+the model's memory of the conversation exact. Streamed, the answer text arrives as it is written and tool calls
+arrive whole in one chunk at the end.
+
+**Thinking on or off.** For models whose chat template can switch it (Qwen3 and later), the page's Settings set it for
+the model (saved with its settings), and that applies to apps too. A request can choose for itself with
+`"chat_template_kwargs": {"enable_thinking": false}` (as for vLLM and llama.cpp), `"enable_thinking": false`, or
+`"think": false` (as for Ollama). gpt-oss always reasons; `"reasoning_effort": "low" | "medium" | "high"` sets how
+much (`"none"` turns thinking off for the other models). `GET /api/info` says `think_switch`, `thinking` and
+`reasoning_effort`; `POST /api/thinking {"thinking": false}` or `{"effort": "low"}` sets the model's default (on this
+computer only).
 
 Coding agents send long prompts (opencode's instructions and tool list are about 11,000 tokens): load the model
 with a context of at least 32K. The first request reads all of it; later ones reuse it from the cache.
@@ -137,6 +149,19 @@ Not yet: `logprobs`; `n` > 1; embeddings.
 
 Errors use OpenAI's format: `{"error": {"message": "...", "type": "...", "code": ...}}`.
 
+### LM Studio's REST API (`/api/v0`)
+
+For apps written for LM Studio, which list models at LM Studio's own address:
+
+- `GET /api/v0/models`: every model, in LM Studio's fields: `id`, `type` (`llm`; `vlm` for one that reads images, which a
+  model with its `mmproj` file next to it does; `embeddings`), `state` (`loaded` or `not-loaded`), `publisher` (the first
+  folder of the id), `arch`, `compatibility_type` (`gguf`), `quantization` (from the file name), `max_context_length`,
+  and `loaded_context_length` for a loaded model.
+- `GET /api/v0/models/<id>`: one of them (404 if there is no such model).
+- `POST /api/v0/chat/completions` and `POST /api/v0/embeddings`: the same as `/v1/chat/completions` and `/v1/embeddings`.
+
+These need the API key when one is set, like `/v1`.
+
 ### Other devices and API keys
 
 By default tierlm only answers this computer. In the web page, **Connect other apps** has:
@@ -150,7 +175,15 @@ By default tierlm only answers this computer. In the web page, **Connect other a
   `X-Forwarded-For` or `Cf-Connecting-Ip`) never count as this computer.
 
 Both are saved in `tierlm-settings.json`. `--host 0.0.0.0` and `--api-key KEY` on the command line override
-them. Network settings can only be changed on the computer running tierlm.
+them.
+
+**Other devices use the model; they don't run the computer.** From anywhere but the computer running tierlm, the
+server answers chats (`/api/chat`, `/v1`, `/api/v0`) and what the page needs to show them (`/api/info`, speed and
+context), and refuses with 403 everything that changes the computer: loading or unloading models (also through a
+`model` name in a request), settings (`/api/spec`, `/api/network`), Find the fastest settings and the benchmark, the
+models folder, the embedding model and its download, the workspace and saved chats; and the console, hardware and
+model-file lists. The page there shows the chat, speed, context and the address to connect with. `/api/info` adds
+`"remote": true` there, and gives the model's file name instead of its full path.
 
 ## tierlm's own API (`/api`)
 
@@ -311,9 +344,24 @@ The engine's recent log lines (what the black window shows), after line number `
 `{"lines": [{"n": 12, "text": "reply: 212 tokens at 22.3 tok/s (end)", "v": false}], "next": 13}`. `v` marks lines
 from ggml and the graphics drivers (the console's Verbose view).
 
+### GET /api/context, POST /api/context
+
+Changes the context length while the model stays loaded: the cache is made again at the new size on the same devices
+(VRAM and RAM as they are), keeping what's in it, in about a second.
+
+- `GET /api/context?ctx=N` (tokens per connection): what it would take. `{"ctx", "current", "connections", "trained",
+  "vram_change", "ram_change", "vram_free", "ram_free", "bytes_per_token", "live", "reload", "why"}`. `live`: it fits
+  where the cache is now and can be done right away. `reload`: it needs more VRAM than is free, so loading the model
+  again (which would move part of it to RAM) is the way; `why` says so, or why it isn't possible (longer than the
+  model was trained for, or shorter than the conversations in the cache).
+- `POST /api/context {"ctx": N}`: does it (409 with the reason if it can't), and saves N as this model's context for
+  next time. `{"ok": true, "ctx": N, "seconds": ...}`. Waits for running replies to finish. On this computer only.
+
 ### POST /api/unload
 
-Frees the model and its memory. Returns `{"ok": true}`.
+Frees the model and everything that belongs to it (its vision file, draft block and the replies' caches), so its VRAM
+and RAM are free again; replies still being written finish first. `{"embedding": true}` frees the embedding model too
+(it stays the saved choice). The page's **Eject** button sends that. Returns `{"ok": true}`.
 
 ### POST /api/chat
 

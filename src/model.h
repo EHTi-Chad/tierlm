@@ -12,6 +12,7 @@ struct ggml_tensor;
 struct ggml_cgraph;
 struct ggml_backend;
 struct ggml_backend_buffer;
+struct ggml_backend_buffer_type;
 struct ggml_backend_sched;
 
 namespace tierlm {
@@ -201,6 +202,15 @@ public:
     void restore(const Snapshot& s);          // the cache becomes exactly the saved conversation
     int n_past() const { return n_past_; }
     int max_ctx() const { return max_ctx_; }
+    // Change the context length (all conversations' positions together) without loading the model again: the
+    // cache is made again at the new size on the same devices, keeping what's in it. Throws if the conversations
+    // in the cache are longer than the new size, or if it doesn't fit (the old size is then kept, unchanged).
+    // Not while a step runs (the caller holds the engine's lock).
+    void resize_ctx(int new_ctx);
+    int ctx_in_use() const { return hi_; }        // one past the highest cache position any conversation uses
+    // Bytes the KV cache takes per position, all layers (the hybrid models' fixed running memories aside), and how
+    // much of that is in VRAM (the rest is in RAM).
+    size_t kv_bytes_per_token(size_t* in_vram = nullptr) const;
     const std::string& device_name() const { return device_name_; }
     const std::string& arch() const { return hp_.arch; }
     uint64_t weights_bytes() const { return weights_bytes_; }
@@ -341,6 +351,9 @@ private:
     Placement place_;
     EvalStats stats_;
     std::vector<ggml_backend_buffer*> kvbufs_;   // KV cache memory: VRAM part and RAM part
+    std::vector<ggml_backend_buffer_type*> kv_bufts_;   // where each part of the cache goes: per GPU, then RAM
+    void make_kv(int ctx, int n_seq);
+    void free_kv();
     // Scratch for building graphs, one per kind (one token; several tokens; the MTP draft block): the GPU keeps a
     // recorded replay (CUDA graph) per graph, found by where it was built, so each kind keeps its own.
     std::vector<uint8_t> graph_mem_[3];

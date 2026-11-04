@@ -60,6 +60,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -172,7 +173,10 @@ json with_tools(const json& messages, const agent::ojson& tools, agent::ToolFmt 
     return out;
 }
 
-std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok) {
+// think: what the assistant turn starts with in models that can think (Qwen3 and later, as their chat templates
+// do): 1 "<think>\n" (the model reasons first; only for templates that start it), 0 "<think>\n\n</think>\n\n" (thinking
+// off: the answer straight away), -1 nothing (the model decides, or can't think).
+std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, int think = -1) {
     std::string s;
     switch (f) {
     case ChatFmt::Tulu: {                                 // OLMoE-Instruct / Tulu, and Zephyr (TinyLlama)
@@ -190,7 +194,7 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok) {
     case ChatFmt::ChatML:                                 // Qwen, and many others
         for (const auto& m : messages)
             s += "<|im_start|>" + m.value("role", std::string("user")) + "\n" + m.value("content", std::string()) + "<|im_end|>\n";
-        return s + "<|im_start|>assistant\n";
+        return s + "<|im_start|>assistant\n" + (think == 0 ? "<think>\n\n</think>\n\n" : think == 1 ? "<think>\n" : "");
     case ChatFmt::Llama3:
         s = "<|begin_of_text|>";
         for (const auto& m : messages)
@@ -631,6 +635,12 @@ struct Engine {
     Tokenizer tok;
     ChatFmt chat = ChatFmt::Plain;
     agent::ToolFmt tool_fmt = agent::ToolFmt::Hermes;   // how this model writes tool calls
+    // Thinking (reasoning before the answer). think_switch: the model's chat template can turn it off (Qwen3 and
+    // later: "enable_thinking"); think_starts: its template opens the <think> block itself, so the model's reply
+    // begins inside it. thinking: on or off for this model (saved with its settings; a request can choose too).
+    // gpt-oss always reasons; effort sets how much ("low", "medium", "high").
+    bool think_switch = false, think_starts = false, thinking = true;
+    std::string effort = "medium";
     std::string identity;                                // harmony models: the model identity line of their template
     std::vector<int32_t> cached;      // the tokens currently in the KV cache
     // Other conversations, saved to RAM when a request for a different one needed the cache, so they come back
@@ -999,6 +1009,17 @@ void oai_error(httplib::Response& res, int status, const std::string& msg, const
 
 // A request from this computer: a loopback address, and not passed on by a tunnel or proxy (Cloudflare Tunnel,
 // ngrok and friends connect from localhost but add one of these headers), so it can't be someone outside.
+// What another device may not do (see the pre-routing handler): anything but reading under /api/, except
+// writing a reply (/api/chat) and starting a new chat (/api/reset); and a few reads that are about the computer
+// rather than the model (the console, the hardware, the models folder's files).
+bool remote_refused(const httplib::Request& req) {
+    const std::string& p = req.path;
+    if (p.compare(0, 5, "/api/") != 0 || p.compare(0, 8, "/api/v0/") == 0) return false;   // the page, /v1, LM Studio's API
+    if (req.method == "GET" || req.method == "HEAD")
+        return p == "/api/log" || p == "/api/devices" || p == "/api/models";
+    return !(p == "/api/chat" || p == "/api/reset");
+}
+
 bool is_local(const httplib::Request& req) {
     const std::string& a = req.remote_addr;
     const bool loop = a == "127.0.0.1" || a == "::1" || a == "::ffff:127.0.0.1";
@@ -1280,6 +1301,18 @@ int main(int argc, char** argv) {
         eng.chat = detect_chat(eng.tok);
         eng.tool_fmt = agent::detect_tool_fmt(eng.tok.chat_template());
         eng.identity = harmony::identity_of(eng.tok.chat_template());
+        {
+            const std::string& ct = eng.tok.chat_template();
+            eng.think_switch = eng.chat == ChatFmt::ChatML && ct.find("enable_thinking") != std::string::npos;
+            eng.think_starts = eng.think_switch &&       // (its generation prompt: {{- '<think>\\n' }}, as Qwen3.5 and later)
+                std::regex_search(ct, std::regex(R"('<think>(\\n|\n)'\s*\}\})"));
+            const json ms = settings.value("models", json::object());
+            std::error_code ec;
+            const auto rel = fs::u8path(path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec)).generic_u8string();
+            const json saved = ms.contains(rel) && ms[rel].is_object() ? ms[rel] : json::object();
+            eng.thinking = saved.value("thinking", true);
+            eng.effort = saved.value("effort", std::string("medium"));
+        }
         eng.path = path;
         eng.name = gguf_string(path, "general.name");
         eng.threads = threads > 0 ? threads : a.threads;
@@ -1394,6 +1427,7 @@ int main(int argc, char** argv) {
             {"gpus", [&] { json g = json::array(); for (const auto& x : eng.model->placement().gpus)
                                g.push_back({{"name", x.name}, {"weights", x.weights}, {"kv", x.kv}, {"layers", x.layers}}); return g; }()},
             {"vision", eng.vision != nullptr}, {"vision_file", eng.vision_file},
+            {"think_switch", eng.think_switch}, {"thinking", eng.thinking}, {"reasoning_effort", eng.chat == ChatFmt::Harmony ? eng.effort : std::string()},
             {"vision_device", eng.vision ? eng.vision->device_name() : std::string()}, {"image_tokens", eng.image_tokens_for(0)},
             {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}, {"lookup_setting", eng.lookup}, {"has_draft_block", hp.n_nextn > 0},
             {"mtp_loaded", eng.model->has_mtp()}, {"ffn_vram", eng.model->placement().ffn_vram},
@@ -1637,8 +1671,113 @@ int main(int argc, char** argv) {
         }
     });
 
-    svr.Post("/api/unload", [&](const httplib::Request&, httplib::Response& res) {
+    // Thinking for the loaded model, as the page's Settings set it: {"thinking": false} (models that can switch it
+    // off), {"effort": "low"} (gpt-oss). Applies to the page and to apps (unless a request says otherwise), and is
+    // saved with the model's settings.
+    svr.Post("/api/thinking", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        if (!body.is_object()) return oai_error(res, 400, "expected {\"thinking\": true|false} or {\"effort\": \"low\"|\"medium\"|\"high\"}");
         std::lock_guard<std::shared_timed_mutex> lk(mu);
+        if (!eng.model) return oai_error(res, 400, "no model is loaded");
+        std::error_code ec;
+        const std::string id = fs::u8path(eng.path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec)).generic_u8string();
+        if (body.contains("thinking") && body["thinking"].is_boolean()) {
+            eng.thinking = body["thinking"].get<bool>();
+            if (settings.contains("models") && settings["models"].contains(id)) settings["models"][id]["thinking"] = eng.thinking;
+        }
+        if (body.contains("effort") && body["effort"].is_string()) {
+            const std::string e = body["effort"].get<std::string>();
+            if (e != "low" && e != "medium" && e != "high") return oai_error(res, 400, "effort is low, medium or high");
+            eng.effort = e;
+            if (settings.contains("models") && settings["models"].contains(id)) settings["models"][id]["effort"] = e;
+        }
+        write_settings(a.settings, settings);
+        std::fprintf(stderr, "thinking: %s\n", eng.chat == ChatFmt::Harmony ? ("reasoning effort " + eng.effort).c_str() : eng.thinking ? "on" : "off");
+        res.set_content(dump({{"ok", true}, {"thinking", eng.thinking}, {"effort", eng.effort}}), "application/json");
+    });
+
+    // ---- live context length: the cache made again at another size, without loading the model again ----
+    // GET /api/context?ctx=N: what N tokens per connection would take and whether it fits where the cache is now
+    // (VRAM and RAM, with room to spare), or needs a reload (more VRAM than is free: part of the model would move).
+    // POST /api/context {"ctx": N}: does it, and saves N as this model's context for next time.
+    auto context_plan = [&](int want) {
+        const int conns = std::max<int>(1, (int)eng.slots.size());
+        const int cur = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
+        size_t vram_tok = 0;
+        const size_t all_tok = eng.model->kv_bytes_per_token(&vram_tok), ram_tok = all_tok - vram_tok;
+        const long long d = (long long)(want - cur) * conns;          // positions added (or dropped), all connections
+        size_t vfree = 0, vtotal = 0, rfree = 0, rtotal = 0;
+        eng.model->device_memory(vfree, vtotal);
+        if (auto c = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(c, &rfree, &rtotal);
+        const long long dv = d * (long long)vram_tok, dr = d * (long long)ram_tok;
+        const long long spare_v = 512ll << 20, spare_r = 2048ll << 20; // (room the GPU driver and Windows keep using)
+        const bool fits_v = dv <= 0 || !eng.model->on_gpu() || dv + spare_v <= (long long)vfree;
+        const bool fits_r = dr <= 0 || dr + spare_r <= (long long)rfree;
+        const int trained = eng.model->hparams().n_ctx;
+        json j = {{"ctx", want}, {"current", cur}, {"connections", conns}, {"trained", trained},
+                  {"vram_bytes", (long long)vram_tok * want * conns}, {"ram_bytes", (long long)ram_tok * want * conns},
+                  {"vram_change", dv}, {"ram_change", dr}, {"vram_free", vfree}, {"ram_free", rfree},
+                  {"bytes_per_token", all_tok}};
+        std::string why;
+        if (want < 256) why = "the context must be at least 256 tokens";
+        else if (trained > 0 && want > trained) why = "longer than this model was trained for (" + std::to_string(trained) + " tokens)";
+        else if (eng.model->ctx_in_use() > want * conns) why = "the conversations in the cache are longer: start a new chat first";
+        j["live"] = why.empty() && fits_v && fits_r;
+        j["reload"] = why.empty() && (!fits_v || !fits_r);
+        if (!why.empty()) j["why"] = why;
+        else if (!fits_v) j["why"] = "not enough free VRAM for the bigger cache: loading again would move part of the model to RAM";
+        else if (!fits_r) j["why"] = "not enough free RAM for the bigger cache";
+        return j;
+    };
+    svr.Get("/api/context", [&](const httplib::Request& req, httplib::Response& res) {
+        std::shared_lock<std::shared_timed_mutex> lk(mu);
+        if (!eng.model) return oai_error(res, 400, "no model is loaded");
+        const int want = req.has_param("ctx") ? std::atoi(req.get_param_value("ctx").c_str()) : 0;
+        res.set_content(dump(context_plan(want > 0 ? want : (eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per))), "application/json");
+    });
+    svr.Post("/api/context", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        const int want = body.is_object() ? body.value("ctx", 0) : 0;
+        if (!line.enter(mu, req.is_connection_closed)) return oai_error(res, 503, "busy: waited too long for earlier replies to finish");
+        std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
+        if (!eng.model) return oai_error(res, 400, "no model is loaded");
+        const json plan = context_plan(want);
+        if (!plan.value("live", false)) return oai_error(res, 409, plan.value("why", std::string("can't change the context now")));
+        const int conns = std::max<int>(1, (int)eng.slots.size());
+        const auto t0 = std::chrono::steady_clock::now();
+        try { eng.model->resize_ctx(want * conns); }
+        catch (const std::exception& e) { return oai_error(res, 409, e.what()); }
+        if (!eng.slots.empty()) eng.ctx_per = want;
+        // (kept for next time with the other load settings of this model)
+        std::error_code ec;
+        const auto rel = fs::u8path(eng.path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec));
+        const std::string id = rel.generic_u8string();               // (as loaded_id below)
+        if (settings.contains("models") && settings["models"].contains(id) && settings["models"][id].is_object()) {
+            settings["models"][id]["ctx"] = want;
+            write_settings(a.settings, settings);
+        }
+        const double s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "context: %d tokens%s, changed in %.2f s without loading again\n", want,
+                     conns > 1 ? (" per connection (" + std::to_string(conns) + " connections)").c_str() : "", s_);
+        res.set_content(dump({{"ok", true}, {"ctx", want}, {"seconds", s_}}), "application/json");
+    });
+
+    // The embedding model's slot (see "The embedding model" below).
+    struct EmbedSlot {
+        std::mutex mu;                       // guards the slot; held while embedding
+        std::unique_ptr<Encoder> enc;
+        Tokenizer tok;
+        std::string id, path, name;
+        double load_s = 0;
+    } emb;
+    // Eject: frees the model and everything that belongs to it (its vision file, draft block, the replies'
+    // caches), giving its VRAM and RAM back; {"embedding": true} frees the embedding model too (it stays the
+    // saved choice, for the next start). Waits for running replies to finish.
+    svr.Post("/api/unload", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body.empty() ? "{}" : req.body, nullptr, false);
+        const bool with_embed = body.is_object() && body.value("embedding", false);
+        std::lock_guard<std::shared_timed_mutex> lk(mu);
+        const bool had = eng.model != nullptr;
         eng.save_usage(true);
         eng.batch.finish();
         eng.slots.clear(); eng.free_slots = 0;
@@ -1648,6 +1787,11 @@ int main(int argc, char** argv) {
         eng.model.reset();
         eng.cached.clear();
         eng.path.clear();
+        bool emb_freed = false;
+        if (with_embed) { std::lock_guard<std::mutex> le(emb.mu); emb_freed = emb.enc != nullptr; emb.enc.reset(); emb.id.clear(); emb.path.clear(); emb.name.clear(); }
+        if (had || emb_freed)
+            std::fprintf(stderr, "ejected: %s%s; %s memory is free again\n", had ? "the model" : "",
+                         emb_freed ? (had ? " and the embedding model" : "the embedding model") : "", had && emb_freed ? "their" : "its");
         res.set_content("{\"ok\":true}", "application/json");
     });
 
@@ -1674,6 +1818,32 @@ int main(int argc, char** argv) {
     // The cache length of the reply being written on this thread (several connections: each has its own).
     static thread_local int tl_past = 0;
     static thread_local int tl_image_tokens = 0;      // this request's image detail (0: automatic)
+    static thread_local int tl_think = -1;            // this request's thinking: 1 on, 0 off, -1 the model's setting
+    // gpt-oss: this request's reasoning effort, 1 low, 2 medium, 3 high, 0 the model's setting (a number: a thread-local
+    // std::string used from the route lambdas isn't set up on their threads with GCC)
+    static thread_local int tl_effort = 0;
+    // How the assistant turn starts (format_chat's `think`), for the loaded model and this request.
+    auto think_mode = [&]() -> int {
+        if (!eng.think_switch) return -1;
+        const bool on = tl_think >= 0 ? tl_think == 1 : eng.thinking;
+        return on ? (eng.think_starts ? 1 : -1) : 0;
+    };
+    auto effort_now = [&]() { return tl_effort == 1 ? std::string("low") : tl_effort == 2 ? std::string("medium") : tl_effort == 3 ? std::string("high") : eng.effort; };
+    // A request's own choice, in the forms apps send it: {"chat_template_kwargs": {"enable_thinking": false}} (vLLM,
+    // llama.cpp), "enable_thinking", "think" (Ollama), "thinking" (tierlm's page); "reasoning_effort" for gpt-oss
+    // ("none" or "minimal" turn thinking off for the others).
+    auto take_think = [&](const json& body) {
+        tl_think = -1; tl_effort = 0;
+        if (!body.is_object()) return;
+        auto flag = [&](const json& j, const char* k) { if (j.is_object() && j.contains(k) && j[k].is_boolean()) tl_think = j[k].get<bool>() ? 1 : 0; };
+        flag(body, "thinking"); flag(body, "think"); flag(body, "enable_thinking");
+        if (body.contains("chat_template_kwargs")) flag(body["chat_template_kwargs"], "enable_thinking");
+        if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string()) {
+            const std::string e = body["reasoning_effort"].get<std::string>();
+            tl_effort = e == "low" ? 1 : e == "medium" ? 2 : e == "high" ? 3 : 0;
+            if (e == "none" || e == "minimal") tl_think = 0; else if (tl_think < 0 && !e.empty()) tl_think = 1;
+        }
+    };
     auto generate = [&](const json& messages, const Sampling& sp, int max_tokens, const std::vector<std::string>& stops_in,
                         const std::function<void(const json&)>& on_prompt,
                         const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token,
@@ -1693,8 +1863,11 @@ int main(int argc, char** argv) {
         json msgs = messages;
         const std::vector<std::string> pics = take_pictures(msgs);
         if (!pics.empty() && harm) throw std::runtime_error("this model can't read images");
-        std::vector<int32_t> toks = tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity)
-                                                    : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok), true);
+        const int think = think_mode();
+        // (the template opened the <think> block: the reply is shown, split and saved with it, as the model wrote it)
+        const std::string pre = think == 1 ? "<think>\n" : "";
+        std::vector<int32_t> toks = tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
+                                                    : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok, think), true);
         if (!pics.empty()) {                                      // each image's <|image_pad|> becomes its words
             const int32_t pad = tok.find("<|image_pad|>");
             std::vector<int32_t> with;
@@ -1837,7 +2010,7 @@ int main(int argc, char** argv) {
         auto add = [&](int32_t id) {
             out.push_back(id);
             const std::string text = tok.decode(out);
-            raw = text.substr(0, utf8_complete(text));
+            raw = pre + text.substr(0, utf8_complete(text));
             visible = harm ? harmony::display(raw) : raw;
             // A stop string: end the reply just before it.
             size_t cut = std::string::npos;
@@ -1946,8 +2119,8 @@ int main(int argc, char** argv) {
         json msgs = messages;
         std::vector<std::string> pics;
         try { pics = take_pictures(msgs); } catch (...) {}
-        int n = (int)eng.tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity)
-                                         : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, eng.tok), true).size();
+        int n = (int)eng.tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
+                                         : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, eng.tok, think_mode()), true).size();
         for (const std::string& b : pics) {                        // each image: its words instead of one pad token
             int w = 0, h = 0;
             if (eng.vision && image_size((const uint8_t*)b.data(), b.size(), &w, &h)) n += eng.vision->tokens_for(w, h, eng.image_tokens_for(tl_image_tokens)) - 1;
@@ -2013,6 +2186,7 @@ int main(int argc, char** argv) {
                 // finishes or the context window is full. Thinking models (Qwen3.x) need thousands of tokens.
                 const int max_tokens = body.value("max_tokens", -1);
                 tl_image_tokens = body.value("image_tokens", 0);      // image detail (0: automatic)
+                take_think(body);
                 const int L = eng.model->hparams().n_layer, K = eng.model->hparams().n_expert_used;
                 // The workspace (tierlm's own page): the model gets the folder's tools and is told about them. The
                 // tools only describe; running them is /api/workspace/tool, which only this computer's page can use.
@@ -2602,13 +2776,7 @@ int main(int argc, char** argv) {
     // ---------------- The embedding model (a second model, next to the chat model) ----------------
     // Embedding models are small and run on their own: requests for embeddings don't wait for a chat reply to
     // finish. The two models take turns on the GPU between steps (device_mutex), so neither stalls for long.
-    struct EmbedSlot {
-        std::mutex mu;                       // guards the slot; held while embedding
-        std::unique_ptr<Encoder> enc;
-        Tokenizer tok;
-        std::string id, path, name;
-        double load_s = 0;
-    } emb;
+    // (the slot itself, `emb`, is declared before the model routes: Eject frees it too)
     // For looking back at a chat's archive by meaning (chats::recall): one text to a unit vector with the embedding
     // model, if one is loaded. Nomic's models are trained with "search_query: " / "search_document: " in front.
     embed_for_recall = [&](const std::string& text, bool query) -> std::vector<float> {
@@ -2691,7 +2859,81 @@ int main(int argc, char** argv) {
         res.set_content(dump({{"object", "list"}, {"data", data}}), "application/json");
     });
 
-    svr.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+    // LM Studio's own REST API (/api/v0): apps written for LM Studio list the models here, with what each one is
+    // ("llm", "vlm" for one that reads images, "embeddings") and whether it is loaded, and some send their requests
+    // to /api/v0/chat/completions and /api/v0/embeddings (the same as /v1). The fields are LM Studio's.
+    auto v0_model = [&](const std::string& id, const std::string& type, bool loaded, const std::string& arch, int64_t ctx_max, int64_t ctx_loaded) {
+        const auto slash = id.find('/');
+        std::string quant;                                    // from the file name, as LM Studio shows it: Q4_K_M, Q8_0, MXFP4...
+        static const std::regex qre(R"((?:^|[-_.])((?:UD-)?(?:I?Q\d(?:_[A-Z0-9]+)*|MXFP4|BF16|F16|F32|\d(?:\.\d)?bpw))(?:[-_.]|$))", std::regex::icase);
+        std::smatch mq;
+        const std::string stem = fs::u8path(id).stem().u8string();
+        if (std::regex_search(stem, mq, qre)) quant = mq[1].str();
+        json m = {{"id", id}, {"object", "model"}, {"type", type}, {"publisher", slash == std::string::npos ? std::string("local") : id.substr(0, slash)},
+                  {"arch", arch}, {"compatibility_type", "gguf"}, {"quantization", quant}, {"state", loaded ? "loaded" : "not-loaded"},
+                  {"max_context_length", ctx_max}};
+        if (loaded && ctx_loaded > 0) m["loaded_context_length"] = ctx_loaded;
+        if (type == "vlm") m["capabilities"] = json::array({"vision"});
+        return m;
+    };
+    auto v0_models = [&]() {
+        json data = json::array();
+        std::string cur;
+        json cur_m;
+        {
+            std::shared_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
+            if (lk.owns_lock() && eng.model) {
+                cur = loaded_id();
+                cur_m = v0_model(cur, eng.vision ? "vlm" : "llm", true, eng.model->arch(), 0,
+                                 eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per);
+            } else if (!lk.owns_lock()) {                     // (busy writing a reply: what was loaded last)
+                cur = last_info.value("path", std::string());
+                if (!cur.empty()) {
+                    cur = fs::u8path(cur).filename().u8string();
+                    cur_m = v0_model(cur, last_info.value("vision", false) ? "vlm" : "llm", true, last_info.value("arch", std::string()),
+                                     0, last_info.value("ctx", 0));
+                }
+            }
+        }
+        if (!cur_m.is_null()) data.push_back(cur_m);
+        std::string emb_id;
+        {
+            std::lock_guard<std::mutex> lk(emb.mu);
+            if (emb.enc) { emb_id = emb.id; data.push_back(v0_model(emb.id, "embeddings", true, emb.enc->arch(), 0, 0)); }
+        }
+        bool exists = false;
+        for (const auto& m : scan_models(exists)) {
+            const std::string id = m.value("id", std::string());
+            for (auto& d : data)                              // the loaded ones: the context the model was trained for
+                if (d["id"] == id) d["max_context_length"] = m.value("ctx_train", 0);
+            if (id == cur || id == emb_id) continue;
+            const bool embedding = m.value("kind", std::string()) == "embedding" && m.value("embedding", false);
+            if (!embedding && !m.value("supported", false)) continue;
+            std::string type = embedding ? "embeddings" : "llm";
+            if (!embedding) {                                 // a vision file next to it: it reads images once loaded
+                std::error_code ec;
+                const fs::path dir = (fs::u8path(a.models) / fs::u8path(id)).parent_path();
+                for (const auto& f : fs::directory_iterator(dir, ec)) {
+                    const std::string n = f.path().filename().u8string();
+                    std::string low = n; std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+                    if (low.find("mmproj") != std::string::npos && f.path().extension() == ".gguf") { type = "vlm"; break; }
+                }
+            }
+            data.push_back(v0_model(id, type, false, m.value("arch", std::string()), m.value("ctx_train", 0), 0));
+        }
+        return data;
+    };
+    svr.Get("/api/v0/models", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_content(dump({{"object", "list"}, {"data", v0_models()}}), "application/json");
+    });
+    svr.Get(R"(/api/v0/models/(.+))", [&](const httplib::Request& req, httplib::Response& res) {
+        const std::string want = req.matches[1].str();
+        for (const auto& m : v0_models())
+            if (m["id"] == want) return res.set_content(dump(m), "application/json");
+        oai_error(res, 404, "no model \"" + want + "\" in the models folder", "invalid_request_error", "model_not_found");
+    });
+
+    svr.Post(R"(/(?:v1|api/v0)/chat/completions)", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array())
             return oai_error(res, 400, "expected a JSON body with a \"messages\" array");
@@ -2699,8 +2941,9 @@ int main(int argc, char** argv) {
         // Wait in line for replies already asked for (from the web page or other apps): one at a time, or as many
         // at once as there are connections. Loading a different model needs the engine to itself.
         const std::string want = body.value("model", std::string());
-        // (another model only if it is one in the models folder: many apps send a fixed name such as "gpt-4o")
-        const bool other_model = !want.empty() && want != loaded_id() && [&] {
+        // (another model only if it is one in the models folder: many apps send a fixed name such as "gpt-4o"; and
+        // only for apps on this computer: an app elsewhere uses the loaded model, as switching models is a setting)
+        const bool other_model = !want.empty() && want != loaded_id() && is_local(req) && [&] {
             std::error_code ec;
             const auto base = fs::weakly_canonical(fs::u8path(a.models), ec);
             const auto file = fs::weakly_canonical(fs::u8path(a.models) / fs::u8path(want), ec);
@@ -2796,9 +3039,18 @@ int main(int argc, char** argv) {
         if (!stream) {
             try {
                 tl_image_tokens = body.value("image_tokens", 0);   // image detail (0: automatic)
+                take_think(body);
                 Gen g = generate(messages, sp, max_tokens, stops, nullptr, nullptr, tools);
                 json msg = {{"role", "assistant"}, {"content", g.text}};
                 std::string fin = finish(g.stop);
+                // The model's thinking goes in reasoning_content, the answer in content, as LM Studio and OpenAI's
+                // reasoning models send them: apps that show `content` show just the answer (even when the reply was
+                // cut off while still thinking: then content is empty).
+                {
+                    const auto [reasoning, answer] = agent::split_thinking(g.text);
+                    msg["content"] = answer;
+                    if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
+                }
                 if (!tools.empty()) {
                     const agent::Parsed pc = parse_calls(g.full, tools);
                     const auto [reasoning, answer] = agent::split_thinking(pc.calls.empty() ? g.text : pc.content);
@@ -2830,7 +3082,7 @@ int main(int argc, char** argv) {
             };
             try {
                 chunk({{"role", "assistant"}, {"content", ""}}, nullptr);
-                agent::ThinkSplit split;                            // with tools, thinking goes out as reasoning_content
+                agent::ThinkSplit split;                            // thinking goes out as reasoning_content (as above)
                 auto send_parts = [&](const std::pair<std::string, std::string>& p) {
                     bool ok = true;
                     if (!p.first.empty()) ok = chunk({{"reasoning_content", p.first}}, nullptr);
@@ -2838,12 +3090,13 @@ int main(int argc, char** argv) {
                     return ok;
                 };
                 tl_image_tokens = body.value("image_tokens", 0);   // image detail (0: automatic)
+                take_think(body);
                 Gen g = generate(messages, sp, max_tokens, stops, nullptr,
                                  [&](const std::string& delta, double, const std::vector<int32_t>&) {
                                      if (delta.empty()) return true;
-                                     return tools.empty() ? chunk({{"content", delta}}, nullptr) : send_parts(split.feed(delta));
+                                     return send_parts(split.feed(delta));
                                  }, tools);
-                if (!tools.empty() && g.stop != "abort") send_parts(split.feed("", true));
+                if (g.stop != "abort") send_parts(split.feed("", true));
                 if (g.stop != "abort") {
                     std::string fin = finish(g.stop);
                     if (!tools.empty()) {
@@ -2882,6 +3135,18 @@ int main(int argc, char** argv) {
     std::atomic<bool> relisten{false};
     auto bind_host = [&]() { return a.host_given ? a.host : (allow_network ? std::string("0.0.0.0") : std::string("127.0.0.1")); };
 
+    // The page asks /api/info what it may show: from another device it says so ("remote"), and the model's
+    // location on the disk is left out (its file name is enough there).
+    svr.set_post_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
+        if (req.path != "/api/info" || is_local(req) || res.status != 200) return;
+        json j = json::parse(res.body, nullptr, false);
+        if (!j.is_object()) return;
+        j["remote"] = true;
+        for (const char* k : {"path", "vision_file"})
+            if (j.contains(k) && j[k].is_string()) j[k] = fs::u8path(j[k].get<std::string>()).filename().u8string();
+        res.set_content(dump(j), "application/json");
+    });
+
     svr.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
         const bool local = is_local(req);
         if (!local && !allow_network && !a.host_given) {
@@ -2889,10 +3154,18 @@ int main(int argc, char** argv) {
                       "permission_error");
             return httplib::Server::HandlerResponse::Handled;
         }
+        // Other devices use the model (chat, the API) but don't run the computer: loading or unloading models,
+        // settings, the tuner and the benchmark, the models folder, the embedding model and the console are for
+        // the computer running tierlm only (the workspace, saved chats and network settings check this themselves).
+        // Refused here, so a script can't do what the page doesn't offer either.
+        if (!local && remote_refused(req)) {
+            oai_error(res, 403, "settings can only be changed on the computer running tierlm", "permission_error");
+            return httplib::Server::HandlerResponse::Handled;
+        }
         std::string key;
         { std::lock_guard<std::mutex> lk(net_mu); key = api_key; }
         const bool is_api = req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 5, "/api/") == 0;
-        const bool needs_key = !key.empty() && is_api && (!local || req.path.compare(0, 4, "/v1/") == 0);
+        const bool needs_key = !key.empty() && is_api && (!local || req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 8, "/api/v0/") == 0);
         if (needs_key) {
             std::string auth = req.get_header_value("Authorization");
             std::string given = auth.compare(0, 7, "Bearer ") == 0 ? auth.substr(7) : req.get_header_value("X-Api-Key");
@@ -3236,7 +3509,7 @@ int main(int argc, char** argv) {
     // "encoding_format": "float" | "base64", "dimensions": n}. Each vector is normalised to length 1, as OpenAI's
     // are; "dimensions" keeps the first n numbers (for models trained for it, such as nomic-embed-text v1.5) and
     // normalises again. Texts longer than the model takes are cut to fit (as sentence-transformers does).
-    svr.Post("/v1/embeddings", [&](const httplib::Request& req, httplib::Response& res) {
+    svr.Post(R"(/(?:v1|api/v0)/embeddings)", [&](const httplib::Request& req, httplib::Response& res) {
         const json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object() || !body.contains("input")) return oai_error(res, 400, "expected a JSON body with \"input\"");
         std::vector<std::vector<int32_t>> inputs;

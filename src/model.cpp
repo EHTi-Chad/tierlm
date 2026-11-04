@@ -32,9 +32,8 @@ static constexpr int kGraphSize = 16384;
 Model::~Model() {
     release_pending();
     if (sched_) ggml_backend_sched_free(sched_);
-    for (auto* b : kvbufs_) if (b) ggml_backend_buffer_free(b);
+    free_kv();
     for (auto* b : wbufs_) if (b) ggml_backend_buffer_free(b);
-    if (kvctx_) ggml_free(kvctx_);
     if (wctx_) ggml_free(wctx_);
     for (auto* b : gpus_) if (b && b != cpu_) ggml_backend_free(b);
     if (cpu_) ggml_backend_free(cpu_);
@@ -923,41 +922,10 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     }
 
     // ---- KV cache on the same device, in f16: half the size and memory traffic of f32 ----
-    const int hd = hp.head_dim;
-    const ggml_type kv_type = (ggml_type)m->kv_t_;
     const int n_seq = std::max(1, opt.parallel);
-    ggml_init_params kp{ (size_t)2 * nl_all * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
-    m->kvctx_ = ggml_init(kp);
-    std::vector<std::vector<ggml_tensor*>> kv_t(G + 1);              // per GPU, then RAM
-    for (int i = 0; i < nl_all; ++i) {
-        auto& L = i < hp.n_layer ? m->layers_[i] : *m->mtp_;
-        auto& dst = kv_t[m->layer_dev_[i] >= 0 ? m->layer_dev_[i] : G];
-        if (L.recurrent) {                                            // DeltaNet: fixed-size state, always f32
-            for (int s = 0; s < n_seq; ++s) {                         // one running memory per conversation
-                L.conv_states.push_back(ggml_new_tensor_2d(m->kvctx_, GGML_TYPE_F32, hp.ssm_conv - 1, hp.ssm_conv_dim()));
-                L.ssm_states.push_back(ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hp.ssm_state, hp.ssm_state, hp.ssm_v_heads));
-                dst.push_back(L.conv_states.back());
-                dst.push_back(L.ssm_states.back());
-            }
-            L.conv_state = L.conv_states[0];
-            L.ssm_state_t = L.ssm_states[0];
-            continue;
-        }
-        L.k_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
-        L.v_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
-        dst.push_back(L.k_cache);
-        dst.push_back(L.v_cache);
-    }
-    for (int tier = 0; tier <= G; ++tier) {
-        auto& ts = kv_t[tier];
-        if (ts.empty()) continue;
-        ggml_backend_buffer* b = ggml_backend_buft_alloc_buffer_n(tier < G ? bufts[tier] : cpu_buft, ts.data(), (int)ts.size());
-        if (!b) throw std::runtime_error("not enough memory for the KV cache (try a smaller context)");
-        ggml_backend_buffer_clear(b, 0);
-        m->kv_bytes_ += ggml_backend_buffer_get_size(b);
-        if (tier < G) m->place_.gpus[tier].kv += ggml_backend_buffer_get_size(b);
-        m->kvbufs_.push_back(b);
-    }
+    m->kv_bufts_.assign(bufts.begin(), bufts.end());
+    m->kv_bufts_.push_back(cpu_buft);
+    m->make_kv(m->max_ctx_, n_seq);
     for (int i = 0; i < hp.n_layer; ++i) if (m->layer_dev_[i] >= 0) m->place_.gpus[m->layer_dev_[i]].layers++;
     m->cell_seq_.assign(m->max_ctx_, -1);
     m->cell_pos_.assign(m->max_ctx_, -1);
@@ -1805,6 +1773,141 @@ std::vector<float> Model::eval_batch(const int32_t* ids, int n_tok, int n_thread
 }
 
 // The graph of a speculative check, kept until accept() knows how many of its tokens to keep.
+// The KV cache (and the hybrid models' fixed-size running memories) at `ctx` positions, for n_seq conversations:
+// each layer's part on the device that computes the layer (layer_dev_), one buffer per device. Cleared to zero.
+void Model::make_kv(int ctx, int n_seq) {
+    const Hparams& hp = hp_;
+    const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), G = (int)gpus_.size(), hd = hp.head_dim;
+    const ggml_type kv_type = (ggml_type)kv_t_;
+    ggml_init_params kp{ (size_t)2 * nl_all * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
+    kvctx_ = ggml_init(kp);
+    std::vector<std::vector<ggml_tensor*>> kv_t(G + 1);              // per GPU, then RAM
+    for (int i = 0; i < nl_all; ++i) {
+        auto& L = i < hp.n_layer ? layers_[i] : *mtp_;
+        auto& dst = kv_t[layer_dev_[i] >= 0 ? layer_dev_[i] : G];
+        if (L.recurrent) {                                            // DeltaNet: fixed-size state, always f32
+            L.conv_states.clear(); L.ssm_states.clear();
+            for (int s = 0; s < n_seq; ++s) {                         // one running memory per conversation
+                L.conv_states.push_back(ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, hp.ssm_conv - 1, hp.ssm_conv_dim()));
+                L.ssm_states.push_back(ggml_new_tensor_3d(kvctx_, GGML_TYPE_F32, hp.ssm_state, hp.ssm_state, hp.ssm_v_heads));
+                dst.push_back(L.conv_states.back());
+                dst.push_back(L.ssm_states.back());
+            }
+            L.conv_state = L.conv_states[0];
+            L.ssm_state_t = L.ssm_states[0];
+            continue;
+        }
+        L.k_cache = ggml_new_tensor_3d(kvctx_, kv_type, hd, hp.n_head_kv, ctx);
+        L.v_cache = ggml_new_tensor_3d(kvctx_, kv_type, hd, hp.n_head_kv, ctx);
+        dst.push_back(L.k_cache);
+        dst.push_back(L.v_cache);
+    }
+    kv_bytes_ = 0;
+    for (auto& g : place_.gpus) g.kv = 0;
+    for (int tier = 0; tier <= G; ++tier) {
+        auto& ts = kv_t[tier];
+        if (ts.empty()) continue;
+        ggml_backend_buffer* b = ggml_backend_buft_alloc_buffer_n(kv_bufts_[tier], ts.data(), (int)ts.size());
+        if (!b) throw std::runtime_error("not enough memory for the KV cache (try a smaller context)");
+        ggml_backend_buffer_clear(b, 0);
+        kv_bytes_ += ggml_backend_buffer_get_size(b);
+        if (tier < G) place_.gpus[tier].kv += ggml_backend_buffer_get_size(b);
+        kvbufs_.push_back(b);
+    }
+}
+
+size_t Model::kv_bytes_per_token(size_t* in_vram) const {
+    size_t all = 0, vram = 0;
+    const int nl_all = hp_.n_layer + (mtp_ ? 1 : 0);
+    for (int i = 0; i < nl_all; ++i) {
+        const auto& L = i < hp_.n_layer ? layers_[i] : *mtp_;
+        if (L.recurrent || !L.k_cache) continue;
+        const size_t b = L.k_cache->nb[2] + L.v_cache->nb[2];
+        all += b;
+        if (layer_dev_[i] >= 0) vram += b;
+    }
+    if (in_vram) *in_vram = vram;
+    return all;
+}
+
+void Model::free_kv() {
+    for (auto* b : kvbufs_) if (b) ggml_backend_buffer_free(b);
+    kvbufs_.clear();
+    if (kvctx_) ggml_free(kvctx_);
+    kvctx_ = nullptr;
+}
+
+// Live context length (see the header): what's in the cache goes to RAM, the cache is made again at the new size
+// on the same devices, and it comes back. Positions stay where they are, so only the cells in use (up to hi_) are
+// copied; the running memories of hybrid layers are copied whole. If the new size doesn't fit, the old one is made
+// again and the conversations are as they were.
+void Model::resize_ctx(int new_ctx) {
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    if (new_ctx == max_ctx_) return;
+    if (new_ctx < 256) throw std::runtime_error("the context must be at least 256 tokens");
+    if (hi_ > new_ctx)
+        throw std::runtime_error("the conversations in the cache use " + std::to_string(hi_) + " tokens, more than " +
+                                 std::to_string(new_ctx) + ": start a new chat first, or choose a longer context");
+    release_pending();
+    const Hparams& hp = hp_;
+    const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), n_seq = n_seq_max();
+    // 1. what to keep, in RAM
+    struct Kept { std::vector<uint8_t> k, v; std::vector<std::vector<uint8_t>> conv, ssm; };
+    std::vector<Kept> kept(nl_all);
+    auto get = [](ggml_tensor* t, size_t bytes) { std::vector<uint8_t> d(bytes); if (bytes) ggml_backend_tensor_get(t, d.data(), 0, bytes); return d; };
+    for (int i = 0; i < nl_all; ++i) {
+        auto& L = i < hp.n_layer ? layers_[i] : *mtp_;
+        if (L.recurrent) {
+            for (int s = 0; s < n_seq; ++s) {
+                kept[i].conv.push_back(get(L.conv_states[s], ggml_nbytes(L.conv_states[s])));
+                kept[i].ssm.push_back(get(L.ssm_states[s], ggml_nbytes(L.ssm_states[s])));
+            }
+        } else if (L.k_cache) {
+            kept[i].k = get(L.k_cache, (size_t)hi_ * L.k_cache->nb[2]);
+            kept[i].v = get(L.v_cache, (size_t)hi_ * L.v_cache->nb[2]);
+        }
+    }
+    // 2. the cache again, at the new size (or the old one if that doesn't fit)
+    const int old_ctx = max_ctx_;
+    free_kv();
+    std::string err;
+    try { make_kv(new_ctx, n_seq); }
+    catch (const std::exception& e) {
+        err = e.what();
+        free_kv();
+        make_kv(old_ctx, n_seq);                                      // (it fitted a moment ago)
+        new_ctx = old_ctx;
+    }
+    // 3. back in
+    for (int i = 0; i < nl_all; ++i) {
+        auto& L = i < hp.n_layer ? layers_[i] : *mtp_;
+        if (L.recurrent) {
+            for (int s = 0; s < n_seq; ++s) {
+                ggml_backend_tensor_set(L.conv_states[s], kept[i].conv[s].data(), 0, kept[i].conv[s].size());
+                ggml_backend_tensor_set(L.ssm_states[s], kept[i].ssm[s].data(), 0, kept[i].ssm[s].size());
+            }
+        } else if (L.k_cache) {
+            if (!kept[i].k.empty()) ggml_backend_tensor_set(L.k_cache, kept[i].k.data(), 0, kept[i].k.size());
+            if (!kept[i].v.empty()) ggml_backend_tensor_set(L.v_cache, kept[i].v.data(), 0, kept[i].v.size());
+        }
+    }
+    if (!err.empty()) throw std::runtime_error("the context stays at " + std::to_string(old_ctx) + " tokens: " + err);
+    // 4. the cells: new ones free, or the unused end dropped
+    cell_seq_.resize(new_ctx, -1);
+    cell_pos_.resize(new_ctx, -1);
+    n_free_ += new_ctx - max_ctx_;
+    max_ctx_ = new_ctx;
+    free_lo_ = std::min(free_lo_, max_ctx_);
+    // 5. compute memory for the largest graph at the new size
+    const int n_res = std::min(batch_, max_ctx_);
+    Graph worst = build(n_res, max_ctx_, true);
+    pin_cpu_layers(worst);
+    ggml_backend_sched_reset(sched_);
+    const bool ok = ggml_backend_sched_reserve(sched_, worst.gf);
+    ggml_free(worst.ctx);
+    if (!ok) throw std::runtime_error("failed to reserve compute memory for the new context");
+}
+
 void Model::release_pending() {
     if (pending_) { ggml_free(((Graph*)pending_)->ctx); delete (Graph*)pending_; pending_ = nullptr; }
 }

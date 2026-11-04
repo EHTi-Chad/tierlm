@@ -213,6 +213,9 @@
   .msg.tool .thead .plink, .md .codeblock .open { cursor: pointer; }
   .msg.tool .thead .plink { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
   .md .open { position: absolute; top: 4px; right: 62px; font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); }
+  .md .open.page { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .md .open.page:hover { filter: brightness(1.1); }
+  .pvauto { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted); margin-left: auto; margin-right: 8px; white-space: nowrap; cursor: pointer; }
   @media (max-width: 980px) {
     #preview { position: fixed; inset: 0; z-index: 50; border-radius: 0; }
     #pvsplit { display: none; }
@@ -276,6 +279,8 @@
   button.primary:disabled { opacity: .5; cursor: default; }
   button.ghost { background: transparent; }
   button.tiny { padding: 2px 8px; font-size: 12px; }
+  .ejectcard { margin-left: auto; }
+  #ctxnum, #ctxcustom { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; font: inherit; }
   button.on { background: var(--accent-soft); border-color: var(--accent); }
 
   /* dashboard */
@@ -285,6 +290,10 @@
   .kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
   .bar { height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; margin-top: 6px; }
   .bar > div { height: 100%; background: var(--accent); width: 0; transition: width .25s; }
+  .bar.stack { display: flex; }
+  .bar.stack > .now { background: var(--vram); }
+  .bar.stack > .add { background: var(--kv); }
+  .bar.stack > .add.less { background: transparent; box-shadow: inset 0 0 0 1px var(--kv); }
   canvas { display: block; width: 100%; }
   #spark { height: 58px; margin-top: 6px; }
   .chead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
@@ -430,6 +439,11 @@
   #netcard label.chk input { accent-color: var(--accent); width: 16px; height: 16px; }
   #netmsg { color: var(--muted); }
   .warnline { color: var(--danger); font-size: 12.5px; margin-top: 6px; }
+  /* Another device (a phone, a colleague's PC): the chat, speed, context and how to connect; the computer's settings
+     stay on the computer running tierlm (the server refuses them from elsewhere too). */
+  body.guest .hostonly, body.guest .ricon[data-sec="settings"], body.guest .ricon[data-sec="console"], body.guest .ricon[data-sec="model"],
+  body.guest .ricon[data-sec="bench"], body.guest .sec[data-sec="settings"], body.guest .sec[data-sec="console"],
+  body.guest .sec[data-sec="model"], body.guest .sec[data-sec="bench"], body.guest #setupbtn, body.guest #ejectbtn, body.guest #m-folder, body.guest #m-recent { display: none !important; }
 </style>
 <script src="vendor/katex.min.js"></script>
 </head>
@@ -443,6 +457,7 @@
   <div class="themesw" role="group" aria-label="Theme">
     <button data-theme="auto" aria-pressed="true">Auto</button><button data-theme="light" aria-pressed="false">Light</button><button data-theme="dark" aria-pressed="false">Dark</button>
   </div>
+  <button class="tiny" id="ejectbtn" hidden title="Unload the model and free its VRAM and RAM">Eject</button>
   <button class="tiny" id="setupbtn" hidden>Change setup</button>
 </header>
 
@@ -495,6 +510,7 @@
         <div>
           <label for="ctxsel">Context length</label>
           <select id="ctxsel"></select>
+          <input id="ctxcustom" type="number" min="256" step="1024" hidden aria-label="Context length in tokens" style="margin-top:6px;width:140px">
           <div class="help" id="ctxhelp">How much conversation the model can remember. Longer uses more memory.</div>
         </div>
         <div>
@@ -615,27 +631,27 @@
     <div class="head"><h2>Connect other apps</h2><span class="caption">OpenAI-compatible API</span></div>
     <div class="body" id="netbody">
       <div class="help" style="margin-bottom:8px">Apps that work with OpenAI (Open WebUI, Continue, LibreChat, scripts using the OpenAI library)
-        can use tierlm instead: give them the address below as the <b>base URL</b>. They use the model loaded here, or load another
-        one by name (the names are listed at <code>/v1/models</code>).</div>
+        can use tierlm instead: give them the address below as the <b>base URL</b>. They use the model loaded here<span class="hostonly">, or load another
+        one by name (the names are listed at <code>/v1/models</code>; apps on this computer only)</span>.</div>
       <div id="urls"></div>
-      <div style="margin-top:12px">
+      <div class="hostonly" style="margin-top:12px">
         <label class="chk"><input type="checkbox" id="allownet"> Allow other devices</label>
         <div class="help">Let other computers, phones, or Open WebUI running in Docker reach tierlm over your network. Off: only
           this computer can. Anyone on your network can use your GPU while this is on, so set an API key too. Windows may ask
           whether to allow tierlm through the firewall: choose <b>Private networks</b>.</div>
       </div>
-      <div class="apirow" style="margin-top:12px">
+      <div class="apirow hostonly" style="margin-top:12px">
         <span class="lbl">API key</span>
         <input id="apikey" type="text" readonly placeholder="none: apps on this computer don't need one" spellcheck="false">
         <button class="tiny" id="keygen">New key</button>
         <button class="tiny" id="keycopy">Copy</button>
         <button class="tiny ghost" id="keyclear">Remove</button>
       </div>
-      <div class="help">When set, apps must send it as their API key, and the tierlm page asks for it on other devices. Needed if you
+      <div class="help hostonly">When set, apps must send it as their API key, and the tierlm page asks for it on other devices. Needed if you
         open tierlm to the internet through a tunnel (Cursor works that way).</div>
       <div class="caption" id="netmsg"></div>
-      <label class="chk" style="margin-top:12px"><input type="checkbox" id="apitrim"> When an app's conversation is too long, drop its oldest messages</label>
-      <div class="help">Off (the default): the app gets an error and can shorten the conversation itself, as coding agents such as
+      <label class="chk hostonly" style="margin-top:12px"><input type="checkbox" id="apitrim"> When an app's conversation is too long, drop its oldest messages</label>
+      <div class="help hostonly">Off (the default): the app gets an error and can shorten the conversation itself, as coding agents such as
         opencode do. On: tierlm leaves out the oldest messages so the rest fits, like LM Studio's "truncate" option.</div>
       <div id="appsetup" hidden>
         <h3 class="setuph">Set up an app</h3>
@@ -699,6 +715,14 @@
         <div class="mid" id="ctxbig">0<small id="ctxof">/ – tokens</small></div>
         <div class="bar"><div id="ctxbar"></div></div>
         <div class="help" id="ctxwarn" hidden></div>
+        <button class="tiny ghost hostonly" id="ctxchg" style="margin-top:8px">Change length…</button>
+        <div id="ctxpanel" class="hostonly" hidden>
+          <input type="range" id="ctxrange" min="0" max="1" step="1" aria-label="Context length" style="width:100%;margin-top:10px">
+          <div class="apirow"><input type="number" id="ctxnum" min="256" step="1024" style="width:110px" aria-label="Context length in tokens"><span class="caption">tokens<span id="ctxper"></span></span></div>
+          <div class="bar stack" id="ctxmem" title="VRAM: in use now, and the change"><div class="now"></div><div class="add"></div></div>
+          <div class="help" id="ctxplan"></div>
+          <div class="apirow"><button class="tiny" id="ctxapply" disabled>Apply</button><button class="tiny ghost" id="ctxcancel">Close</button></div>
+        </div>
       </div>
     </div>
     </div>
@@ -725,6 +749,11 @@
           <select id="picdetail"><option value="0">Automatic</option><option value="2048">High (scanned pages, small text)</option><option value="1024">Medium</option><option value="512">Low (fastest)</option></select>
         </div>
         <div class="help" id="pichelp" hidden></div>
+        <div class="lrow2" id="thinkrow" hidden>
+          <label for="thinksel" id="thinklbl">Thinking</label>
+          <select id="thinksel"><option value="1">On: reasons before answering</option><option value="0">Off: answers straight away</option></select>
+        </div>
+        <div class="help" id="thinkhelp" hidden>For this model, here and for apps using the API (an app can still ask for either). Off gives quicker, shorter replies; on is better for hard questions.</div>
         <div class="lrow2" id="wsrow" hidden>
           <label class="chk"><input type="checkbox" id="wson"> Workspace</label>
           <span class="wsfolder" id="wsfolder"></span>
@@ -735,7 +764,7 @@
           code): tierlm guesses the repeat and the model checks it in one pass. Works with every model.</div>
         <label class="lrow" for="sysprompt">System prompt</label>
         <textarea id="sysprompt" rows="3" placeholder="Optional: instructions the model follows in every reply"></textarea>
-        <div class="reloadnote">Context length, split mode, context memory and the model itself need a reload.
+        <div class="reloadnote">Split mode, context memory and the model itself need a reload; the context length changes right away with <b>Change length…</b> under Context.
           <button class="tiny" id="chgsetup2">Change model and load settings…</button></div>
       </div>
     </div>
@@ -863,7 +892,7 @@
     <div id="messages">
       <div class="empty" id="empty">
         <b>Chat with your own engine.</b><br>
-        Every reply runs through tierlm on this machine. Speed and context are at the top of the menu; the expert map is in Model info.
+        Every reply runs through tierlm on this machine. Speed and context are at the top of the menu<span class="hostonly">; the expert map is in Model info</span>.
         <div class="suggest">
           <button class="ghost" data-q="What is the capital of France, and why is it famous?">Capital of France</button>
           <button class="ghost" data-q="Explain what a mixture-of-experts language model is, in simple terms.">Explain MoE</button>
@@ -897,7 +926,7 @@
 
   <div id="pvsplit" hidden role="separator" aria-orientation="vertical" aria-label="Resize the preview" tabindex="0"></div>
   <section class="card" id="preview" hidden aria-label="Preview">
-    <div class="pvhead"><div id="pvtabs" role="tablist"></div><button class="tiny ghost" id="pvclose" aria-label="Close the preview" title="Close the preview">✕</button></div>
+    <div class="pvhead"><div id="pvtabs" role="tablist"></div><label class="pvauto" title="When a reply ends with a whole web page in it, show the page here"><input type="checkbox" id="pvauto" checked> Show pages by themselves</label><button class="tiny ghost" id="pvclose" aria-label="Close the preview" title="Close the preview">✕</button></div>
     <div id="pvbody"></div>
   </section>
 
@@ -1029,6 +1058,13 @@ async function loadInfo() {
     info = await (await api("/api/info")).json();
   } catch (e) { $("devname").textContent = "server not reachable"; return; }
   if (info.version) $("ver").textContent = "v" + info.version;
+  document.body.classList.toggle("guest", !!info.remote);
+  if (!info.loaded && info.remote) {                       // another device: nothing it can set up from here
+    info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "";
+    showApp();
+    $("messages").innerHTML = '<div class="help" style="padding:24px">No model is loaded yet. It can be loaded on the computer running tierlm.</div>';
+    return;
+  }
   if (!info.loaded) { info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "setup"; showSetup(); return; }
   showApp();
   loadEmbed();
@@ -1059,6 +1095,16 @@ async function loadInfo() {
   $("vis").textContent = info.vision ? "yes, on " + (info.vision_device || "").replace(/ \([^)]*\)/g, "") : "no";
   // Image detail: how many image words an image may become (more: finer detail, slower to read).
   $("picrow").hidden = $("pichelp").hidden = !info.vision;
+  // Thinking: on/off for models whose chat template can switch it (Qwen3 and later); gpt-oss: how much it reasons.
+  {
+    const harm = !!info.reasoning_effort, sw = !!info.think_switch, sel = $("thinksel");
+    $("thinkrow").hidden = $("thinkhelp").hidden = !(sw || harm);
+    $("thinklbl").textContent = harm ? "Reasoning" : "Thinking";
+    sel.innerHTML = harm
+      ? '<option value="low">Low: quick replies</option><option value="medium">Medium</option><option value="high">High: for hard questions</option>'
+      : '<option value="1">On: reasons before answering</option><option value="0">Off: answers straight away</option>';
+    sel.value = harm ? info.reasoning_effort : (info.thinking ? "1" : "0");
+  }
   if (info.vision) $("pichelp").textContent = "Images are scaled to at most this many image words. Automatic: " +
     (info.image_tokens || 2048).toLocaleString() + (/^CPU$/.test(info.vision_device || "") ? " (the CPU reads images here: lower is much faster)" : "") +
     ". High suits scanned pages and small text; Low is quick for photos and screenshots.";
@@ -1092,7 +1138,7 @@ async function loadInfo() {
     (info.device_type === "igpu" ? " · an integrated GPU shares system RAM, so its 'VRAM' is borrowed memory" : "") +
     " · KV cache " + info.kv_type + ", flash attention " + (info.flash_attn ? "on" : "off") +
     (info.experts_used !== info.experts_default ? " · " + info.experts_used + " active experts (model default " + info.experts_default + ")" : "") +
-    (rw > 0 ? " · split between VRAM and RAM" : "") + " · SSD tier comes next";
+    (rw > 0 && !info.all_on_gpu ? " · split between VRAM and RAM" : "") + " · SSD tier comes next";
   resizeCanvases();
 }
 function setContext(n) {
@@ -1138,7 +1184,9 @@ function mdBlocks(src) {
       const fence = m[1], lang = m[2]; const body = [];
       for (i++; i < lines.length && !lines[i].trim().startsWith(fence); i++) body.push(lines[i]);
       i++;
-      out.push(`<div class="codeblock${lang ? " haslang" : ""}">${lang ? `<span class="codelang">${lang}</span>` : ""}<button class="open" type="button" title="Open in the preview">Open</button><button class="copy" type="button">Copy</button><pre><code>${body.join("\n")}</code></pre></div>`);
+      // A web page (HTML or SVG) gets a Preview button that draws it; other code opens as text.
+      const page = /^(html?|svg)$/i.test(lang) || /^\s*(&lt;|<)(!doctype\s+html|html|svg)\b/i.test(body.join("\n"));
+      out.push(`<div class="codeblock${lang ? " haslang" : ""}">${lang ? `<span class="codelang">${lang}</span>` : ""}<button class="open${page ? " page" : ""}" type="button" title="${page ? "Show the page in the preview" : "Open in the preview"}">${page ? "Preview" : "Open"}</button><button class="copy" type="button">Copy</button><pre><code>${body.join("\n")}</code></pre></div>`);
       continue;
     }
     if (!l.trim()) { i++; continue; }
@@ -1382,6 +1430,7 @@ async function send(text) {
 // The model's turn: its reply, and with the workspace, the tool rounds that follow.
 async function runTurn() {
   setBusy(true);
+  pagePath = null;
   controller = new AbortController();
   // With the workspace on, the model may ask for its tools: they run (reading at once, changes after Apply), their
   // results go back, and the model carries on, until it answers without a tool call.
@@ -1414,6 +1463,7 @@ async function runTurn() {
   controller = null;
   if (info && info.live_experts) refreshLive();
   if (rerender) { rerender = false; renderHistory(); }
+  autoPreview();
   if (lastFull) { const why = lastFull; lastFull = null; showContextFull(why); }
 }
 // ---------- long conversations: the archive ----------
@@ -1693,11 +1743,11 @@ let devices = [], models = [], warnings = [], hwThreads = 8, defThreads = 4, def
 const typeLabel = { gpu: "Dedicated GPU", igpu: "Integrated GPU", cpu: "CPU" };
 function showSetup() {
   $("netcard").appendChild($("netbody"));        // the API card lives in the side menu while chatting
-  $("app").hidden = true; $("setup").hidden = false; $("setupbtn").hidden = true;
+  $("app").hidden = true; $("setup").hidden = false; $("setupbtn").hidden = true; $("ejectbtn").hidden = !info;
   $("backbtn").hidden = !info;
   loadSetup();
 }
-function showApp() { $("apihome").appendChild($("netbody")); $("setup").hidden = true; $("app").hidden = false; $("setupbtn").hidden = false; resizeCanvases(); }
+function showApp() { $("apihome").appendChild($("netbody")); $("setup").hidden = true; $("app").hidden = false; $("setupbtn").hidden = false; $("ejectbtn").hidden = !info; resizeCanvases(); }
 let cpuFeatures = "";
 const WORK = 768 * 1048576;
 // KV cache size relative to 16-bit: q8_0 stores 32 values in 34 bytes, q4_0 in 18.
@@ -1734,7 +1784,7 @@ function gpuGroup(first) {
 // in VRAM first and the rest in RAM. "layers" moves whole layers with their part of the context; "experts" puts
 // all of the context (and attention) in VRAM first, then as many experts as fit.
 function plan() {
-  const ctx = +$("ctxsel").value || defCtx;
+  const ctx = ctxValue() || defCtx;
   const W = selModel ? selModel.bytes || 0 : 0;
   const KV = selModel ? (selModel.kv_bytes_per_token || 0) * ctx * kvFactor() * Math.max(1, +$("connsel").value || 1) : 0;
   const gpu = bestGpu(), cpu = cpuDev();
@@ -1846,8 +1896,9 @@ function applySaved() {
 // Context choices go up to the model's own limit (read from the file), with the memory each one needs.
 function buildCtx(want) {
   const max = selModel && selModel.ctx_train ? selModel.ctx_train : 4096;
-  const opts = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576].filter(v => v <= max);
+  const opts = [1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 1048576].filter(v => v <= max);
   if (!opts.includes(max)) opts.push(max);
+  const custom = +want && !opts.includes(+want) && +want <= max ? +want : 0;
   const kvpt = (selModel && selModel.kv_bytes_per_token || 0) * kvFactor();
   const sel = $("ctxsel"); sel.innerHTML = "";
   for (const v of opts) {
@@ -1856,7 +1907,24 @@ function buildCtx(want) {
     o.textContent = k + " tokens" + (kvpt ? " · " + fmtGiB(kvpt * v) : "") + (v === max ? " (model max)" : "");
     sel.appendChild(o);
   }
-  sel.value = opts.includes(+want) ? want : opts.filter(v => v <= 4096).at(-1) || opts[0];
+  const oc = document.createElement("option"); oc.value = "custom"; oc.textContent = "Custom…"; sel.appendChild(oc);
+  sel.value = custom ? "custom" : opts.includes(+want) ? want : opts.filter(v => v <= 4096).at(-1) || opts[0];
+  ctxCustomMax = max;
+  if (custom) $("ctxcustom").value = custom;
+  syncCtxCustom();
+}
+// "Custom…": any length up to the model's own (rounded to a multiple of 256, as the cache is used in steps of 256).
+let ctxCustomMax = 4096;
+function syncCtxCustom() {
+  const on = $("ctxsel").value === "custom";
+  $("ctxcustom").hidden = !on;
+  $("ctxcustom").max = ctxCustomMax;
+  if (on && !+$("ctxcustom").value) $("ctxcustom").value = Math.min(ctxCustomMax, 49152);
+}
+function ctxValue() {
+  if ($("ctxsel").value !== "custom") return +$("ctxsel").value;
+  const v = Math.round((+$("ctxcustom").value || 0) / 256) * 256;
+  return Math.max(256, Math.min(ctxCustomMax, v));
 }
 function renderWarnings() {
   const w = $("warnings"); w.innerHTML = "";
@@ -1875,7 +1943,7 @@ function renderWarnings() {
 }
 function tagger(el) { return (t, c) => { const s = document.createElement("span"); s.className = "tag " + (c || ""); s.textContent = t; el.appendChild(s); }; }
 function renderSetup() {
-  const ctx = +$("ctxsel").value || defCtx;
+  const ctx = ctxValue() || defCtx;
   const p = plan();
   $("allgpusrow").hidden = !(p.gpu && gpuGroup(p.gpu).length > 1);
   // hardware (read-only)
@@ -1965,6 +2033,15 @@ function renderSetup() {
     } else if (m.kind === "mmproj") add("Vision add-on (mmproj): used together with its model, not on its own", "warn");
     else if (m.kind === "draft") add("Draft add-on (MTP): makes its model faster with Speculative decoding, not a model on its own", "warn");
     else add(m.reason || "Not supported", "bad");
+    // The model that's loaded now: says so, with Eject to free its memory from here too
+    const loadedNow = info && info.path && info.path.replace(/\\/g, "/").endsWith((m.folder ? m.folder + "/" : "") + m.file);
+    if (loadedNow) {
+      add("Loaded now", "good");
+      const ej = document.createElement("button"); ej.type = "button"; ej.className = "tiny ejectcard"; ej.textContent = "Eject";
+      ej.title = "Unload this model and free its VRAM and RAM";
+      ej.onclick = e => { e.preventDefault(); e.stopPropagation(); ejectModel(ej); };
+      lab.querySelector(".tags").appendChild(ej);
+    }
     if (m.supported) lab.onclick = e => { e.preventDefault(); if (selModel && selModel.id === m.id) return; selModel = m; applySaved(); renderSetup(); };
     ml.appendChild(lab);
   }
@@ -2017,13 +2094,15 @@ $("pathok").onclick = async () => {
 $("pathin").onkeydown = e => { if (e.key === "Enter") $("pathok").click(); if (e.key === "Escape") $("pathcancel").click(); };
 $("rescanhw").onclick = e => { e.preventDefault(); loadSetup(); };
 for (const id of ["ctxsel", "forcecpu", "splitsel", "allgpus", "connsel"]) $(id).onchange = renderSetup;
+$("ctxsel").onchange = () => { syncCtxCustom(); renderSetup(); };
+$("ctxcustom").oninput = renderSetup;
 $("vramlim").oninput = renderSetup;
 function syncFa() {                       // a quantized cache needs flash attention
   const q = $("kvsel").value.startsWith("q");
   if (q) $("fa").checked = true;
   $("fa").disabled = q;
 }
-$("kvsel").onchange = () => { syncFa(); buildCtx($("ctxsel").value); renderSetup(); };
+$("kvsel").onchange = () => { syncFa(); buildCtx(ctxValue()); renderSetup(); };
 $("thr").oninput = () => $("thrv").textContent = $("thr").value;
 $("experts").oninput = () => $("expv").textContent = $("experts").value;
 $("topk").oninput = () => $("topkv").textContent = +$("topk").value || "off";
@@ -2031,6 +2110,89 @@ $("topp").oninput = () => $("toppv").textContent = (+$("topp").value).toFixed(2)
 $("minp").oninput = () => $("minpv").textContent = (+$("minp").value).toFixed(2);
 $("rpen").oninput = () => $("rpenv").textContent = (+$("rpen").value).toFixed(2);
 $("setupbtn").onclick = () => { if (!busy) showSetup(); };
+// ---- live context length: the cache made again at another size, without loading the model again ----
+// The slider steps through common lengths up to the model's own; the number box takes any. Each change asks the
+// server what it would take (GET /api/context) and shows where the cache would sit in VRAM, and whether it applies
+// right away or needs a reload (when there isn't the free VRAM: part of the model would have to move to RAM).
+const CTX_STEPS = [2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 1048576];
+let ctxSteps = [], ctxTimer = 0, ctxPlanned = null;
+const kTok = v => v >= 1024 && v % 1024 === 0 ? (v / 1024) + "K" : v.toLocaleString();
+async function ctxPlan(v) {
+  const r = await api("/api/context?ctx=" + v); const j = await r.json();
+  if (!r.ok) throw new Error(j.error?.message || r.statusText);
+  return j;
+}
+function ctxShow(p) {
+  ctxPlanned = p;
+  $("ctxper").textContent = p.connections > 1 ? ` per connection (${p.connections} connections)` : "";
+  const total = info?.device_total || 0, used = total ? total - p.vram_free : 0;
+  const now = $("ctxmem").querySelector(".now"), add = $("ctxmem").querySelector(".add");
+  $("ctxmem").hidden = !total || !info?.on_gpu;
+  if (total) {
+    const ch = p.vram_change;
+    now.style.width = Math.max(0, Math.min(100, 100 * (ch < 0 ? used + ch : used) / total)) + "%";
+    add.style.width = Math.min(100, 100 * Math.abs(ch) / total) + "%";
+    add.classList.toggle("less", ch < 0);
+  }
+  const mem = (ch, where) => ch === 0 ? "" : (ch > 0 ? "+" : "−") + fmtGiB(Math.abs(ch)) + " " + where;
+  const parts = [mem(p.vram_change, "VRAM"), mem(p.ram_change, "RAM")].filter(Boolean).join(", ");
+  let t;
+  if (p.ctx === p.current) t = "The current length.";
+  else if (p.live) t = `<b>Applies right away</b>, no reload: ${parts || "no change in memory"}` + (p.vram_change > 0 ? ` (${fmtGiB(p.vram_free)} VRAM free now).` : ".");
+  else if (p.reload) t = `<b>Needs a reload</b>: ${esc(p.why)}. Use <b>Change setup</b> to load it with ${kTok(p.ctx)}.`;
+  else t = esc(p.why || "Not possible.");
+  $("ctxplan").innerHTML = t;
+  $("ctxapply").disabled = !p.live || p.ctx === p.current;
+}
+function ctxPick(v, fromRange) {
+  v = Math.max(256, Math.round(v / 256) * 256);
+  $("ctxnum").value = v;
+  if (!fromRange) { let i = ctxSteps.findIndex(x => x >= v); if (i < 0) i = ctxSteps.length - 1; $("ctxrange").value = i; }
+  clearTimeout(ctxTimer);
+  ctxTimer = setTimeout(() => ctxPlan(v).then(ctxShow).catch(e => { $("ctxplan").textContent = e.message; $("ctxapply").disabled = true; }), 120);
+}
+$("ctxchg").onclick = async () => {
+  if (!info) return;
+  try {
+    const p = await ctxPlan(info.ctx);
+    const max = p.trained || info.ctx;
+    ctxSteps = CTX_STEPS.filter(v => v <= max); if (!ctxSteps.includes(max)) ctxSteps.push(max);
+    if (!ctxSteps.includes(info.ctx)) { ctxSteps.push(info.ctx); ctxSteps.sort((a, b) => a - b); }
+    $("ctxrange").max = ctxSteps.length - 1; $("ctxnum").max = max;
+    $("ctxpanel").hidden = false; $("ctxchg").hidden = true;
+    $("ctxrange").value = ctxSteps.indexOf(info.ctx); $("ctxnum").value = info.ctx;
+    ctxShow(p);
+  } catch (e) { $("ctxwarn").hidden = false; $("ctxwarn").textContent = e.message; }
+};
+$("ctxrange").oninput = () => ctxPick(ctxSteps[+$("ctxrange").value], true);
+$("ctxnum").onchange = () => ctxPick(+$("ctxnum").value, false);
+$("ctxcancel").onclick = () => { $("ctxpanel").hidden = true; $("ctxchg").hidden = false; };
+$("ctxapply").onclick = async () => {
+  if (!ctxPlanned || busy) return;
+  const b = $("ctxapply"); b.disabled = true; b.textContent = "Changing…";
+  try {
+    const r = await api("/api/context", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ctx: ctxPlanned.ctx }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || r.statusText);
+    await loadInfo();
+    $("ctxplan").innerHTML = `Done: ${kTok(j.ctx)} tokens, in ${j.seconds.toFixed(1)} s. The conversation is kept.`;
+    ctxPlan(j.ctx).then(p => { ctxPlanned = p; $("ctxapply").disabled = true; }).catch(() => {});
+  } catch (e) { $("ctxplan").textContent = e.message; }
+  b.textContent = "Apply";
+};
+
+// Eject: unload the model (and the embedding model) and give their memory back, e.g. before a game or another app
+// needs the GPU. Replies still being written finish first. The setup screen then shows the memory free again.
+async function ejectModel(b) {
+  if (busy || !info) return;
+  b.disabled = true; b.textContent = "Ejecting…";
+  try { await api("/api/unload", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embedding: true }) }); }
+  catch (e) {}
+  b.disabled = false; b.textContent = "Eject";
+  history = []; $("messages").innerHTML = "";
+  await loadInfo();                                   // (no model: the setup screen, with the memory free again)
+}
+$("ejectbtn").onclick = () => ejectModel($("ejectbtn"));
 $("backbtn").onclick = () => showApp();
 $("loadbtn").onclick = async () => {
   const p = plan();
@@ -2060,7 +2222,7 @@ function samplingBody() {
 }
 function loadBody(p) {
   const exp = +$("experts").value;
-  const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : (p.gpus || []).length > 1 ? "gpu" : p.dev.id, ctx: +$("ctxsel").value, threads: +$("thr").value,
+  const body = { model: selModel.id, device: p.dev.type === "cpu" ? "cpu" : (p.gpus || []).length > 1 ? "gpu" : p.dev.id, ctx: ctxValue(), threads: +$("thr").value,
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value, lookup: +$("llook").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
@@ -2220,6 +2382,11 @@ $("llook").onchange = async () => {
 };
 $("lspecn").onchange = () => { if ($("lspec").checked) setLiveSpec(); };
 try { $("picdetail").value = localStorage.getItem("tierlm.picdetail") || "0"; } catch (e) {}
+$("thinksel").onchange = async () => {
+  const v = $("thinksel").value, harm = !!info?.reasoning_effort;
+  try { await api("/api/thinking", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(harm ? { effort: v } : { thinking: v === "1" }) }); } catch (e) {}
+  if (info) { if (harm) info.reasoning_effort = v; else info.thinking = v === "1"; }
+};
 $("picdetail").onchange = () => { try { localStorage.setItem("tierlm.picdetail", $("picdetail").value); } catch (e) {} };
 
 // ---------- workspace: a folder the model can read, and change with your approval ----------
@@ -2462,6 +2629,21 @@ function cardDiff(card, diff) {
 }
 
 // ---------- the preview pane ----------
+// A reply that ends with a whole web page in it (HTML or SVG) shows the page in the preview by itself, unless that's
+// turned off (the checkbox in the preview's header, kept per browser) or the screen is narrow (the preview would
+// cover the chat there).
+try { if (localStorage.getItem("tierlm.pvauto") === "0") $("pvauto").checked = false; } catch (e) {}
+$("pvauto").onchange = () => { try { localStorage.setItem("tierlm.pvauto", $("pvauto").checked ? "1" : "0"); } catch (e) {} };
+let pagePath = null;                            // a web page the model saved in the workspace during this turn
+function autoPreview() {
+  const saved = pagePath; pagePath = null;
+  if (!$("pvauto").checked || matchMedia("(max-width: 980px)").matches) return;
+  if (saved) return previewWorkspaceFile(saved);
+  const bub = [...document.querySelectorAll(".msg.assistant")].at(-1);
+  const pages = [...(bub?.querySelectorAll(".codeblock .open.page") || [])]
+    .filter(b => /<\/(html|svg)>\s*$/i.test(b.closest(".codeblock").querySelector("code").textContent.trim()));
+  pages.at(-1)?.click();
+}
 // Files, the model's proposed changes, code from replies, pages and images open on the right, in tabs; the chat
 // moves to the left and comes back to the middle when the last tab closes.
 let pvTabs = [], pvCur = null;
@@ -2635,14 +2817,20 @@ function sbsView(before, after, name) {
 }
 // A change the model proposes: opened beside the chat with Apply and Skip, which answer the same question as the card's buttons.
 function previewChange(key, path, before, after, created, decide) {
-  let state = null;
+  let state = null, page = false;
+  const web = /\.(html?|svg)$/i.test(path);
   const tab = { key, title: (created ? "New: " : "Change: ") + path, render(el) {
     const bar = pvBar(el, `<b></b><span class="grow"></span>` + (state ? `<span></span>` :
       `<button class="tiny primary" data-a="apply">${created ? "Create file" : "Apply change"}</button><button class="tiny" data-a="skip">Skip</button>`));
     bar.querySelector("b").textContent = (created ? "New file " : "Proposed change to ") + path + (created ? "" : " · before ▸ after");
     if (state) bar.lastChild.textContent = state;
     else { bar.querySelector('[data-a="apply"]').onclick = () => decide("apply"); bar.querySelector('[data-a="skip"]').onclick = () => decide("skip"); }
-    el.appendChild(created ? Object.assign(document.createElement("div"), { innerHTML: codeView(after, path) }) : sbsView(before, after, path));
+    if (web) {                                   // a web page: see it drawn (scripts off) before deciding
+      const t = document.createElement("button"); t.className = "tiny ghost"; t.textContent = page ? "Code" : "Page";
+      t.onclick = () => { page = !page; pvRender(); }; bar.querySelector(".grow").after(t);
+    }
+    if (web && page) { const f = document.createElement("iframe"); f.className = "pvframe"; f.setAttribute("sandbox", ""); f.srcdoc = after; el.appendChild(f); }
+    else el.appendChild(created ? Object.assign(document.createElement("div"), { innerHTML: codeView(after, path) }) : sbsView(before, after, path));
   } };
   previewOpen(tab);
   return s => { state = s; if (pvTabs.includes(tab) && pvCur === key) pvRender(); };
@@ -2700,6 +2888,7 @@ async function runTool(call) {
   if (done.error) { card.classList.add("err"); note.textContent = done.error; return "Error: " + done.error; }
   note.textContent = done.result; card.classList.add("applied");
   if (setState) setState("Applied");
+  if (/\.(html?|svg)$/i.test(r.path || "")) pagePath = r.path;     // a web page saved: shown as the page after the reply
   return done.result + " The user approved it.";
 }
 // A tool result in a saved chat
@@ -2978,8 +3167,9 @@ async function loadNetwork() {
   try { n = await (await api("/api/network")).json(); } catch (e) { return; }
   const local = "api_key" in n;                       // the key and the controls only on the computer running tierlm
   const urls = $("urls"); urls.innerHTML = "";
-  for (const u of n.urls) {
-    if (u.label !== "This computer" && !n.allow_network) continue;
+  // (another device: the address it reached tierlm by; "This computer" would mean that device)
+  for (const u of local ? n.urls : [{ label: "Address", url: location.origin + "/v1" }]) {
+    if (local && u.label !== "This computer" && !n.allow_network) continue;
     const row = document.createElement("div"); row.className = "apirow";
     const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = u.label;
     const code = document.createElement("code"); code.textContent = u.url;
@@ -2992,7 +3182,7 @@ async function loadNetwork() {
   for (const id of ["allownet", "keygen", "keyclear"]) $(id).disabled = !local || n.fixed_by_command_line;
   $("apitrim").checked = !!n.api_trim_oldest; $("apitrim").disabled = !local;
   $("keycopy").disabled = !local || !n.api_key;
-  $("netmsg").innerHTML = !local ? "These settings can only be changed on the computer running tierlm."
+  $("netmsg").innerHTML = !local ? "Settings, and which model is loaded, can be changed on the computer running tierlm."
     : n.fixed_by_command_line ? "Set by --host / --api-key on the command line."
     : n.allow_network && !n.api_key_set ? '<span class="warnline">Other devices can use tierlm without a key. Consider setting one.</span>' : "";
 }
