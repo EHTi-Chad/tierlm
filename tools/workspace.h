@@ -395,7 +395,11 @@ inline json run(const fs::path& root, const std::string& tool, const json& args,
     const Change c = plan(root, tool, args);
     const std::string fp = fingerprint(c.exists, c.before);
     json r = {{"diff", unified_diff(c.before, c.after, c.name, !c.exists)}, {"hash", fp}, {"path", c.name}, {"created", !c.exists}};
-    if (!do_apply) return r;
+    if (!do_apply) {
+        // The whole file before and after, for the page's side-by-side view (not for very big files).
+        if (c.before.size() + c.after.size() <= 4u * 1048576) { r["before"] = c.before; r["after"] = c.after; }
+        return r;
+    }
     if (hash != fp) throw Error(c.name + " changed since the change was shown; it was not made");
     apply(c);
     r["result"] = (c.exists ? "Changed " : "Created ") + c.name + ".";

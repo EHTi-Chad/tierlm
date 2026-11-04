@@ -323,6 +323,17 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             for (int i = 0; i < hp.n_layer; ++i) hp.recurrent[i] = (i + 1) % interval != 0;
         }
         if (hp.ssm_v_heads % hp.ssm_k_heads != 0) { gguf_free(g); throw std::runtime_error("unexpected linear attention head counts"); }
+        // Qwen3.5 reads images too (with its vision file): 3-part positions, sections from the file.
+        const int64_t sid = gguf_find_key(g, (arch + ".rope.dimension_sections").c_str());
+        if (arch != "qwen3next" && sid >= 0 && gguf_get_kv_type(g, sid) == GGUF_TYPE_ARRAY &&
+            (gguf_get_arr_type(g, sid) == GGUF_TYPE_INT32 || gguf_get_arr_type(g, sid) == GGUF_TYPE_UINT32)) {
+            const int32_t* d = (const int32_t*)gguf_get_arr_data(g, sid);
+            for (int i = 0; i < 4 && i < (int)gguf_get_arr_n(g, sid); ++i) hp.mrope_sections[i] = d[i];
+            hp.mrope = hp.mrope_sections[0] + hp.mrope_sections[1] + hp.mrope_sections[2] > 0;
+        } else if (arch != "qwen3next" && hp.n_rot == 64) {          // files without the key: Qwen3.5's own sizes
+            hp.mrope_sections[0] = 11; hp.mrope_sections[1] = 11; hp.mrope_sections[2] = 10;
+            hp.mrope = true;
+        }
     }
     m->n_expert_used_file_ = hp.n_expert_used;
     // Speculation with a separate MTP draft file: add its draft-block tensors as one more part.
@@ -383,7 +394,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // Conversation memory per layer: a KV cache for attention layers, a small fixed-size state for DeltaNet layers.
     auto layer_mem = [&](int il) -> size_t {
         if (hp.is_recurrent(il))
-            return ((size_t)(hp.ssm_conv - 1) * hp.ssm_conv_dim() + (size_t)hp.ssm_state * hp.ssm_state * hp.ssm_v_heads) * 4;
+            return ((size_t)(hp.ssm_conv - 1) * hp.ssm_conv_dim() + (size_t)hp.ssm_state * hp.ssm_state * hp.ssm_v_heads) * 4 *
+                   (size_t)std::max(1, opt.parallel);
         return (size_t)2 * ggml_row_size((ggml_type)m->kv_t_, (int64_t)hp.head_dim * hp.n_head_kv) * (size_t)m->max_ctx_;
     };
     size_t kv_need = 0;
@@ -913,17 +925,22 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // ---- KV cache on the same device, in f16: half the size and memory traffic of f32 ----
     const int hd = hp.head_dim;
     const ggml_type kv_type = (ggml_type)m->kv_t_;
-    ggml_init_params kp{ (size_t)2 * nl_all * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
+    const int n_seq = std::max(1, opt.parallel);
+    ggml_init_params kp{ (size_t)2 * nl_all * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     m->kvctx_ = ggml_init(kp);
     std::vector<std::vector<ggml_tensor*>> kv_t(G + 1);              // per GPU, then RAM
     for (int i = 0; i < nl_all; ++i) {
         auto& L = i < hp.n_layer ? m->layers_[i] : *m->mtp_;
         auto& dst = kv_t[m->layer_dev_[i] >= 0 ? m->layer_dev_[i] : G];
         if (L.recurrent) {                                            // DeltaNet: fixed-size state, always f32
-            L.conv_state  = ggml_new_tensor_2d(m->kvctx_, GGML_TYPE_F32, hp.ssm_conv - 1, hp.ssm_conv_dim());
-            L.ssm_state_t = ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hp.ssm_state, hp.ssm_state, hp.ssm_v_heads);
-            dst.push_back(L.conv_state);
-            dst.push_back(L.ssm_state_t);
+            for (int s = 0; s < n_seq; ++s) {                         // one running memory per conversation
+                L.conv_states.push_back(ggml_new_tensor_2d(m->kvctx_, GGML_TYPE_F32, hp.ssm_conv - 1, hp.ssm_conv_dim()));
+                L.ssm_states.push_back(ggml_new_tensor_3d(m->kvctx_, GGML_TYPE_F32, hp.ssm_state, hp.ssm_state, hp.ssm_v_heads));
+                dst.push_back(L.conv_states.back());
+                dst.push_back(L.ssm_states.back());
+            }
+            L.conv_state = L.conv_states[0];
+            L.ssm_state_t = L.ssm_states[0];
             continue;
         }
         L.k_cache = ggml_new_tensor_3d(m->kvctx_, kv_type, hd, hp.n_head_kv, m->max_ctx_);
@@ -942,6 +959,14 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         m->kvbufs_.push_back(b);
     }
     for (int i = 0; i < hp.n_layer; ++i) if (m->layer_dev_[i] >= 0) m->place_.gpus[m->layer_dev_[i]].layers++;
+    m->cell_seq_.assign(m->max_ctx_, -1);
+    m->cell_pos_.assign(m->max_ctx_, -1);
+    m->seq_cells_.assign(n_seq, {});
+    m->seq_rope_.assign(n_seq, {});
+    m->seq_next_.assign(n_seq, 0);
+    m->n_free_ = m->max_ctx_;
+    // Several conversations in one step: a DeltaNet layer runs once per conversation, so the graph has more nodes.
+    if (hp.hybrid && n_seq > 1) m->graph_size_ = 16384 + n_seq * hp.n_layer * 48;
 
     // Fused flash attention reads the cache once, with no copies. TIERLM_NO_FA=1 uses the plain version.
     m->flash_attn_ = opt.flash_attn >= 0 ? opt.flash_attn == 1 : std::getenv("TIERLM_NO_FA") == nullptr;
@@ -957,14 +982,14 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // Layer split: pin each layer's ops to its device (RAM layers to the CPU; with several GPUs, each layer to its
     // GPU too, so ops without weights don't wander to another card).
     m->pin_layers_ = m->main_ != m->cpu_ && m->place_.mode == "layers" && (m->place_.kv_gpu_layers < hp.n_layer || G > 1);
-    m->sched_ = ggml_backend_sched_new(backends.data(), nullptr, n_backends, kGraphSize, false, offload);
+    m->sched_ = ggml_backend_sched_new(backends.data(), nullptr, n_backends, m->graph_size_, false, offload);
     if (!m->sched_) throw std::runtime_error("failed to create the scheduler");
-    for (auto& gm : m->graph_mem_) gm.resize(ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false));
+    for (auto& gm : m->graph_mem_) gm.resize(ggml_tensor_overhead() * m->graph_size_ + ggml_graph_overhead_custom(m->graph_size_, false));
 
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
     // of the context), so it is not re-planned on every token.
     const int n_res = std::min(m->batch_, m->max_ctx_);
-    Graph worst = m->build(n_res, m->max_ctx_ - n_res, true);
+    Graph worst = m->build(n_res, m->max_ctx_, true);
     m->pin_cpu_layers(worst);
     bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
     ggml_free(worst.ctx);
@@ -997,10 +1022,142 @@ void Model::pin_cpu_layers(const Graph& g) {
     }
 }
 
+// ---- the cache's cells, shared by the conversations ----
+std::vector<int> Model::alloc_cells(int s, int n) {
+    if (n > n_free_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens" +
+                                              (n_seq_max() > 1 ? ", shared by all conversations)" : ")"));
+    std::vector<int> got;
+    got.reserve(n);
+    auto& mine = seq_cells_[s];
+    for (int c = free_lo_; (int)got.size() < n; ++c) {
+        if (cell_seq_[c] >= 0) continue;
+        cell_seq_[c] = s;
+        cell_pos_[c] = (int)mine.size();
+        mine.push_back(c);
+        got.push_back(c);
+        free_lo_ = c + 1;
+        hi_ = std::max(hi_, c + 1);
+    }
+    n_free_ -= n;
+    return got;
+}
+
+void Model::free_cells_from(int s, int n) {
+    auto& mine = seq_cells_[s];
+    n = std::max(0, n);
+    for (int i = n; i < (int)mine.size(); ++i) {
+        const int c = mine[i];
+        cell_seq_[c] = cell_pos_[c] = -1;
+        free_lo_ = std::min(free_lo_, c);
+        ++n_free_;
+    }
+    if ((int)mine.size() > n) mine.resize(n);
+    while (hi_ > 0 && cell_seq_[hi_ - 1] < 0) --hi_;
+    rope_truncate(s, n);
+}
+
+// Images: the 3-part positions of a conversation's first n positions are kept; the next text position is one
+// past the largest of them.
+void Model::rope_truncate(int s, int n) {
+    if (s >= (int)seq_rope_.size()) return;
+    auto& r = seq_rope_[s];
+    if ((int)r.size() > n) r.resize(std::max(0, n));
+    int next = 0;
+    for (const auto& p : r) next = std::max(next, std::max(p[0], std::max(p[1], p[2])) + 1);
+    seq_next_[s] = next;
+}
+
+const Model::ImageRec* Model::image_of(int32_t id) const {
+    for (const ImageRec& im : images_)
+        if (id >= im.first && id < im.first + im.rows * im.cols) return &im;
+    return nullptr;
+}
+
+int32_t Model::find_image(uint64_t key) {
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // steps read the images under this lock
+    for (ImageRec& im : images_) if (im.key == key) { im.used = ++image_clock_; return im.first; }
+    return -1;
+}
+
+int32_t Model::add_image(uint64_t key, std::vector<float> words, int rows, int cols) {
+    if (rows <= 0 || cols <= 0 || words.size() != (size_t)rows * cols * hp_.n_embd)
+        throw std::runtime_error("image words don't match the model (is the vision file for this model?)");
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    if (const int32_t f = find_image(key); f >= 0) return f;
+    // Forget the least recently used images beyond ~1 GB (they can be added again; cached conversations that
+    // used them simply read the new ids again).
+    size_t bytes = words.size() * sizeof(float);
+    for (const ImageRec& im : images_) bytes += im.words.size() * sizeof(float);
+    while (bytes > ((size_t)1 << 30) && !images_.empty()) {
+        auto old = std::min_element(images_.begin(), images_.end(), [](const ImageRec& a, const ImageRec& b) { return a.used < b.used; });
+        bytes -= old->words.size() * sizeof(float);
+        images_.erase(old);
+    }
+    if ((int64_t)next_image_id_ + (int64_t)rows * cols >= INT32_MAX) next_image_id_ = kImageIdBase;   // (never in practice)
+    ImageRec im;
+    im.key = key; im.first = next_image_id_; im.rows = rows; im.cols = cols; im.words = std::move(words); im.used = ++image_clock_;
+    next_image_id_ += rows * cols;
+    images_.push_back(std::move(im));
+    return images_.back().first;
+}
+
+int Model::cells_end() const { return hi_; }
+
+void Model::clear_state(int s) {
+    std::vector<uint8_t> zeros;
+    for (Layer& L : layers_)
+        if (L.recurrent)
+            for (ggml_tensor* t : {L.conv_states[s], L.ssm_states[s]}) {
+                zeros.assign(ggml_nbytes(t), 0);
+                ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
+            }
+}
+
+// Each token sees the cells of its own conversation up to its own position (sliding-window layers: only the last
+// n_swa of those). Cells of other conversations, free cells and the padding past the last used cell: -inf.
+void Model::fill_masks(Graph& g, int n_kv, const std::vector<int>& tok_seq, const std::vector<int>& tok_pos) {
+    const int n_tok = (int)tok_seq.size();
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    std::vector<ggml_fp16_t> mask((size_t)n_kv * n_tok, ninf);
+    const int end = std::min(n_kv, hi_);
+    for (int t = 0; t < n_tok; ++t) {
+        ggml_fp16_t* row = mask.data() + (size_t)t * n_kv;
+        const int s = tok_seq[t], p = tok_pos[t];
+        // Usually a conversation's cells: walk its own list (positions 0..p), not the whole cache.
+        const auto& mine = seq_cells_[s];
+        for (int q = 0; q <= p && q < (int)mine.size(); ++q) if (mine[q] < end) row[mine[q]] = zero;
+    }
+    if (g.mask) ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+    if (g.mask_swa) {
+        for (int t = 0; t < n_tok; ++t) {
+            ggml_fp16_t* row = mask.data() + (size_t)t * n_kv;
+            const auto& mine = seq_cells_[tok_seq[t]];
+            for (int q = 0; q <= tok_pos[t] - hp_.n_swa && q < (int)mine.size(); ++q) if (mine[q] < end) row[mine[q]] = ninf;
+        }
+        ggml_backend_tensor_set(g.mask_swa, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+    }
+}
+
+void Model::seq_reset(int s) {
+    if (s == 0) { reset(); return; }
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    free_cells_from(s, 0);
+    if (hp_.hybrid) clear_state(s);
+}
+
+void Model::seq_truncate(int s, int n) {
+    if (s == 0) { truncate(n); return; }
+    if (n >= seq_past(s)) return;
+    if (hp_.hybrid) { seq_reset(s); return; }                  // the running memory can't be rewound
+    free_cells_from(s, n);
+}
+
 void Model::reset() {
     release_pending();
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
     n_past_ = 0;
-    if (hp_.hybrid) for (auto* b : kvbufs_) ggml_backend_buffer_clear(b, 0);   // clear the running memory
+    free_cells_from(0, 0);
+    if (hp_.hybrid) clear_state(0);                             // clear the running memory
 }
 
 void Model::truncate(int n) {
@@ -1008,46 +1165,86 @@ void Model::truncate(int n) {
     if (n >= n_past_) return;
     if (hp_.hybrid) { reset(); return; }                        // the running memory can't be rewound
     n_past_ = n < 0 ? 0 : n;
+    free_cells_from(0, n_past_);
 }
 
-// The KV cache keeps position p at offset p * nb[2] in each K and V tensor, so the first n_past positions are one
-// contiguous block; DeltaNet layers' memories are small and copied whole.
+// Conversation 0's positions, in order, as runs of consecutive cache cells: {first cell, count} (one run when it
+// has the cache to itself). The KV cache keeps cell c at offset c * nb[2] in each K and V tensor; the MTP block's
+// cache is by position (one run from 0). DeltaNet layers' memories are small and copied whole.
+static std::vector<std::pair<int, int>> runs_of(const std::vector<int>& cells) {
+    std::vector<std::pair<int, int>> r;
+    for (int c : cells) {
+        if (!r.empty() && r.back().first + r.back().second == c) ++r.back().second;
+        else r.push_back({c, 1});
+    }
+    return r;
+}
+
 Model::Snapshot Model::save() const {
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
     Snapshot s;
     s.n_past = n_past_;
+    s.rope = seq_rope_[0];
+    const auto runs = runs_of(seq_cells_[0]);
+    const std::vector<std::pair<int, int>> by_pos(n_past_ ? 1 : 0, {0, n_past_});
     auto grab = [&](ggml_tensor* t, size_t n) {
         s.parts.emplace_back(n);
         if (n) ggml_backend_tensor_get(t, s.parts.back().data(), 0, n);
         s.bytes += n;
     };
-    auto layer = [&](const Layer& L) {
-        if (L.conv_state) { grab(L.conv_state, ggml_nbytes(L.conv_state)); grab(L.ssm_state_t, ggml_nbytes(L.ssm_state_t)); }
-        if (L.k_cache) { grab(L.k_cache, (size_t)n_past_ * L.k_cache->nb[2]); grab(L.v_cache, (size_t)n_past_ * L.v_cache->nb[2]); }
+    auto grab_rows = [&](ggml_tensor* t, const std::vector<std::pair<int, int>>& rs) {
+        const size_t row = t->nb[2];
+        s.parts.emplace_back((size_t)n_past_ * row);
+        size_t off = 0;
+        for (auto [c, n] : rs) { ggml_backend_tensor_get(t, s.parts.back().data() + off, (size_t)c * row, (size_t)n * row); off += (size_t)n * row; }
+        s.bytes += s.parts.back().size();
     };
-    for (const auto& L : layers_) layer(L);
-    if (mtp_) layer(*mtp_);
+    auto layer = [&](const Layer& L, bool mtp) {
+        if (L.conv_state) { grab(L.conv_state, ggml_nbytes(L.conv_state)); grab(L.ssm_state_t, ggml_nbytes(L.ssm_state_t)); }
+        if (L.k_cache) { grab_rows(L.k_cache, mtp ? by_pos : runs); grab_rows(L.v_cache, mtp ? by_pos : runs); }
+    };
+    for (const auto& L : layers_) layer(L, false);
+    if (mtp_) layer(*mtp_, true);
     return s;
 }
 
 void Model::restore(const Snapshot& s) {
     release_pending();
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    n_past_ = 0;
+    free_cells_from(0, 0);
+    alloc_cells(0, s.n_past);                                     // throws if the other conversations left no room
+    n_past_ = s.n_past;
+    seq_rope_[0] = s.rope;
+    if ((int)seq_rope_[0].size() != s.n_past) {                   // (saved by a model without 3-part positions)
+        seq_rope_[0].resize(s.n_past);
+        for (int i = 0; i < s.n_past; ++i) seq_rope_[0][i] = {i, i, i};
+    }
+    rope_truncate(0, s.n_past);
+    const auto runs = runs_of(seq_cells_[0]);
+    const std::vector<std::pair<int, int>> by_pos(s.n_past ? 1 : 0, {0, s.n_past});
     size_t i = 0;
-    auto put = [&](ggml_tensor* t) {
+    auto next = [&](ggml_tensor* t) -> const std::vector<uint8_t>& {
         if (i >= s.parts.size()) throw std::runtime_error("saved conversation doesn't match this model");
         const auto& p = s.parts[i++];
         if (p.size() > ggml_nbytes(t)) throw std::runtime_error("saved conversation doesn't match this model");
-        if (!p.empty()) ggml_backend_tensor_set(t, p.data(), 0, p.size());
+        return p;
     };
-    auto layer = [&](const Layer& L) {
+    auto put = [&](ggml_tensor* t) { const auto& p = next(t); if (!p.empty()) ggml_backend_tensor_set(t, p.data(), 0, p.size()); };
+    auto put_rows = [&](ggml_tensor* t, const std::vector<std::pair<int, int>>& rs) {
+        const auto& p = next(t);
+        const size_t row = t->nb[2];
+        if (p.size() != (size_t)s.n_past * row) throw std::runtime_error("saved conversation doesn't match this model");
+        size_t off = 0;
+        for (auto [c, n] : rs) { ggml_backend_tensor_set(t, p.data() + off, (size_t)c * row, (size_t)n * row); off += (size_t)n * row; }
+    };
+    auto layer = [&](const Layer& L, bool mtp) {
         if (L.conv_state) { put(L.conv_state); put(L.ssm_state_t); }
-        if (L.k_cache) { put(L.k_cache); put(L.v_cache); }
+        if (L.k_cache) { put_rows(L.k_cache, mtp ? by_pos : runs); put_rows(L.v_cache, mtp ? by_pos : runs); }
     };
-    for (const auto& L : layers_) layer(L);
-    if (mtp_) layer(*mtp_);
+    for (const auto& L : layers_) layer(L, false);
+    if (mtp_) layer(*mtp_, true);
     if (i != s.parts.size()) throw std::runtime_error("saved conversation doesn't match this model");
-    n_past_ = s.n_past;
 }
 
 const char* Model::kv_type() const { return ggml_type_name((ggml_type)kv_t_); }
@@ -1090,19 +1287,27 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
         const int mode = hp.rope_neox ? GGML_ROPE_TYPE_NEOX : 0;
         ggml_tensor* ff = g.rope_ff ? g.rope_ff : rope_freqs_;           // YaRN (computed) or Llama 3.1 factors (file)
         if (L.rope) {                                                        // (Flint's full-attention layers: no positions)
-            q = ggml_rope_ext(c, q, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
-            k = ggml_rope_ext(c, k, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+            if (g.mrope) {                                                   // images: 3-part positions (interleaved)
+                int sec[4] = { hp.mrope_sections[0], hp.mrope_sections[1], hp.mrope_sections[2], hp.mrope_sections[3] };
+                q = ggml_rope_multi(c, q, g.pos, ff, hp.n_rot, sec, GGML_ROPE_TYPE_IMROPE, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+                k = ggml_rope_multi(c, k, g.pos, ff, hp.n_rot, sec, GGML_ROPE_TYPE_IMROPE, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+            } else {
+                q = ggml_rope_ext(c, q, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+                k = ggml_rope_ext(c, k, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+            }
         }
 
-        // Write this batch's keys/values into the cache at their positions (g.pos: n_past, n_past + 1, ...).
+        // Write this batch's keys/values into the cache at their cells (g.cells; for one conversation alone, its
+        // positions n_past, n_past + 1, ...).
         // Written by index rather than into a view at n_past, so the graph is the same from one token to the
         // next (CUDA graphs can replay it). Added to the graph first, so they run before the attention below.
         const size_t knb1 = L.k_cache->nb[1], knb2 = L.k_cache->nb[2];
         const size_t vnb1 = L.v_cache->nb[1], vnb2 = L.v_cache->nb[2];
         ggml_tensor* krows = ggml_reshape_2d(c, L.k_cache, hd * hp.n_head_kv, L.k_cache->ne[2]);
         ggml_tensor* vrows = ggml_reshape_2d(c, L.v_cache, hd * hp.n_head_kv, L.v_cache->ne[2]);
-        ggml_build_forward_expand(g.gf, ggml_set_rows(c, krows, ggml_reshape_2d(c, k, hd * hp.n_head_kv, n_tok), g.pos));
-        ggml_build_forward_expand(g.gf, ggml_set_rows(c, vrows, ggml_reshape_2d(c, v, hd * hp.n_head_kv, n_tok), g.pos));
+        ggml_tensor* where = g.cells ? g.cells : g.pos;                      // (the MTP block's cache: by position)
+        ggml_build_forward_expand(g.gf, ggml_set_rows(c, krows, ggml_reshape_2d(c, k, hd * hp.n_head_kv, n_tok), where));
+        ggml_build_forward_expand(g.gf, ggml_set_rows(c, vrows, ggml_reshape_2d(c, v, hd * hp.n_head_kv, n_tok), where));
         ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_kv, knb1, knb2, 0);   // all tokens so far, padded
         ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_kv, vnb1, vnb2, 0);
 
@@ -1320,27 +1525,35 @@ void Model::profile_step(int n_tok, double prep_ms, double compute_ms, double ou
     prof_ = {};
 }
 
-Model::Graph Model::build(int n_tok, int n_past, bool want_routing, int n_logits, bool want_hidden, int snapshots) {
+Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logits, bool want_hidden, int snapshots,
+                          const std::vector<SeqGroup>* groups) {
     const Hparams& hp = hp_;
-    const int n_kv = kv_span(n_past + n_tok);
+    const int n_kv = kv_span(n_kv_end), n_past = n_kv_end - n_tok;   // (attn_block takes the span as n_past + n_tok)
+    const SeqGroup one{0, n_tok};
+    const std::vector<SeqGroup> single(1, one);
+    const std::vector<SeqGroup>& grp = groups ? *groups : single;
     const int hd = hp.head_dim;
 
     Graph g;
     std::vector<uint8_t>& gm = graph_mem(n_tok == 1 ? 0 : 1);
     ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
     ggml_context* c = g.ctx = ggml_init(ip);
-    g.gf = ggml_new_graph_custom(c, kGraphSize, false);
+    g.gf = ggml_new_graph_custom(c, graph_size_, false);
 
     g.inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
     ggml_set_input(g.inp);
-    g.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
+    g.mrope = build_mrope_;
+    g.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, g.mrope ? 4 * n_tok : n_tok);
     ggml_set_input(g.pos);
-    // Causal mask (0 = visible, -inf = future): for flash attention, and for the window or sinks (gpt-oss)
-    const bool sinks = !layers_.empty() && layers_[0].sinks;
-    if (flash_attn_ || hp.n_swa > 0 || sinks) {
-        g.mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok);
-        ggml_set_input(g.mask);
+    if (build_images_) {
+        g.img = ggml_new_tensor_2d(c, GGML_TYPE_F32, hp.n_embd, n_tok);  ggml_set_input(g.img);
+        g.keep = ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, n_tok);         ggml_set_input(g.keep);
     }
+    g.cells = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
+    ggml_set_input(g.cells);
+    // Mask (0 = visible, -inf = not): each token sees its own conversation's earlier positions (and itself).
+    g.mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok);
+    ggml_set_input(g.mask);
     if (hp.n_swa > 0) {                                                    // the same, limited to the last n_swa tokens
         g.mask_swa = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok);
         ggml_set_input(g.mask_swa);
@@ -1352,6 +1565,7 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing, int n_logits
     const float scale = 1.0f / std::sqrt((float)hd);
 
     ggml_tensor* x = ggml_get_rows(c, tok_embd_, g.inp);                   // [n_embd, n_tok]
+    if (g.img) x = ggml_add(c, ggml_mul(c, x, g.keep), g.img);             // images' words in place of their tokens
     // Remember which layer created each tensor, so a layer split can keep RAM layers wholly on the CPU.
     ggml_tensor* mark = nullptr;
     auto tag = [&](int layer) {
@@ -1393,61 +1607,78 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing, int n_logits
                 b_in = ggml_mul_mat(c, L.ssm_beta, h);
                 a_in = ggml_mul_mat(c, L.ssm_alpha, h);
             }
-            ggml_tensor* beta = ggml_sigmoid(c, b_in);                           // how strongly to write, per head
-            beta = ggml_reshape_4d(c, beta, 1, Hv, n_tok, 1);
-            // log of the memory's decay: -exp(A_log) * softplus(alpha + dt_bias)  (ssm_a holds -exp(A_log))
-            ggml_tensor* dec = ggml_mul(c, ggml_softplus(c, ggml_add(c, a_in, L.ssm_dt)), L.ssm_a);
-            dec = ggml_reshape_4d(c, dec, 1, Hv, n_tok, 1);
-            // Causal convolution over the last KC inputs: [the KC-1 saved from before | this batch]
-            ggml_tensor* cs  = ggml_reshape_3d(c, L.conv_state, KC - 1, CD, 1);
-            ggml_tensor* cin = ggml_concat(c, cs, ggml_transpose(c, ggml_reshape_3d(c, qkv, CD, n_tok, 1)), 0);
-            ggml_build_forward_expand(g.gf, ggml_cpy(c, ggml_view_3d(c, cin, KC - 1, CD, 1, cin->nb[1], cin->nb[2],
-                                                                     (size_t)n_tok * ggml_element_size(cin)), cs));
-            ggml_tensor* co = ggml_silu(c, ggml_ssm_conv(c, cin, L.ssm_conv1d)); // [CD, n_tok, 1]
-            const size_t es = ggml_element_size(co), rs = co->nb[1];
-            ggml_tensor* qh = ggml_view_4d(c, co, S, Hk, n_tok, 1, S * es, rs, rs * n_tok, 0);
-            ggml_tensor* kh = ggml_view_4d(c, co, S, Hk, n_tok, 1, S * es, rs, rs * n_tok, (size_t)S * Hk * es);
-            ggml_tensor* vh = ggml_view_4d(c, co, S, Hv, n_tok, 1, S * es, rs, rs * n_tok, (size_t)2 * S * Hk * es);
-            // l2-normalise q and k: x / sqrt(sum(x^2) + eps), written with rms_norm so every backend has it
-            auto l2 = [&](ggml_tensor* t) { return ggml_scale(c, ggml_rms_norm(c, t, hp.rms_eps / S), 1.0f / std::sqrt((float)S)); };
-            qh = l2(qh);
-            kh = l2(kh);
-            if (hp.v_grouped && R > 1) {
-                // Value heads grouped by key head (head j uses key head j / R): repeat each key head R times in place.
-                auto rep_heads = [&](ggml_tensor* t) {
-                    t = ggml_repeat_4d(c, ggml_reshape_4d(c, t, S, 1, Hk, n_tok), S, R, Hk, n_tok);
-                    return ggml_reshape_4d(c, t, S, Hv, n_tok, 1);
+            // One conversation's tokens [t0, t0 + n) through the convolution and the memory, with that
+            // conversation's saved inputs and memory; returns the gated, normed output [S*Hv, n].
+            auto run = [&](int sq, int t0, int n) -> ggml_tensor* {
+                const bool all = n == n_tok;
+                auto cols = [&](ggml_tensor* t) {                                 // columns [t0, t0 + n) of [rows, n_tok]
+                    return all ? t : ggml_view_2d(c, t, t->ne[0], n, t->nb[1], (size_t)t0 * t->nb[1]);
                 };
-                qh = rep_heads(qh);
-                kh = rep_heads(kh);
-            }
-            ggml_tensor* st  = ggml_reshape_4d(c, L.ssm_state_t, S, S, Hv, 1);
-            // Outputs, then the new memory. With snapshots > 1 the op also keeps the memory as it was 1, 2, ...
-            // tokens back, so a speculative check can be undone for the tokens that weren't accepted.
-            ggml_tensor* res = ggml_gated_delta_net(c, qh, kh, vh, dec, beta, st, snapshots);
-            ggml_tensor* out = ggml_view_4d(c, res, S, Hv, n_tok, 1, (size_t)S * 4, (size_t)S * Hv * 4, (size_t)S * Hv * n_tok * 4, 0);
-            ggml_tensor* ns  = ggml_view_1d(c, res, (int64_t)S * S * Hv, (size_t)S * Hv * n_tok * 4);
-            ggml_build_forward_expand(g.gf, ggml_cpy(c, ns, ggml_view_1d(c, L.ssm_state_t, (int64_t)S * S * Hv, 0)));
-            if (snapshots > 1) {
-                // For dropping the last d tokens: the memory d tokens back, and the convolution's last inputs before
-                // them. Kept as outputs until Model::accept() has used them.
-                ggml_set_output(res);
-                auto& rb = g.rollback[li];
-                rb.resize(std::min(snapshots, n_tok));
-                for (int d = 1; d < (int)rb.size(); ++d) {
-                    rb[d].first = ggml_view_3d(c, res, S, S, Hv, (size_t)S * 4, (size_t)S * S * 4,
-                                               ((size_t)S * Hv * n_tok + (size_t)d * S * S * Hv) * 4);
-                    rb[d].second = ggml_cont(c, ggml_view_3d(c, cin, KC - 1, CD, 1, cin->nb[1], cin->nb[2],
-                                                             (size_t)(n_tok - d) * ggml_element_size(cin)));
-                    ggml_set_output(rb[d].second);
-                    ggml_build_forward_expand(g.gf, rb[d].first);      // views get their memory only as graph nodes
-                    ggml_build_forward_expand(g.gf, rb[d].second);
+                ggml_tensor* conv_state = L.conv_states[sq];
+                ggml_tensor* ssm_state  = L.ssm_states[sq];
+                ggml_tensor* beta = ggml_sigmoid(c, cols(b_in));                     // how strongly to write, per head
+                beta = ggml_reshape_4d(c, beta, 1, Hv, n, 1);
+                // log of the memory's decay: -exp(A_log) * softplus(alpha + dt_bias)  (ssm_a holds -exp(A_log))
+                ggml_tensor* dec = ggml_mul(c, ggml_softplus(c, ggml_add(c, cols(a_in), L.ssm_dt)), L.ssm_a);
+                dec = ggml_reshape_4d(c, dec, 1, Hv, n, 1);
+                // Causal convolution over the last KC inputs: [the KC-1 saved from before | this batch]
+                ggml_tensor* cs  = ggml_reshape_3d(c, conv_state, KC - 1, CD, 1);
+                ggml_tensor* q_in = all ? qkv : ggml_cont(c, cols(qkv));
+                ggml_tensor* cin = ggml_concat(c, cs, ggml_transpose(c, ggml_reshape_3d(c, q_in, CD, n, 1)), 0);
+                ggml_build_forward_expand(g.gf, ggml_cpy(c, ggml_view_3d(c, cin, KC - 1, CD, 1, cin->nb[1], cin->nb[2],
+                                                                         (size_t)n * ggml_element_size(cin)), cs));
+                ggml_tensor* co = ggml_silu(c, ggml_ssm_conv(c, cin, L.ssm_conv1d)); // [CD, n, 1]
+                const size_t es = ggml_element_size(co), rs = co->nb[1];
+                ggml_tensor* qh = ggml_view_4d(c, co, S, Hk, n, 1, S * es, rs, rs * n, 0);
+                ggml_tensor* kh = ggml_view_4d(c, co, S, Hk, n, 1, S * es, rs, rs * n, (size_t)S * Hk * es);
+                ggml_tensor* vh = ggml_view_4d(c, co, S, Hv, n, 1, S * es, rs, rs * n, (size_t)2 * S * Hk * es);
+                // l2-normalise q and k: x / sqrt(sum(x^2) + eps), written with rms_norm so every backend has it
+                auto l2 = [&](ggml_tensor* t) { return ggml_scale(c, ggml_rms_norm(c, t, hp.rms_eps / S), 1.0f / std::sqrt((float)S)); };
+                qh = l2(qh);
+                kh = l2(kh);
+                if (hp.v_grouped && R > 1) {
+                    // Value heads grouped by key head (head j uses key head j / R): repeat each key head R times in place.
+                    auto rep_heads = [&](ggml_tensor* t) {
+                        t = ggml_repeat_4d(c, ggml_reshape_4d(c, t, S, 1, Hk, n), S, R, Hk, n);
+                        return ggml_reshape_4d(c, t, S, Hv, n, 1);
+                    };
+                    qh = rep_heads(qh);
+                    kh = rep_heads(kh);
                 }
+                ggml_tensor* st  = ggml_reshape_4d(c, ssm_state, S, S, Hv, 1);
+                // Outputs, then the new memory. With snapshots > 1 the op also keeps the memory as it was 1, 2, ...
+                // tokens back, so a speculative check can be undone for the tokens that weren't accepted.
+                ggml_tensor* res = ggml_gated_delta_net(c, qh, kh, vh, dec, beta, st, snapshots);
+                ggml_tensor* out = ggml_view_4d(c, res, S, Hv, n, 1, (size_t)S * 4, (size_t)S * Hv * 4, (size_t)S * Hv * n * 4, 0);
+                ggml_tensor* ns  = ggml_view_1d(c, res, (int64_t)S * S * Hv, (size_t)S * Hv * n * 4);
+                ggml_build_forward_expand(g.gf, ggml_cpy(c, ns, ggml_view_1d(c, ssm_state, (int64_t)S * S * Hv, 0)));
+                if (snapshots > 1) {
+                    // For dropping the last d tokens: the memory d tokens back, and the convolution's last inputs before
+                    // them. Kept as outputs until Model::accept() has used them. (One conversation only.)
+                    ggml_set_output(res);
+                    auto& rb = g.rollback[li];
+                    rb.resize(std::min(snapshots, n));
+                    for (int d = 1; d < (int)rb.size(); ++d) {
+                        rb[d].first = ggml_view_3d(c, res, S, S, Hv, (size_t)S * 4, (size_t)S * S * 4,
+                                                   ((size_t)S * Hv * n + (size_t)d * S * S * Hv) * 4);
+                        rb[d].second = ggml_cont(c, ggml_view_3d(c, cin, KC - 1, CD, 1, cin->nb[1], cin->nb[2],
+                                                                 (size_t)(n - d) * ggml_element_size(cin)));
+                        ggml_set_output(rb[d].second);
+                        ggml_build_forward_expand(g.gf, rb[d].first);      // views get their memory only as graph nodes
+                        ggml_build_forward_expand(g.gf, rb[d].second);
+                    }
+                }
+                // Gated norm: rms_norm(out) * w * silu(z), then back to the model width
+                ggml_tensor* z_in = all ? z : ggml_cont(c, cols(z));
+                ggml_tensor* on = ggml_mul(c, ggml_mul(c, ggml_rms_norm(c, out, hp.rms_eps), L.ssm_norm),
+                                           ggml_silu(c, ggml_reshape_4d(c, z_in, S, Hv, n, 1)));
+                return ggml_reshape_2d(c, on, (int64_t)S * Hv, n);
+            };
+            ggml_tensor* on = nullptr;
+            for (int gi = 0, t0 = 0; gi < (int)grp.size(); t0 += grp[gi].n, ++gi) {
+                ggml_tensor* part = run(grp[gi].seq, t0, grp[gi].n);
+                on = on ? ggml_concat(c, on, part, 1) : part;
             }
-            // Gated norm: rms_norm(out) * w * silu(z), then back to the model width
-            ggml_tensor* on = ggml_mul(c, ggml_mul(c, ggml_rms_norm(c, out, hp.rms_eps), L.ssm_norm),
-                                       ggml_silu(c, ggml_reshape_4d(c, z, S, Hv, n_tok, 1)));
-            on = ggml_reshape_2d(c, on, (int64_t)S * Hv, n_tok);
             x = ggml_add(c, x, ggml_mul_mat(c, L.ssm_out, on));
         } else {
             x = ggml_add(c, x, attn_block(c, g, L, h, n_tok, n_past));
@@ -1468,8 +1699,15 @@ Model::Graph Model::build(int n_tok, int n_past, bool want_routing, int n_logits
 
     x = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), out_norm_);
     if (want_hidden) { g.hidden = x; ggml_set_output(x); }                  // [n_embd, n_tok]: what the MTP head reads
-    n_logits = std::max(1, std::min(n_logits, n_tok));                     // predictions for the last n_logits positions
-    ggml_tensor* last = ggml_view_2d(c, x, hp.n_embd, n_logits, x->nb[1], (size_t)(n_tok - n_logits) * x->nb[1]);
+    ggml_tensor* last;
+    if (groups) {                                                           // several conversations: each one's last token
+        g.out_idx = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t)grp.size());
+        ggml_set_input(g.out_idx);
+        last = ggml_get_rows(c, x, g.out_idx);                              // [n_embd, n_groups]
+    } else {
+        n_logits = std::max(1, std::min(n_logits, n_tok));                 // predictions for the last n_logits positions
+        last = ggml_view_2d(c, x, hp.n_embd, n_logits, x->nb[1], (size_t)(n_tok - n_logits) * x->nb[1]);
+    }
     g.logits = ggml_mul_mat(c, output_, last);                             // [n_vocab, n_logits]
     ggml_set_output(g.logits);
     ggml_build_forward_expand(g.gf, g.logits);
@@ -1577,6 +1815,7 @@ void Model::accept(int n_keep) {
     const int d = g.n_tok - n_keep;                               // tokens to drop
     if (d > 0) {
         n_past_ -= d;                                             // attention layers: just forget their keys/values
+        free_cells_from(0, n_past_);
         for (auto& [li, rb] : g.rollback) {                       // DeltaNet layers: restore the memory d tokens back
             if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
             Layer& L = layers_[li];
@@ -1591,14 +1830,114 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
                               std::vector<int32_t>* routing) {
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // another loaded model waits for this step
     release_pending();                                            // an unanswered check counts as fully accepted
+    return step(ids, n_tok, n_threads, n_logits, want_hidden, snapshots, routing, nullptr);
+}
+
+std::vector<std::vector<float>> Model::eval_seqs(const std::vector<SeqInput>& in, int n_threads, std::vector<int32_t>* routing) {
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    release_pending();
+    std::vector<std::vector<float>> out(in.size());
+    if (routing) routing->clear();
+    size_t need = 0;
+    for (const SeqInput& x : in) {
+        if (x.seq < 0 || x.seq >= n_seq_max()) throw std::runtime_error("no such conversation: " + std::to_string(x.seq));
+        need += x.ids.size();
+    }
+    if ((int)need > n_free_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens, shared by all conversations)");
+    // Packed into batches of at most batch_ tokens; a long input is spread over several, and its logits come
+    // from the batch holding its last token.
+    std::vector<size_t> done(in.size(), 0);
+    std::vector<int32_t> part;
+    for (;;) {
+        std::vector<int32_t> ids;
+        std::vector<SeqGroup> groups;
+        std::vector<int> which;
+        for (size_t i = 0; i < in.size() && (int)ids.size() < batch_; ++i) {
+            const size_t left = in[i].ids.size() - done[i];
+            if (!left) continue;
+            const int n = (int)std::min<size_t>(left, (size_t)(batch_ - (int)ids.size()));
+            ids.insert(ids.end(), in[i].ids.begin() + done[i], in[i].ids.begin() + done[i] + n);
+            groups.push_back({in[i].seq, n});
+            which.push_back((int)i);
+            done[i] += n;
+        }
+        if (ids.empty()) break;
+        EvalOut r = step(ids.data(), (int)ids.size(), n_threads, 1, false, 1, routing ? &part : nullptr, &groups);
+        if (routing) routing->insert(routing->end(), part.begin(), part.end());
+        const size_t V = (size_t)hp_.n_vocab;
+        for (size_t k = 0; k < which.size(); ++k)
+            if (done[which[k]] == in[which[k]].ids.size())
+                out[which[k]].assign(r.logits.begin() + k * V, r.logits.begin() + (k + 1) * V);
+    }
+    return out;
+}
+
+Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
+                           std::vector<int32_t>* routing, const std::vector<SeqGroup>* groups) {
     const Hparams& hp = hp_;
-    const int n_past = n_past_, n_kv = n_past + n_tok;
     using clk = std::chrono::steady_clock;
     auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     auto t0 = clk::now();
+    // Each token's conversation and position, and a cache cell for it.
+    std::vector<int> tok_seq, tok_pos, cells;
+    tok_seq.reserve(n_tok); tok_pos.reserve(n_tok); cells.reserve(n_tok);
+    std::vector<std::pair<int, int>> undo;                        // (conversation, tokens before) if this step fails
+    {
+        const SeqGroup one{0, n_tok};
+        const std::vector<SeqGroup> single(1, one);
+        for (const SeqGroup& gr : groups ? *groups : single) {
+            undo.push_back({gr.seq, seq_past(gr.seq)});
+            const int p0 = seq_past(gr.seq);
+            std::vector<int> got;
+            try { got = alloc_cells(gr.seq, gr.n); }
+            catch (...) { for (auto [s, n] : undo) free_cells_from(s, n); throw; }
+            for (int i = 0; i < gr.n; ++i) { tok_seq.push_back(gr.seq); tok_pos.push_back(p0 + i); cells.push_back(got[i]); }
+        }
+    }
+    // Each token's rotary position. Text: the conversation's next position. An image's word: (start, start + row,
+    // start + column), start being where the image began; after the image, text continues at
+    // start + max(rows, cols). Without images that is the token's index, as before.
+    std::vector<std::array<int, 3>> rope(n_tok);
+    bool any_image = false;
+    {
+        std::map<int, int> next;                                  // per conversation in this step
+        for (int t = 0; t < n_tok; ++t) {
+            const int s = tok_seq[t];
+            auto it = next.find(s);
+            if (it == next.end()) it = next.emplace(s, seq_next_[s]).first;
+            const int32_t id = ids[t];
+            if (!is_image_id(id)) { rope[t] = {it->second, it->second, it->second}; it->second++; continue; }
+            const ImageRec* im = image_of(id);
+            if (!im) throw std::runtime_error("an image this conversation refers to is no longer known; send it again");
+            if (!hp.mrope) throw std::runtime_error("this model doesn't read images");
+            any_image = true;
+            const int k = id - im->first, row = k / im->cols, col = k % im->cols;
+            // the image's start: this word's own position if it is the first, else the first word's
+            int start;
+            if (k == 0) start = it->second;
+            else {
+                const int back = t - k;                           // the first word, in this step or earlier
+                if (back >= 0 && tok_seq[back] == s) start = rope[back][0];
+                else {
+                    const int idx = tok_pos[t] - k;
+                    if (idx < 0 || idx >= (int)seq_rope_[s].size()) throw std::runtime_error("an image's words arrived out of order");
+                    start = seq_rope_[s][idx][0];
+                }
+            }
+            rope[t] = {start, start + row, start + col};
+            it->second = start + std::max(im->rows, im->cols);
+        }
+    }
+    struct Undo {                                                 // on an exception: give the cells back
+        Model& m; std::vector<std::pair<int, int>>& u; bool on = true;
+        ~Undo() { if (on) for (auto [s, n] : u) m.free_cells_from(s, n); }
+    } undo_guard{*this, undo};
+    const int n_kv_end = cells_end(), n_kv = kv_span(n_kv_end);
     std::vector<int32_t> live_routing;                            // live hot experts need the picks even if the caller doesn't
     if (!routing && !live_.empty()) routing = &live_routing;
-    Graph g = build(n_tok, n_past, routing != nullptr, n_logits, want_hidden, snapshots);
+    build_images_ = any_image; build_mrope_ = any_image;
+    Graph g = build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups);
+    build_images_ = build_mrope_ = false;
     g.n_tok = n_tok;
     auto t1 = clk::now();
 
@@ -1628,22 +1967,34 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
         std::fprintf(stderr, "splits %d\n", ggml_backend_sched_get_n_splits(sched_));
     }
 
-    std::vector<int32_t> positions(n_tok);
-    for (int i = 0; i < n_tok; ++i) positions[i] = n_past + i;
-    ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
-    ggml_backend_tensor_set(g.pos, positions.data(), 0, sizeof(int32_t) * n_tok);
-    if (g.mask) {
-        const int span = kv_span(n_kv);                            // padded columns are future: -inf
-        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-        std::vector<ggml_fp16_t> mask((size_t)span * n_tok);
-        for (int t = 0; t < n_tok; ++t)
-            for (int j = 0; j < span; ++j) mask[(size_t)t * span + j] = j <= n_past + t ? zero : ninf;
-        ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
-        if (g.mask_swa) {                                           // and nothing more than n_swa - 1 tokens back
-            for (int t = 0; t < n_tok; ++t)
-                for (int j = 0; j < span; ++j) if (n_past + t - j >= hp.n_swa) mask[(size_t)t * span + j] = ninf;
-            ggml_backend_tensor_set(g.mask_swa, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+    if (g.img) {                                                  // images: their words replace the embeddings
+        std::vector<int32_t> tid(ids, ids + n_tok);
+        std::vector<float> keep(n_tok, 1.0f), words((size_t)hp.n_embd * n_tok, 0.0f);
+        for (int t = 0; t < n_tok; ++t) {
+            if (!is_image_id(ids[t])) continue;
+            const ImageRec* im = image_of(ids[t]);
+            std::copy_n(im->words.data() + (size_t)(ids[t] - im->first) * hp.n_embd, hp.n_embd, words.data() + (size_t)t * hp.n_embd);
+            tid[t] = 0; keep[t] = 0.0f;
         }
+        ggml_backend_tensor_set(g.inp, tid.data(), 0, sizeof(int32_t) * n_tok);
+        ggml_backend_tensor_set(g.keep, keep.data(), 0, sizeof(float) * n_tok);
+        ggml_backend_tensor_set(g.img, words.data(), 0, sizeof(float) * words.size());
+    } else ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
+    {
+        std::vector<int32_t> pos(g.mrope ? 4 * (size_t)n_tok : n_tok, 0);
+        for (int t = 0; t < n_tok; ++t) {
+            pos[t] = rope[t][0];
+            if (g.mrope) { pos[n_tok + t] = rope[t][1]; pos[2 * n_tok + t] = rope[t][2]; }
+        }
+        ggml_backend_tensor_set(g.pos, pos.data(), 0, sizeof(int32_t) * pos.size());
+    }
+    ggml_backend_tensor_set(g.cells, cells.data(), 0, sizeof(int32_t) * n_tok);
+    fill_masks(g, n_kv, tok_seq, tok_pos);
+    if (g.out_idx) {                                               // each conversation's last token
+        std::vector<int32_t> idx;
+        int t = 0;
+        for (const SeqGroup& gr : *groups) { t += gr.n; idx.push_back(t - 1); }
+        ggml_backend_tensor_set(g.out_idx, idx.data(), 0, sizeof(int32_t) * idx.size());
     }
     if (g.rope_ff) ggml_backend_tensor_set(g.rope_ff, hp.rope_ff.data(), 0, sizeof(float) * hp.rope_ff.size());
     set_n_threads(cpu_, n_threads);
@@ -1684,7 +2035,17 @@ Model::EvalOut Model::eval_ex(const int32_t* ids, int n_tok, int n_threads, int 
     stats_.build_ms += ms(t0, t1); stats_.alloc_ms += ms(t1, t2); stats_.input_ms += ms(t2, t3);
     stats_.compute_ms += ms(t3, t4); stats_.output_ms += ms(t4, t5);
     stats_.splits = ggml_backend_sched_get_n_splits(sched_); stats_.copies = ggml_backend_sched_get_n_copies(sched_);
-    n_past_ = n_kv;
+    undo_guard.on = false;
+    for (int t = 0; t < n_tok; ++t) {                            // the positions are now part of the conversations
+        auto& r = seq_rope_[tok_seq[t]];
+        if ((int)r.size() != tok_pos[t]) r.resize(tok_pos[t]);
+        r.push_back(rope[t]);
+        const auto& p = rope[t];
+        seq_next_[tok_seq[t]] = std::max(seq_next_[tok_seq[t]], is_image_id(ids[t]) ? seq_next_[tok_seq[t]] : p[0] + 1);
+    }
+    for (int t = 0; t < n_tok; ++t)
+        if (is_image_id(ids[t])) { const ImageRec* im = image_of(ids[t]); seq_next_[tok_seq[t]] = std::max(seq_next_[tok_seq[t]], rope[t][0] + std::max(im->rows, im->cols)); }
+    n_past_ = seq_past(0);
     if (std::getenv("TIERLM_PROFILE")) profile_step(n_tok, ms(t0, t3), ms(t3, t4), ms(t4, t5));
     return res;
 }

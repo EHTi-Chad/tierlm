@@ -77,7 +77,7 @@ store and `search_query: ` for what you search with.
 | Field | Notes |
 |---|---|
 | `model` | An `id` from `/v1/models` loads that model first (with the settings last used for it in tierlm), which takes as long as loading it on the setup screen. Any other name, such as `gpt-4o`, uses the loaded model. |
-| `messages` | `system`, `developer` (same as system), `user`, `assistant`. Content can be a string or a list of text parts; images are skipped (no vision yet). Also `tool` (a tool's result), and `assistant` messages with `tool_calls` and `reasoning_content`. |
+| `messages` | `system`, `developer` (same as system), `user`, `assistant`. Content can be a string or a list of parts: text, and images (see [Images](#images)). Also `tool` (a tool's result), and `assistant` messages with `tool_calls` and `reasoning_content`. |
 | `tools`, `tool_choice` | OpenAI function tools. The model may answer with `tool_calls` instead of text (see Tool calling below). `tool_choice: "none"` leaves the tools out. |
 | `stream` | `true` streams `chat.completion.chunk` events, ending with `data: [DONE]`. `stream_options: {"include_usage": true}` adds a final chunk with token counts. |
 | `max_tokens`, `max_completion_tokens` | Longest reply. Left out: no limit (until the model finishes or the context is full). |
@@ -111,7 +111,29 @@ first served, and a request whose app disconnects while waiting leaves the line.
 minutes (`503`). Requests share the model's memory of the conversation, and up to 8 conversations are kept aside, so
 an app that resends a growing conversation only pays for the new part, even when others took turns in between.
 
-Not yet: `logprobs`; `n` > 1; embeddings; images.
+#### Images
+
+Models that read images (Qwen3.5 / 3.6, with their `mmproj-*.gguf` vision file in the same folder; `/v1/models`
+shows them as `"type": "vlm"` with `"capabilities": ["vision"]`) take images the way OpenAI's API does:
+
+```json
+{"role": "user", "content": [
+  {"type": "text", "text": "What does this receipt say?"},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+]}
+```
+
+- Send images as base64 `data:` URLs (PNG, JPEG, GIF or BMP); tierlm doesn't fetch `http(s)` addresses.
+  `{"type": "input_image", "image_url": "data:..."}` (OpenAI's newer form) works too.
+- An image becomes one "image word" per 32 x 32 pixels, at most 2,048 (bigger images are scaled down, keeping
+  their shape; a full scanned page at that size is about 1,250 x 1,650 pixels), or 1,024 when only the CPU reads
+  images. `"image_tokens": 512` (any number from 64) in the request sets another limit. These count towards the
+  context.
+- The same image sent again (each turn of a conversation sends it again) is recognised and not read twice, and
+  the conversation's cache is reused as for text.
+- With images in a conversation, speculative decoding is off for that reply (the draft block reads text only).
+
+Not yet: `logprobs`; `n` > 1; embeddings.
 
 Errors use OpenAI's format: `{"error": {"message": "...", "type": "...", "code": ...}}`.
 
@@ -155,7 +177,8 @@ GPU in use: `name`, `weights`, `kv`, `layers`), `ffn_vram` (per layer: are its e
 switch speculation on), `lookup` (most tokens prompt lookup guesses now, 0 when off) and `lookup_setting` (as set: -1 automatic), `hot_experts` (experts placed in VRAM by usage), `hot` (per layer: those experts' numbers, which change as you chat with
 live hot experts), `live_experts` (on or off) and `live` (`picks`, `hits`: picks served from VRAM, `swaps`, `swap_ms`),
 `hot_share` (the share of the learned expert use those VRAM experts cover, 0 to 1) and `learned_tokens` (about how
-many tokens of use the expert counts come from).
+many tokens of use the expert counts come from), and for images `vision` (the model reads them: its mmproj file is
+loaded), `vision_file`, `vision_device` and `image_tokens` (most image words per image).
 
 While a reply is streaming or a model is loading, `/api/info` returns the last known details with
 `"busy": true` and `waiting` (requests in line) instead of waiting. It also gives `ram_free` (system RAM free, bytes) and `tuned_tps`
@@ -254,7 +277,7 @@ Finds the fastest settings for a model on this PC. The body is the same as `/api
 (`temperature`, `top_k`, `top_p`, `min_p`, `repeat_penalty`), which every measurement uses: each one answers two
 questions exactly as `/api/chat` would. The reply is a stream of
 server-sent events: `{"type":"status","text":"Measuring experts in RAM"}` while it works,
-`{"type":"result","label":"Split: experts in RAM","tps":17.0}` for each measurement, then
+`{"type":"result","label":"GPU + RAM, experts in RAM, 6 CPU threads, no speculative decoding","tps":17.0}` for each measurement (the label lists every setting it was measured with), then
 `{"type":"done","tps":22.3,"settings":{...},"results":[...]}` with the settings it saved for the model (`split_mode`,
 `threads`, `speculative`, `draft_max`, `hot_experts`, `live_experts`), or `{"type":"error","message":"..."}`. The model stays loaded with the winner.
 
@@ -309,7 +332,14 @@ Request:
 ```
 
 - `messages` is the whole conversation; roles are `system`, `user` and `assistant`. The server formats it
-  with the model's own chat format (ChatML, Llama 3, Tulu, `[INST]`).
+  with the model's own chat format (ChatML, Llama 3, Tulu, `[INST]`). A message may carry `"images": ["data:image/png;base64,..."]`
+  (models that read images): they go before its text. The `/v1` content parts work here too.
+- `chat_id` (tierlm's page, on this computer): the saved chat this request continues. If it has an archive (below),
+  its summary is added to the system message and the archived passages that best match the new message are put just
+  before it (a `recall` event lists them).
+- `overflow`: `"archive"` lets tierlm leave out the oldest messages when the conversation doesn't fit (down to
+  about 60% of the context, so it isn't needed again at once); an `archived` event says how many, so the page can
+  mark them archived. Without it, a conversation that doesn't fit gives an `error` event with `"code": "context_full"`.
 - `temperature` 0 means greedy (always the most likely token). Defaults: 0.7, top_p 0.9, and no limit on `max_tokens` (0 or less, or leaving it out, means the reply runs until the model finishes or the context is full).
 - Whatever part of the conversation is already in the KV cache is reused, so follow-up messages only process
   the new text.
@@ -377,6 +407,28 @@ curl -N http://127.0.0.1:8040/api/chat -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":20}'
 ```
 
+### Saved chats (`/api/chats`)
+
+For tierlm's own page on the computer running tierlm (the same checks as the workspace below; from other devices the
+page keeps chats in that browser). Each chat is a folder in `chats` next to the settings file, named
+`<date> <title> (<id>)`, holding `chat.json` (what the page needs), `chat.md` (the conversation as readable
+Markdown, with links to attached files and to the workspace files the model worked on) and `files/` (attached files).
+
+- `GET /api/chats`: `{"folder": "C:\\tierlm\\chats", "chats": [{"id", "title", "created", "updated", "model", "messages", "archived", "folder"}]}`, newest first
+- `GET /api/chats/<id>`: the chat: `{"id", "title", "created", "updated", "model", "summary", "autoArchive", "messages": [...]}`;
+  a message can have `time` (ms), `archived`, `files` (`[{"name", "size"}]`), `shown`, `meta`, `tool_calls`, `recall`
+- `POST /api/chats/<id>`: saves the chat (writes `chat.json` and `chat.md`); needs the `X-Tierlm-Workspace: 1` header
+- `DELETE /api/chats/<id>`: deletes its folder
+- `POST /api/chats/<id>/files` `{"name": "notes.txt", "text": "..."}`: keeps an attached file with the chat
+- `GET /api/chats/<id>/files/<name>`: an attached file
+- `POST /api/chats-folder` (`{}` or `{"id": ...}`): opens the folder in Explorer (Windows)
+
+**The archive.** When a conversation no longer fits the context, the page can archive its oldest messages (see
+`overflow` above): they stay in the chat but aren't sent any more. For each new message, tierlm finds the archived
+passages that best match it, by meaning with the embedding model if one is loaded, else by keywords, and gives them
+to the model with the message. The page can also have the model write a short summary of the archive, which is given
+to the model from then on.
+
 ### The workspace (`/api/workspace`)
 
 For tierlm's own chat page on the computer running tierlm. Every request must come from this computer (not through a
@@ -407,6 +459,14 @@ shown) and `tool_calls` (`[{"name", "arguments", "arguments_json"}]`). The page 
 In `/api/models`, embedding models have `"kind": "embedding"`, `"embedding": true` when tierlm can load them, and
 `"dims"`. `/v1/models` lists the loaded embedding model with `"type": "embeddings"` (the chat model has `"type": "llm"`).
 
+### POST /api/embed/download, GET /api/embed/download
+
+`POST` (this computer only) downloads nomic-embed-text-v1.5 Q8_0 from `huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF`
+into the models folder, with curl (part of Windows 10 and 11). The file is checked against the size and SHA-256
+Hugging Face gives for it (`X-Linked-Size`, `X-Linked-Etag`) before it gets its name; a file that doesn't match is
+deleted. `GET` reports `{"state": "idle" | "downloading" | "checking" | "done" | "error", "bytes", "total", "error",
+"file"}`; then `POST /api/embed/load {"model": file}` loads it (the page does that by itself).
+
 ### POST /api/reset
 
 Clears the KV cache. Returns `{"ok": true}`.
@@ -425,4 +485,6 @@ Clears the KV cache. Returns `{"ok": true}`.
 ### POST /api/network
 
 `{"allow_network": true}` and/or `{"api_key": "generate"}` (a new random key), `{"api_key": "my-key"}` or
-`{"api_key": ""}` (no key). Only accepted from this computer. Returns the same as `GET /api/network`.
+`{"api_key": ""}` (no key), and/or `{"api_trim_oldest": true}`: when an app's conversation is too long for the
+context, leave out its oldest messages instead of returning an error (off by default: coding agents shorten their
+conversations themselves when told). Only accepted from this computer. Returns the same as `GET /api/network`.

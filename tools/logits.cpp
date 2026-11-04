@@ -34,8 +34,11 @@ int main(int argc, char** argv) {
         const bool rollback = !std::strcmp(argv[2], "--rollback");
         const bool mtp = !std::strcmp(argv[2], "--mtp"), mtp_step = !std::strcmp(argv[2], "--mtp-step");
         const bool gen = !std::strcmp(argv[2], "--gen"), gen_spec = !std::strcmp(argv[2], "--gen-spec");
+        // --parallel K: K conversations made from the ids (conversation s: the ids rotated by 3s, s fewer of them),
+        // computed together in mixed steps (see below); prints each one's last logits, conversation 0 first.
+        const int par = !std::strcmp(argv[2], "--parallel") ? std::atoi(argv[3]) : 0;
         const int n_gen = gen || gen_spec ? std::atoi(argv[3]) : 0;
-        int nb = 0, keep = 0, first = step || mtp || mtp_step ? 3 : gen || gen_spec ? 4 : 2;
+        int nb = 0, keep = 0, first = step || mtp || mtp_step ? 3 : gen || gen_spec || par ? 4 : 2;
         if (rollback) { nb = std::atoi(argv[3]); keep = std::atoi(argv[4]); first = 5; }
         std::vector<int32_t> ids;
         for (int i = first; i < argc; ++i) ids.push_back(std::atoi(argv[i]));
@@ -51,6 +54,7 @@ int main(int argc, char** argv) {
         if (const char* v = std::getenv("TIERLM_DEVICE")) o.device = v;      // e.g. cpu, CUDA0, Vulkan0
         o.mtp = mtp || mtp_step || (gen_spec && !std::getenv("TIERLM_DRAFT_SCRIPT"));
         o.max_ctx = std::max<int>(o.max_ctx, (int)ids.size() + n_gen + 16);
+        if (par) { o.parallel = par + 1; o.max_ctx = std::max<int>(o.max_ctx, (int)ids.size() * par + 64); }
         auto m = Model::load(argv[1], o);
         if (std::getenv("TIERLM_SHOW_PLACEMENT")) {
             const auto& p = m->placement();
@@ -108,6 +112,46 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "steps %d, drafted %d, accepted %d, lookup %d/%d\n", st.steps, st.drafted, st.accepted, st.look_ok, st.looked);
             }
             for (int32_t t : out) std::printf("%d\n", t);
+            return 0;
+        } else if (par) {
+            // 1. a throwaway conversation (the last one) takes some cells, so the others' cells are scattered later;
+            // 2. conversation 0's first half through the one-conversation path (eval);
+            // 3. the other conversations' first halves together; then the throwaway one is dropped (a hole);
+            // 4. the rest in mixed steps: even conversations 1 token per step, odd ones up to 3.
+            const int K = par, junk = par, n = (int)ids.size();
+            std::vector<std::vector<int32_t>> seq(K);
+            for (int s = 0; s < K; ++s) {
+                const int len = std::max(1, n - s);
+                for (int i = 0; i < len; ++i) seq[s].push_back(ids[(i + 3 * s) % n]);
+            }
+            m->eval_seqs({{junk, {1, 2, 3, 4, 5, 6, 7}}}, nt);
+            std::vector<size_t> at(K, 0);
+            std::vector<std::vector<float>> last(K);
+            at[0] = std::max<size_t>(1, seq[0].size() / 2);
+            last[0] = m->eval(std::vector<int32_t>(seq[0].begin(), seq[0].begin() + at[0]), nt);
+            std::vector<Model::SeqInput> in;
+            for (int s = 1; s < K; ++s) {
+                at[s] = std::max<size_t>(1, seq[s].size() / 2);
+                in.push_back({s, std::vector<int32_t>(seq[s].begin(), seq[s].begin() + at[s])});
+            }
+            auto run = [&](const std::vector<Model::SeqInput>& in) {
+                auto r = m->eval_seqs(in, nt);
+                for (size_t k = 0; k < in.size(); ++k) last[in[k].seq] = r[k];
+            };
+            if (!in.empty()) run(in);
+            m->seq_reset(junk);
+            for (;;) {
+                in.clear();
+                for (int s = 0; s < K; ++s) {
+                    const size_t take = std::min<size_t>(seq[s].size() - at[s], s % 2 ? 3 : 1);
+                    if (!take) continue;
+                    in.push_back({s, std::vector<int32_t>(seq[s].begin() + at[s], seq[s].begin() + at[s] + take)});
+                    at[s] += take;
+                }
+                if (in.empty()) break;
+                run(in);
+            }
+            for (int s = 0; s < K; ++s) for (float v : last[s]) std::printf("%.6g\n", v);
             return 0;
         } else if (mtp || mtp_step) {
             const int n = (int)ids.size(), E = m->hparams().n_embd;

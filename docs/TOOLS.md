@@ -96,7 +96,11 @@ single-token steps.
 
 ```
 tierlm-bench model.gguf [-d auto|cpu|gpu] [-t N] [contexts...]       # default contexts: 64 512 1024 2048
+tierlm-bench model.gguf --parallel 1,2,4,8 512                        # several conversations at once, 512 tokens each
 ```
+
+With `--parallel`, each number of conversations is advanced one token each per step, and the total and
+per-conversation speed printed.
 
 ## tierlm-devices
 
@@ -141,6 +145,19 @@ tierlm-embed model.gguf --ids 101,2023,102 -d auto                            # 
 
 It prints the token ids and the pooled embedding (not normalised; `/v1/embeddings` normalises).
 
+## tierlm-vision
+
+Image reading, for tests and for trying a vision (mmproj) file by hand:
+
+```
+tierlm-vision mmproj-Qwen3.5-9B-F16.gguf page.png words.f32            # the image words (prints rows cols width)
+tierlm-vision mmproj.gguf --patches page.png patches.f32                # just the resized image, cut into patches
+tierlm-vision mmproj.gguf --chat model.gguf page.png logits.f32 all 5 17 -1 9   # a model reading it (-1: the image)
+```
+
+`TIERLM_DEVICE=cpu` (or `CUDA0`, ...) picks the device; `TIERLM_VISION_EXACT=1` uses plain attention even for big
+images (tests).
+
 ## tierlm-kv
 
 Dumps all metadata keys in a GGUF file (architecture settings, tokenizer type, vocabulary sizes, chat
@@ -168,6 +185,7 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_KV_F32=1` | Keep the KV cache in f32 instead of f16 (exact; used by the tests) |
 | `TIERLM_THREADS=N` | CPU threads for `tierlm-logits` and `tierlm-bench` |
 | `TIERLM_PROFILE=1` | Timing: `tierlm-run` prints a per-token breakdown and the number of graph splits; every tool and the server also print, every 64 reply steps, each device's input-copy and work time per step (`profile:` lines). Each split is waited for while it's on, so everything runs a little slower |
+| `TIERLM_BATCH_LOG=1` | Server, Connections above one: every 2 seconds, how many replies shared each model step, the compute time per step and the share of the time spent computing (`batcher:` lines). Close to the number of replies running means they share steps as they should |
 | `TIERLM_DUMP_SCHED=1` | Debugging: prints each point where the work switches between CPU and GPU |
 | `TIERLM_CPU_OPS=MUL_MAT,...` | Debugging: runs the listed ggml operation types on the CPU, to find which GPU kernel differs |
 | `TIERLM_DEVICE=cpu` | `tierlm-logits` (tests): device to load the model on |

@@ -73,14 +73,27 @@ No. The model runs entirely on your machine, and the web page talks only to `127
 tierlm doesn't collect or send anything.
 
 **Can other computers on my network use it?**
-Only if you start the server with `--host 0.0.0.0`. There's no password or login, so only do that on a
-network you trust.
+Yes. In **API** (side menu), tick **Allow other devices** and press **New key** to set an API key. The panel then
+shows this PC's network address (like `http://192.168.1.20:8040/v1`); give that and the key to the app on the other
+computer, or use **Set up an app** there for ready-made settings. If Windows asks about the firewall, choose
+**Private networks**. Keep it to your own network: don't forward the port on your router.
 
 **Can several people or apps use it at the same time?**
 Yes, they take turns: one reply is written at a time, and other requests wait in line, first come first served (the
 chat shows "Waiting in line: 2 requests ahead of this one…"). Nothing fails with "busy". Switching between
 conversations is quick, because tierlm keeps up to 8 recent conversations aside instead of reading them again.
-Writing several replies at once, sized to what your PC can handle, is planned next.
+To write several replies at once instead, set **Connections** (Advanced on the setup screen); **Find the fastest
+settings** recommends how many your PC can handle. On an RTX 5090, 4 at once with Qwen3.6-35B-A3B Q4_K_M write
+364 tok/s in all (about 90 tok/s each), against 177 tok/s for one reply.
+
+**What happens when a conversation fills the context?**
+The reply stops and tierlm offers **Keep going** or **New chat** (the context card turns amber a little before).
+Keep going archives the oldest messages: they stay in the chat and its file, but the model no longer reads them
+every time. For each new message, tierlm looks back at the archive and gives the model the earlier passages that
+relate to it (by meaning, with an embedding model loaded; otherwise by keywords), and a line under the reply shows
+what it looked back at. **Add a summary for the model** has it write a short summary of the archived part, which it
+keeps in mind from then on. Apps using the API get an error by default (coding agents shorten their conversations
+themselves); **When an app's conversation is too long, drop its oldest messages** in the API panel changes that.
 
 **Why do replies get slower in long conversations?**
 Every new word has to look back over the whole conversation so far. tierlm uses flash attention to keep this
@@ -127,8 +140,14 @@ lists the model once, marked "3 files", and loads every part. If one is missing,
 
 **My model shows as "not supported yet"**
 The label says which architecture (or tokenizer) the file uses that tierlm doesn't support yet, for example
-`qwen35` or `gemma3`. A file labelled **Vision add-on (mmproj)** isn't a model on its own: it's the image part of
-the model next to it.
+`qwen35` or `gemma3`. A file labelled **Vision file (mmproj)** isn't a model on its own: it's the image part of
+the model next to it, and loads with that model.
+
+**Can it read images?**
+Yes, with Qwen3.5 and 3.6 models and their `mmproj-….gguf` vision file in the same folder (LM Studio downloads it
+with the model). **Model info** shows **Reads images: yes** when it's loaded. Attach, drag or paste an image
+into the chat; apps send them through the API as with OpenAI. Other models read text only, and say so when given a
+image. PDFs aren't read yet: turn their pages into images first (your document tools may already do that).
 
 **How does tierlm choose between my GPU and CPU?**
 Automatically. It uses a dedicated GPU if the model fits in its memory, then integrated graphics, then the CPU

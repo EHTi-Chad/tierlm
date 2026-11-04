@@ -60,6 +60,7 @@
   #railstat small { display: block; font-size: 10px; }
   #railstat .rbar { height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; margin: 6px 4px 2px; }
   #railstat .rbar > div { height: 100%; width: 0; background: var(--accent); }
+  #rctx.warn { background: var(--ram); } #rctx.full { background: var(--danger); }
   .sec { border-bottom: 1px solid var(--line); }
   .sechead { width: 100%; display: flex; align-items: baseline; gap: 10px; padding: 13px 16px; border: 0; border-radius: 0; background: transparent; font-weight: 600; font-size: 13.5px; text-align: left; }
   .sechead:hover { background: var(--panel-2); }
@@ -180,6 +181,55 @@
   .msg.tool .row { display: flex; gap: 8px; margin-top: 6px; }
   .wsfolder { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); color: var(--muted); }
   .msg.error { align-self: center; background: transparent; color: var(--danger); font-size: 13px; }
+  /* ---- the preview pane: chat on the left, a file / change / page on the right ---- */
+  #preview { flex: var(--pvr, 1.25) 1 0; min-width: 280px; border-radius: 0; border-width: 0 1px 0 0; display: flex; flex-direction: column; }
+  #app.previewing #chat { flex: 1 1 0; min-width: 300px; }
+  #pvsplit { flex: 0 0 6px; cursor: col-resize; background: var(--line); opacity: .5; }
+  #pvsplit:hover, #pvsplit.drag { opacity: 1; background: var(--accent); }
+  .pvhead { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  #pvtabs { display: flex; gap: 4px; overflow-x: auto; flex: 1; }
+  .pvtab { display: inline-flex; align-items: center; gap: 6px; padding: 4px 6px 4px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); color: var(--muted); font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+  .pvtab.cur { background: var(--panel); color: var(--ink); border-color: var(--accent); }
+  .pvtab .x { border: 0; background: none; color: inherit; cursor: pointer; padding: 0 2px; font-size: 12px; }
+  #pvbody { flex: 1; min-height: 0; overflow: auto; }
+  .pvbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12.5px; color: var(--muted); position: sticky; top: 0; background: var(--panel); z-index: 1; flex-wrap: wrap; }
+  .pvbar .grow { flex: 1; }
+  .pvbar b { color: var(--ink); }
+  .code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px; line-height: 1.5; border-collapse: collapse; width: 100%; }
+  .code td { padding: 0 10px; white-space: pre; vertical-align: top; }
+  .code td.ln { width: 1%; text-align: right; color: var(--faint); user-select: none; border-right: 1px solid var(--line); }
+  .code .k { color: #8250df; } .code .s { color: #0a7d3c; } .code .c { color: var(--faint); font-style: italic; } .code .n { color: #b35900; }
+  :root[data-theme="dark"] .code .k { color: #c792ea; } :root[data-theme="dark"] .code .s { color: #8bd49c; } :root[data-theme="dark"] .code .n { color: #f0a868; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .code .k { color: #c792ea; } :root:not([data-theme="light"]) .code .s { color: #8bd49c; } :root:not([data-theme="light"]) .code .n { color: #f0a868; } }
+  .pvmd { padding: 14px 18px; }
+  .pvimg { padding: 14px; text-align: center; } .pvimg img { max-width: 100%; height: auto; background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 16px 16px; }
+  .pvframe { width: 100%; height: calc(100% - 41px); border: 0; background: #fff; }
+  .sbs { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; line-height: 1.5; border-collapse: collapse; width: 100%; table-layout: fixed; }
+  .sbs td { padding: 0 6px; white-space: pre-wrap; word-break: break-all; vertical-align: top; }
+  .sbs td.ln { width: 38px; text-align: right; color: var(--faint); user-select: none; }
+  .sbs td.del { background: rgba(207, 34, 46, .13); } .sbs td.add { background: rgba(26, 127, 55, .14); }
+  .sbs td.gap { background: var(--panel-2); color: var(--muted); text-align: center; cursor: pointer; font-family: inherit; }
+  .sbs td.rcol { border-left: 1px solid var(--line); }
+  .msg.tool .thead .plink, .md .codeblock .open { cursor: pointer; }
+  .msg.tool .thead .plink { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
+  .md .open { position: absolute; top: 4px; right: 62px; font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); }
+  @media (max-width: 980px) {
+    #preview { position: fixed; inset: 0; z-index: 50; border-radius: 0; }
+    #pvsplit { display: none; }
+    #app.previewing #chat { flex: 1 1 100%; }
+  }
+  .msg.archived { opacity: .5; }
+  .archdiv { align-self: stretch; border-top: 1px dashed var(--line); border-bottom: 1px dashed var(--line); padding: 8px 4px; font-size: 13px; color: var(--muted); display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .archdiv .sum { color: var(--ink); }
+  details.recall { margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+  details.recall summary { cursor: pointer; }
+  details.recall .rq { margin: 6px 0 0 12px; white-space: pre-wrap; }
+  .msg.fullcard { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; color: var(--ink); }
+  .msg.fullcard .row { display: flex; gap: 8px; }
+  #ctxbar.warn { background: var(--ram); }
+  #ctxbar.full { background: var(--danger); }
+  .chip.link { cursor: pointer; }
+  .chip.link:hover .nm { text-decoration: underline; }
   .msg.note { align-self: center; background: var(--panel-2); color: var(--muted); font-size: 13px; max-width: 720px; }
   /* Markdown in replies */
   .msg.assistant { white-space: normal; }
@@ -346,6 +396,9 @@
   .chip button { border: 0; background: transparent; padding: 0 6px; line-height: 18px; border-radius: 999px; color: var(--muted); font-size: 14px; }
   .chip button:hover { color: var(--ink); background: var(--line); }
   .msg .chips { margin-top: 6px; }
+  .msg .pics { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .msg .pics img { max-height: 160px; max-width: 240px; border-radius: 8px; cursor: zoom-in; display: block; background: #fff; }
+  .chip img.thumb { width: 22px; height: 22px; object-fit: cover; border-radius: 4px; margin-right: 2px; }
   .msg .chip { padding-right: 10px; }
   .msg.user .chip { background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.32); color: inherit; }
   .msg.user .chip .sz { color: inherit; opacity: .72; }
@@ -503,6 +556,17 @@
             <select id="splitsel"><option value="auto">Automatic (recommended)</option><option value="layers">Split by whole layers</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
             <div class="help">Automatic uses experts in RAM for mixture-of-experts models and whole layers for the rest. Experts in RAM: the GPU does all the attention and the CPU only the few experts each word picks, much faster for MoE models (Qwen3.6-35B-A3B on an RTX 3070 laptop: 33 against 13 tok/s). Whole layers: the GPU and CPU hand over once per word; best for dense models.</div>
           </div>
+          <div>
+            <label for="connsel">Connections (replies written at once)</label>
+            <select id="connsel"><option value="1">1: one reply at a time (fastest for one person)</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="6">6</option><option value="8">8</option><option value="12">12</option><option value="16">16</option></select>
+            <div class="help">For several people or apps using one tierlm. Each connection gets its own context of the length chosen above (the purple part of the bars grows with each), and the replies are written together, so the total speed goes up while each reply gets slower. With more than one, speculative decoding is off. <b>Find the fastest settings</b> measures 1, 2, 4… at once and recommends the most that keeps every reply at or above the speed below. More requests than connections wait in line.</div>
+            <div id="connrec" class="help" hidden></div>
+          </div>
+          <div>
+            <label for="mintps">Slowest speed per reply (tok/s)</label>
+            <input id="mintps" type="number" min="1" max="100" step="1" value="5">
+            <div class="help">What Find the fastest settings keeps every reply above when it recommends a number of connections.</div>
+          </div>
           <div id="allgpusrow" hidden>
             <label class="chk"><input type="checkbox" id="allgpus" checked> Use every graphics card</label>
             <div class="help">With several cards of the same kind, tierlm fills the best one, then the next, then RAM. Off: only the best card (and RAM). A much slower second card can cost more than its memory brings, and keeping the busiest experts in VRAM works with one card for now; <b>Find the fastest settings</b> measures both ways and keeps the faster.</div>
@@ -570,6 +634,9 @@
       <div class="help">When set, apps must send it as their API key, and the tierlm page asks for it on other devices. Needed if you
         open tierlm to the internet through a tunnel (Cursor works that way).</div>
       <div class="caption" id="netmsg"></div>
+      <label class="chk" style="margin-top:12px"><input type="checkbox" id="apitrim"> When an app's conversation is too long, drop its oldest messages</label>
+      <div class="help">Off (the default): the app gets an error and can shorten the conversation itself, as coding agents such as
+        opencode do. On: tierlm leaves out the oldest messages so the rest fits, like LM Studio's "truncate" option.</div>
       <div id="appsetup" hidden>
         <h3 class="setuph">Set up an app</h3>
         <div class="help">Ready-made settings for the loaded model: its name, context length, tool calling and this address.
@@ -631,6 +698,7 @@
         <div class="ctitle">Context</div>
         <div class="mid" id="ctxbig">0<small id="ctxof">/ – tokens</small></div>
         <div class="bar"><div id="ctxbar"></div></div>
+        <div class="help" id="ctxwarn" hidden></div>
       </div>
     </div>
     </div>
@@ -652,6 +720,11 @@
           <label for="llook">Prompt lookup</label>
           <select id="llook"><option value="-1">Automatic</option><option value="0">Off</option><option value="4">Up to 4 tokens</option><option value="8">Up to 8 tokens</option><option value="16">Up to 16 tokens</option></select>
         </div>
+        <div class="lrow2" id="picrow" hidden>
+          <label for="picdetail">Image detail</label>
+          <select id="picdetail"><option value="0">Automatic</option><option value="2048">High (scanned pages, small text)</option><option value="1024">Medium</option><option value="512">Low (fastest)</option></select>
+        </div>
+        <div class="help" id="pichelp" hidden></div>
         <div class="lrow2" id="wsrow" hidden>
           <label class="chk"><input type="checkbox" id="wson"> Workspace</label>
           <span class="wsfolder" id="wsfolder"></span>
@@ -690,6 +763,10 @@
         <div class="lrow2" style="margin-top:4px">
           <select id="embsel" aria-label="Embedding model" style="flex:1;min-width:0"><option value="">None</option></select>
         </div>
+        <div class="lrow2" id="embdlrow" hidden style="margin-top:6px">
+          <button class="tiny" id="embdl">Download nomic-embed-text (146 MB)</button>
+          <span class="caption" id="embdlnote"></span>
+        </div>
         <div class="help" id="embnote">A second, small model that turns text into numbers for search and document comparison. Apps use it
           through <code>/v1/embeddings</code>, while the chat model stays loaded.</div>
         <div class="subhead">Chat model</div>
@@ -697,6 +774,7 @@
           <dt>Model</dt><dd id="arch">–</dd>
           <dt>Layers × experts</dt><dd id="lx">–</dd>
           <dt>Active per token</dt><dd id="active">–</dd>
+          <dt>Reads images</dt><dd id="vis" title="">–</dd>
         </dl>
         <div class="tiers">
           <div class="tier"><div class="name"><span class="sw" style="background:var(--vram)"></span>VRAM</div><div class="val" id="t-vram">–</div><div class="sub" id="t-vram-sub">–</div></div>
@@ -751,7 +829,8 @@
         <div class="subhead">System prompt presets</div>
         <div id="presets" class="presets"></div>
         <button class="tiny ghost" id="savepreset">Save the current system prompt as a preset…</button>
-        <div class="help">Chats and presets are kept in this browser.</div>
+        <button class="tiny ghost" id="chatsfolder" hidden>Open the chats folder</button>
+        <div class="help" id="chatshelp">Chats and presets are kept in this browser.</div>
       </div>
     </div>
     <div class="sec" data-sec="bench">
@@ -801,7 +880,8 @@
         <div class="menuwrap">
           <button class="iconbtn" id="plus" aria-label="Add files or a folder" title="Add files or a folder" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
           <div class="menu up" id="plusmenu" role="menu" hidden>
-            <button class="mi2" role="menuitem" id="m-attach"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></svg><span><b>Attach files</b><span class="sub">Text and code files go into your message</span></span></button>
+            <button class="mi2" role="menuitem" id="m-attach"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></svg><span><b>Attach files</b><span class="sub">Text and code files, and images for models that read them</span></span></button>
+            <div id="m-recent"></div>
             <button class="mi2" role="menuitem" id="m-folder"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span><b id="m-folder-t">Work in a folder…</b><span class="sub" id="m-folder-s">The model reads your project; you approve each change</span></span></button>
           </div>
         </div>
@@ -813,6 +893,12 @@
         <button class="primary" id="send">Send</button>
       </div>
     </div>
+  </section>
+
+  <div id="pvsplit" hidden role="separator" aria-orientation="vertical" aria-label="Resize the preview" tabindex="0"></div>
+  <section class="card" id="preview" hidden aria-label="Preview">
+    <div class="pvhead"><div id="pvtabs" role="tablist"></div><button class="tiny ghost" id="pvclose" aria-label="Close the preview" title="Close the preview">✕</button></div>
+    <div id="pvbody"></div>
   </section>
 
 </main>
@@ -866,8 +952,41 @@ async function loadEmbed() {
   $("embnote").textContent = e.loaded
     ? `${e.name}: ${e.dims} numbers per text, up to ${e.max_tokens.toLocaleString()} tokens, on ${e.on_gpu ? e.device.replace(/ \(.*$/, "") : "the CPU"}. Apps use it through /v1/embeddings, while the chat model stays loaded.`
     : opts.length ? "A second, small model that turns text into numbers for search and document comparison. Choose one to load it next to the chat model; apps use it through /v1/embeddings."
-    : "No embedding models in your models folder (or LM Studio's built-in one). Download one in GGUF format, for example nomic-embed-text-v1.5 (Q8_0, about 140 MB), into the models folder, then choose it here.";
+    : "No embedding model yet: the button above downloads nomic-embed-text from Nomic's own Hugging Face page and checks it, or put any GGUF embedding model in the models folder.";
+  // One click for nomic-embed-text, when no copy of it is here yet (this computer only).
+  const haveNomic = opts.some(m => !m.builtin && /nomic-embed-text/i.test(m.id));   // (LM Studio's copy aside: tierlm keeps its own)
+  $("embdlrow").hidden = haveNomic || !embLocal;
+  if (!haveNomic && embLocal && !embDlTimer) pollEmbDl(false);
 }
+let embDlTimer = 0;
+const embLocal = ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
+async function pollEmbDl(loadWhenDone) {
+  let j;
+  try { j = await (await api("/api/embed/download")).json(); } catch (e) { return; }
+  const b = $("embdl"), n = $("embdlnote");
+  const mb = x => Math.round(x / 1e6);
+  if (j.state === "downloading" || j.state === "checking") {
+    b.disabled = true;
+    n.textContent = j.state === "checking" ? "Checking the file…" : `Downloading… ${mb(j.bytes)} of ${mb(j.total || j.size_hint)} MB`;
+    embDlTimer = setTimeout(() => pollEmbDl(true), 700);
+    return;
+  }
+  embDlTimer = 0;
+  b.disabled = false;
+  if (j.state === "error") { n.textContent = "⚠ " + j.error; b.textContent = "Try again"; return; }
+  n.textContent = "";
+  if (j.state === "done" && loadWhenDone && j.file) {           // load it now, as if chosen in the list
+    n.textContent = "Downloaded and checked. Loading…";
+    try { await api("/api/embed/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: j.file }) }); } catch (e) {}
+    n.textContent = "";
+    await loadEmbed();
+  }
+}
+$("embdl").onclick = async () => {
+  $("embdl").disabled = true; $("embdlnote").textContent = "Starting…";
+  try { await api("/api/embed/download", { method: "POST" }); } catch (e) {}
+  pollEmbDl(true);
+};
 $("embsel").onchange = async () => {
   const id = $("embsel").value, sel = $("embsel");
   sel.disabled = true;
@@ -891,7 +1010,7 @@ function renderHot() {   // the hot-expert note and the map's VRAM rings (again 
       (info.live_experts ? (info.live && info.live.picks > 0
         ? ` They follow the conversation: ${Math.round(100 * info.live.hits / info.live.picks)}% of picks served from VRAM so far, ${info.live.swaps.toLocaleString()} moved in.`
         : " They follow the conversation: experts it keeps using move into VRAM as you chat.") : "");
-  } else if (moe && info.ram_weights > 0 && info.split_mode === "experts") {
+  } else if (moe && info.ram_weights > 0 && !info.all_on_gpu && info.split_mode === "experts") {
     hn.hidden = false;
     hn.textContent = learned > 0 ? `tierlm has learned this model's busiest experts from about ${learned.toLocaleString()} words. Turn on "Keep the busiest experts in VRAM" and load again to put them in VRAM; Find the fastest settings checks whether that's faster on this PC.`
       : "tierlm learns which experts this model uses as you chat. With \"Keep the busiest experts in VRAM\" on, the busiest go in VRAM at the next load; Find the fastest settings learns them straight away and checks whether that's faster.";
@@ -937,6 +1056,14 @@ async function loadInfo() {
   $("arch").textContent = info.arch.toUpperCase() + ", vocab " + info.vocab.toLocaleString() + (info.chat_format ? ", " + info.chat_format + " chat" : "");
   $("lx").textContent = E ? L + " × " + E + " = " + (L * E).toLocaleString() : L + " layers (dense)";
   $("active").textContent = E ? K + " of " + E + " experts per layer" : "all weights, every token";
+  $("vis").textContent = info.vision ? "yes, on " + (info.vision_device || "").replace(/ \([^)]*\)/g, "") : "no";
+  // Image detail: how many image words an image may become (more: finer detail, slower to read).
+  $("picrow").hidden = $("pichelp").hidden = !info.vision;
+  if (info.vision) $("pichelp").textContent = "Images are scaled to at most this many image words. Automatic: " +
+    (info.image_tokens || 2048).toLocaleString() + (/^CPU$/.test(info.vision_device || "") ? " (the CPU reads images here: lower is much faster)" : "") +
+    ". High suits scanned pages and small text; Low is quick for photos and screenshots.";
+  $("vis").title = info.vision ? info.vision_file + " (up to " + (info.image_tokens || 0).toLocaleString() + " image words per image)"
+                               : "Qwen3.5 / 3.6 read images when their mmproj file is in the same folder";
   $("ctxof").textContent = "/ " + info.ctx.toLocaleString() + " tokens";
   setContext(info.n_past);
   const w = info.weights_bytes, kv = info.kv_bytes;
@@ -970,11 +1097,18 @@ async function loadInfo() {
 }
 function setContext(n) {
   $("ctxbig").firstChild.nodeValue = n.toLocaleString();
-  $("ctxbar").style.width = info ? Math.min(100, 100 * n / info.ctx) + "%" : "0";
   const f = info ? n / info.ctx : 0;
-  $("rctx").style.width = Math.min(100, 100 * f) + "%";
+  $("ctxbar").style.width = Math.min(100, 100 * f) + "%";
+  $("ctxbar").classList.toggle("warn", f >= 0.9 && f < 0.995);
+  $("ctxbar").classList.toggle("full", f >= 0.995);
+  const rc = $("rctx"); rc.style.width = Math.min(100, 100 * f) + "%";
+  rc.classList.toggle("warn", f >= 0.9 && f < 0.995); rc.classList.toggle("full", f >= 0.995);
   $("rctxt").textContent = Math.round(100 * f) + "% ctx";
   $("railstat").title = "Context: " + n.toLocaleString() + (info ? " of " + info.ctx.toLocaleString() : "") + " tokens";
+  const w = $("ctxwarn");
+  w.hidden = f < 0.9;
+  w.textContent = curChat?.autoArchive ? "Full: the oldest messages are archived as needed, and looked back at when relevant."
+                : "Nearly full. When it's full, tierlm can archive the oldest messages and keep going.";
 }
 
 // ---------- Markdown ----------
@@ -994,7 +1128,8 @@ function mdBlocks(src) {
   const lines = src.split("\n"), out = [];
   let i = 0;
   const isTableSep = l => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l) && l.includes("-");
-  const cells = l => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => mdInline(c.trim()));
+  // (a <br> in a table cell, which models write for line breaks there since a table row is one line, becomes one)
+  const cells = l => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => mdInline(c.trim()).replace(/&lt;br\s*\/?&gt;/gi, "<br>"));
   const listRe = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
   while (i < lines.length) {
     const l = lines[i];
@@ -1003,7 +1138,7 @@ function mdBlocks(src) {
       const fence = m[1], lang = m[2]; const body = [];
       for (i++; i < lines.length && !lines[i].trim().startsWith(fence); i++) body.push(lines[i]);
       i++;
-      out.push(`<div class="codeblock${lang ? " haslang" : ""}">${lang ? `<span class="codelang">${lang}</span>` : ""}<button class="copy" type="button">Copy</button><pre><code>${body.join("\n")}</code></pre></div>`);
+      out.push(`<div class="codeblock${lang ? " haslang" : ""}">${lang ? `<span class="codelang">${lang}</span>` : ""}<button class="open" type="button" title="Open in the preview">Open</button><button class="copy" type="button">Copy</button><pre><code>${body.join("\n")}</code></pre></div>`);
       continue;
     }
     if (!l.trim()) { i++; continue; }
@@ -1119,14 +1254,23 @@ document.addEventListener("click", e => {
 });
 
 // ---------- chat ----------
-function addMsg(role, text, files) {
+function addMsg(role, text, files, images) {
   $("empty")?.remove();
   const d = document.createElement("div");
   d.className = "msg " + role;
   if (role === "assistant") setReply(d, text); else d.textContent = text;
+  if (images?.length) {                                               // images sent with the message (click: full size)
+    const g = document.createElement("div"); g.className = "pics";
+    images.forEach((u, i) => {
+      const im = document.createElement("img"); im.src = u; im.alt = "Image " + (i + 1); im.title = "Open the image";
+      im.onclick = () => previewImage("pic:" + u.length + ":" + u.slice(-24), "Image " + (i + 1), u);
+      g.appendChild(im);
+    });
+    d.insertBefore(g, d.firstChild);
+  }
   if (files?.length) {                                                // attached files show as chips, not their text
     const c = document.createElement("div"); c.className = "chips";
-    for (const f of files) { const s = document.createElement("span"); s.className = "chip"; s.innerHTML = `<span class="nm"></span><span class="sz"></span>`;
+    for (const f of files) { const s = document.createElement("span"); s.className = role === "user" ? "chip link" : "chip"; s.innerHTML = `<span class="nm"></span><span class="sz"></span>`;
       s.querySelector(".nm").textContent = f.name; s.querySelector(".sz").textContent = fmtSize(f.size); c.appendChild(s); }
     d.appendChild(c);
   }
@@ -1138,17 +1282,29 @@ function setBusy(b) {
   busy = b;
   $("send").disabled = b; $("stop").style.display = b ? "" : "none";
   for (const id of ["benchbtn", "newchat", "newchat2"]) $(id).disabled = b;
-  $("status").textContent = b ? "generating…" : "idle";
+  showStatus();
 }
+// With several connections: how many are writing replies now (from any app), next to this page's own state.
+let connActive = 0;
+function showStatus() {
+  const n = info?.connections || 1;
+  $("status").textContent = (busy ? "generating…" : "idle") + (n > 1 ? ` · ${connActive} of ${n} connections busy` : "");
+}
+setInterval(async () => {
+  if (!info || (info.connections || 1) < 2 || document.hidden) return;
+  try { const j = await (await api("/api/info")).json(); connActive = j.busy ? (j.active ?? 0) : 0; showStatus(); } catch (e) {}
+}, 3000);
 // One reply from the model, streamed into a new bubble. Returns { reply, meta, done } (done: the "done" event).
 async function streamReply(useWs) {
   const bubble = addMsg("assistant", "");
   bubble.classList.add("streaming");
-  let reply = "", meta = "", drawPending = false, doneEv = null;
+  let reply = "", meta = "", drawPending = false, doneEv = null, recall = null;
   try {
     const res = await api("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
       body: JSON.stringify({ messages: withSystem(history), temperature: +$("temp").value, max_tokens: maxTokens(), workspace: useWs,
+        chat_id: chatFiles && curChat ? curChat.id : undefined, overflow: curChat?.autoArchive ? "archive" : undefined,
+        image_tokens: +$("picdetail").value || undefined,
         top_p: +$("topp").value, top_k: +$("topk").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value }),
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
@@ -1163,7 +1319,9 @@ async function streamReply(useWs) {
         const line = buf.slice(0, i); buf = buf.slice(i + 2);
         if (!line.startsWith("data: ")) continue;
         const ev = JSON.parse(line.slice(6));
-        if (ev.type === "queue") {                                   // waiting in line behind other replies
+        if (ev.type === "archived") archiveOldest(ev.count);
+        else if (ev.type === "recall") { recall = ev.items; }
+        else if (ev.type === "queue") {                              // waiting in line behind other replies
           bubble.textContent = ev.ahead > 0 ? `Waiting in line: ${ev.ahead} ${ev.ahead === 1 ? "request" : "requests"} ahead of this one…`
                                             : "Waiting for another reply to finish…";
         }
@@ -1180,6 +1338,7 @@ async function streamReply(useWs) {
             (ev.spec.looked ? " (prompt lookup: " + ev.spec.look_ok + " of " + ev.spec.looked + ")" : "");
           onDone(ev);
         }
+        else if (ev.type === "error" && ev.code === "context_full") { lastFull = "full"; }
         else if (ev.type === "error") throw new Error(ev.message);
       }
     }
@@ -1190,20 +1349,38 @@ async function streamReply(useWs) {
   bubble.classList.remove("streaming");
   setReply(bubble, reply);
   const calls = doneEv?.tool_calls || [];
-  if (!reply.trim() && calls.length) bubble.remove();              // only a tool call: its card says it all
-  else if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m); }
-  return { reply, meta, done: doneEv };
+  if (doneEv?.stop === "context") lastFull = "cut";
+  if (!reply.trim() && !calls.length && lastFull === "full") bubble.remove();
+  else if (!reply.trim() && calls.length) bubble.remove();         // only a tool call: its card says it all
+  else {
+    if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m); }
+    if (recall?.length) bubble.appendChild(recallLine(recall));
+  }
+  return { reply, meta, done: doneEv, recall };
 }
 async function send(text) {
   text = (text ?? $("input").value).trim();
   if ((!text && !attached.length) || busy) return;
   if (consoleWide) setConsoleWide(false);
   $("input").value = "";
-  const files = attached.map(f => ({ name: f.name, size: f.size }));
+  const files = attached.filter(f => !f.image).map(f => ({ name: f.name, size: f.size }));
+  const images = attached.filter(f => f.image).map(f => f.image);    // images: sent as images, every turn
   const content = withFiles(text, attached);                          // the model gets the files' text with the message
+  const keep = attached.filter(f => !f.image);
+  for (const f of keep) fileCache.set(f.name, f.text);
   attached = []; renderChips();
-  addMsg("user", text, files);
-  history.push(files.length ? { role: "user", content, shown: text, files } : { role: "user", content: text });
+  addMsg("user", text, files, images);
+  const um = files.length ? { role: "user", content, shown: text, files, time: Date.now() } : { role: "user", content: text, time: Date.now() };
+  if (images.length) um.images = images;
+  history.push(um);
+  await saveChat();
+  if (chatFiles && curChat)                                           // a copy of each attached file, kept with the chat
+    for (const f of keep) await chatApi(`/api/chats/${curChat.id}/files`, { method: "POST", headers: { "Content-Type": "application/json" },
+                                                                         body: JSON.stringify({ name: f.name, text: f.text }) }).catch(() => {});
+  await runTurn();
+}
+// The model's turn: its reply, and with the workspace, the tool rounds that follow.
+async function runTurn() {
   setBusy(true);
   controller = new AbortController();
   // With the workspace on, the model may ask for its tools: they run (reading at once, changes after Apply), their
@@ -1216,17 +1393,18 @@ async function send(text) {
       // Sent back as the model wrote it (call included), so tierlm reuses its cache; harmony models get the calls
       // separately and their template writes them.
       const raw = calls.length && info.chat_format !== "harmony" && r.done.raw !== undefined ? r.done.raw : r.reply;
-      const m = { role: "assistant", content: raw, meta: r.meta };
+      const m = { role: "assistant", content: raw, meta: r.meta, time: Date.now() };
       if (calls.length) m.tool_calls = calls;
+      if (r.recall?.length) m.recall = r.recall;
       history.push(m);
-    } else if (history.at(-1)?.role === "user" && r.meta !== "stopped") history.pop();
+    } else if (history.at(-1)?.role === "user" && r.meta !== "stopped" && lastFull !== "full") history.pop();
     saveChat();
     if (!calls.length || r.meta === "stopped" || !controller) break;
     let stopped = false;
     for (const c of calls) {
       const result = stopped ? "Not run: the user stopped." : await runTool(c);
       if (result === null) stopped = true;
-      history.push({ role: "tool", name: c.name, content: result ?? "Not run: the user stopped." });
+      history.push({ role: "tool", name: c.name, content: result ?? "Not run: the user stopped.", time: Date.now() });
     }
     saveChat();
     if (stopped) break;
@@ -1235,6 +1413,95 @@ async function send(text) {
   setBusy(false);
   controller = null;
   if (info && info.live_experts) refreshLive();
+  if (rerender) { rerender = false; renderHistory(); }
+  if (lastFull) { const why = lastFull; lastFull = null; showContextFull(why); }
+}
+// ---------- long conversations: the archive ----------
+// When a conversation no longer fits the context, its oldest messages can be archived: they stay in the chat (and
+// its file) but aren't sent to the model any more; tierlm looks back at them when a new message relates to them.
+let lastFull = null, rerender = false;           // "full": didn't fit at all; "cut": the reply was cut off
+function archiveOldest(count) {
+  for (const m of history) { if (count <= 0) break; if (!m.archived) { m.archived = true; --count; } }
+  if (curChat) curChat.autoArchive = true;
+  rerender = true;
+}
+function recallLine(items) {
+  const d = document.createElement("details"); d.className = "recall";
+  const n = items.length;
+  d.innerHTML = `<summary>Looked back at ${n} earlier ${n === 1 ? "passage" : "passages"} from the archive</summary>`;
+  for (const it of items) {
+    const p = document.createElement("div"); p.className = "rq";
+    const who = it.role === "user" ? "You" : it.role === "assistant" ? "Model" : "Tool";
+    p.innerHTML = `<b></b> <span></span>`;
+    p.querySelector("b").textContent = who + (it.time ? " · " + new Date(it.time).toLocaleString([], { dateStyle: "short", timeStyle: "short" }) : "") + ":";
+    p.querySelector("span").textContent = it.text + (it.text.length >= 300 ? "…" : "");
+    d.appendChild(p);
+  }
+  return d;
+}
+function showContextFull(why) {
+  const ctx = info ? info.ctx.toLocaleString() : "";
+  const d = addMsg("note", "");
+  d.classList.add("fullcard");
+  d.style.whiteSpace = "normal";
+  d.innerHTML = `<b>${why === "cut" ? "The reply stopped: the conversation filled the model's memory" : "This conversation no longer fits in the model's memory"} (${ctx} tokens).</b>
+<div class="help">Keep going archives the oldest messages: they stay in this chat${chatFiles ? " and its file" : ""}, and tierlm looks back at them when a new message relates to them. You can also add a short summary of them for the model. Or start a new chat.</div><div class="row"><button class="tiny primary" data-a="go">Keep going</button><button class="tiny ghost" data-a="new">New chat</button></div>`;
+  d.querySelector('[data-a="new"]').onclick = () => { d.remove(); newChat(); };
+  d.querySelector('[data-a="go"]').onclick = async () => {
+    if (busy) return;
+    d.remove();
+    if (!curChat) saveChat();
+    curChat.autoArchive = true;
+    if (why === "cut" || history.at(-1)?.role !== "user") {
+      history.push({ role: "user", content: "Your last reply was cut off because the conversation filled your memory. Continue it exactly where it stopped.",
+                     shown: "↪ Continue", time: Date.now() });
+      addMsg("user", "↪ Continue");
+    }
+    await saveChat();
+    await runTurn();
+  };
+  $("messages").scrollTop = $("messages").scrollHeight;
+}
+// A short summary of the archived messages, written by the model, kept with the chat and given to the model.
+async function summariseArchive(btn) {
+  if (busy || !curChat) return;
+  const arch = history.filter(m => m.archived && (m.role === "user" || m.role === "assistant"));
+  if (!arch.length) return;
+  const strip = t => String(t || "").replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim();
+  let lines = arch.map(m => (m.role === "user" ? "User: " : "Assistant: ") + strip(m.role === "user" && m.shown !== undefined ? m.shown : m.content));
+  let text = lines.join("\n\n");
+  const room = Math.max(4000, (info?.ctx || 8192) * 2);         // about half the context, in characters
+  if (text.length > room) text = text.slice(0, room * 0.4) + "\n\n[…]\n\n" + text.slice(text.length - room * 0.6);
+  btn.disabled = true; btn.textContent = "Summarising…";
+  setBusy(true);
+  controller = new AbortController();
+  let out = "";
+  try {
+    const res = await api("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+      body: JSON.stringify({ temperature: 0.3, max_tokens: 900, messages: [
+        { role: "system", content: "You write short, factual summaries." },
+        { role: "user", content: "Summarise this earlier part of a conversation in at most 150 words, for the assistant to remember it by: " +
+          "the topics, facts, names, numbers and decisions, and anything left open. Write only the summary.\n\n" + text }] }) });
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!line.startsWith("data: ")) continue;
+        const ev = JSON.parse(line.slice(6));
+        if (ev.type === "token") out += ev.text;
+        else if (ev.type === "error") throw new Error(ev.message);
+      }
+    }
+    curChat.summary = strip(out);
+    await saveChat();
+  } catch (e) { if (e.name !== "AbortError") addMsg("error", "⚠ Summary: " + e.message); }
+  setBusy(false); controller = null;
+  renderHistory();
 }
 function onPrompt(ev) {
   for (let i = 0; i < ev.counts.length; i++) counts[i] += ev.counts[i];
@@ -1469,7 +1736,7 @@ function gpuGroup(first) {
 function plan() {
   const ctx = +$("ctxsel").value || defCtx;
   const W = selModel ? selModel.bytes || 0 : 0;
-  const KV = selModel ? (selModel.kv_bytes_per_token || 0) * ctx * kvFactor() : 0;
+  const KV = selModel ? (selModel.kv_bytes_per_token || 0) * ctx * kvFactor() * Math.max(1, +$("connsel").value || 1) : 0;
   const gpu = bestGpu(), cpu = cpuDev();
   const held = heldNow(gpu);
   const ramFree = cpu ? cpu.free + held.ram : 0;
@@ -1556,6 +1823,14 @@ function applySaved() {
   $("splitsel").value = (s.settings_v >= 2 || s.split_mode === "experts") && s.split_mode ? s.split_mode : "auto";
   $("hotexp").checked = s.hot_experts === true;   // opt-in: Find the fastest settings turns it on where it wins
   $("allgpus").checked = s.multi_gpu !== false;
+  $("connsel").value = String(s.connections || 1);
+  if (!$("connsel").value) $("connsel").value = "1";
+  $("mintps").value = s.min_tps || 5;
+  // What Find the fastest settings measured for connections, if it did.
+  const cr = (s.tuned?.results || []).filter(r => r.connections);
+  $("connrec").hidden = !cr.length;
+  if (cr.length) $("connrec").textContent = "Measured: " + cr.map(r => `${r.connections} at once: ${r.tps} tok/s each`).join(" · ") +
+    `. Recommended: ${s.connections || 1} (every reply at least ${s.min_tps || 5} tok/s).`;
   $("liveexp").checked = s.live_experts === true;
   const canSpec = !!(selModel && selModel.mtp);
   $("specon").disabled = !canSpec; $("specn").disabled = !canSpec;
@@ -1700,7 +1975,7 @@ function renderSetup() {
     $("rec").innerHTML = "";
     const b = document.createElement("b"); b.textContent = selModel.name || selModel.file;
     $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description + (p.wr + p.kvr > 0 ? " and system RAM" : "")}, needing about ${fmtGiB(p.W + p.KV)} ` +
-      `(${fmtGiB(p.W)} model + ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context).` +
+      `(${fmtGiB(p.W)} model + ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context${(+$("connsel").value || 1) > 1 ? ` for each of ${$("connsel").value} connections` : ""}).` +
       (p.wr + p.kvr > p.ramFree ? " That's more than is free, so loading may fail; try a shorter context or close other programs." : ""));
   }
   $("ctxhelp").textContent = "How much conversation the model can remember, up to what this model was trained for (" +
@@ -1741,7 +2016,7 @@ $("pathok").onclick = async () => {
 };
 $("pathin").onkeydown = e => { if (e.key === "Enter") $("pathok").click(); if (e.key === "Escape") $("pathcancel").click(); };
 $("rescanhw").onclick = e => { e.preventDefault(); loadSetup(); };
-for (const id of ["ctxsel", "forcecpu", "splitsel", "allgpus"]) $(id).onchange = renderSetup;
+for (const id of ["ctxsel", "forcecpu", "splitsel", "allgpus", "connsel"]) $(id).onchange = renderSetup;
 $("vramlim").oninput = renderSetup;
 function syncFa() {                       // a quantized cache needs flash attention
   const q = $("kvsel").value.startsWith("q");
@@ -1789,7 +2064,7 @@ function loadBody(p) {
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value, lookup: +$("llook").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, multi_gpu: $("allgpus").checked, hot_experts: $("hotexp").checked || $("liveexp").checked, live_experts: $("liveexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, temperature: +$("temp").value };
+                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, multi_gpu: $("allgpus").checked, connections: +$("connsel").value || 1, min_tps: +$("mintps").value || 5, hot_experts: $("hotexp").checked || $("liveexp").checked, live_experts: $("liveexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, temperature: +$("temp").value };
   if ($("forcecpu").checked) body.device = "cpu";
   return body;
 }
@@ -1832,8 +2107,10 @@ $("tunebtn").onclick = async () => {
     const st = fin.settings;
     const parts = [];
     if (st.multi_gpu === false) parts.push("only the first graphics card");
-    if (st.split_mode === "experts") parts.push(st.live_experts ? "experts in RAM, VRAM experts following the conversation" : st.hot_experts ? "experts in RAM, busiest experts in VRAM" : "experts in RAM"); else if (st.split_mode === "layers") parts.push("whole layers");
-    parts.push(st.threads + " CPU threads");
+    if ((st.connections || 1) > 1) parts.push(st.connections + " connections");
+    if (fin.all_on_gpu) parts.push("all on the GPU");
+    else if (st.split_mode === "experts") parts.push(st.live_experts ? "GPU + RAM, experts in RAM, VRAM experts following the conversation" : st.hot_experts ? "GPU + RAM, experts in RAM, busiest experts in VRAM" : "GPU + RAM, experts in RAM"); else if (st.split_mode === "layers") parts.push("GPU + RAM, split by whole layers");
+    if (!fin.all_on_gpu) parts.push(st.threads + " CPU threads");
     parts.push(st.speculative ? "speculative decoding, " + st.draft_max + (st.draft_max === 1 ? " guess" : " guesses") + " per check" : "no speculative decoding");
     for (const li of rows) if (Math.abs(+li.dataset.tps - fin.tps) < 0.05) { li.classList.add("best"); break; }
     $("tunestat").textContent = ""; $("tunetitle").textContent = "Fastest settings for this PC"; watchProgress(false);
@@ -1942,9 +2219,37 @@ $("llook").onchange = async () => {
   await loadInfo();
 };
 $("lspecn").onchange = () => { if ($("lspec").checked) setLiveSpec(); };
+try { $("picdetail").value = localStorage.getItem("tierlm.picdetail") || "0"; } catch (e) {}
+$("picdetail").onchange = () => { try { localStorage.setItem("tierlm.picdetail", $("picdetail").value); } catch (e) {} };
 
 // ---------- workspace: a folder the model can read, and change with your approval ----------
+// Each chat has its own folder (or none): it's saved with the chat, switching chats switches to it, and a new chat
+// starts without one. Recently used folders are a click away in the + menu.
 let ws = { available: false, folder: "", exists: false, picker: false };
+const wsRecent = () => LS.get("tierlm.wsRecent", []);
+function rememberFolder(f) { if (f) LS.set("tierlm.wsRecent", [f, ...wsRecent().filter(x => x !== f)].slice(0, 5)); }
+// The chat's folder: on (and chosen on the server) when the chat has one, else off.
+async function applyChatWorkspace() {
+  const want = curChat?.workspace || "";
+  if (want && ws.available && ws.folder !== want) {
+    const r = await api("/api/workspace", { method: "POST", headers: wsHeaders, body: JSON.stringify({ folder: want }) }).catch(() => null);
+    if (r?.ok) await loadWorkspace();
+  }
+  $("wson").checked = !!want && ws.available && ws.exists && ws.folder === want;
+  if (want) rememberFolder(want);
+  renderChips();
+}
+// Turning the folder on or off belongs to the chat (saved with it once it has messages).
+function setChatWorkspace(on) {
+  $("wson").checked = on && !$("wson").disabled;
+  if (!curChat && history.length) saveChat();
+  if (curChat) {
+    if ($("wson").checked) { curChat.workspace = ws.folder; rememberFolder(ws.folder); } else delete curChat.workspace;
+    if (history.length) saveChat();
+  }
+  if ($("wson").checked) rememberFolder(ws.folder);
+  renderChips();
+}
 const wsHeaders = { "Content-Type": "application/json", "X-Tierlm-Workspace": "1" };
 const wsOn = () => ws.available && ws.exists && $("wson").checked;
 async function loadWorkspace() {
@@ -1953,7 +2258,7 @@ async function loadWorkspace() {
   $("wsfolder").textContent = ws.folder || "No folder chosen";
   $("wsfolder").title = ws.folder || "";
   $("wson").disabled = !ws.folder || !ws.exists;
-  $("wson").checked = !$("wson").disabled && LS.get("tierlm.ws", false);
+  $("wson").checked = !$("wson").disabled && !!curChat?.workspace && curChat.workspace === ws.folder;
   $("wshelp").textContent = !ws.folder ? "Choose a project folder to let the model read its files and suggest changes. You approve every change."
     : !ws.exists ? "That folder doesn't exist any more: choose it again."
     : "The model can list, read and search the files in this folder, and suggest changes that you see as a diff and approve. Nothing runs, nothing outside the folder.";
@@ -1963,8 +2268,8 @@ async function setWorkspace(folder) {
   const r = await api("/api/workspace", { method: "POST", headers: wsHeaders, body: JSON.stringify({ folder }) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) addMsg("error", "⚠ " + (j.error?.message || j.error || r.statusText));
-  else { LS.set("tierlm.ws", true); }
   await loadWorkspace();
+  if (r.ok) setChatWorkspace(true);
 }
 $("wspick").onclick = async () => {
   if (ws.picker) {
@@ -1976,15 +2281,32 @@ $("wspick").onclick = async () => {
     if (f !== null) await setWorkspace(f.trim());
   }
 };
-$("wson").onchange = () => { LS.set("tierlm.ws", $("wson").checked); renderChips(); };
+$("wson").onchange = () => setChatWorkspace($("wson").checked);
 
 // ---------- the + menu: attach files, work in a folder ----------
 // Attached files are read here, in the browser, and their text goes into the message (so it works with every model
-// and through the API's normal messages). Only text: images, PDFs and Word files need support that isn't in tierlm yet.
-let attached = [];                                                    // [{name, size, text}]
+// and through the API's normal messages). Images go with the message as images, for models that read them
+// (Qwen3.5 / 3.6 with their mmproj file): PNG, JPEG, GIF, BMP; WebP and very large ones are converted here first.
+let attached = [];                                                    // [{name, size, text}] or [{name, size, image: dataURL, w, h}]
+const isPicture = f => /^image\/(png|jpe?g|gif|bmp|webp)$/i.test(f.type) || /\.(png|jpe?g|gif|bmp|webp)$/i.test(f.name);
+// An image file as a data URL tierlm reads: as it is when it's PNG / JPEG / GIF / BMP and not huge, else redrawn
+// (WebP, or more than 16 megapixels: scaled down; tierlm scales images to the model's limit anyway).
+async function pictureData(f) {
+  const url = await new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => bad(r.error); r.readAsDataURL(f); });
+  const img = await new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error("not an image this browser can open")); i.src = url; });
+  const w = img.naturalWidth, h = img.naturalHeight, px = w * h, maxPx = 16e6;
+  if (!/^data:image\/webp/i.test(url) && px <= maxPx && f.size <= 12 * 1048576) return { url, w, h };
+  const k = Math.min(1, Math.sqrt(maxPx / px)), cw = Math.max(1, Math.round(w * k)), ch = Math.max(1, Math.round(h * k));
+  const c = document.createElement("canvas"); c.width = cw; c.height = ch;
+  const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, cw, ch); g.drawImage(img, 0, 0, cw, ch);
+  return { url: c.toDataURL("image/jpeg", 0.92), w: cw, h: ch };
+}
+// About how many tokens an image becomes (Qwen: one per 32x32 pixels, at most the server's limit).
+const pictureTokens = a => Math.min(+$("picdetail").value || info?.image_tokens || 2048, Math.ceil(a.w / 32) * Math.ceil(a.h / 32));
 const fmtSize = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB" : (n / 1048576).toFixed(1) + " MB";
 const kMaxFile = 2 * 1048576;
 function withFiles(text, files) {
+  files = files.filter(f => !f.image);
   if (!files.length) return text;
   const parts = files.map(f => {
     const ext = (f.name.match(/\.([\w+-]+)$/) || [])[1] || "";
@@ -1998,15 +2320,22 @@ async function addFiles(list) {
   const problems = [];
   for (const f of list) {
     if (attached.some(a => a.name === f.name && a.size === f.size)) continue;
+    if (isPicture(f)) {
+      if (!info?.vision) { problems.push(f.name + ": this model can't read images (Qwen3.5 / 3.6 can, with their mmproj file in the same folder)"); continue; }
+      if (f.size > 64 * 1048576) { problems.push(f.name + " is bigger than 64 MB"); continue; }
+      try { const p = await pictureData(f); attached.push({ name: f.name || "pasted image.png", size: f.size, image: p.url, w: p.w, h: p.h }); }
+      catch (e) { problems.push((f.name || "the image") + ": " + e.message); }
+      continue;
+    }
     if (f.size > kMaxFile) { problems.push(f.name + " is bigger than 2 MB"); continue; }
     const buf = new Uint8Array(await f.arrayBuffer());
     let txt = null;
     if (!buf.subarray(0, 8192).includes(0)) { try { txt = new TextDecoder("utf-8", { fatal: true }).decode(buf); } catch (e) { txt = null; } }
-    if (txt === null) { problems.push(f.name + " isn't a text file (images, PDFs and Word files come in a later update)"); continue; }
+    if (txt === null) { problems.push(f.name + " isn't a text file or an image (PDFs and Word files come in a later update)"); continue; }
     attached.push({ name: f.name, size: f.size, text: txt.replace(/^\uFEFF/, "") });
   }
   // Keep the attachments within the context window, with room for the reply (about 3.5 characters per token).
-  const ctx = info?.ctx || 0, est = Math.round(attached.reduce((n, a) => n + a.text.length, 0) / 3.5);
+  const ctx = info?.ctx || 0, est = Math.round(attached.reduce((n, a) => n + (a.image ? pictureTokens(a) * 3.5 : a.text.length), 0) / 3.5);
   if (ctx && est > ctx * 0.75) {
     const drop = attached.pop();
     problems.push(`${drop.name} doesn't fit: the files would take about ${est.toLocaleString()} tokens of the ${ctx.toLocaleString()}-token context`);
@@ -2018,29 +2347,40 @@ async function addFiles(list) {
 function renderChips() {
   const box = $("chips");
   box.innerHTML = "";
-  const chip = (cls, name, size, title, onRemove) => {
+  const chip = (cls, name, size, title, onRemove, thumb) => {
     const c = document.createElement("span"); c.className = "chip" + (cls ? " " + cls : "");
-    c.innerHTML = `<span class="nm"></span>${size ? `<span class="sz"></span>` : ""}<button type="button"></button>`;
+    c.innerHTML = `${thumb ? `<img class="thumb" alt="">` : ""}<span class="nm"></span>${size ? `<span class="sz"></span>` : ""}<button type="button"></button>`;
+    if (thumb) c.querySelector("img").src = thumb;
     c.querySelector(".nm").textContent = name; if (size) c.querySelector(".sz").textContent = size;
     const b = c.querySelector("button"); b.textContent = "✕"; b.title = title; b.setAttribute("aria-label", title); b.onclick = onRemove;
     box.appendChild(c);
   };
   if (wsOn()) chip("folder", "Folder: " + ws.folder.split(/[\\/]/).filter(Boolean).pop(), "", "Stop working in this folder",
                    () => { $("wson").checked = false; $("wson").onchange(); });
-  attached.forEach((a, i) => chip("", a.name, fmtSize(a.size), "Remove " + a.name, () => { attached.splice(i, 1); renderChips(); }));
+  attached.forEach((a, i) => chip(a.image ? "pic" : "", a.name, a.image ? a.w + "×" + a.h : fmtSize(a.size), "Remove " + a.name, () => { attached.splice(i, 1); renderChips(); }, a.image));
   box.hidden = !box.children.length;
 }
 function setPlusMenu(open) {
   $("plusmenu").hidden = !open; $("plus").setAttribute("aria-expanded", String(open));
   if (!open) return;
   // The folder item: choose one, or switch it on and off; only on the computer running tierlm.
+  const rec = $("m-recent"); rec.innerHTML = "";
+  if (ws.available)                                                     // recent folders: one click to work in one
+    for (const f of wsRecent().filter(f => !(wsOn() && f === ws.folder)).slice(0, 4)) {
+      const it = document.createElement("button"); it.className = "mi2"; it.setAttribute("role", "menuitem");
+      it.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span><b></b><span class="sub"></span></span>`;
+      it.querySelector("b").textContent = "Work in " + f.split(/[\\/]/).filter(Boolean).pop();
+      it.querySelector(".sub").textContent = f;
+      it.onclick = async () => { setPlusMenu(false); await setWorkspace(f); };
+      rec.appendChild(it);
+    }
   const t = $("m-folder-t"), sub = $("m-folder-s"), b = $("m-folder");
   b.disabled = !ws.available;
   if (!ws.available) { t.textContent = "Work in a folder…"; sub.textContent = "Open tierlm on the PC running it to use a folder"; }
   else if (ws.folder && ws.exists) {
     const name = ws.folder.split(/[\\/]/).filter(Boolean).pop();
-    t.textContent = wsOn() ? "Stop working in " + name : "Work in " + name;
-    sub.textContent = wsOn() ? "The model won't see the folder" : "Or choose another folder in Settings";
+    t.textContent = wsOn() ? "Stop working in " + name : "Work in a folder…";
+    sub.textContent = wsOn() ? "The model won't see the folder" : "Choose a project folder for this chat";
   } else { t.textContent = "Work in a folder…"; sub.textContent = "The model reads your project; you approve each change"; }
   b.focus();
 }
@@ -2065,15 +2405,14 @@ $("m-attach").onclick = () => { setPlusMenu(false); $("filepick").click(); };
 $("filepick").onchange = () => { addFiles([...$("filepick").files]); $("filepick").value = ""; };
 $("m-folder").onclick = async () => {
   setPlusMenu(false);
-  if (ws.folder && ws.exists) { $("wson").checked = !wsOn(); $("wson").onchange(); return; }
-  await $("wspick").onclick();
-  if (ws.folder && ws.exists) { $("wson").checked = true; $("wson").onchange(); }
+  if (wsOn()) { setChatWorkspace(false); return; }
+  await $("wspick").onclick();                                          // (choosing one turns it on for this chat)
 };
 // Drag files onto the chat, or paste them into the message box.
 $("chat").addEventListener("dragover", e => { if ([...e.dataTransfer.types].includes("Files")) { e.preventDefault(); $("chat").classList.add("dropping"); } });
 $("chat").addEventListener("dragleave", e => { if (!e.relatedTarget || !$("chat").contains(e.relatedTarget)) $("chat").classList.remove("dropping"); });
 $("chat").addEventListener("drop", e => { if (!e.dataTransfer.files.length) return; e.preventDefault(); $("chat").classList.remove("dropping"); addFiles([...e.dataTransfer.files]); });
-$("input").addEventListener("paste", e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); addFiles(fs); } });
+$("input").addEventListener("paste", e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); addFiles(fs); } });   // (screenshots too)
 async function wsTool(name, args, apply = false, hash = "") {
   try {
     const r = await api("/api/workspace/tool", { method: "POST", headers: wsHeaders, body: JSON.stringify({ name, arguments: args, apply, hash }) });
@@ -2094,6 +2433,14 @@ function toolCard(name, args) {
   $("empty")?.remove();
   const d = document.createElement("div"); d.className = "msg tool";
   const head = document.createElement("div"); head.className = "thead"; head.textContent = toolLabel(name, args || {});
+  // The file's name opens it in the preview (files only: a path the model read, wrote or edited).
+  const p = args?.path;
+  if (p && /^(read_file|write_file|edit_file)$/.test(name) && head.textContent.includes(p)) {
+    const i = head.textContent.lastIndexOf(p), t = head.textContent;
+    head.textContent = t.slice(0, i);
+    const a = document.createElement("span"); a.className = "plink"; a.dataset.path = p; a.textContent = p; a.title = "Open " + p;
+    head.append(a, t.slice(i + p.length));
+  }
   d.append(head);
   $("messages").appendChild(d); $("messages").scrollTop = $("messages").scrollHeight;
   return d;
@@ -2113,6 +2460,207 @@ function cardDiff(card, diff) {
   }
   card.append(pre);
 }
+
+// ---------- the preview pane ----------
+// Files, the model's proposed changes, code from replies, pages and images open on the right, in tabs; the chat
+// moves to the left and comes back to the middle when the last tab closes.
+let pvTabs = [], pvCur = null;
+const fileCache = new Map();                    // attached files' text by name (this session), for opening them
+function previewOpen(tab) {
+  const i = pvTabs.findIndex(t => t.key === tab.key);
+  if (i >= 0) pvTabs[i] = tab; else pvTabs.push(tab);
+  pvCur = tab.key;
+  pvShow(true);
+  pvRender();
+}
+function pvShow(on) {
+  $("preview").hidden = !on; $("pvsplit").hidden = !on;
+  $("app").classList.toggle("previewing", on);
+  try { const w = localStorage.getItem("tierlm.pvr"); if (w) $("app").style.setProperty("--pvr", w); } catch (e) {}
+  requestAnimationFrame(resizeCanvases);
+}
+function pvClose(key) {
+  pvTabs = pvTabs.filter(t => t.key !== key);
+  if (!pvTabs.length) { pvCur = null; pvShow(false); $("pvbody").innerHTML = ""; $("pvtabs").innerHTML = ""; return; }
+  if (pvCur === key) pvCur = pvTabs.at(-1).key;
+  pvRender();
+}
+function pvRender() {
+  const strip = $("pvtabs"); strip.innerHTML = "";
+  for (const t of pvTabs) {
+    const b = document.createElement("span"); b.className = "pvtab" + (t.key === pvCur ? " cur" : ""); b.setAttribute("role", "tab");
+    b.innerHTML = `<span></span><button class="x" aria-label="Close">✕</button>`;
+    b.firstChild.textContent = t.title; b.title = t.title;
+    b.onclick = e => { if (e.target.closest(".x")) { pvClose(t.key); return; } pvCur = t.key; pvRender(); };
+    strip.appendChild(b);
+  }
+  const body = $("pvbody"); body.innerHTML = ""; body.scrollTop = 0;
+  pvTabs.find(t => t.key === pvCur)?.render(body);
+}
+$("pvclose").onclick = () => { if (pvCur) pvClose(pvCur); };
+// The divider between chat and preview can be dragged (the chat's share of the width is remembered).
+$("pvsplit").addEventListener("pointerdown", e => {
+  const sp = $("pvsplit"), chat = $("chat"), left = chat.getBoundingClientRect().left;
+  const total = chat.getBoundingClientRect().width + $("preview").getBoundingClientRect().width;
+  sp.classList.add("drag"); sp.setPointerCapture(e.pointerId);
+  const move = ev => {                          // the preview's width as a multiple of the chat's
+    const f = Math.max(0.2, Math.min(0.8, (ev.clientX - left) / total));
+    $("app").style.setProperty("--pvr", ((1 - f) / f).toFixed(3));
+  };
+  const up = () => { sp.classList.remove("drag"); sp.removeEventListener("pointermove", move); sp.removeEventListener("pointerup", up);
+    try { localStorage.setItem("tierlm.pvr", $("app").style.getPropertyValue("--pvr")); } catch (e) {} resizeCanvases(); };
+  sp.addEventListener("pointermove", move); sp.addEventListener("pointerup", up);
+});
+
+// Light syntax colouring: comments, strings, numbers and common keywords, line by line.
+const PV_KW = new Set(("if else for while do return function const let var class struct public private protected static void int float double " +
+  "bool char auto new delete try catch finally throw import from export default async await def lambda in not and or is None True False " +
+  "null true false nullptr template typename namespace using include define switch case break continue enum interface extends implements " +
+  "this self yield with as pass elif fn mut pub impl match use mod type of unsigned long short size_t std string echo set local").split(" "));
+function extOf(name) { return ((name || "").match(/\.([\w+-]+)$/) || [])[1]?.toLowerCase() || ""; }
+function hlLine(line, ext) {
+  const hash = /^(py|sh|bash|zsh|ps1|psm1|rb|r|pl|yaml|yml|toml|ini|cfg|conf|cmake|txt|mk|dockerfile|nim|jl)$/.test(ext);
+  const re = hash ? /(#.*$)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(\b\d[\w.]*\b)|([A-Za-z_]\w*)/g
+                  : /(\/\/.*$|\/\*.*?\*\/|<!--.*?-->)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)|(\b\d[\w.]*\b)|([A-Za-z_]\w*)/g;
+  let out = "", at = 0, m;
+  while ((m = re.exec(line))) {
+    out += esc(line.slice(at, m.index));
+    if (m[1]) out += `<span class="c">${esc(m[1])}</span>`;
+    else if (m[2]) out += `<span class="s">${esc(m[2])}</span>`;
+    else if (m[3]) out += `<span class="n">${esc(m[3])}</span>`;
+    else out += PV_KW.has(m[4]) ? `<span class="k">${esc(m[4])}</span>` : esc(m[4]);
+    at = re.lastIndex;
+  }
+  return out + esc(line.slice(at));
+}
+function codeView(text, name) {
+  const lines = text.replace(/\n$/, "").split("\n"), ext = extOf(name);
+  const big = lines.length > 20000;
+  const rows = (big ? lines.slice(0, 20000) : lines).map((l, i) => `<tr><td class="ln">${i + 1}</td><td>${hlLine(l, ext)}</td></tr>`);
+  return `<table class="code">${rows.join("")}</table>` + (big ? `<div class="pvbar">Showing the first 20,000 of ${lines.length.toLocaleString()} lines.</div>` : "");
+}
+function pvBar(el, html) { const b = document.createElement("div"); b.className = "pvbar"; b.innerHTML = html; el.appendChild(b); return b; }
+// A text file or a piece of code: Markdown is shown rendered and HTML as a page (scripts off), each with its source a click away.
+function previewText(key, name, text, kind) {
+  const ext = kind || extOf(name);
+  const md = ext === "md" || ext === "markdown", html = ext === "html" || ext === "htm" || ext === "svg";
+  let src = false;
+  previewOpen({ key, title: name, render(el) {
+    const bar = pvBar(el, `<b></b><span class="grow"></span>${md || html ? `<button class="tiny ghost" data-a="src">${src ? (md ? "Rendered" : "Page") : "Source"}</button>` : ""}<button class="tiny ghost" data-a="copy">Copy</button>`);
+    bar.querySelector("b").textContent = name + " · " + text.split("\n").length.toLocaleString() + " lines";
+    bar.querySelector('[data-a="copy"]').onclick = e => navigator.clipboard?.writeText(text).then(() => { e.target.textContent = "Copied"; });
+    const s = bar.querySelector('[data-a="src"]'); if (s) s.onclick = () => { src = !src; pvRender(); };
+    const box = document.createElement("div"); el.appendChild(box);
+    if (md && !src) { box.className = "pvmd md"; box.innerHTML = renderMd(text); }
+    else if (html && !src) {
+      const f = document.createElement("iframe"); f.className = "pvframe";
+      f.setAttribute("sandbox", "");               // no scripts, no access to tierlm: the page is only drawn
+      f.srcdoc = text; box.replaceWith(f);
+    } else box.innerHTML = codeView(text, name);
+  } });
+}
+function previewImage(key, name, url) {
+  previewOpen({ key, title: name, render(el) {
+    pvBar(el, "<b></b>").querySelector("b").textContent = name;
+    const d = document.createElement("div"); d.className = "pvimg"; d.innerHTML = `<img alt="">`; d.querySelector("img").src = url; el.appendChild(d);
+  } });
+}
+async function previewWorkspaceFile(path) {
+  const img = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path) && !/\.svg$/i.test(path);
+  const url = "/api/workspace/file?path=" + encodeURIComponent(path);
+  if (img) return previewImage("ws:" + path, path, url);
+  try {
+    const r = await api(url, { headers: CH });
+    const t = await r.text();
+    if (!r.ok) { let m = t; try { m = JSON.parse(t).error?.message || t; } catch (e) {} throw new Error(m); }
+    previewText("ws:" + path, path, t);
+  } catch (e) { addMsg("error", "⚠ Couldn't open " + path + ": " + e.message); }
+}
+async function previewAttachment(name) {
+  let text = fileCache.get(name);
+  if (text === undefined && chatFiles && curChat) {
+    try { const r = await chatApi(`/api/chats/${curChat.id}/files/${encodeURIComponent(name)}`); if (r.ok) text = await r.text(); } catch (e) {}
+  }
+  if (text === undefined) {                      // from the message itself, where the model got it
+    const m = history.find(x => x.files?.some(f => f.name === name));
+    const i = m?.content?.indexOf("File: " + name + "\n");
+    if (i >= 0) { const rest = m.content.slice(i + name.length + 7); const f = rest.match(/^(`{3,})[^\n]*\n([\s\S]*?)\n\1/); if (f) text = f[2]; }
+  }
+  if (text === undefined) { addMsg("error", "⚠ " + name + " isn't available any more."); return; }
+  previewText("file:" + name, name, text);
+}
+
+// Side by side: the file before and after a change, aligned line by line; long unchanged stretches fold away.
+function lineDiff(a, b) {
+  let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) ++p;
+  let s = 0; while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) ++s;
+  const A = a.slice(p, a.length - s), B = b.slice(p, b.length - s), ops = [];
+  for (let i = 0; i < p; ++i) ops.push(["=", i, i]);
+  if (A.length * B.length <= 4e6) {                 // longest common subsequence of the middle
+    const n = A.length, m = B.length, L = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+    for (let i = n - 1; i >= 0; --i) for (let j = m - 1; j >= 0; --j) L[i][j] = A[i] === B[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    let i = 0, j = 0;
+    while (i < n || j < m) {
+      if (i < n && j < m && A[i] === B[j]) { ops.push(["=", p + i, p + j]); ++i; ++j; }
+      else if (j < m && (i === n || L[i][j + 1] >= L[i + 1][j])) { ops.push(["+", -1, p + j]); ++j; }
+      else { ops.push(["-", p + i, -1]); ++i; }
+    }
+  } else { for (let i = 0; i < A.length; ++i) ops.push(["-", p + i, -1]); for (let j = 0; j < B.length; ++j) ops.push(["+", -1, p + j]); }
+  for (let i = 0; i < s; ++i) ops.push(["=", a.length - s + i, b.length - s + i]);
+  return ops;
+}
+function sbsView(before, after, name) {
+  const a = before.split("\n"), b = after.split("\n"), ops = lineDiff(a, b), ext = extOf(name);
+  const rows = [];
+  for (let k = 0; k < ops.length;) {               // pair each run of removed lines with the added lines after it
+    if (ops[k][0] === "=") { rows.push({ l: ops[k][1], r: ops[k][2], eq: true }); ++k; continue; }
+    const del = [], add = [];
+    while (k < ops.length && ops[k][0] !== "=") { (ops[k][0] === "-" ? del : add).push(ops[k]); ++k; }
+    for (let i = 0; i < Math.max(del.length, add.length); ++i) rows.push({ l: del[i] ? del[i][1] : -1, r: add[i] ? add[i][2] : -1 });
+  }
+  const changed = rows.map(r => !r.eq);
+  const near = i => { for (let d = -3; d <= 3; ++d) if (changed[i + d]) return true; return false; };
+  let html = '<table class="sbs"><colgroup><col style="width:38px"><col><col style="width:38px"><col></colgroup>', gap = [];
+  const flush = () => { if (gap.length) { html += `<tr class="gaprow" data-rows="${gap.join(",")}"><td colspan="4" class="gap">⋯ ${gap.length} unchanged lines (click to show)</td></tr>`; gap = []; } };
+  const row = r => `<tr><td class="ln">${r.l >= 0 ? r.l + 1 : ""}</td><td class="${r.eq ? "" : r.l >= 0 ? "del" : ""}">${r.l >= 0 ? hlLine(a[r.l], ext) : ""}</td>` +
+                   `<td class="ln rcol">${r.r >= 0 ? r.r + 1 : ""}</td><td class="${r.eq ? "" : r.r >= 0 ? "add" : ""}">${r.r >= 0 ? hlLine(b[r.r], ext) : ""}</td></tr>`;
+  rows.forEach((r, i) => { if (r.eq && !near(i) && rows.length > 40) gap.push(i); else { flush(); html += row(r); } });
+  flush();
+  const box = document.createElement("div"); box.innerHTML = html + "</table>";
+  box.addEventListener("click", e => {
+    const g = e.target.closest(".gaprow"); if (!g) return;
+    g.outerHTML = g.dataset.rows.split(",").map(i => row(rows[+i])).join("");
+  });
+  return box;
+}
+// A change the model proposes: opened beside the chat with Apply and Skip, which answer the same question as the card's buttons.
+function previewChange(key, path, before, after, created, decide) {
+  let state = null;
+  const tab = { key, title: (created ? "New: " : "Change: ") + path, render(el) {
+    const bar = pvBar(el, `<b></b><span class="grow"></span>` + (state ? `<span></span>` :
+      `<button class="tiny primary" data-a="apply">${created ? "Create file" : "Apply change"}</button><button class="tiny" data-a="skip">Skip</button>`));
+    bar.querySelector("b").textContent = (created ? "New file " : "Proposed change to ") + path + (created ? "" : " · before ▸ after");
+    if (state) bar.lastChild.textContent = state;
+    else { bar.querySelector('[data-a="apply"]').onclick = () => decide("apply"); bar.querySelector('[data-a="skip"]').onclick = () => decide("skip"); }
+    el.appendChild(created ? Object.assign(document.createElement("div"), { innerHTML: codeView(after, path) }) : sbsView(before, after, path));
+  } };
+  previewOpen(tab);
+  return s => { state = s; if (pvTabs.includes(tab) && pvCur === key) pvRender(); };
+}
+document.addEventListener("click", e => {
+  const o = e.target.closest(".md .codeblock .open");
+  if (o) {
+    const blk = o.closest(".codeblock"), lang = (blk.querySelector(".codelang")?.textContent || "").toLowerCase();
+    const code = blk.querySelector("code").textContent;
+    const ext = { markdown: "md", javascript: "js", typescript: "ts", python: "py", shell: "sh", bash: "sh", powershell: "ps1", "c++": "cpp", html: "html", xml: "xml", svg: "svg" }[lang] || lang;
+    previewText("code:" + code.length + ":" + code.slice(0, 40), (lang ? lang.toUpperCase() + " " : "") + "code from the reply", code, ext);
+    return;
+  }
+  const chip = e.target.closest(".msg.user .chip");
+  if (chip) { const n = chip.querySelector(".nm")?.textContent; if (n) previewAttachment(n); return; }
+  const pl = e.target.closest(".msg.tool .plink");
+  if (pl) previewWorkspaceFile(pl.dataset.path);
+});
 // Runs one tool call; returns its result for the model, or null if the user pressed Stop while it waited.
 async function runTool(call) {
   const name = call.name, args = call.arguments || {};
@@ -2132,10 +2680,18 @@ async function runTool(call) {
   const skip = document.createElement("button"); skip.className = "tiny"; skip.textContent = "Skip";
   row.append(apply, skip); card.append(row);
   $("messages").scrollTop = $("messages").scrollHeight;
+  let setState = null;
   const choice = await new Promise(res => {
     apply.onclick = () => res("apply"); skip.onclick = () => res("skip");
     controller?.signal.addEventListener("abort", () => res("stop"), { once: true });
+    // The whole file, before and after, beside the chat (when the server sent them: not for very big files).
+    if (r.after !== undefined) {
+      const sbs = document.createElement("button"); sbs.className = "tiny ghost"; sbs.textContent = "Side by side";
+      const open = () => { setState = previewChange("chg:" + r.path + ":" + r.hash, r.path, r.before || "", r.after, r.created, res); };
+      sbs.onclick = open; row.append(sbs); open();
+    }
   });
+  if (setState) setState(choice === "apply" ? "Applying…" : choice === "skip" ? "Skipped" : "Not applied (stopped)");
   row.remove();
   const note = document.createElement("div"); note.className = "tnote"; card.append(note);
   if (choice === "stop") { note.textContent = "Not applied (stopped)"; return null; }
@@ -2143,6 +2699,7 @@ async function runTool(call) {
   const done = await wsTool(name, args, true, r.hash);
   if (done.error) { card.classList.add("err"); note.textContent = done.error; return "Error: " + done.error; }
   note.textContent = done.result; card.classList.add("applied");
+  if (setState) setState("Applied");
   return done.result + " The user approved it.";
 }
 // A tool result in a saved chat
@@ -2203,10 +2760,48 @@ const LS = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 };
 let chats = LS.get("tierlm.chats", []), curChat = null;
+// Chats are saved as files on the computer running tierlm (a folder per chat, with a readable chat.md), when this
+// page is tierlm's own page on that computer; from another device they stay in this browser, as before.
+let chatFiles = false, chatsFolder = "";
+const CH = { "X-Tierlm-Workspace": "1" };
+async function chatApi(url, opts = {}) {
+  return api(url, { ...opts, headers: { ...CH, ...(opts.headers || {}) } });
+}
+async function initChats() {
+  try {
+    const r = await chatApi("/api/chats");
+    if (!r.ok) return;
+    const j = await r.json();
+    chatFiles = true; chatsFolder = j.folder;
+    // Once: the chats this browser kept move into files (the browser's copy stays, as a backup).
+    const old = LS.get("tierlm.chats", []);
+    if (old.length && !LS.get("tierlm.chats.moved", false)) {
+      const have = new Set(j.chats.map(c => c.id));
+      for (const c of old.slice().reverse()) {
+        if (have.has(c.id) || !c.messages?.length) continue;
+        await chatApi("/api/chats/" + c.id, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(c) });
+      }
+      LS.set("tierlm.chats.moved", true);
+      j.chats = (await (await chatApi("/api/chats")).json()).chats;
+    }
+    chats = j.chats;
+    $("chatshelp").textContent = "Each chat is saved as a file you can open in any text editor, in " + chatsFolder + ".";
+    $("chatsfolder").hidden = false;
+  } catch (e) { chatFiles = false; }
+  renderChats();
+}
+let saving = Promise.resolve();
+function persistChat() {                       // the current chat to its file (one save at a time, in order)
+  if (!chatFiles || !curChat) return saving;
+  const c = { ...curChat, messages: history };
+  saving = saving.then(() => chatApi("/api/chats/" + c.id, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(c) })).catch(() => {});
+  return saving;
+}
 function withSystem(h) {
   const sp = $("sysprompt").value.trim();
-  const msgs = h.map(m => {
+  const msgs = h.filter(m => !m.archived).map(m => {
     const o = { role: m.role, content: m.content };
+    if (m.images?.length) o.images = m.images;
     if (m.tool_calls) o.tool_calls = m.tool_calls;
     if (m.role === "tool" && m.name) o.name = m.name;
     return o;
@@ -2214,15 +2809,21 @@ function withSystem(h) {
   return sp ? [{ role: "system", content: sp }, ...msgs] : msgs;
 }
 function saveChat() {
-  if (!history.length) return;
-  if (!curChat) { curChat = { id: Date.now().toString(36), created: Date.now() }; chats.unshift(curChat); }
-  curChat.messages = history;
+  if (!history.length) return saving;
+  if (!curChat) {
+    curChat = { id: Date.now().toString(36), created: Date.now() }; chats.unshift(curChat);
+    if (wsOn()) { curChat.workspace = ws.folder; rememberFolder(ws.folder); }   // (the folder chosen before the first message)
+  }
   curChat.title = curChat.title || (() => { const u = history.find(m => m.role === "user"); return (u?.shown || u?.files?.[0]?.name || u?.content || "Chat"); })().slice(0, 60);
   curChat.updated = Date.now();
   curChat.model = info ? info.name : "";
+  curChat.messages = history.length;           // (the list shows a count; the messages themselves are in the file)
+  if (chatFiles) { renderChats(); return persistChat(); }
+  curChat.messages = history;
   if (chats.length > 100) chats.length = 100;
   LS.set("tierlm.chats", chats);
   renderChats();
+  return saving;
 }
 function ago(t) {
   const m = Math.round((Date.now() - t) / 60000);
@@ -2238,31 +2839,63 @@ function renderChats() {
     o.innerHTML = `${esc(c.title)} <small>· ${ago(c.updated || c.created)}</small>`;
     o.onclick = () => openChat(c);
     const d = document.createElement("button"); d.className = "del"; d.textContent = "✕"; d.setAttribute("aria-label", "Delete chat " + c.title);
-    d.onclick = () => { chats = chats.filter(x => x !== c); if (curChat === c) curChat = null; LS.set("tierlm.chats", chats); renderChats(); };
+    d.onclick = () => {
+      if (chatFiles && !confirm(`Delete "${c.title}"? Its folder, chat file and attached files are deleted.`)) return;
+      chats = chats.filter(x => x !== c); if (curChat === c) curChat = null;
+      if (chatFiles) chatApi("/api/chats/" + c.id, { method: "DELETE" }); else LS.set("tierlm.chats", chats);
+      renderChats();
+    };
     row.append(o, d); el.appendChild(row);
   }
 }
 function renderHistory() {
-  $("messages").innerHTML = "";
+  const box = $("messages");
+  box.innerHTML = "";
   let calls = [];
-  for (const m of history) {
-    if (m.role === "tool") { renderToolMsg(m, calls.shift()); continue; }
-    calls = (m.tool_calls || []).slice();
-    if (m.role === "assistant" && m.tool_calls && !stripCalls(m.content).trim()) continue;
-    const d = addMsg(m.role, m.role === "user" && m.shown !== undefined ? m.shown : m.content, m.files);
-    if (m.meta) { const s = document.createElement("span"); s.className = "meta"; s.textContent = m.meta; d.appendChild(s); }
-  }
+  const lastArch = history.reduce((k, m, i) => m.archived ? i : k, -1);
+  history.forEach((m, i) => {
+    const before = box.children.length;
+    if (m.role === "tool") renderToolMsg(m, calls.shift());
+    else {
+      calls = (m.tool_calls || []).slice();
+      if (!(m.role === "assistant" && m.tool_calls && !stripCalls(m.content).trim())) {
+        const d = addMsg(m.role, m.role === "user" && m.shown !== undefined ? m.shown : m.content, m.files, m.images);
+        if (m.meta) { const s = document.createElement("span"); s.className = "meta"; s.textContent = m.meta; d.appendChild(s); }
+        if (m.recall?.length) d.appendChild(recallLine(m.recall));
+      }
+    }
+    if (m.archived) for (let k = before; k < box.children.length; ++k) box.children[k].classList.add("archived");
+    if (i === lastArch) {                        // where the archive ends: what it is, and its summary
+      const div = document.createElement("div"); div.className = "archdiv";
+      div.innerHTML = `<div class="t">Above: archived from the model's memory. tierlm looks back at these when a new message relates to them.</div>`;
+      if (curChat?.summary) { const s = document.createElement("div"); s.className = "sum"; s.textContent = "Summary given to the model: " + curChat.summary; div.appendChild(s); }
+      const b = document.createElement("button"); b.className = "tiny ghost";
+      b.textContent = curChat?.summary ? "Write the summary again" : "Add a summary for the model";
+      b.onclick = () => summariseArchive(b);
+      div.appendChild(b);
+      box.appendChild(div);
+    }
+  });
+  box.querySelectorAll(".msg.user .chip").forEach(ch => { ch.classList.add("link"); ch.title = "Open " + (ch.querySelector(".nm")?.textContent || ""); });
 }
 async function openChat(c) {
   if (busy) return;
-  curChat = c; history = (c.messages || []).map(m => ({ ...m }));
+  let msgs = c.messages;
+  if (chatFiles) {
+    try { const full = await (await chatApi("/api/chats/" + c.id)).json(); msgs = full.messages; c.summary = full.summary; c.autoArchive = full.autoArchive;
+          if (full.workspace) c.workspace = full.workspace; else delete c.workspace; }
+    catch (e) { addMsg("error", "⚠ Couldn't open that chat: " + e.message); return; }
+  }
+  curChat = c; history = (Array.isArray(msgs) ? msgs : []).map(m => ({ ...m }));
   renderHistory(); renderChats();
+  await applyChatWorkspace();
   // The engine reuses whatever start of the conversation is still in its cache, so switching back is quick.
 }
 async function newChat() {
   if (busy) return;
   history = []; curChat = null;
   $("messages").innerHTML = "";
+  $("wson").checked = false; renderChips();                             // a new chat starts without a folder
   await api("/api/reset", { method: "POST" });
   setContext(0); renderChats();
 }
@@ -2290,7 +2923,9 @@ $("savepreset").onclick = () => {
 $("sysprompt").value = LS.get("tierlm.sysprompt", "");
 $("sysprompt").oninput = () => { LS.set("tierlm.sysprompt", $("sysprompt").value); $("sysbadge").hidden = !$("sysprompt").value.trim(); };
 $("sysprompt").oninput();
-renderChats(); renderPresets();
+renderChats(); renderPresets(); initChats();
+$("chatsfolder").onclick = () => chatApi("/api/chats-folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+  .then(r => r.json()).then(j => { if (!j.opened) addMsg("note", "Your chats are saved in " + j.folder); }).catch(() => {});
 
 // ---------- benchmark ----------
 $("benchbtn").onclick = async () => {
@@ -2303,7 +2938,7 @@ $("benchbtn").onclick = async () => {
     if (!r.ok) throw new Error(j.error || r.statusText);
     $("b-prompt").textContent = j.prompt_tps.toFixed(1); $("b-gen").textContent = j.gen_tps.toFixed(1);
     const line = `tierlm ${info.version} · ${info.name} · ${info.device} · ${info.ctx.toLocaleString()} context, ${info.kv_type} · ` +
-      `${!info.on_gpu ? "CPU only" : info.ram_weights > 0 ? (info.split_mode === "experts" ? "experts in RAM" : "whole layers in RAM") : "all in VRAM"} · ${j.threads} threads · ` +
+      `${!info.on_gpu ? "CPU only" : info.ram_weights > 0 && !info.all_on_gpu ? (info.split_mode === "experts" ? "experts in RAM" : "whole layers in RAM") : "all in VRAM"} · ${j.threads} threads · ` +
       `${j.speculative ? "speculative " + j.draft_max : "no speculation"} → prompt ${j.prompt_tps.toFixed(1)} tok/s, generation ${j.gen_tps.toFixed(1)} tok/s`;
     $("benchline").textContent = line; $("benchcopy").hidden = false;
     $("benchcopy").onclick = () => navigator.clipboard?.writeText(line);
@@ -2355,11 +2990,14 @@ async function loadNetwork() {
   $("allownet").checked = n.allow_network;
   $("apikey").value = local ? (n.api_key || "") : (n.api_key_set ? "set (shown only on the computer running tierlm)" : "");
   for (const id of ["allownet", "keygen", "keyclear"]) $(id).disabled = !local || n.fixed_by_command_line;
+  $("apitrim").checked = !!n.api_trim_oldest; $("apitrim").disabled = !local;
   $("keycopy").disabled = !local || !n.api_key;
   $("netmsg").innerHTML = !local ? "These settings can only be changed on the computer running tierlm."
     : n.fixed_by_command_line ? "Set by --host / --api-key on the command line."
     : n.allow_network && !n.api_key_set ? '<span class="warnline">Other devices can use tierlm without a key. Consider setting one.</span>' : "";
 }
+$("apitrim").onchange = () => api("/api/network", { method: "POST", headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ api_trim_oldest: $("apitrim").checked }) }).catch(() => {});
 async function setNetwork(body, msg) {
   $("netmsg").textContent = msg || "Saving…";
   try {

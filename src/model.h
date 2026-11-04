@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -59,6 +60,10 @@ struct Hparams {
     // YaRN context extension, computed as Hugging Face does: per-dimension frequency factors (ggml divides each
     // rotation frequency by its factor) and the scale of cos/sin. Empty: no YaRN.
     std::vector<float> rope_ff;
+    // Qwen3.5: positions in 3 parts (image/time, row, column), interleaved over the rotated dimensions in these
+    // sizes (pairs of dimensions). Text has all three equal, which is plain RoPE; images differ (see add_image).
+    bool mrope = false;
+    int mrope_sections[4] = {0, 0, 0, 0};
     float rope_attn_factor = 1.0f;
     bool is_moe() const { return n_expert > 0; }
     // Hybrid (qwen35): Gated DeltaNet layers
@@ -76,7 +81,10 @@ using OlmoeHparams = Hparams;
 
 // Load-time options. -1 / 0 mean "use the default".
 struct LoadOptions {
-    int max_ctx = 0;                 // 0 = the model's own context length
+    int max_ctx = 0;                 // 0 = the model's own context length (shared by all conversations, see parallel)
+    // Conversations the model can hold and compute at once (eval_seqs). They share the max_ctx cache positions,
+    // each taking what it needs; DeltaNet layers keep one small running memory per conversation.
+    int parallel = 1;
     std::string device = "auto";     // "auto", "cpu", "gpu", or a ggml device name ("Vulkan0", "CUDA0")
     int flash_attn = -1;             // 1 on, 0 off, -1 default (on, unless TIERLM_NO_FA is set)
     int kv_f32 = -1;                 // 1 f32 cache, 0 f16, -1 default (f16, unless TIERLM_KV_F32 is set)
@@ -132,7 +140,11 @@ struct Placement {
     std::vector<std::vector<int>> hot;           // per layer: experts kept in VRAM by the hot-expert placement (all of
                                                  // them when ffn_vram is set; empty when none or not used)
     int hot_experts = 0;                         // experts in VRAM through the hot-expert placement, all layers
-    bool split() const { return gpu_weights > 0 && cpu_weights > 0; }
+    // Every layer (attention, feed-forward/experts and its cache) in VRAM: only the token embedding table, which
+    // is looked up by row and costs nothing per step, may be in RAM.
+    bool all_on_gpu() const { return gpu_weights > 0 && layers > 0 && attn_gpu == layers && ffn_gpu == layers && kv_on_gpu; }
+    // Work is shared between GPU and CPU (some layers or experts in RAM).
+    bool split() const { return gpu_weights > 0 && cpu_weights > 0 && !all_on_gpu(); }
 };
 
 // Forward pass through ggml's backend API, so it runs on any ggml device (CPU, Vulkan, CUDA, ...).
@@ -178,7 +190,8 @@ public:
     // A conversation's memory, copied out to system RAM so another conversation can use the cache meanwhile and
     // this one can come back without being read again: the keys and values of its n_past positions in every
     // attention layer (and the MTP draft block), and the running memories of DeltaNet layers.
-    struct Snapshot { int n_past = 0; std::vector<std::vector<uint8_t>> parts; size_t bytes = 0; };
+    struct Snapshot { int n_past = 0; std::vector<std::vector<uint8_t>> parts; size_t bytes = 0;
+                      std::vector<std::array<int, 3>> rope; };   // (images) each position's 3-part position
     Snapshot save() const;
     // Live hot experts (LoadOptions::live_hot): how well VRAM is serving the router's picks.
     struct LiveStats { long long picks = 0, hits = 0, swaps = 0; double swap_ms = 0; };
@@ -203,6 +216,33 @@ public:
     int batch() const { return batch_; }
     int experts_default() const { return n_expert_used_file_; }   // active experts the model was trained with
 
+    // ---- several conversations at once ----
+    // Conversation 0 is the one eval / eval_ex / save / restore / the MTP block work on. With LoadOptions::parallel
+    // > 1, conversations 1 .. n_seq_max()-1 exist as well, and eval_seqs advances any of them (0 included) in one
+    // step: the weights are read once for all of them. Each conversation has its own positions; their keys and
+    // values share the cache (each position goes to any free place in it, and the attention mask keeps every
+    // conversation to its own). Returns the logits of each input's last token, in input order.
+    struct SeqInput { int seq = 0; std::vector<int32_t> ids; };
+
+    // ---- images (Qwen3.5 with its vision file) ----
+    // An image's image words (Vision::encode: rows x cols vectors of n_embd numbers, row by row) are registered
+    // once and then fed like tokens, as ids first .. first + rows*cols - 1 (all >= kImageIdBase), between the
+    // model's vision start and end tokens. Each word gets the image's 3-part position (start, start + row,
+    // start + column); text after it continues from start + max(rows, cols). key identifies the image (a hash
+    // of its pixels), so sending the same image again gives the same ids and reuses cached conversations.
+    // Images not used for a while are forgotten when they take more than about 1 GB.
+    static constexpr int32_t kImageIdBase = 1 << 30;
+    static bool is_image_id(int32_t id) { return id >= kImageIdBase; }
+    int32_t add_image(uint64_t key, std::vector<float> words, int rows, int cols);
+    int32_t find_image(uint64_t key);            // its first id, or -1
+    bool has_positions3() const { return hp_.mrope; }
+    std::vector<std::vector<float>> eval_seqs(const std::vector<SeqInput>& in, int n_threads, std::vector<int32_t>* routing = nullptr);
+    int n_seq_max() const { return (int)seq_cells_.size(); }
+    int seq_past(int s) const { return (int)seq_cells_[s].size(); }
+    void seq_reset(int s);                        // forget conversation s (s = 0: like reset())
+    void seq_truncate(int s, int n);              // keep its first n tokens (hybrid models: all or nothing)
+    int free_cells() const { return n_free_; }    // cache positions not used by any conversation
+
     // Convenience: reset, then evaluate the whole sequence.
     std::vector<float> forward(const std::vector<int32_t>& ids, int n_threads) { reset(); return eval(ids, n_threads); }
 
@@ -214,10 +254,14 @@ private:
         ggml_context* ctx = nullptr;
         struct ggml_cgraph* gf = nullptr;
         ggml_tensor *inp = nullptr, *pos = nullptr, *mask = nullptr, *logits = nullptr;
+        ggml_tensor *img = nullptr, *keep = nullptr;   // images: image words [n_embd, n_tok], 1 for text tokens [1, n_tok]
+        bool mrope = false;                      // pos holds 4 x n_tok 3-part positions
         ggml_tensor *hidden = nullptr;           // final-norm hidden states of every position (for the MTP head)
         ggml_tensor *mask_swa = nullptr;         // causal mask limited to the sliding window (models that use one)
         ggml_tensor *rope_ff = nullptr;          // YaRN frequency factors (Hparams::rope_ff), as input
         ggml_tensor *h_in = nullptr;             // MTP head: the target model's hidden states, as input
+        ggml_tensor *cells = nullptr;            // where each token's key and value go in the cache
+        ggml_tensor *out_idx = nullptr;          // several conversations: the tokens whose logits are wanted
         int n_tok = 0;
         // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
@@ -227,13 +271,20 @@ private:
         std::vector<std::pair<ggml_tensor*, int>> owner;   // every op tensor of each layer, with its layer
         std::vector<ggml_tensor*> cpu_ops;       // small ops that must run on the CPU (hot-expert bookkeeping)
     };
-    Graph build(int n_tok, int n_past, bool want_routing, int n_logits = 1, bool want_hidden = false, int snapshots = 1);
+    // A batch's tokens, conversation by conversation (contiguous): n tokens of conversation seq.
+    struct SeqGroup { int seq, n; };
+    // n_kv_end: the cache positions attention covers (all used ones), at least n_tok.
+    Graph build(int n_tok, int n_kv_end, bool want_routing, int n_logits = 1, bool want_hidden = false, int snapshots = 1,
+                const std::vector<SeqGroup>* groups = nullptr);
     struct Layer;
     ggml_tensor* attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
     ggml_tensor* ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing);
     void pin_cpu_layers(const Graph& g);        // keep every op of a RAM layer on the CPU
     std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
     void release_pending();
+    // One graph: n_tok tokens of conversation 0 (groups null), or of the conversations in groups.
+    EvalOut step(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
+                 std::vector<int32_t>* routing, const std::vector<SeqGroup>* groups);
     Graph build_mtp(int n_tok, int n_past);
     void* pending_ = nullptr;                    // Graph of the last undoable batch, until accept()
     // Live hot experts: per split layer, which expert each VRAM slot holds and how much each is wanted.
@@ -277,6 +328,7 @@ private:
         // MTP draft block only
         ggml_tensor *eh_proj = nullptr, *enorm = nullptr, *hnorm = nullptr, *mtp_embd = nullptr, *head_norm = nullptr, *head = nullptr;
         ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
+        std::vector<ggml_tensor*> conv_states, ssm_states;   // per conversation ([0]: conv_state, ssm_state_t)
     };
     Hparams hp_;
     ggml_backend* main_ = nullptr;               // device holding weights + cache (the first GPU)
@@ -305,7 +357,28 @@ private:
     void profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms);
     bool pin_layers_ = false;                    // layer split: RAM layers must run entirely on the CPU
     std::string device_name_;
-    int max_ctx_ = 0, n_past_ = 0;
+    int max_ctx_ = 0, n_past_ = 0;               // n_past_: conversation 0's tokens (seq_cells_[0].size())
+    // The cache's positions ("cells"): which conversation uses each and for which of its positions (-1: free);
+    // per conversation, the cell of each of its positions. Cells are handed out lowest first, so a single
+    // conversation's positions are its cells, as before.
+    std::vector<int> cell_seq_, cell_pos_;
+    std::vector<std::vector<int>> seq_cells_;
+    // (Qwen3.5) per conversation: each position's 3-part position, and the next text position
+    std::vector<std::vector<std::array<int, 3>>> seq_rope_;
+    std::vector<int> seq_next_;
+    void rope_truncate(int s, int n);
+    struct ImageRec { uint64_t key = 0; int32_t first = 0; int rows = 0, cols = 0; std::vector<float> words; uint64_t used = 0; };
+    std::vector<ImageRec> images_;
+    int32_t next_image_id_ = kImageIdBase;
+    uint64_t image_clock_ = 0;
+    const ImageRec* image_of(int32_t id) const;
+    bool build_images_ = false, build_mrope_ = false;   // set by step() for build()
+    int n_free_ = 0, graph_size_ = 16384, hi_ = 0, free_lo_ = 0;   // hi_: one past the highest used cell
+    std::vector<int> alloc_cells(int s, int n);   // n more positions for conversation s; throws when full
+    void free_cells_from(int s, int n);          // conversation s keeps its first n positions
+    int cells_end() const;                       // one past the highest cell in use
+    void fill_masks(Graph& g, int n_kv, const std::vector<int>& tok_seq, const std::vector<int>& tok_pos);
+    void clear_state(int s);                     // DeltaNet memories of conversation s back to zero
     uint64_t weights_bytes_ = 0, kv_bytes_ = 0;
     void* dev_ = nullptr;                        // ggml_backend_dev_t of the main device
     bool flash_attn_ = true, kv_f32_ = false;

@@ -267,6 +267,20 @@ for variant in NAMES:
                     worst = max(worst, err)
                     all_top &= bool(got.argmax() == want.argmax())
                 worst_mode["one token at a time" if mode == ["--step"] else "saved and restored" if mode else "whole prompt"] = worst
+            # Several conversations at once (--parallel 3), each with its own running memory: each must match on its own.
+            worst = 0.0
+            for ids in ([7, 42, 99, 0, 13, 13, 64, 8, 21, 55], long_ids):
+                run = subprocess.run([sys.argv[1], path, "--parallel", "3", *map(str, ids)], capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", env={**os.environ, **env})
+                if run.returncode != 0:
+                    sys.exit(f"tierlm-logits --parallel failed: {run.stderr.strip()}")
+                got = np.array([float(x) for x in run.stdout.split()]).reshape(3, -1)
+                n = len(ids)
+                for sq in range(3):
+                    want = reference(np.array([ids[(i + 3 * sq) % n] for i in range(max(1, n - sq))]), variant)
+                    worst = max(worst, float(np.abs(got[sq] - want).max() / np.abs(want).max()))
+                    all_top &= bool(got[sq].argmax() == want.argmax())
+            worst_mode["3 at once"] = worst
             worst = max(worst_mode.values())
             passed = worst < tol and (all_top or not need_top)
             ok &= passed

@@ -112,7 +112,10 @@ fold the menu away and give the chat more room.
   **Expand** shows it full size in place of the chat; **Back to chat** returns.
 - **Model info**: the model, where each part of it lives, and the hot experts: how many are in VRAM and the share of
   the expert work they did (**Forget** resets what tierlm has learned).
-- **Chats**: your past chats (kept in this browser), and system-prompt presets.
+- **Chats**: your past chats and system-prompt presets. Each chat is saved as a folder in `chats` next to tierlm
+  (for example `C:\tierlm\chats\2026-11-03 Backup plan (mw0rkoej)`), with `chat.md`, the conversation as a
+  readable file you can open in Notepad, VS Code or Obsidian, and the files you attached. **Open the chats folder**
+  shows them in Explorer. (Opened from another device, the page keeps its chats in that browser instead.)
 - **Benchmark**: one click measures prompt reading and generation speed with the current settings, with a line to
   copy and share.
 
@@ -128,11 +131,19 @@ The **Auto / Light / Dark** switch at the top chooses the theme; Auto follows Wi
 
 ### The workspace: let the model work on a project folder
 
-In **Settings**, **Workspace** → **Choose…** picks a folder (a project, say), and the checkbox turns it on for your
-chats. The model can then **list, read and search** the files in that folder, and **suggest changes**: each one
+In **Settings**, **Workspace** → **Choose…** (or **+** → **Work in a folder…**) picks a folder (a project, say) for
+the chat you're in. Each chat keeps its own folder: switching chats switches to it, a new chat starts without one, and
+the **+** menu lists your recent folders for one click. The folder is saved with the chat (and named in its `chat.md`). The model can then **list, read and search** the files in that folder, and **suggest changes**: each one
 shows in the chat as a diff (red lines removed, green lines added) with **Apply change** and **Skip**, and nothing is
 written until you click Apply. If the file changed in the meantime, the change isn't made. Each step the model takes
 shows as a small card in the chat; the model keeps going after each one until it has answered.
+
+When the model proposes a change, the **preview** opens beside the chat: the whole file before and after, side by
+side, with **Apply change** and **Skip** at the top (long unchanged parts fold away; click them to show them). The
+chat moves to the left while the preview is open, and back to the middle when you close its last tab. The preview also
+opens for: a file name in a step card (click it), an attached file's chip, and **Open** on a block of code in a reply.
+Code is shown with line numbers and colour, Markdown rendered, images as images, and HTML drawn as a page with its
+scripts off (**Source** shows the code). Drag the bar between chat and preview to resize them.
 
 The model can't run anything, and can't read or write outside the folder. The workspace only works from the tierlm
 page on the computer running tierlm, not from other devices, so nobody on your network can reach your files through
@@ -142,15 +153,45 @@ it. It works best with models that are good at tools: Qwen3.5 / 3.6, Qwen3-Coder
 
 The **+** under the message box adds things to your message. **Attach files** puts the text of one or more text or
 code files into your message (up to 2 MB each); you can also drag files onto the chat or paste them into the box.
-**Work in a folder…** turns the workspace on or off. What's attached shows as chips above the box, each with an ✕ to
-remove it. Images, PDFs and Word files aren't supported yet.
+Images (PNG, JPEG, GIF, BMP, WebP; a pasted screenshot too) go with the message as images, for models that read
+them (below). **Work in a folder…** turns the workspace on or off. What's attached shows as chips above the box, each
+with an ✕ to remove it. PDFs and Word files aren't supported yet.
+
+### Reading images
+
+Qwen3.5 and 3.6 models read images: screenshots, photos, scanned and handwritten documents. They need their
+**vision file**, a `mmproj-….gguf` downloaded with the model (LM Studio and Hugging Face put it in the same folder,
+for example `Qwen3.5-9B-Q4_K_M.gguf` and `mmproj-Qwen3.5-9B-F16.gguf`). tierlm loads it with the model when it's
+there; **Model info** then says **Reads images: yes**. Attach an image with **+**, drag it onto the chat or paste
+it, and ask about it. Each image becomes "image words" (one per 32 x 32 pixels), which take that much context;
+**Image detail** in Settings sets the most per image (bigger images are scaled down): **High** (2,048, for
+scanned pages and small text), **Medium** (1,024) or **Low** (512, quickest). **Automatic** is High when a GPU reads
+images and Medium when only the CPU does. The image reader goes on the GPU when there's room next to the model;
+when the model fills the GPU, its weights stay in RAM and the GPU still does the heavy work if it has a little room
+(Model info: **Reads images: yes, on CPU + …**), else the CPU reads images, which takes much longer (about a
+minute for a full-size screenshot on a laptop). The image is kept with the chat (in its `files` folder, and shown in
+`chat.md`). Apps send images through the API as OpenAI's do ([API](API.md#images)).
+
+### Several people or apps at once: Connections
+
+By default tierlm writes one reply at a time and other requests wait in line. With **Connections** (under
+**Advanced** on the setup screen) set to more than one, it writes that many at once: each connection gets its own
+context of the length you chose (so the context part of the memory bars grows with each), and every running reply
+advances in the same step, so the total speed goes up while each reply gets a bit slower. Requests beyond that wait
+in line; the top bar shows how many connections are busy. Speculative decoding is off with more than one.
+
+**Find the fastest settings** measures it when Connections is more than one: 1, 2, 4… replies at once, and
+recommends the most that keeps every reply at or above **Slowest speed per reply** (5 tok/s unless you change it).
+It loads the model with that recommendation, and you can choose differently.
 
 ### Two models at once: an embedding model
 
 Search, document comparison and retrieval (RAG) tools need an **embedding model**: a small model that turns a text
 into a list of numbers, so similar texts get similar numbers. tierlm can keep one loaded next to the chat model, as
-LM Studio does: put one in your models folder (for example **nomic-embed-text-v1.5**, about 140 MB at Q8_0), then in
-the side menu open **Model info** and choose it under **Embedding model**. If you have LM Studio, the one built into it
+LM Studio does. In the side menu open **Model info**: **Download nomic-embed-text (146 MB)** fetches
+**nomic-embed-text-v1.5** (Q8_0, Apache 2.0) from Nomic's own Hugging Face page into your models folder, checks it
+against Hugging Face's SHA-256 and loads it. Or put any GGUF embedding model in the models folder and choose it under
+**Embedding model**. If you have LM Studio, the one built into it
 ("text-embedding-nomic-embed-text-v1.5") is listed there too, marked **built into LM Studio**, with nothing to download.
 tierlm remembers your choice and loads it again next time. Apps reach it at `/v1/embeddings` on the same address as the chat model ([API](API.md#post-v1embeddings)).
 
@@ -252,8 +293,8 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Embedding models: Nomic | `nomic-bert` | nomic-embed-text v1, v1.5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
 | Gemma, Phi, DeepSeek, GLM, Nemotron, ... | various | | Not yet |
 
-A `mmproj-*.gguf` file next to a model is its **vision add-on** (for reading images). tierlm lists it but
-doesn't use it yet.
+A `mmproj-*.gguf` file next to a model is its **vision file**: tierlm loads it with the model so it can read
+images (Qwen3.5 / 3.6; see [Reading images](#reading-images)). Checked against Hugging Face's code; tested with Qwen3.5-9B on an RTX 3070 laptop.
 
 The OLMoE file used in this guide is the safe choice to start with.
 

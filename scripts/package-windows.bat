@@ -63,6 +63,7 @@ copy /y third_party\ggml\LICENSE "%OUT%\licenses\ggml-LICENSE.txt" >nul
 copy /y third_party\httplib\LICENSE "%OUT%\licenses\cpp-httplib-LICENSE.txt" >nul
 copy /y third_party\json\LICENSE.MIT "%OUT%\licenses\nlohmann-json-LICENSE.txt" >nul
 copy /y web\vendor\katex-LICENSE.txt "%OUT%\licenses\katex-LICENSE.txt" >nul
+copy /y third_party\stb\LICENSE "%OUT%\licenses\stb_image-LICENSE.txt" >nul
 echo Put your .gguf model file in this folder.> "%OUT%\models\PUT-MODEL-HERE.txt"
 
 echo == Zipping ==

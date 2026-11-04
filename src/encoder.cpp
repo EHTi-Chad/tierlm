@@ -98,22 +98,30 @@ std::unique_ptr<Encoder> Encoder::load(const std::string& path, const std::strin
     if (!e->cpu_) throw std::runtime_error("failed to start the CPU backend");
     e->main_ = e->cpu_;
     ggml_backend_dev_t dev = nullptr;
-    if (device == "auto" || device == "gpu") {
-        size_t best = 0;
-        for (enum ggml_backend_dev_type want : { GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU }) {
+    // "auto:<device>": the chat model's GPU (as "CUDA0"); the embedding model goes there when it has room, else on
+    // the CPU, never on another, slower chip (such as a laptop's built-in graphics next to its real GPU).
+    std::string mode = device;
+    ggml_backend_dev_t pref = nullptr;
+    if (device.rfind("auto:", 0) == 0) { pref = ggml_backend_dev_by_name(device.substr(5).c_str()); mode = "auto"; }
+    const size_t need = e->weight_bytes_ + e->weight_bytes_ / 2 + ((size_t)768 << 20);   // weights + working memory
+    auto room = [&](ggml_backend_dev_t d) { size_t free = 0, total = 0; ggml_backend_dev_memory(d, &free, &total); return free; };
+    if (mode == "auto" || mode == "gpu") {
+        if (pref) dev = room(pref) >= need ? pref : nullptr;
+        else {
+            bool any_discrete = false;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) any_discrete |= ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
+            size_t best = 0;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t d = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_type(d) != want) continue;
-                size_t free = 0, total = 0;
-                ggml_backend_dev_memory(d, &free, &total);
-                const size_t need = e->weight_bytes_ + e->weight_bytes_ / 2 + ((size_t)768 << 20);   // weights + working memory
-                if (free >= need && free > best) { dev = d; best = free; }
+                const auto t = ggml_backend_dev_type(d);
+                if (t != GGML_BACKEND_DEVICE_TYPE_GPU && !(t == GGML_BACKEND_DEVICE_TYPE_IGPU && !any_discrete)) continue;
+                const size_t f = room(d);
+                if (f >= need && f > best) { dev = d; best = f; }
             }
-            if (dev) break;
         }
-    } else if (device != "cpu") {
-        dev = ggml_backend_dev_by_name(device.c_str());
-        if (!dev) throw std::runtime_error("unknown device '" + device + "'");
+    } else if (mode != "cpu") {
+        dev = ggml_backend_dev_by_name(mode.c_str());
+        if (!dev) throw std::runtime_error("unknown device '" + mode + "'");
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = nullptr;
     }
     if (dev) {

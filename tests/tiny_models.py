@@ -237,6 +237,19 @@ for idx, name in enumerate(names):
                 got = np.array([float(v) for v in run.stdout.split()])
                 worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
                 all_top &= bool(got.argmax() == want.argmax())
+        # Several conversations at once (--parallel 3): each must match the reference on its own.
+        for ids in ([7, 42, 99, 0, 13, 13, 64, 8, 21, 55], long_ids):
+            run = subprocess.run([sys.argv[1], path, "--parallel", "3", *map(str, ids)], capture_output=True, text=True,
+                                 env={**os.environ, **env})
+            if run.returncode != 0:
+                sys.exit(f"{name}: tierlm-logits --parallel failed: {run.stderr.strip()}")
+            got = np.array([float(v) for v in run.stdout.split()]).reshape(3, -1)
+            n = len(ids)
+            for sq in range(3):
+                sid = [ids[(i + 3 * sq) % n] for i in range(max(1, n - sq))]
+                want = reference(arch, s, W, L, np.array(sid))
+                worst = max(worst, float(np.abs(got[sq] - want).max() / np.abs(want).max()))
+                all_top &= bool(got[sq].argmax() == want.argmax())
         passed = worst < tol and all_top
         ok &= passed
         where = "" if frac is None else f" [{placement.split(': ', 1)[-1]}]"

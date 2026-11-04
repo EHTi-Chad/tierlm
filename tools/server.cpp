@@ -34,6 +34,7 @@
 #include "gguf_split.h"
 #include "tokenizer.h"
 #include "encoder.h"
+#include "vision.h"
 #include "gguf.h"
 #include "ggml-backend.h"
 #include <list>
@@ -42,6 +43,8 @@
 #include "agent.h"
 #include "harmony.h"
 #include "workspace.h"
+#include "chats.h"
+#include "download.h"
 
 #include <climits>
 #include <algorithm>
@@ -65,9 +68,11 @@
 #include "backends.h"
 #include <deque>
 #include <condition_variable>
+#include <shared_mutex>
 #ifdef _WIN32
 #include <windows.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 #include <io.h>
 #include <fcntl.h>
 #else
@@ -445,7 +450,149 @@ std::string pick_folder_windows(const std::string& start, bool& cancelled) {
 
 
 // The loaded model and everything that belongs to it.
+// ---- several replies at once (Connections > 1) ----
+// Each reply runs on its own thread, as with one, but asks the batcher for its steps: the batcher waits a moment for
+// every running reply to ask, then computes all of them in one model step (Model::eval_seqs), so the weights are read
+// once for all of them. A long prompt is fed in pieces of 256 tokens, so it doesn't hold up the others' words.
+struct Batcher {
+    std::mutex m;
+    std::condition_variable cv, done_cv;
+    struct Req { int seq; std::vector<int32_t> ids; std::vector<float> logits; std::vector<int32_t> routing; bool done = false; std::string err; };
+    std::vector<Req*> pending;
+    int active = 0;                      // replies running now (each asks for one step at a time)
+    bool stop = false;
+    Model* model = nullptr;
+    const int* threads = nullptr;        // (the engine's setting, which Find the fastest settings changes)
+    std::thread th;
+    const bool log = !env("TIERLM_BATCH_LOG").empty();
+    int st_steps = 0, st_reqs = 0;
+    double st_ms = 0;
+    std::chrono::steady_clock::time_point st_t0 = std::chrono::steady_clock::now();
+    void start(Model* m_, const int* threads_) {
+        model = m_; threads = threads_; stop = false; active = 0; pending.clear();
+        th = std::thread([this] { loop(); });
+    }
+    void finish() {
+        { std::lock_guard<std::mutex> lk(m); stop = true; }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+        model = nullptr;
+    }
+    ~Batcher() { finish(); }
+    std::vector<float> eval(int seq, const std::vector<int32_t>& ids, std::vector<int32_t>* routing) {
+        if (routing) routing->clear();
+        std::vector<float> lg;
+        for (size_t at = 0; at < ids.size();) {
+            const size_t n = std::min<size_t>(256, ids.size() - at);
+            Req r{seq, std::vector<int32_t>(ids.begin() + at, ids.begin() + at + n)};
+            {
+                std::unique_lock<std::mutex> lk(m);
+                pending.push_back(&r);
+                cv.notify_all();
+                done_cv.wait(lk, [&] { return r.done; });
+            }
+            if (!r.err.empty()) throw std::runtime_error(r.err);
+            if (routing) routing->insert(routing->end(), r.routing.begin(), r.routing.end());
+            lg.swap(r.logits);
+            at += n;
+        }
+        return lg;
+    }
+    void loop() {
+        for (;;) {
+            std::vector<Req*> batch;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] { return stop || !pending.empty(); });
+                if (stop) {
+                    for (Req* r : pending) { r->err = "the model was unloaded"; r->done = true; }
+                    pending.clear();
+                    done_cv.notify_all();
+                    return;
+                }
+                // Wait for the other running replies to ask too: between steps they only pick their next word and
+                // send it, well under a millisecond. Going without them made the replies take turns (one step each,
+                // one after the other) instead of sharing steps, so 2 at once were no faster than 1. The time limit is
+                // only for a reply held up by something else (a slow connection), so it can't stall the others long.
+                const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(30);
+                while ((int)pending.size() < active && !stop)
+                    if (cv.wait_until(lk, until) == std::cv_status::timeout) break;
+                batch.swap(pending);
+            }
+            // Always in conversation order: a step then looks the same as the last one when the same replies are
+            // running, so the GPU can replay it (CUDA graphs need identical steps; with the order flipping between
+            // steps they never kick in, and 2 replies ran at 123 tok/s in all where the engine does 262).
+            std::sort(batch.begin(), batch.end(), [](const Req* x, const Req* y) { return x->seq < y->seq; });
+            std::vector<Model::SeqInput> in;
+            int n_tok = 0;
+            for (Req* r : batch) { in.push_back({r->seq, r->ids}); n_tok += (int)r->ids.size(); }
+            std::string err;
+            std::vector<std::vector<float>> out;
+            std::vector<int32_t> routing;
+            const bool one_batch = n_tok <= model->batch();
+            const auto c0 = std::chrono::steady_clock::now();
+            try { out = model->eval_seqs(in, *threads, one_batch ? &routing : nullptr); }
+            catch (const std::exception& e) { err = e.what(); }
+            if (log) {                           // TIERLM_BATCH_LOG=1: how well the steps are shared, every 2 s
+                const auto now = std::chrono::steady_clock::now();
+                st_steps++; st_reqs += (int)batch.size(); st_ms += std::chrono::duration<double, std::milli>(now - c0).count();
+                if (now - st_t0 > std::chrono::seconds(2)) {
+                    const double wall = std::chrono::duration<double, std::milli>(now - st_t0).count();
+                    std::fprintf(stderr, "batcher: %d steps, %.2f replies each, %.1f ms computing per step, %.0f%% of the time computing\n",
+                                 st_steps, (double)st_reqs / st_steps, st_ms / st_steps, 100.0 * st_ms / wall);
+                    st_steps = st_reqs = 0; st_ms = 0; st_t0 = now;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(m);
+                const auto& hp = model->hparams();
+                const size_t per = hp.is_moe() ? (size_t)hp.n_layer * hp.n_expert_used : 0;
+                size_t t0 = 0;
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    Req* r = batch[i];
+                    if (!err.empty()) r->err = err;
+                    else {
+                        r->logits = std::move(out[i]);
+                        if (one_batch && per) r->routing.assign(routing.begin() + t0 * per, routing.begin() + (t0 + r->ids.size()) * per);
+                    }
+                    t0 += r->ids.size();
+                    r->done = true;
+                }
+            }
+            done_cv.notify_all();
+        }
+    }
+};
+
+// FNV-1a: a quick 64-bit fingerprint (images: the same image sent again is recognised).
+uint64_t fnv1a(const std::string& s, uint64_t h = 1469598103934665603ULL) {
+    for (unsigned char ch : s) { h ^= ch; h *= 1099511628211ULL; }
+    return h;
+}
+
+// What a reply holds while it runs: the engine lock (shared when several replies run at once, so they don't block
+// each other but a model load waits for all of them) and, then, one of the connections. Released when it ends.
+struct Hold {
+    std::shared_timed_mutex* m = nullptr;
+    bool shared = false;
+    std::atomic<int>* free = nullptr;
+    void release() {
+        if (m) { if (shared) m->unlock_shared(); else m->unlock(); m = nullptr; }
+        if (free) { ++*free; free = nullptr; }
+    }
+    ~Hold() { release(); }
+};
+
 struct Engine {
+    // Several replies at once: one slot per connection (a conversation of the model, Model::eval_seqs), with the
+    // tokens in its part of the cache. Empty: one reply at a time, as before.
+    struct Slot { std::vector<int32_t> cached; bool busy = false; std::mt19937 rng{std::random_device{}()}; };
+    std::vector<Slot> slots;
+    std::mutex slots_mu;
+    std::atomic<int> free_slots{0};
+    int ctx_per = 0;                    // context of each connection (the cache holds ctx_per x connections)
+    Batcher batch;
+    std::mutex usage_mu;                // expert usage is learned from every reply, which may run at once
     std::unique_ptr<Speculator> spec;   // speculative decoding with the model's MTP draft block, when turned on
     int draft_max = 0;                  // most tokens the draft block guesses per check (0: 2 for MoE models, 3 for dense)
     // Prompt lookup (guesses copied from earlier in the conversation): most tokens guessed per check; -1 chooses
@@ -453,6 +600,34 @@ struct Engine {
     int lookup = -1;
     std::unique_ptr<Speculator> look;
     std::unique_ptr<Model> model;
+    std::unique_ptr<Vision> vision;     // the model's eyes (Qwen3.5 / 3.6 with an mmproj file next to it)
+    std::string vision_file;
+    // Most image words per image (bigger images are scaled down; reading time grows faster than this). The page's
+    // "Image detail" sends 512, 1024 or 2048 with each request; 0 (automatic): 2048 when a GPU reads images,
+    // 1024 when only the CPU does.
+    int image_tokens_for(int asked) const {
+        if (asked > 0) return std::max(64, std::min(asked, 16384));
+        return vision && (vision->on_gpu() || vision->gpu_helps()) ? 2048 : 1024;
+    }
+    // The image words of an image: (find or encode, then register with the model) its first id and size.
+    struct Pic { int32_t first = 0; int n = 0; };
+    Pic image(const std::string& bytes, int n_threads, int asked_tokens) {
+        const int image_tokens = image_tokens_for(asked_tokens);
+        if (!vision) throw std::runtime_error("this model can't read images: load Qwen3.5 / 3.6 with its mmproj (vision) file in the same folder");
+        const uint64_t key = fnv1a(bytes, (uint64_t)image_tokens * 1000003ULL);
+        int w = 0, h = 0;
+        if (!image_size((const uint8_t*)bytes.data(), bytes.size(), &w, &h)) throw std::runtime_error("an image isn't in a format tierlm reads (PNG, JPEG, BMP, GIF)");
+        const int n = vision->tokens_for(w, h, image_tokens);
+        if (const int32_t f = model->find_image(key); f >= 0) return {f, n};
+        const auto t0 = std::chrono::steady_clock::now();
+        const Vision::Prepared p = vision->prepare(decode_image((const uint8_t*)bytes.data(), bytes.size()), image_tokens);
+        std::vector<float> words = vision->encode(p, n_threads);
+        const int32_t first = model->add_image(key, std::move(words), p.gh / vision->merge(), p.gw / vision->merge());
+        std::fprintf(stderr, "image: %dx%d -> %dx%d, %d image words, read in %.2f s%s\n", w, h, p.width, p.height, p.tokens(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                     vision->gpu_helps() ? (vision->last_helped() ? " (CPU + GPU)" : " (CPU: no room on the GPU)") : "");
+        return {first, p.tokens()};
+    }
     Tokenizer tok;
     ChatFmt chat = ChatFmt::Plain;
     agent::ToolFmt tool_fmt = agent::ToolFmt::Hermes;   // how this model writes tool calls
@@ -504,7 +679,7 @@ struct Engine {
     int lookup_len() const {
         if (!model || lookup == 0) return 0;
         if (lookup > 0) return std::min(lookup, 16);
-        if (model->hparams().is_moe() && model->placement().cpu_weights > 0) return 4;
+        if (model->hparams().is_moe() && model->placement().split()) return 4;
         if (model->hparams().hybrid) return 6;
         return 8;
     }
@@ -529,6 +704,7 @@ struct Engine {
     Clock::time_point usage_saved;
     int hot_E = 0, hot_L = 0;
     void add_usage(const std::vector<int32_t>& routing, int K) {
+        std::lock_guard<std::mutex> lk(usage_mu);
         if (usage.empty() || K <= 0) return;
         for (size_t i = 0; i < routing.size(); ++i) {
             const size_t l = (i / K) % hot_L;
@@ -537,6 +713,7 @@ struct Engine {
         usage_dirty = true;
     }
     void save_usage(bool force = false) {
+        std::lock_guard<std::mutex> lk(usage_mu);
         if (!usage_dirty || usage_path.empty() || (!force && since(usage_saved) < 10.0)) return;
         // Older habits fade: once the counts get large, halve them, so recent use weighs more.
         double tot = 0; for (float v : usage) tot += v;
@@ -625,14 +802,116 @@ json describe_model(const std::string& path) {
     else if (arch == "clip") {
         // A vision projector (mmproj file): the "eyes" of a vision model, not a model that runs on its own.
         j["kind"] = "mmproj";
-        j["reason"] = "Vision add-on (mmproj) for a model in the same folder, not a standalone model";
+        j["reason"] = "Vision file (mmproj): lets the model next to it read images. It loads with that model.";
     }
     else j["reason"] = "the " + (arch.empty() ? std::string("unknown") : arch) + " architecture is not supported yet";
     gguf_free(g);
     return j;
 }
 
+// The vision (mmproj) file for a model: a GGUF in the same folder with "mmproj" in its name that this engine reads
+// and whose output width matches the model's (LM Studio and Hugging Face downloads keep them side by side, e.g.
+// Qwen3.5-9B-Q4_K_M.gguf and mmproj-Qwen3.5-9B-F16.gguf). With several, the name closest to the model's wins, then
+// F16 / BF16 over smaller ones (the vision part is small, and suffers most from rounding).
+fs::path vision_file_for(const std::string& model_path, int n_embd) {
+    std::error_code ec;
+    const fs::path mp = fs::u8path(model_path), dir = mp.parent_path();
+    auto lower = [](std::string x) { for (char& ch : x) ch = (char)std::tolower((unsigned char)ch); return x; };
+    const std::string stem = lower(mp.stem().u8string());
+    fs::path best;
+    int best_score = -1;
+    for (const auto& f : fs::directory_iterator(dir, ec)) {
+        if (!f.is_regular_file(ec) || f.path().extension() != ".gguf") continue;
+        const std::string name = lower(f.path().stem().u8string());
+        if (name.find("mmproj") == std::string::npos) continue;
+        if (!is_vision_file(f.path().u8string())) continue;
+        gguf_init_params gp{ true, nullptr };
+        if (gguf_context* g = gguf_init_from_file(f.path().u8string().c_str(), gp)) {
+            const int64_t id = gguf_find_key(g, "clip.vision.projection_dim");
+            const int64_t dim = id >= 0 ? (int64_t)gguf_get_val_u32(g, id) : 0;
+            gguf_free(g);
+            if (n_embd > 0 && dim > 0 && dim != n_embd) continue;          // another model's eyes
+        }
+        std::string bare = name;
+        for (const char* cut : { "mmproj-", "mmproj_", "-mmproj", "_mmproj", "mmproj" })
+            if (const size_t at = bare.find(cut); at != std::string::npos) { bare.erase(at, std::strlen(cut)); break; }
+        size_t common = 0;
+        while (common < bare.size() && common < stem.size() && bare[common] == stem[common]) ++common;
+        const int prec = name.find("f16") != std::string::npos ? 3 : name.find("f32") != std::string::npos ? 2 : name.find("q8") != std::string::npos ? 1 : 0;
+        const int score = (int)common * 4 + prec;
+        if (score > best_score) { best_score = score; best = f.path(); }
+    }
+    return best;
+}
+
 // ---- OpenAI-compatible API helpers ----
+
+// Images in a conversation. A message may carry "images" (data: URLs or plain base64 of PNG / JPEG / ...); in its
+// text, each image's place is kPictureMark (the page puts them before the text; the API where they were sent).
+// For Qwen3.5 / 3.6 the mark is what their chat template writes for an image; its <|image_pad|> token is replaced by
+// the image's words just before the model reads the prompt.
+const char* const kPictureMark = "<|vision_start|><|image_pad|><|vision_end|>";
+
+// Base64 (standard or URL-safe; whitespace and padding ignored) to bytes. Empty if it isn't base64.
+std::string base64_decode(const std::string& in) {
+    auto val = [](unsigned char ch) -> int {
+        if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+        if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+        if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+        if (ch == '+' || ch == '-') return 62;
+        if (ch == '/' || ch == '_') return 63;
+        return -1;
+    };
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+    uint32_t acc = 0; int bits = 0;
+    for (unsigned char ch : in) {
+        if (ch == '=' || ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t') continue;
+        const int v = val(ch);
+        if (v < 0) return std::string();
+        acc = acc << 6 | (uint32_t)v; bits += 6;
+        if (bits >= 8) { bits -= 8; out += (char)(acc >> bits & 0xFF); }
+    }
+    return out;
+}
+
+// An image as sent ("data:image/png;base64,...." or plain base64) to its bytes. Throws with a message for the user.
+std::string picture_bytes(const std::string& url) {
+    std::string b64 = url;
+    if (url.rfind("data:", 0) == 0) {
+        const size_t comma = url.find(',');
+        if (comma == std::string::npos || url.substr(0, comma).find(";base64") == std::string::npos)
+            throw std::runtime_error("images must be sent as base64 data URLs (data:image/png;base64,...)");
+        b64 = url.substr(comma + 1);
+    } else if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        throw std::runtime_error("tierlm doesn't fetch images from the web: send them as data URLs (data:image/png;base64,...)");
+    }
+    std::string bytes = base64_decode(b64);
+    if (bytes.empty()) throw std::runtime_error("an image isn't valid base64");
+    return bytes;
+}
+
+// The images of a conversation, in order, with each message's marks in place (a message whose text has fewer
+// marks than images gets the missing ones first, as the page sends them). The "images" fields are removed.
+std::vector<std::string> take_pictures(json& messages) {
+    std::vector<std::string> pics;
+    for (auto& m : messages) {
+        if (!m.is_object() || !m.contains("images")) continue;
+        const json imgs = m["images"];
+        m.erase("images");
+        if (!imgs.is_array() || imgs.empty()) continue;
+        std::string text = m.contains("content") && m["content"].is_string() ? m["content"].get<std::string>() : std::string();
+        size_t marks = 0;
+        for (size_t at = text.find(kPictureMark); at != std::string::npos; at = text.find(kPictureMark, at + 1)) ++marks;
+        std::string lead;
+        for (size_t i = marks; i < imgs.size(); ++i) lead += kPictureMark;
+        if (!lead.empty()) text = lead + (text.empty() ? "" : "\n") + text;
+        m["content"] = text;
+        for (const auto& u : imgs) if (u.is_string()) pics.push_back(picture_bytes(u.get<std::string>()));
+    }
+    return pics;
+}
+
 
 // OpenAI messages to plain {role, content} ones. Content may be a string, a list of parts
 // ([{"type": "text", "text": ...}], images are skipped: no vision yet) or null. "developer" is OpenAI's newer
@@ -644,11 +923,27 @@ json normalize_messages(const json& in) {
         if (!m.is_object()) continue;
         std::string role = m.value("role", std::string("user")), text;
         const json c = m.contains("content") ? m["content"] : json();
+        json images = json::array();
         if (c.is_string()) text = c.get<std::string>();
         else if (c.is_array())
             for (const auto& part : c) {
-                if (part.is_string()) text += part.get<std::string>();
-                else if (part.is_object() && part.value("type", std::string()) == "text") text += part.value("text", std::string());
+                if (part.is_string()) { text += part.get<std::string>(); continue; }
+                if (!part.is_object()) continue;
+                const std::string type = part.value("type", std::string());
+                if (type == "text" || type == "input_text") text += part.value("text", std::string());
+                else if (type == "image_url" || type == "input_image" || type == "image") {
+                    // {"image_url": {"url": "data:..."}} (OpenAI chat), {"image_url": "data:..."} (OpenAI responses),
+                    // {"source": {"data": "...", "media_type": ...}} (Anthropic-style)
+                    std::string url;
+                    const json iu = part.contains("image_url") ? part["image_url"] : json();
+                    if (iu.is_object()) url = iu.value("url", std::string());
+                    else if (iu.is_string()) url = iu.get<std::string>();
+                    else if (part.contains("source") && part["source"].is_object()) url = part["source"].value("data", std::string());
+                    else if (part.contains("data") && part["data"].is_string()) url = part["data"].get<std::string>();
+                    if (url.empty()) continue;
+                    images.push_back(url);
+                    text += kPictureMark;                          // where the image goes
+                }
             }
         if (role == "developer") role = "system";
         if (role == "function") role = "tool";
@@ -658,6 +953,7 @@ json normalize_messages(const json& in) {
             !m["reasoning_content"].get<std::string>().empty() && text.find("<think>") == std::string::npos)
             text = "<think>\n" + m["reasoning_content"].get<std::string>() + "\n</think>\n\n" + text;
         json o = {{"role", role}, {"content", text}};
+        if (!images.empty()) o["images"] = images;
         if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
             json calls = json::array();
             for (const auto& tc : m["tool_calls"]) {
@@ -837,7 +1133,7 @@ int main(int argc, char** argv) {
     if (const char* ep = std::getenv("TIERLM_RPC")) add_rpc_server(ep);
     Engine eng;
     eng.threads = a.threads;
-    std::timed_mutex mu;                 // one load or generation at a time
+    std::shared_timed_mutex mu;                 // one load or generation at a time
     // Requests for a reply or a load wait their turn in line, first come first served (a mutex alone lets any
     // waiter in next, so a request could wait forever behind newer ones). Only replies and loads queue; Find the
     // fastest settings, the benchmark and setting changes still answer "busy" at once.
@@ -850,7 +1146,7 @@ int main(int argc, char** argv) {
         // Waits until this request is first in line and the engine is free, then holds `mu` (the caller adopts
         // it). on_wait(ahead) is called whenever the number of requests ahead changes (0: only the one running).
         // Gives up (false) when gone() says the client left, or after max_wait.
-        bool enter(std::timed_mutex& mu, const std::function<bool()>& gone, const std::function<void(int)>& on_wait = nullptr,
+        bool enter(std::shared_timed_mutex& mu, const std::function<bool()>& gone, const std::function<void(int)>& on_wait = nullptr,
                    std::chrono::seconds max_wait = std::chrono::seconds(1800)) {
             std::unique_lock<std::mutex> l(m);
             const uint64_t me = next++;
@@ -869,7 +1165,40 @@ int main(int argc, char** argv) {
                 cv.wait_for(l, std::chrono::milliseconds(50));   // also polls: mu is freed without telling the line
             }
         }
+        // For a reply: like enter, but with several connections (slots() gives their free count, or null with one)
+        // it takes the lock shared and one free connection, so up to that many replies run at once.
+        bool enter_reply(std::shared_timed_mutex& mu, Hold& hold, const std::function<std::atomic<int>*()>& slots,
+                         const std::function<bool()>& gone, const std::function<void(int)>& on_wait = nullptr,
+                         std::chrono::seconds max_wait = std::chrono::seconds(1800)) {
+            std::unique_lock<std::mutex> l(m);
+            const uint64_t me = next++;
+            q.push_back(me);
+            const auto until = std::chrono::steady_clock::now() + max_wait;
+            int shown = -1;
+            for (;;) {
+                if (q.front() == me) {
+                    std::atomic<int>* free = slots ? slots() : nullptr;
+                    if (!free) {
+                        if (mu.try_lock()) { hold.m = &mu; hold.shared = false; q.pop_front(); cv.notify_all(); return true; }
+                    } else if (mu.try_lock_shared()) {
+                        int f = free->load();
+                        while (f > 0 && !free->compare_exchange_weak(f, f - 1)) {}
+                        if (f > 0) { hold.m = &mu; hold.shared = true; hold.free = free; q.pop_front(); cv.notify_all(); return true; }
+                        mu.unlock_shared();
+                    }
+                }
+                const int ahead = (int)(std::find(q.begin(), q.end(), me) - q.begin());
+                if (on_wait && ahead != shown) { shown = ahead; l.unlock(); on_wait(ahead); l.lock(); }
+                if ((gone && gone()) || std::chrono::steady_clock::now() > until) {
+                    q.erase(std::find(q.begin(), q.end(), me));
+                    cv.notify_all();
+                    return false;
+                }
+                cv.wait_for(l, std::chrono::milliseconds(20));
+            }
+        }
     } line;
+    auto reply_slots = [&]() -> std::atomic<int>* { return eng.slots.empty() ? nullptr : &eng.free_slots; };
     std::atomic<bool> loading{false};    // a model is being loaded (for the page's progress bar)
     std::atomic<float> load_progress{0.0f};
 
@@ -888,8 +1217,11 @@ int main(int argc, char** argv) {
         json info = describe_model(path);
         if (!info.value("supported", false)) throw std::runtime_error(info.value("reason", std::string("unsupported model")));
         eng.save_usage(true);            // what the previous model learned
+        eng.batch.finish();              // no replies run during a load (it holds the lock), so nothing is waiting
+        eng.slots.clear(); eng.free_slots = 0;
         eng.spec.reset();
         eng.look.reset();
+        eng.vision.reset(); eng.vision_file.clear();
         eng.model.reset();               // free the old model (and its GPU memory) first
         eng.cached.clear();
         eng.saved.clear();
@@ -914,11 +1246,37 @@ int main(int argc, char** argv) {
         loading = true;
         struct Done { std::atomic<bool>& b; ~Done() { b = false; } } done{loading};
         eng.model = Model::load(path, o);
+        eng.ctx_per = eng.model->max_ctx();
+        if (o.parallel > 1) {            // several connections: each gets its share of the cache
+            eng.slots.resize(o.parallel);
+            eng.free_slots = o.parallel;
+            eng.ctx_per = eng.model->max_ctx() / o.parallel;
+            eng.batch.start(eng.model.get(), &eng.threads);
+            std::fprintf(stderr, "connections: %d at once, %d tokens of context each\n", o.parallel, eng.ctx_per);
+        }
         // Each guess an MoE model checks pulls in its own experts, so shorter guesses pay off there
         // (Qwen3.6-35B-A3B, RTX 3070 laptop: 35 tok/s with 1 or 2, 28 with 3); dense models do best with 3.
         if (eng.draft_max <= 0) eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
         if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max);
         eng.spec_changed();
+        // Its eyes: an mmproj (vision) file in the same folder, for models that read images (Qwen3.5 / 3.6).
+        if (eng.model->has_positions3()) {
+            const fs::path vf = vision_file_for(path, eng.model->hparams().n_embd);
+            if (!vf.empty()) {
+                try {
+                    // with the chat model's own GPU (on it, or helping), never another chip
+                    const auto& gp = eng.model->placement().gpus;
+                    const std::string where = opt.device == "cpu" || !eng.model->on_gpu() ? "cpu"
+                                            : gp.empty() ? std::string("auto") : "auto:" + gp[0].name;
+                    eng.vision = Vision::load(vf.u8string(), where);
+                    eng.vision_file = vf.filename().u8string();
+                    std::fprintf(stderr, "vision: %s on %s (%.0f MB)\n", eng.vision_file.c_str(), eng.vision->device_name().c_str(),
+                                 eng.vision->weight_bytes() / 1048576.0);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "vision: %s could not be loaded: %s\n", vf.filename().u8string().c_str(), e.what());
+                }
+            }
+        }
         eng.chat = detect_chat(eng.tok);
         eng.tool_fmt = agent::detect_tool_fmt(eng.tok.chat_template());
         eng.identity = harmony::identity_of(eng.tok.chat_template());
@@ -928,9 +1286,17 @@ int main(int argc, char** argv) {
         eng.seed = seed;
         if (seed >= 0) eng.rng.seed((uint32_t)seed);
         eng.load_s = since(t0);
-        std::fprintf(stderr, "loaded %s (%s, %s chat format) on %s in %.1fs\n", path.c_str(), eng.model->arch().c_str(),
-                     chat_fmt_name(eng.chat), eng.model->device_name().c_str(), eng.load_s);
         const Placement& pl = eng.model->placement();
+        std::string where;                      // how much is in RAM: it decides the speed, and it can change with the context
+        if (pl.all_on_gpu()) where = ", all on the GPU";
+        else if (eng.model->on_gpu() && pl.cpu_weights > 0) {
+            char b[160];
+            std::snprintf(b, sizeof b, ", %.1f GB in RAM (%d of %d layers' attention and %d of %d %s in VRAM)", pl.cpu_weights / 1e9,
+                          pl.attn_gpu, pl.layers, pl.ffn_gpu, pl.layers, eng.model->hparams().is_moe() ? "layers' experts" : "feed-forwards");
+            where = b;
+        }
+        std::fprintf(stderr, "loaded %s (%s, %s chat format) on %s%s in %.1fs\n", path.c_str(), eng.model->arch().c_str(),
+                     chat_fmt_name(eng.chat), eng.model->device_name().c_str(), where.c_str(), eng.load_s);
         if (pl.hot_experts > 0) {
             int split = 0; for (size_t l = 0; l < pl.hot.size(); ++l) split += !pl.hot[l].empty() && !pl.ffn_vram[l];
             // How much of the past expert work the VRAM experts would have done: what the CPU is spared.
@@ -961,6 +1327,9 @@ int main(int argc, char** argv) {
         o.mtp = body.value("speculative", false);      // load the MTP draft block for speculative decoding
         o.multi_gpu = body.value("multi_gpu", true);
         o.live_hot = body.value("live_experts", false);  // VRAM experts follow the conversation (see LoadOptions::live_hot)
+        // Connections: replies written at once. The context length is per connection, so the cache holds that many.
+        o.parallel = std::max(1, std::min(64, body.value("connections", 1)));
+        if (o.parallel > 1 && o.max_ctx > 0) o.max_ctx *= o.parallel;
         return o;
     };
     if (!a.model.empty()) {
@@ -995,8 +1364,12 @@ int main(int argc, char** argv) {
     json last_info = {{"loaded", false}, {"version", TIERLM_VERSION}};
     svr.Get("/api/info", [&](const httplib::Request&, httplib::Response& res) {
         // While a reply is streaming or a model is loading, answer from the last snapshot instead of waiting.
-        std::unique_lock<std::timed_mutex> lk(mu, std::try_to_lock);
-        if (!lk.owns_lock()) { json j = last_info; j["busy"] = true; j["waiting"] = line.waiting(); res.set_content(dump(j), "application/json"); return; }
+        std::unique_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
+        if (!lk.owns_lock()) {
+            json j = last_info; j["busy"] = true; j["waiting"] = line.waiting();
+            if (!eng.slots.empty()) j["active"] = (int)eng.slots.size() - eng.free_slots.load();   // replies running now
+            res.set_content(dump(j), "application/json"); return;
+        }
         if (!eng.model) { last_info = {{"loaded", false}, {"version", TIERLM_VERSION}}; res.set_content(dump(last_info), "application/json"); return; }
         const auto& hp = eng.model->hparams();
         size_t free = 0, total = 0;
@@ -1006,7 +1379,8 @@ int main(int argc, char** argv) {
             {"name", eng.name.empty() ? fs::u8path(eng.path).stem().u8string() : eng.name}, {"arch", eng.model->arch()},
             {"chat_format", chat_fmt_name(eng.chat)}, {"moe", hp.is_moe()},
             {"layers", hp.n_layer}, {"experts", hp.n_expert}, {"experts_used", hp.n_expert_used},
-            {"vocab", hp.n_vocab}, {"ctx", eng.model->max_ctx()}, {"n_past", eng.model->n_past()},
+            {"vocab", hp.n_vocab}, {"ctx", eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per}, {"n_past", eng.model->n_past()},
+            {"connections", std::max<int>(1, (int)eng.slots.size())},
             {"device", eng.model->device_name()}, {"on_gpu", eng.model->on_gpu()}, {"threads", eng.threads},
             {"device_type", eng.model->integrated_gpu() ? "igpu" : eng.model->on_gpu() ? "gpu" : "cpu"},
             {"weights_bytes", eng.model->weights_bytes()}, {"kv_bytes", eng.model->kv_bytes()},
@@ -1014,11 +1388,13 @@ int main(int argc, char** argv) {
             {"kv_type", eng.model->kv_type()}, {"flash_attn", eng.model->flash_attn()}, {"load_s", eng.load_s},
             {"batch", eng.model->batch()}, {"experts_default", eng.model->experts_default()}, {"seed", eng.seed},
             {"vram_weights", eng.model->placement().gpu_weights}, {"ram_weights", eng.model->placement().cpu_weights},
-            {"kv_on_gpu", eng.model->placement().kv_on_gpu}, {"attn_gpu", eng.model->placement().attn_gpu},
+            {"kv_on_gpu", eng.model->placement().kv_on_gpu}, {"all_on_gpu", eng.model->placement().all_on_gpu()}, {"attn_gpu", eng.model->placement().attn_gpu},
             {"ffn_gpu", eng.model->placement().ffn_gpu}, {"kv_gpu_layers", eng.model->placement().kv_gpu_layers},
             {"split_mode", eng.model->placement().mode},
             {"gpus", [&] { json g = json::array(); for (const auto& x : eng.model->placement().gpus)
                                g.push_back({{"name", x.name}, {"weights", x.weights}, {"kv", x.kv}, {"layers", x.layers}}); return g; }()},
+            {"vision", eng.vision != nullptr}, {"vision_file", eng.vision_file},
+            {"vision_device", eng.vision ? eng.vision->device_name() : std::string()}, {"image_tokens", eng.image_tokens_for(0)},
             {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}, {"lookup_setting", eng.lookup}, {"has_draft_block", hp.n_nextn > 0},
             {"mtp_loaded", eng.model->has_mtp()}, {"ffn_vram", eng.model->placement().ffn_vram},
             {"hot_experts", eng.model->placement().hot_experts}, {"hot_share", eng.hot_share}, {"hot", eng.model->placement().hot},
@@ -1151,7 +1527,7 @@ int main(int argc, char** argv) {
     svr.Post("/api/folder", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded()) { res.status = 400; res.set_content(dump({{"error", "bad request"}}), "application/json"); return; }
-        std::lock_guard<std::timed_mutex> lk(mu);
+        std::lock_guard<std::shared_timed_mutex> lk(mu);
         if (body.contains("recursive")) recursive = body.value("recursive", true);
         if (body.contains("folder")) {
             std::string f = body.value("folder", std::string());
@@ -1229,7 +1605,7 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"busy: waited too long for earlier replies to finish\"}", "application/json");
             return;
         }
-        std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
+        std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
         const auto file = model_file(body.value("model", std::string()));
         if (file.empty()) {
             res.status = 400;
@@ -1253,6 +1629,7 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             eng.spec.reset();
             eng.look.reset();
+            eng.vision.reset();
             eng.model.reset();
             eng.path.clear();
             res.status = 500;
@@ -1261,10 +1638,13 @@ int main(int argc, char** argv) {
     });
 
     svr.Post("/api/unload", [&](const httplib::Request&, httplib::Response& res) {
-        std::lock_guard<std::timed_mutex> lk(mu);
+        std::lock_guard<std::shared_timed_mutex> lk(mu);
         eng.save_usage(true);
+        eng.batch.finish();
+        eng.slots.clear(); eng.free_slots = 0;
         eng.spec.reset();
         eng.look.reset();
+        eng.vision.reset(); eng.vision_file.clear();
         eng.model.reset();
         eng.cached.clear();
         eng.path.clear();
@@ -1272,7 +1652,7 @@ int main(int argc, char** argv) {
     });
 
     svr.Post("/api/reset", [&](const httplib::Request&, httplib::Response& res) {
-        std::lock_guard<std::timed_mutex> lk(mu);
+        std::lock_guard<std::shared_timed_mutex> lk(mu);
         eng.save_current();                                      // a new chat: the old one may be opened again
         if (eng.model) eng.model->reset();
         eng.cached.clear();
@@ -1291,6 +1671,9 @@ int main(int argc, char** argv) {
     };
     // With `tools`, the model is told about them, and a tool call it writes is kept out of the streamed text (it is
     // in `full`, the whole reply as the model wrote it, for agent::parse_tool_calls).
+    // The cache length of the reply being written on this thread (several connections: each has its own).
+    static thread_local int tl_past = 0;
+    static thread_local int tl_image_tokens = 0;      // this request's image detail (0: automatic)
     auto generate = [&](const json& messages, const Sampling& sp, int max_tokens, const std::vector<std::string>& stops_in,
                         const std::function<void(const json&)>& on_prompt,
                         const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token,
@@ -1303,14 +1686,68 @@ int main(int argc, char** argv) {
         std::vector<std::string> stops = stops_in;
         if (use_tools && !harm) stops.push_back("<tool_response>");     // the model must not write the tool's answer itself
         if (max_tokens <= 0) max_tokens = INT_MAX;    // no limit: until the model finishes or the context is full
-        if (eng.seed >= 0) eng.rng.seed((uint32_t)eng.seed);    // same seed, same reply
-        auto& model = eng.model; auto& tok = eng.tok; auto& cached = eng.cached;
+        auto& model = eng.model; auto& tok = eng.tok;
         const auto& hp = model->hparams();
         const int L = hp.n_layer, E = hp.n_expert, K = hp.n_expert_used;
 
-        std::vector<int32_t> toks = tok.encode(harm ? harmony::prompt(messages, tools, eng.identity)
-                                                    : format_chat(with_tools(messages, tools, eng.tool_fmt), eng.chat, tok), true);
-        if ((int)toks.size() + 1 >= model->max_ctx()) throw std::runtime_error("conversation is longer than the context window; start a new chat");
+        json msgs = messages;
+        const std::vector<std::string> pics = take_pictures(msgs);
+        if (!pics.empty() && harm) throw std::runtime_error("this model can't read images");
+        std::vector<int32_t> toks = tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity)
+                                                    : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok), true);
+        if (!pics.empty()) {                                      // each image's <|image_pad|> becomes its words
+            const int32_t pad = tok.find("<|image_pad|>");
+            std::vector<int32_t> with;
+            size_t k = 0;
+            for (int32_t t : toks) {
+                if (t != pad || pad < 0) { with.push_back(t); continue; }
+                if (k >= pics.size()) throw std::runtime_error("the conversation has more image places than images");
+                const Engine::Pic p = eng.image(pics[k++], eng.threads, tl_image_tokens);
+                for (int i = 0; i < p.n; ++i) with.push_back(p.first + i);
+            }
+            if (k != pics.size()) throw std::runtime_error("this model's chat format has no place for images");
+            toks.swap(with);
+        }
+        const bool has_pics = !pics.empty() || std::any_of(toks.begin(), toks.end(), Model::is_image_id);
+        // Several connections: this reply gets a slot (a conversation of the model), the free one whose cache
+        // already holds the longest start of this conversation. Its steps go through the batcher.
+        const bool par = !eng.slots.empty();
+        int seq = -1;
+        struct SlotGuard {
+            Engine& e; int s;
+            ~SlotGuard() {
+                if (s < 0) return;
+                { std::lock_guard<std::mutex> lk(e.batch.m); --e.batch.active; }
+                e.batch.cv.notify_all();
+                { std::lock_guard<std::mutex> lk(e.slots_mu); e.slots[s].busy = false; }
+            }
+        } slot_guard{eng, -1};
+        if (par) {
+            std::lock_guard<std::mutex> lk(eng.slots_mu);
+            size_t best_n = 0;
+            for (int s = 0; s < (int)eng.slots.size(); ++s) {
+                if (eng.slots[s].busy) continue;
+                const auto& c = eng.slots[s].cached;
+                size_t n = 0;
+                while (n < c.size() && n < toks.size() && c[n] == toks[n]) ++n;
+                if (hp.hybrid && n < c.size()) n = 0;                    // (hybrid models can't rewind)
+                if (seq < 0 || n > best_n) { seq = s; best_n = n; }
+            }
+            if (seq < 0) throw std::runtime_error("no free connection");   // (the queue lets a reply in only when one is free)
+            eng.slots[seq].busy = true;
+            slot_guard.s = seq;
+            std::lock_guard<std::mutex> lb(eng.batch.m);
+            ++eng.batch.active;
+        }
+        auto& cached = par ? eng.slots[seq].cached : eng.cached;
+        auto& rng = par ? eng.slots[seq].rng : eng.rng;
+        if (eng.seed >= 0) rng.seed((uint32_t)eng.seed);    // same seed, same reply
+        const int ctx_lim = par ? eng.ctx_per : model->max_ctx();
+        auto npast = [&] { return par ? model->seq_past(seq) : model->n_past(); };
+        auto evalm = [&](const std::vector<int32_t>& ids, std::vector<int32_t>* rt) {
+            return par ? eng.batch.eval(seq, ids, rt) : model->eval(ids, eng.threads, rt);
+        };
+        if ((int)toks.size() + 1 >= ctx_lim) throw std::runtime_error("conversation is longer than the context window; start a new chat");
 
         // Reuse whatever part of the KV cache still matches this conversation.
         auto prefix = [&](const std::vector<int32_t>& a) {
@@ -1319,7 +1756,7 @@ int main(int argc, char** argv) {
             return n;
         };
         size_t common = prefix(cached);
-        {
+        if (!par) {
             // A saved conversation that this request continues further than the cache does: swap it in (saving the
             // cache's own conversation first). Hybrid models can't rewind, so for them it must continue all of it.
             auto best = eng.saved.end();
@@ -1345,16 +1782,17 @@ int main(int argc, char** argv) {
             }
         }
         if (common == toks.size()) common = toks.size() - 1;      // must evaluate at least one token
-        model->truncate((int)common);
-        common = (size_t)model->n_past();     // hybrid models start over rather than rewind
+        if (par) model->seq_truncate(seq, (int)common); else model->truncate((int)common);
+        common = (size_t)npast();             // hybrid models start over rather than rewind
         cached.resize(common);
 
         std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;
         auto p0 = Clock::now();
         std::vector<float> lg;
-        Speculator* const spx = eng.active_spec();
+        // (speculation: one conversation only, and not with images: the draft block reads text only)
+        Speculator* const spx = par || has_pics ? nullptr : eng.active_spec();
         if (spx) { lg = spx->prompt(toks, eng.threads, &routing); spx->reset_stats(); }   // also feeds the draft block
-        else lg = model->eval(suffix, eng.threads, &routing);
+        else lg = evalm(suffix, &routing);
         r.prompt_s = since(p0);
         std::fprintf(stderr, "chat: %zu prompt tokens, %zu reused from the cache, %zu read at %.0f tok/s\n", toks.size(), (size_t)common,
                      toks.size() - common, (toks.size() - common) / std::max(r.prompt_s, 1e-9));
@@ -1367,7 +1805,7 @@ int main(int argc, char** argv) {
         eng.add_usage(routing, K);
         if (on_prompt)
             on_prompt({{"n_prompt", toks.size()}, {"n_new", suffix.size()}, {"reused", common}, {"prompt_s", r.prompt_s},
-                       {"prompt_tps", suffix.size() / std::max(r.prompt_s, 1e-9)}, {"counts", counts}, {"n_past", model->n_past()}});
+                       {"prompt_tps", suffix.size() / std::max(r.prompt_s, 1e-9)}, {"counts", counts}, {"n_past", npast()}});
 
         std::vector<int32_t> out;
         size_t shown = 0;
@@ -1377,6 +1815,7 @@ int main(int argc, char** argv) {
             const std::string delta = visible.substr(shown, upto - shown);
             shown = upto;
             r.text += delta;
+            tl_past = npast();
             return on_token ? on_token(delta, out.size() / std::max(since(g0), 1e-9), routing) : true;
         };
         std::string visible, raw;                                 // raw: the reply as the model wrote it (harmony: before display)
@@ -1432,10 +1871,10 @@ int main(int argc, char** argv) {
         if (!spx) {
             for (;;) {
                 if ((int)out.size() >= max_tokens) { r.stop = "length"; break; }
-                const int32_t id = sample(lg.data(), lg.size(), sp, recent_with({}), eng.rng);
+                const int32_t id = sample(lg.data(), lg.size(), sp, recent_with({}), rng);
                 if (is_end(id)) { r.stop = "end"; break; }
-                if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
-                lg = model->eval({id}, eng.threads, &routing);            // also tells us which experts it used
+                if (npast() + 1 >= ctx_lim) { r.stop = "context"; break; }
+                lg = evalm({id}, &routing);                               // also tells us which experts it used
                 eng.add_usage(routing, K);
                 cached.push_back(id);
                 if (!add(id)) break;
@@ -1453,7 +1892,7 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> extra;
                 if (cur >= 0) extra.push_back(cur);
                 extra.insert(extra.end(), acc.begin(), acc.end());
-                return sample(row, (size_t)hp.n_vocab, sp, recent_with(extra), eng.rng);
+                return sample(row, (size_t)hp.n_vocab, sp, recent_with(extra), rng);
             };
             int32_t x = pick(lg.data(), {});
             for (;;) {
@@ -1496,6 +1935,46 @@ int main(int argc, char** argv) {
         return r;
     };
 
+    // ---- long conversations: fitting the context, the archive and looking back at it ----
+    // Saved chats live in a "chats" folder next to the settings file (see chats.h).
+    const fs::path chats_dir = [&] { std::error_code ec; return fs::absolute(fs::u8path(a.settings), ec).parent_path() / "chats"; }();
+    // Set once the embedding slot exists (further down): text -> unit vector, or empty when no embedding model is loaded.
+    std::function<std::vector<float>(const std::string&, bool)> embed_for_recall;
+    // How many tokens a conversation's prompt is, exactly as generate() will build it.
+    auto prompt_tokens = [&](const json& messages, const agent::ojson& tools) {
+        const bool harm = eng.chat == ChatFmt::Harmony;
+        json msgs = messages;
+        std::vector<std::string> pics;
+        try { pics = take_pictures(msgs); } catch (...) {}
+        int n = (int)eng.tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity)
+                                         : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, eng.tok), true).size();
+        for (const std::string& b : pics) {                        // each image: its words instead of one pad token
+            int w = 0, h = 0;
+            if (eng.vision && image_size((const uint8_t*)b.data(), b.size(), &w, &h)) n += eng.vision->tokens_for(w, h, eng.image_tokens_for(tl_image_tokens)) - 1;
+        }
+        return n;
+    };
+    // Drops the oldest messages (never the system message or the last one) until the prompt is at most `budget`
+    // tokens, and so that what's left starts with a message from the user. Returns how many were dropped.
+    auto drop_oldest = [&](json& messages, const agent::ojson& tools, int budget) {
+        const size_t first = !messages.empty() && messages[0].value("role", std::string()) == "system" ? 1 : 0;
+        if (messages.size() <= first + 1 || prompt_tokens(messages, tools) <= budget) return 0;
+        auto without = [&](size_t k) {                          // the first k messages after the system one left out
+            json m = json::array();
+            for (size_t i = 0; i < messages.size(); ++i) if (i < first || i >= first + k) m.push_back(messages[i]);
+            return m;
+        };
+        size_t lo = 1, hi = messages.size() - first - 1;        // binary search for the fewest that's enough
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            if (prompt_tokens(without(mid), tools) <= budget) hi = mid; else lo = mid + 1;
+        }
+        size_t k = lo;
+        while (first + k < messages.size() - 1 && messages[first + k].value("role", std::string()) != "user") ++k;
+        messages = without(k);
+        return (int)k;
+    };
+
     svr.Post("/api/chat", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array()) {
@@ -1503,20 +1982,20 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"expected {\\\"messages\\\": [...]}\"}", "application/json");
             return;
         }
-        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>();   // held until the stream ends
+        auto lock = std::make_shared<Hold>();                              // held until the stream ends
         res.set_header("Cache-Control", "no-cache");
+        const bool local = is_local(req);                                   // saved chats are read only for this computer
 
-        res.set_chunked_content_provider("text/event-stream", [&, body, lock](size_t, httplib::DataSink& sink) {
+        res.set_chunked_content_provider("text/event-stream", [&, body, lock, local](size_t, httplib::DataSink& sink) {
             auto send = [&](const json& j) { std::string s = "data: " + dump(j) + "\n\n"; return sink.write(s.data(), s.size()); };
             // Wait in line, telling the page how many requests are ahead ("queue" events), so it can say so.
             bool gone = false;
-            if (!line.enter(mu, [&] { return gone || !sink.is_writable(); },
-                            [&](int ahead) { if (!send({{"type", "queue"}, {"ahead", ahead}})) gone = true; })) {
+            if (!line.enter_reply(mu, *lock, reply_slots, [&] { return gone || !sink.is_writable(); },
+                                  [&](int ahead) { if (!send({{"type", "queue"}, {"ahead", ahead}})) gone = true; })) {
                 if (!gone) send({{"type", "error"}, {"message", "waited too long for earlier replies to finish"}});
                 sink.done();
                 return true;
             }
-            *lock = std::unique_lock<std::timed_mutex>(mu, std::adopt_lock);
             if (!eng.model) {
                 send({{"type", "error"}, {"message", "no model loaded: choose one on the setup screen"}});
                 sink.done();
@@ -1533,6 +2012,7 @@ int main(int argc, char** argv) {
                 // Longest reply in tokens; 0 or less (the default) means no limit: the reply ends when the model
                 // finishes or the context window is full. Thinking models (Qwen3.x) need thousands of tokens.
                 const int max_tokens = body.value("max_tokens", -1);
+                tl_image_tokens = body.value("image_tokens", 0);      // image detail (0: automatic)
                 const int L = eng.model->hparams().n_layer, K = eng.model->hparams().n_expert_used;
                 // The workspace (tierlm's own page): the model gets the folder's tools and is told about them. The
                 // tools only describe; running them is /api/workspace/tool, which only this computer's page can use.
@@ -1546,6 +2026,59 @@ int main(int argc, char** argv) {
                         messages[0]["content"] = messages[0].value("content", std::string()) + "\n\n" + note;
                     else messages.insert(messages.begin(), json{{"role", "system"}, {"content", note}});
                 }
+                // A saved chat with an archive: its summary goes in the system message (it rarely changes, so the
+                // cache keeps it), and the archived passages that best match the new message go just before it.
+                const std::string chat_id = local ? body.value("chat_id", std::string()) : std::string();
+                if (!chat_id.empty() && !messages.empty() && messages.back().value("role", std::string()) == "user" &&
+                    messages.back()["content"].is_string()) {
+                    json c;
+                    try { c = chats::load(chats_dir, chat_id); } catch (...) {}
+                    if (c.is_object()) {
+                        const std::string summary = c.value("summary", std::string());
+                        bool any_archived = false;
+                        for (const auto& m : c.value("messages", json::array())) if (m.value("archived", false)) { any_archived = true; break; }
+                        if (any_archived) {
+                            const std::string note = "Earlier parts of this conversation were archived to save memory: you no longer see them, "
+                                "but relevant passages from them are shown to you with a new message when there are any." +
+                                (summary.empty() ? std::string() : "\n\nSummary of the archived part: " + summary);
+                            if (messages[0].value("role", std::string()) == "system")
+                                messages[0]["content"] = messages[0].value("content", std::string()) + "\n\n" + note;
+                            else messages.insert(messages.begin(), json{{"role", "system"}, {"content", note}});
+                            const std::string q = messages.back()["content"].get<std::string>();
+                            std::vector<chats::Passage> ps;
+                            try { ps = chats::recall(c, q, 6000, 4, embed_for_recall); } catch (...) {}
+                            if (!ps.empty()) {
+                                std::string ctxt = "[From the archived part of this conversation, possibly relevant:]\n";
+                                json items = json::array();
+                                for (const auto& p : ps) {
+                                    const std::string who = p.role == "user" ? "the user" : p.role == "assistant" ? "you" : "a tool";
+                                    ctxt += "\n--- earlier, from " + who + (p.time ? " at " + chats::local_time(p.time, "%Y-%m-%d %H:%M") : "") + ":\n" + p.text + "\n";
+                                    items.push_back({{"msg", p.msg}, {"role", p.role}, {"time", p.time}, {"text", p.text.substr(0, 300)}});
+                                }
+                                ctxt += "\n[End of the archived passages. The new message:]\n\n";
+                                messages.back()["content"] = ctxt + messages.back()["content"].get<std::string>();
+                                send({{"type", "recall"}, {"items", items}});
+                            }
+                        }
+                    }
+                }
+                // Too long for the context: with "overflow": "archive", the oldest messages are left out (down to
+                // about 60% of the context, so it isn't needed again at once, which would re-read the prompt every
+                // time) and the page is told how many, to archive them; otherwise the page offers what to do.
+                {
+                    const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
+                    const int reserve = max_tokens > 0 ? std::min(max_tokens, ctx / 2) : std::max(256, ctx / 8);
+                    const int need = prompt_tokens(messages, tools);
+                    if (body.value("overflow", std::string()) == "archive" && need > ctx - reserve) {
+                        const int n = drop_oldest(messages, tools, std::min(ctx * 6 / 10, ctx - reserve));
+                        if (n > 0) send({{"type", "archived"}, {"count", n}});
+                    } else if (need + 1 >= ctx) {
+                        send({{"type", "error"}, {"code", "context_full"}, {"tokens", need}, {"ctx", ctx},
+                              {"message", "the conversation is longer than the context window"}});
+                        sink.done();
+                        return true;
+                    }
+                }
                 Gen g = generate(messages, sp, max_tokens, {},
                     [&](const json& p) { json j = p; j["type"] = "prompt"; send(j); },
                     [&](const std::string& delta, double tps, const std::vector<int32_t>& routing) {
@@ -1553,10 +2086,10 @@ int main(int argc, char** argv) {
                         if (K > 0 && routing.size() >= (size_t)L * K)
                             for (int l = 0; l < L; ++l)
                                 picks.push_back(std::vector<int32_t>(routing.begin() + (size_t)l * K, routing.begin() + (size_t)(l + 1) * K));
-                        return send({{"type", "token"}, {"text", delta}, {"tps", tps}, {"n_past", eng.model->n_past()}, {"routing", picks}});
+                        return send({{"type", "token"}, {"text", delta}, {"tps", tps}, {"n_past", tl_past}, {"routing", picks}});
                     }, tools);
                 json done = {{"type", "done"}, {"n_gen", g.n_gen}, {"gen_s", g.gen_s},
-                             {"gen_tps", g.n_gen / std::max(g.gen_s, 1e-9)}, {"stop", g.stop}, {"n_past", eng.model->n_past()}};
+                             {"gen_tps", g.n_gen / std::max(g.gen_s, 1e-9)}, {"stop", g.stop}, {"n_past", tl_past}};
                 if (!tools.empty()) {                          // the reply as written (the next request sends it back) and its calls
                     const agent::Parsed pc = parse_calls(g.full, tools);
                     done["raw"] = g.full;
@@ -1677,7 +2210,7 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
             return;
         }
-        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>(mu, std::adopt_lock);
+        auto lock = std::make_shared<std::unique_lock<std::shared_timed_mutex>>(mu, std::adopt_lock);
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream", [&, body, file, lock](size_t, httplib::DataSink& sink) {
             bool alive = true;
@@ -1695,6 +2228,10 @@ int main(int argc, char** argv) {
                 const int t0 = std::max(1, body.value("threads", a.threads));
                 const int seed = body.value("seed", -1);
                 LoadOptions base = load_options(body);
+                // Connections are measured last: everything before is measured for one reply at a time.
+                const int want_conn = base.parallel;
+                const double floor_tps = std::max(0.5, body.value("min_tps", 5.0));
+                if (want_conn > 1) { if (base.max_ctx > 0) base.max_ctx /= want_conn; base.parallel = 1; }
                 meas_sp = sampling_of(body);                 // measured with the chat's own sampling settings
                 base.mtp = has_mtp;                          // the draft layer stays loaded so guesses can be tried
 
@@ -1756,8 +2293,12 @@ int main(int argc, char** argv) {
                     eng.cached.clear();
                     eng.save_usage(true);
                 };
-                const char* mode_label[] = {"whole layers", "experts in RAM", "experts in RAM, busiest experts in VRAM",
-                                            "experts in RAM, VRAM experts following the conversation"};
+                // Each result is listed with every setting it was measured with (GPU and CPU both work in a split;
+                // "6 CPU threads" alone read as if the GPU weren't used).
+                const char* mode_label[] = {"GPU + RAM, split by whole layers", "GPU + RAM, experts in RAM",
+                                            "GPU + RAM, experts in RAM, busiest experts in VRAM",
+                                            "GPU + RAM, experts in RAM, VRAM experts following the conversation"};
+                std::string mode_text;                        // the split chosen so far, for the later rows
                 if (!status("Loading the model")) throw std::runtime_error("cancelled");
                 load_mode("layers");
                 const Placement& pl = eng.model->placement();
@@ -1806,8 +2347,9 @@ int main(int argc, char** argv) {
                         }
                         if (!status("Measuring " + label)) throw std::runtime_error("cancelled");
                         const double t = measure(n_gen, 0);
-                        if (!record("Split: " + label, {{"split_mode", m}}, t)) throw std::runtime_error("cancelled");
-                        if (t > best) { best = t; mode = m; }
+                        if (!record(label + ", " + std::to_string(eng.threads) + " CPU threads, no speculative decoding", {{"split_mode", m}}, t))
+                            throw std::runtime_error("cancelled");
+                        if (t > best) { best = t; mode = m; mode_text = label; }
                     }
                     if (loaded_mode != mode) {
                         if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
@@ -1817,8 +2359,8 @@ int main(int argc, char** argv) {
                 } else {
                     if (!status("Measuring")) throw std::runtime_error("cancelled");
                     best = measure(n_gen, 0);
-                    record(std::string(eng.model->on_gpu() ? "All in VRAM" : "CPU only") + (cpu_work ? ", " + std::to_string(t0) + " CPU threads" : ""),
-                           json::object(), best);
+                    mode_text = eng.model->on_gpu() ? "All on the GPU" : "CPU only";
+                    record(mode_text + (cpu_work ? ", " + std::to_string(t0) + " CPU threads" : "") + ", no speculative decoding", json::object(), best);
                     mode = "auto";
                 }
 
@@ -1833,7 +2375,7 @@ int main(int argc, char** argv) {
                         eng.threads = c;
                         if (!status("Measuring " + std::to_string(c) + " CPU threads")) throw std::runtime_error("cancelled");
                         const double t = measure(n_gen, 0);
-                        if (!record(std::to_string(c) + " CPU threads", {{"threads", c}}, t)) throw std::runtime_error("cancelled");
+                        if (!record(mode_text + ", " + std::to_string(c) + " CPU threads, no speculative decoding", {{"threads", c}}, t)) throw std::runtime_error("cancelled");
                         if (t > best * 1.02) { best = t; threads = c; }   // a clear win only: the default is a safe choice
                     }
                     eng.threads = threads;
@@ -1847,12 +2389,86 @@ int main(int argc, char** argv) {
                         if (!status("Measuring speculative decoding, " + std::to_string(d) + (d == 1 ? " guess" : " guesses") + " per check"))
                             throw std::runtime_error("cancelled");
                         const double t = measure(n_gen, d);
-                        if (!record("Speculative decoding, " + std::to_string(d) + (d == 1 ? " guess" : " guesses"), {{"draft_max", d}}, t))
+                        if (!record(mode_text + (cpu_work ? ", " + std::to_string(eng.threads) + " CPU threads" : "") + ", speculative decoding " +
+                                    std::to_string(d) + (d == 1 ? " guess" : " guesses"), {{"draft_max", d}}, t))
                             throw std::runtime_error("cancelled");
                         if (t > best) { best = t; draft = d; }
                     }
                     if (draft > 0 && best < plain * 1.03) draft = 0;    // not worth it for a sliver
                     if (draft == 0) best = plain;
+                }
+
+                // ---- 4. connections (asked for more than one): how fast each reply is with 1, 2, 4... at once ----
+                // The most at once that keeps every reply at or above the floor (5 tok/s unless set) is recommended
+                // and saved; the setup screen shows the numbers and the person can choose otherwise.
+                int conns = 1;
+                if (want_conn > 1) {
+                    if (!status("Loading for " + std::to_string(want_conn) + " connections")) throw std::runtime_error("cancelled");
+                    base.parallel = want_conn;
+                    if (base.max_ctx > 0) base.max_ctx *= want_conn;
+                    bool loaded_par = true;
+                    try { load_mode(mode); }
+                    catch (const std::exception& e) {          // (usually: not enough memory for that many contexts)
+                        record("Connections: " + std::to_string(want_conn) + " didn't fit (" + e.what() + ")", {{"connections", want_conn}}, 0);
+                        base.parallel = 1; if (base.max_ctx > 0) base.max_ctx /= want_conn;
+                        load_mode(mode);
+                        loaded_par = false;
+                    }
+                    if (loaded_par) {
+                        static const char* qs[] = {
+                            "Explain step by step how a refrigerator keeps food cold, for someone with no science background.",
+                            "Write a Python function that finds the longest palindrome in a string, with comments, then explain how it works.",
+                            "Describe the water cycle and why it matters for farming." };
+                        std::vector<int> ks;
+                        for (int k = 1; k < want_conn; k *= 2) ks.push_back(k);
+                        ks.push_back(want_conn);
+                        const int saved_seed = eng.seed;
+                        eng.seed = 4242;
+                        // More at once must also add speed in all (10% over the best with fewer), not just stay above
+                        // the floor: on a fast GPU, small batched steps can cost more than they share, and then one
+                        // at a time (the others waiting in line) serves everyone sooner.
+                        double best_total = 0;
+                        bool floor_ok_more = false;
+                        for (int k : ks) {
+                            if (!status("Measuring " + std::to_string(k) + (k == 1 ? " reply" : " replies at once"))) throw std::runtime_error("cancelled");
+                            // Measured twice, the better run kept: a run is only a second or two on a fast GPU, so
+                            // one hiccup (Windows, the browser, a late start) could make it read 25% low.
+                            double each = 0, total = 0;
+                            for (int rep = 0; rep < 2; ++rep) {
+                                for (int sq = 0; sq < (int)eng.slots.size(); ++sq) { eng.model->seq_reset(sq); eng.slots[sq].cached.clear(); }
+                                std::vector<Gen> gs(k);
+                                std::vector<std::thread> th;
+                                std::string err;
+                                std::mutex em;
+                                for (int i = 0; i < k; ++i)
+                                    th.emplace_back([&, i] {
+                                        try { gs[i] = generate(json::array({json{{"role", "user"}, {"content", qs[i % 3]}}}), meas_sp, std::max(32, n_gen / 2), {}, nullptr, nullptr); }
+                                        catch (const std::exception& e) { std::lock_guard<std::mutex> lk(em); err = e.what(); }
+                                    });
+                                for (auto& t : th) t.join();
+                                if (!err.empty()) throw std::runtime_error(err);
+                                double e1 = 1e9, t1 = 0;
+                                for (const Gen& g : gs) { const double t = g.n_gen / std::max(g.gen_s, 1e-9); e1 = std::min(e1, t); t1 += t; }
+                                if (t1 > total) { total = t1; each = e1; }
+                            }
+                            if (!record("Connections: " + std::to_string(k) + " at once, " + std::to_string((int)std::lround(total)) + " tok/s in all, slowest",
+                                        {{"connections", k}, {"total_tps", std::round(total * 10) / 10}}, each)) throw std::runtime_error("cancelled");
+                            if (each >= floor_tps && (k == 1 || total >= best_total * 1.10)) { conns = k; best_total = total; }
+                            else if (each >= floor_tps) floor_ok_more = true;
+                            if (k == 1) best_total = total;
+                        }
+                        if (floor_ok_more && conns < want_conn)
+                            record("Recommended: " + std::to_string(conns) + (conns == 1 ? " connection" : " connections") +
+                                   " (more at once didn't add speed on this PC), in all", json::object(), best_total);
+                        eng.seed = saved_seed;
+                        for (int sq = 0; sq < (int)eng.slots.size(); ++sq) { eng.model->seq_reset(sq); eng.slots[sq].cached.clear(); }
+                        if (conns != want_conn) {
+                            if (!status("Loading with " + std::to_string(conns) + (conns == 1 ? " connection" : " connections"))) throw std::runtime_error("cancelled");
+                            if (base.max_ctx > 0) base.max_ctx = base.max_ctx / want_conn * conns;
+                            base.parallel = conns;
+                            load_mode(mode);
+                        }
+                    }
                 }
 
                 // ---- the winner: keep it loaded and remember it ----
@@ -1876,11 +2492,13 @@ int main(int argc, char** argv) {
                 saved["speculative"] = draft > 0;
                 if (draft > 0) saved["draft_max"] = draft;
                 saved["settings_v"] = 2;
+                if (want_conn > 1) { saved["connections"] = conns; saved["min_tps"] = floor_tps; }
                 saved["tuned"] = {{"tps", std::round(best * 10) / 10}, {"results", results}};
                 settings["models"][id] = saved;
                 settings["last_model"] = id;
                 write_settings(a.settings, settings);
-                send({{"type", "done"}, {"tps", std::round(best * 10) / 10}, {"settings", saved}, {"results", results}});
+                send({{"type", "done"}, {"tps", std::round(best * 10) / 10}, {"settings", saved}, {"results", results},
+                      {"all_on_gpu", eng.model && eng.model->placement().all_on_gpu()}});
             } catch (const std::exception& e) {
                 send({{"type", "error"}, {"message", e.what()}});
             }
@@ -1897,7 +2515,7 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
             return;
         }
-        std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
+        std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
         if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
         try {
             std::fprintf(stderr, "benchmark: reading 512 tokens, then answering three questions like a chat\n");
@@ -1924,7 +2542,7 @@ int main(int argc, char** argv) {
         if (body.is_discarded()) { res.status = 400; res.set_content("{\"error\":\"bad request\"}", "application/json"); return; }
         // A quick change: waits in line behind a running reply instead of answering "busy".
         if (!line.enter(mu, req.is_connection_closed)) { res.status = 503; res.set_content("{\"error\":\"busy\"}", "application/json"); return; }
-        std::lock_guard<std::timed_mutex> lk(mu, std::adopt_lock);
+        std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
         if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
         // Prompt lookup alone changes nothing in the model's cache: no need to start over.
         if (body.contains("lookup") && body["lookup"].is_number_integer()) eng.lookup = std::max(-1, std::min(16, body["lookup"].get<int>()));
@@ -1954,7 +2572,7 @@ int main(int argc, char** argv) {
 
     // ---------------- Forget what was learned about the loaded model's experts ----------------
     svr.Post("/api/usage/reset", [&](const httplib::Request&, httplib::Response& res) {
-        std::lock_guard<std::timed_mutex> lk(mu);
+        std::lock_guard<std::shared_timed_mutex> lk(mu);
         std::fill(eng.usage.begin(), eng.usage.end(), 0.0f);
         std::error_code ec;
         if (!eng.usage_path.empty()) fs::remove(fs::u8path(eng.usage_path), ec);
@@ -1991,6 +2609,25 @@ int main(int argc, char** argv) {
         std::string id, path, name;
         double load_s = 0;
     } emb;
+    // For looking back at a chat's archive by meaning (chats::recall): one text to a unit vector with the embedding
+    // model, if one is loaded. Nomic's models are trained with "search_query: " / "search_document: " in front.
+    embed_for_recall = [&](const std::string& text, bool query) -> std::vector<float> {
+        std::lock_guard<std::mutex> lk(emb.mu);
+        if (!emb.enc) return {};
+        const bool nomic = emb.enc->arch() == "nomic-bert";
+        std::vector<int32_t> ids, body_ids = emb.tok.encode((nomic ? (query ? "search_query: " : "search_document: ") : "") + text);
+        const int room = emb.enc->max_tokens() - (emb.tok.cls() >= 0) - (emb.tok.sep() >= 0);
+        if ((int)body_ids.size() > room) body_ids.resize(std::max(0, room));
+        if (emb.tok.cls() >= 0) ids.push_back(emb.tok.cls());
+        ids.insert(ids.end(), body_ids.begin(), body_ids.end());
+        if (emb.tok.sep() >= 0) ids.push_back(emb.tok.sep());
+        std::vector<float> v = emb.enc->embed(ids, eng.threads);
+        double norm = 0;
+        for (float x : v) norm += (double)x * x;
+        norm = std::sqrt(norm);
+        if (norm > 0) for (float& x : v) x = (float)(x / norm);
+        return v;
+    };
     auto embed_info = [&]() -> json {        // (emb.mu held)
         if (!emb.enc) return {{"loaded", false}};
         return {{"loaded", true}, {"id", emb.id}, {"name", emb.name}, {"arch", emb.enc->arch()}, {"dims", emb.enc->n_embd()},
@@ -2001,7 +2638,10 @@ int main(int argc, char** argv) {
     auto embed_load = [&](const fs::path& file, const std::string& id) {      // (emb.mu held)
         const auto t0 = Clock::now();
         emb.enc.reset();
-        auto enc = Encoder::load(file.u8string(), "auto");
+        // next to the chat model on its own GPU when there's room, else the CPU (never another, slower chip)
+        std::string where = "auto";
+        if (eng.model && eng.model->on_gpu() && !eng.model->placement().gpus.empty()) where = "auto:" + eng.model->placement().gpus[0].name;
+        auto enc = Encoder::load(file.u8string(), where);
         emb.tok = Tokenizer::from_gguf(file.u8string());
         if (!emb.tok.wordpiece()) throw std::runtime_error("this embedding model's tokenizer is not supported yet");
         emb.enc = std::move(enc);
@@ -2029,11 +2669,16 @@ int main(int argc, char** argv) {
         json data = json::array();
         std::string cur;
         {
-            std::unique_lock<std::timed_mutex> lk(mu, std::try_to_lock);
+            std::unique_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
             cur = lk.owns_lock() ? loaded_id() : last_info.value("path", std::string());
             if (!lk.owns_lock() && !cur.empty()) cur = fs::u8path(cur).filename().u8string();
         }
-        if (!cur.empty()) data.push_back({{"id", cur}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}, {"type", "llm"}});
+        if (!cur.empty()) {
+            json m = {{"id", cur}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}, {"type", "llm"}};
+            std::shared_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
+            if (lk.owns_lock() && eng.vision) { m["type"] = "vlm"; m["capabilities"] = json::array({"vision"}); }   // (as LM Studio says it)
+            data.push_back(m);
+        }
         {
             std::lock_guard<std::mutex> lk(emb.mu);
             if (emb.enc) data.push_back({{"id", emb.id}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}, {"type", "embeddings"}});
@@ -2051,14 +2696,24 @@ int main(int argc, char** argv) {
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array())
             return oai_error(res, 400, "expected a JSON body with a \"messages\" array");
         if (body.value("n", 1) != 1) return oai_error(res, 400, "only n = 1 is supported");
-        // Wait in line for replies already asked for (from the web page or other apps) to finish: one at a time.
-        if (!line.enter(mu, req.is_connection_closed))
+        // Wait in line for replies already asked for (from the web page or other apps): one at a time, or as many
+        // at once as there are connections. Loading a different model needs the engine to itself.
+        const std::string want = body.value("model", std::string());
+        // (another model only if it is one in the models folder: many apps send a fixed name such as "gpt-4o")
+        const bool other_model = !want.empty() && want != loaded_id() && [&] {
+            std::error_code ec;
+            const auto base = fs::weakly_canonical(fs::u8path(a.models), ec);
+            const auto file = fs::weakly_canonical(fs::u8path(a.models) / fs::u8path(want), ec);
+            const auto rel = file.lexically_relative(base);
+            return !ec && !rel.empty() && rel.begin()->string() != ".." && fs::is_regular_file(file, ec) && file.extension() == ".gguf";
+        }();
+        auto lock = std::make_shared<Hold>();
+        if (!line.enter_reply(mu, *lock, other_model ? std::function<std::atomic<int>*()>() : std::function<std::atomic<int>*()>(reply_slots),
+                              req.is_connection_closed))
             return oai_error(res, 503, "busy: waited too long for earlier replies to finish");
-        auto lock = std::make_shared<std::unique_lock<std::timed_mutex>>(mu, std::adopt_lock);
         // The model asked for: the loaded one if the name matches it, or is unknown (many apps send a fixed
         // name such as "gpt-4o"); a different model in the models folder is loaded first, with its saved settings.
-        const std::string want = body.value("model", std::string());
-        if (!want.empty() && want != loaded_id()) {
+        if (other_model && want != loaded_id()) {
             std::error_code ec;
             const auto base = fs::weakly_canonical(fs::u8path(a.models), ec);
             const auto file = fs::weakly_canonical(fs::u8path(a.models) / fs::u8path(want), ec);
@@ -2073,7 +2728,7 @@ int main(int argc, char** argv) {
                     settings["last_model"] = rel.generic_u8string();
                     write_settings(a.settings, settings);
                 } catch (const std::exception& e) {
-                    eng.spec.reset(); eng.look.reset(); eng.model.reset(); eng.path.clear();
+                    eng.spec.reset(); eng.look.reset(); eng.vision.reset(); eng.model.reset(); eng.path.clear();
                     return oai_error(res, 500, std::string("could not load ") + want + ": " + e.what(), "server_error");
                 }
             }
@@ -2097,7 +2752,7 @@ int main(int argc, char** argv) {
             else if (body["stop"].is_array()) for (const auto& x : body["stop"]) if (x.is_string()) stops.push_back(x.get<std::string>());
         }
         if (body.contains("seed") && body["seed"].is_number_integer()) eng.rng.seed((uint32_t)body["seed"].get<long long>());
-        const json messages = normalize_messages(body["messages"]);
+        json messages = normalize_messages(body["messages"]);
         // Tools (coding agents such as opencode, Cline or Cursor): the model may answer with tool calls, which the
         // app runs and sends back as "tool" messages. tool_choice "none" leaves them out.
         agent::ojson tools = agent::ojson::array();                 // in the order the app wrote them
@@ -2126,8 +2781,21 @@ int main(int argc, char** argv) {
             return out;
         };
 
+        // Too long for the context: with "Drop the oldest messages" on (API panel, "api_trim_oldest"), the oldest
+        // messages are left out (down to about 60% of the context); otherwise the app gets an error and can compact
+        // the conversation itself, as coding agents do.
+        if (settings.value("api_trim_oldest", false) && eng.model) {
+            const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
+            const int reserve = max_tokens > 0 ? std::min(max_tokens, ctx / 2) : std::max(256, ctx / 8);
+            if (prompt_tokens(messages, tools) > ctx - reserve) {
+                const int n = drop_oldest(messages, tools, std::min(ctx * 6 / 10, ctx - reserve));
+                if (n > 0) std::fprintf(stderr, "api: left out the %d oldest messages to fit the context\n", n);
+            }
+        }
+
         if (!stream) {
             try {
+                tl_image_tokens = body.value("image_tokens", 0);   // image detail (0: automatic)
                 Gen g = generate(messages, sp, max_tokens, stops, nullptr, nullptr, tools);
                 json msg = {{"role", "assistant"}, {"content", g.text}};
                 std::string fin = finish(g.stop);
@@ -2169,6 +2837,7 @@ int main(int argc, char** argv) {
                     if (ok && !p.second.empty()) ok = chunk({{"content", p.second}}, nullptr);
                     return ok;
                 };
+                tl_image_tokens = body.value("image_tokens", 0);   // image detail (0: automatic)
                 Gen g = generate(messages, sp, max_tokens, stops, nullptr,
                                  [&](const std::string& delta, double, const std::vector<int32_t>&) {
                                      if (delta.empty()) return true;
@@ -2245,7 +2914,8 @@ int main(int argc, char** argv) {
         urls.push_back({{"label", "This computer"}, {"url", "http://127.0.0.1:" + std::to_string(a.port) + "/v1"}});
         if (!lan.empty()) urls.push_back({{"label", "Other devices on your network"}, {"url", "http://" + lan + ":" + std::to_string(a.port) + "/v1"}});
         json j = {{"allow_network", (bool)allow_network}, {"listening_on", bind_host()}, {"port", a.port}, {"lan_address", lan},
-                  {"api_key_set", !key.empty()}, {"urls", urls}, {"fixed_by_command_line", a.host_given || a.api_key_given}};
+                  {"api_key_set", !key.empty()}, {"urls", urls}, {"fixed_by_command_line", a.host_given || a.api_key_given},
+                  {"api_trim_oldest", settings.value("api_trim_oldest", false)}};
         if (show_key) j["api_key"] = key;
         return j;
     };
@@ -2260,6 +2930,7 @@ int main(int argc, char** argv) {
         if (body.is_discarded()) { oai_error(res, 400, "bad request"); return; }
         const std::string before = bind_host();
         if (body.contains("allow_network")) { allow_network = body.value("allow_network", false); settings["allow_network"] = (bool)allow_network; }
+        if (body.contains("api_trim_oldest")) settings["api_trim_oldest"] = body.value("api_trim_oldest", false);
         if (body.contains("api_key") && !a.api_key_given) {
             std::string k = body["api_key"].is_string() ? body["api_key"].get<std::string>() : std::string();
             if (k == "generate") k = random_key();
@@ -2363,11 +3034,93 @@ int main(int argc, char** argv) {
     // GET /api/embed: the loaded embedding model. POST /api/embed/load {"model": id}, POST /api/embed/unload.
     // The choice is saved, and the model loads again when tierlm starts.
     auto save_embed_choice = [&](const std::string& id) {
-        std::unique_lock<std::timed_mutex> lk(mu, std::defer_lock);
+        std::unique_lock<std::shared_timed_mutex> lk(mu, std::defer_lock);
         if (!lk.try_lock_for(std::chrono::seconds(10))) return;               // settings are written under mu
         if (id.empty()) settings.erase("embed_model"); else settings["embed_model"] = id;
         write_settings(a.settings, settings);
     };
+    // A workspace file as it is, for the page's preview: text, or an image. ?path=src/main.cpp
+    svr.Get("/api/workspace/file", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, false); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        const std::string folder = settings.value("workspace_folder", std::string()), rel = req.get_param_value("path");
+        try {
+            if (folder.empty()) throw workspace::Error("no workspace folder is chosen");
+            const fs::path p = workspace::inside(fs::u8path(folder), rel);
+            std::string ext = p.extension().u8string();
+            for (auto& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+            static const std::map<std::string, std::string> images = {{".png", "image/png"}, {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"},
+                {".gif", "image/gif"}, {".webp", "image/webp"}, {".bmp", "image/bmp"}, {".svg", "image/svg+xml"}};
+            if (auto it = images.find(ext); it != images.end()) {
+                std::error_code ec;
+                if (!fs::is_regular_file(p, ec) || fs::file_size(p, ec) > 32u * 1048576) throw workspace::Error(rel + " is missing or larger than 32 MB");
+                res.set_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'");   // (an SVG can hold scripts)
+                return res.set_content(workspace::slurp(p, 32u * 1048576), it->second);
+            }
+            res.set_content(workspace::read_text(p, rel), "text/plain; charset=utf-8");
+        } catch (const std::exception& e) { oai_error(res, 404, e.what()); }
+    });
+
+    // ---------------- saved chats, as files (tierlm's own page on this computer only) ----------------
+    // Same checks as the workspace: these are your conversations. From another device the page keeps its chats in
+    // that browser instead.
+    svr.Get("/api/chats", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, false); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        res.set_content(dump({{"folder", chats_dir.u8string()}, {"chats", chats::list(chats_dir)}}), "application/json");
+    });
+    svr.Get(R"(/api/chats/([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, false); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        try { res.set_content(dump(chats::load(chats_dir, req.matches[1])), "application/json"); }
+        catch (const std::exception& e) { oai_error(res, 404, e.what()); }
+    });
+    svr.Post(R"(/api/chats/([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        json c = json::parse(req.body, nullptr, false);
+        if (!c.is_object()) return oai_error(res, 400, "expected a chat object");
+        try {
+            // (links to workspace files: the chat's own folder, else the one chosen now)
+            const std::string wsf = c.is_object() && c.contains("workspace") && c["workspace"].is_string() ? c["workspace"].get<std::string>()
+                                                                                                            : settings.value("workspace_folder", std::string());
+            const fs::path f = chats::save(chats_dir, req.matches[1], c, wsf);
+            res.set_content(dump({{"ok", true}, {"folder", f.filename().u8string()}}), "application/json");
+        } catch (const std::exception& e) { oai_error(res, 500, e.what()); }
+    });
+    svr.Delete(R"(/api/chats/([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        try { chats::remove(chats_dir, req.matches[1]); res.set_content("{\"ok\":true}", "application/json"); }
+        catch (const std::exception& e) { oai_error(res, 500, e.what()); }
+    });
+    // An attached file, kept with the chat (so its link in chat.md works): {"name": "notes.txt", "text": "..."}.
+    svr.Post(R"(/api/chats/([A-Za-z0-9]+)/files)", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        json b = json::parse(req.body, nullptr, false);
+        if (!b.is_object() || !b.contains("name") || !b["text"].is_string()) return oai_error(res, 400, "expected {\"name\", \"text\"}");
+        try { chats::put_file(chats_dir, req.matches[1], b.value("name", std::string()), b["text"].get<std::string>()); res.set_content("{\"ok\":true}", "application/json"); }
+        catch (const std::exception& e) { oai_error(res, 500, e.what()); }
+    });
+    svr.Get(R"(/api/chats/([A-Za-z0-9]+)/files/(.+))", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, false); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        bool found = false;
+        const std::string data = chats::get_file(chats_dir, req.matches[1], std::string(req.matches[2]), found);
+        if (!found) return oai_error(res, 404, "no such file");
+        res.set_header("Content-Disposition", "inline");
+        res.set_content(data, "text/plain; charset=utf-8");
+    });
+    // Opens the chats folder (or one chat's folder) in Explorer, on this computer.
+    svr.Post("/api/chats-folder", [&](const httplib::Request& req, httplib::Response& res) {
+        if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
+        json b = json::parse(req.body.empty() ? "{}" : req.body, nullptr, false);
+        fs::path p = chats_dir;
+        if (b.is_object() && b.contains("id")) { const fs::path f = chats::folder_of(chats_dir, b.value("id", std::string())); if (!f.empty()) p = f; }
+        std::error_code ec;
+        fs::create_directories(p, ec);
+#ifdef _WIN32
+        ShellExecuteW(nullptr, L"open", p.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        res.set_content(dump({{"opened", true}, {"folder", p.u8string()}}), "application/json");
+#else
+        res.set_content(dump({{"opened", false}, {"folder", p.u8string()}}), "application/json");
+#endif
+    });
+
     svr.Get("/api/embed", [&](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lk(emb.mu);
         res.set_content(dump(embed_info()), "application/json");
@@ -2395,6 +3148,82 @@ int main(int argc, char** argv) {
         }
         save_embed_choice(id);
         res.set_content(dump(info), "application/json");
+    });
+    // One click for an embedding model: nomic-embed-text v1.5 (Apache 2.0, about 140 MB), downloaded from Nomic's own
+    // Hugging Face page into the models folder and checked (size and SHA-256, as Hugging Face states them), then
+    // the page loads it. POST starts it (this computer only); GET says how it's going.
+    static download::Status dl;
+    static std::mutex dl_mu;
+    static const char* kNomicUrl = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf";
+    static const char* kNomicFile = "nomic-embed-text-v1.5.Q8_0.gguf";
+    svr.Get("/api/embed/download", [&](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lk(dl_mu);
+        long long bytes = dl.bytes;
+        if (dl.state == "downloading") {
+            std::error_code ec;
+            const auto n = fs::file_size(fs::u8path(a.models) / (std::string(kNomicFile) + ".part"), ec);
+            if (!ec) bytes = (long long)n;
+        }
+        res.set_content(dump({{"state", dl.state}, {"bytes", bytes}, {"total", (long long)dl.total}, {"error", dl.error},
+                              {"file", dl.file}, {"size_hint", 146 * 1000 * 1000}}), "application/json");
+    });
+    svr.Post("/api/embed/download", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!is_local(req)) { res.status = 403; res.set_content(dump({{"error", "only the computer running tierlm can download models"}}), "application/json"); return; }
+        {
+            std::lock_guard<std::mutex> lk(dl_mu);
+            if (dl.running) { res.set_content(dump({{"state", dl.state}}), "application/json"); return; }
+            dl.running = true; dl.state = "downloading"; dl.error.clear(); dl.file.clear(); dl.bytes = 0; dl.total = 0;
+        }
+        const fs::path dir = fs::u8path(a.models);
+        const std::string url = std::getenv("TIERLM_NOMIC_URL") ? std::getenv("TIERLM_NOMIC_URL") : kNomicUrl;   // (tests)
+        std::thread([dir, url] {
+            auto fail = [](const std::string& why) {
+                std::lock_guard<std::mutex> lk(dl_mu);
+                dl.state = "error"; dl.error = why; dl.running = false;
+                std::fprintf(stderr, "download: %s\n", why.c_str());
+            };
+            std::error_code ec;
+            fs::create_directories(dir, ec);
+            const fs::path dest = dir / kNomicFile, part = dir / (std::string(kNomicFile) + ".part"), hdr = dir / (std::string(kNomicFile) + ".headers");
+            const std::string curl = download::curl_exe();
+            // 1. what the file should be: Hugging Face's first answer has its SHA-256 and size
+            if (download::run({curl, "-sS", "-I", "--max-time", "30", "-o", hdr.u8string(), url}) != 0) {
+                fs::remove(hdr, ec);
+                return fail("couldn't reach huggingface.co (is this PC online? curl is needed: Windows 10 and 11 have it)");
+            }
+            std::string headers;
+            { std::ifstream f(hdr, std::ios::binary); headers.assign(std::istreambuf_iterator<char>(f), {}); }
+            fs::remove(hdr, ec);
+            std::string sha = download::header(headers, "x-linked-etag");
+            const long long size = std::atoll(download::header(headers, "x-linked-size").c_str());
+            for (char& ch : sha) ch = (char)std::tolower((unsigned char)ch);
+            if (sha.size() != 64 || size <= 0) return fail("Hugging Face didn't say the file's checksum; try again later");
+            { std::lock_guard<std::mutex> lk(dl_mu); dl.total = size; }
+            // Already here and intact: nothing to download.
+            if (fs::exists(dest, ec) && (long long)fs::file_size(dest, ec) == size && download::sha256_file(dest) == sha) {
+                std::lock_guard<std::mutex> lk(dl_mu);
+                dl.state = "done"; dl.file = kNomicFile; dl.bytes = size; dl.running = false;
+                return;
+            }
+            // 2. the file, to a .part name
+            std::fprintf(stderr, "download: %s (%.0f MB)\n", url.c_str(), size / 1e6);
+            if (download::run({curl, "-sS", "-f", "-L", "--retry", "3", "-o", part.u8string(), url}) != 0) {
+                fs::remove(part, ec);
+                return fail("the download failed (connection lost?); try again");
+            }
+            // 3. checked, then given its name
+            { std::lock_guard<std::mutex> lk(dl_mu); dl.state = "checking"; dl.bytes = size; }
+            if ((long long)fs::file_size(part, ec) != size || download::sha256_file(part) != sha) {
+                fs::remove(part, ec);
+                return fail("the downloaded file didn't match Hugging Face's checksum, so it was deleted; try again");
+            }
+            fs::rename(part, dest, ec);
+            if (ec) { fs::remove(part, ec); return fail("couldn't save " + dest.u8string() + ": " + ec.message()); }
+            std::lock_guard<std::mutex> lk(dl_mu);
+            dl.state = "done"; dl.file = kNomicFile; dl.running = false;
+            std::fprintf(stderr, "download: %s saved and checked (SHA-256 %s)\n", dest.u8string().c_str(), sha.c_str());
+        }).detach();
+        res.set_content(dump({{"state", "downloading"}}), "application/json");
     });
     svr.Post("/api/embed/unload", [&](const httplib::Request&, httplib::Response& res) {
         { std::lock_guard<std::mutex> lk(emb.mu); emb.enc.reset(); emb.id.clear(); emb.path.clear(); emb.name.clear(); }

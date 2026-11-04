@@ -34,6 +34,8 @@ tierlm/
 │   ├── model_map     reads a GGUF header: every tensor's size, type, offset, layer, role
 │   ├── planner       splits experts into units, assigns VRAM / RAM / SSD within a budget (dry run)
 │   ├── tokenizer     byte-level BPE (GPT-2, Llama 3, Qwen splitting) and SentencePiece, added tokens
+│   ├── encoder       embedding models (BERT, Nomic)
+│   ├── vision        the vision encoder (Qwen3.5 / 3.6 mmproj files); image: decoding images
 │   └── model         one compute graph for every supported architecture, KV cache, flash attention,
 │                     batching, device placement
 ├── tools/         command-line tools and the web server
@@ -42,7 +44,8 @@ tierlm/
 └── third_party/
     ├── ggml/      math kernels, quantized formats, device backends, GGUF reader  (MIT, submodule)
     ├── httplib/   HTTP server                                                    (MIT, single header)
-    └── json/      JSON                                                           (MIT, single header)
+    ├── json/      JSON                                                           (MIT, single header)
+    └── stb/       stb_image: decoding PNG / JPEG / GIF / BMP          (public domain or MIT, single header)
 ```
 
 tierlm deliberately does **not** use llama.cpp. ggml supplies the tensor operations, the same way a game
@@ -179,6 +182,42 @@ Checked like everything else: `tests/tiny_encoders.py` compares tiny random `ber
 `nomic-bert` models with a NumPy forward pass (worst difference 4e-7), and the WordPiece tokenizer with Hugging Face's
 own BERT tokenizer, uncased and cased, on strings with accents, CJK, Korean, Turkish, control characters and words too
 long for the vocabulary (all identical).
+
+## Images (the vision encoder)
+
+Qwen3.5 / 3.6 read images with a vision encoder stored in a separate `mmproj-*.gguf` next to the model. tierlm loads
+it with the model (`src/vision.cpp`: on the GPU when there's room after the model; else its weights stay in RAM and
+a GPU with a little room still does the heavy work, ggml copying the weights over op by op ("op offload", worth it
+because an image is thousands of patches); else the CPU) and follows Qwen's
+own code (Hugging Face transformers' `Qwen3_5VisionModel` and `Qwen2VLImageProcessor`):
+
+- **Resize**: the image keeps its shape; both sides become multiples of 32 and the pixel count stays within the
+  limit (2,048 "image words" by default: one per 32 x 32 pixels), with an antialiased bicubic filter. Values are
+  scaled to -1 .. 1.
+- **Patches**: 16 x 16 squares, listed 2 x 2 block by block (the order the merge step needs). The patch layer is a
+  3D convolution over two copies of the image (Qwen treats an image as a 2-frame video); with both frames the same
+  that is one linear layer with the two halves of the kernel added, done once at load.
+- **Positions**: a learned 48 x 48 table, bilinearly resampled to the image's grid (corners aligned), is added; in
+  the blocks, 2D rotary positions (row and column, a quarter of each head each, ggml's vision rope).
+- **Blocks**: LayerNorm, attention over the whole image (flash attention with 16-bit keys and values for big
+  images, more than 1,024 patches, so a scanned page doesn't need N x N scores per head), GELU (tanh form, written
+  out: ggml's own reads a 16-bit table on the CPU) MLP.
+- **Merge**: LayerNorm, each 2 x 2 block becomes one vector, and an MLP maps it to the chat model's width.
+
+**In the chat model** (`Model::add_image`): an image's words are registered once (keyed by a fingerprint of the
+file, so the same image sent again with each turn isn't read again) and fed like tokens, as ids above 2^30 that
+the step swaps for the words. Qwen gives positions in 3 parts (image, row, column), interleaved over the rotated
+dimensions (`rope.dimension_sections`, ggml's IMROPE): text has all three equal, which is plain RoPE, so text-only
+steps are unchanged; an image's words get (start, start + row, start + column), and text after it continues at start
++ max(rows, columns), as Qwen's `get_rope_index` does. The attention mask still follows the order of the tokens.
+Each conversation keeps its tokens' positions, so cached and saved conversations, rewinding and several
+conversations at once work with images too; an image cut across prompt chunks finds its start in the earlier part.
+
+Checked by `tests/tiny_vision.py` against Hugging Face's own Qwen3_5ForConditionalGeneration (PyTorch) on a tiny
+random model: patches identical; image words within 7e-7 (3e-5 with flash attention on a 1,152-patch image); a
+model reading images between text within 1e-4 of Hugging Face's logits (the text-only difference of the two
+implementations), whether the prompt is fed at once, a token at a time or in pieces that cut an image in two; the
+resize within about 1 of 255 levels of PIL's.
 
 ## Flint
 
@@ -354,6 +393,45 @@ tierlm learned about the model, adds a fading score with a swap margin, and keep
 expert can leave VRAM without any bookkeeping on the CPU side. Not done yet: having the CPU compute a step's RAM picks
 while the GPU computes its VRAM picks (see "CPU and GPU on the same layer at once" below).
 
+## Several conversations at once
+
+With `LoadOptions::parallel` > 1 the model holds several conversations and `eval_seqs` advances any of them in one
+step, so the weights are read once for all of them (where the gain comes from: one token's step is mostly reading
+weights).
+
+- **One cache, shared by position.** The KV cache has `max_ctx` places ("cells"). Each conversation takes cells as
+  it grows, lowest free first, and gives them back when it ends or is cut short; a table records each cell's
+  conversation and position. So a short chat holds little memory, and what one finishes the others can use at
+  once (the benefit of vLLM's paged cache, without fixed pages). One conversation alone gets cells 0, 1, 2...: its
+  positions, as before.
+- **The mask keeps them apart.** Keys and values are written to their cells by index; each token's attention mask
+  shows only its own conversation's cells up to its own position (sliding-window layers: only the last `n_swa` of
+  those). Positions for RoPE are each conversation's own.
+- **DeltaNet layers** (Qwen3.5, Qwen3-Next) keep one running memory per conversation. A batch is laid out
+  conversation by conversation; the projections run once for all tokens, then the convolution and the memory
+  update run per conversation with its own memory, and the outputs are joined again.
+- **Each conversation's last token** gives its logits (picked out with one lookup).
+- Conversation 0 is also what `eval`, `eval_ex`, speculative decoding, the MTP block and saved conversations use;
+  saving and restoring copy its cells run by run, wherever they are.
+
+Tested like everything else: `tierlm-logits --parallel 3` runs three conversations made from the same ids (one
+through the one-conversation path, the others together, with a throwaway conversation leaving a hole in the cache,
+then mixed steps of 1 and 3 tokens), and each must match the reference on its own, for every model family, split
+between the stand-in GPU and RAM, with hot experts and live swapping. `tierlm-bench --parallel 1,2,4,8 ctx`
+measures the total and per-conversation speed.
+
+**In the server** (the **Connections** setting, `"connections"` in `/api/load`): the cache holds `ctx x connections`
+cells and each connection is a slot (a conversation). Each reply still runs on its own thread with the same code as a
+single reply (chat formats, tools, stop strings, sampling with its own random generator); only its model steps go
+through a **batcher**: a thread that waits a moment (up to 3 ms) for every running reply to ask for its next step,
+then computes them all in one `eval_seqs` and hands each its logits. A long prompt is fed 256 tokens per step, so a
+new request doesn't stall the others' words. A reply takes the slot whose cache already holds the longest start of
+its conversation. Replies take the engine lock shared (a model load takes it whole, so it waits for them), and one
+free connection; the fair queue lets in as many as there are connections. Speculative decoding and the saved
+conversations stay with single replies. **Find the fastest settings** measures 1, 2, 4… replies at once and
+recommends the most that keeps the slowest reply at or above a floor (5 tok/s by default). Same answers: with greedy
+sampling, four replies written at once came out identical to the same four written one at a time.
+
 ## Several GPUs
 
 With `device` `auto` or `gpu`, every GPU of the same kind as the best one (the same engine: CUDA, Vulkan...) becomes
@@ -401,6 +479,7 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 | Tokenizer | Hugging Face's OLMoE tokenizer, 14 tricky strings | All exact; all decode back byte-for-byte |
 | Pre-tokenizer | The reference split regex, ~3,000 random and edge-case strings | 0 mismatches |
 | Model graph | Plain NumPy reference of each architecture on tiny random models (`tests/tiny_models.py`: Llama, Llama 3 with RoPE factors, Mixtral, Qwen2, Qwen3, Qwen3 MoE, OLMoE) | ~2e-6 relative with an f32 cache, including flash attention, grouped-query attention, the KV cache and 300-token batched prompts |
+| Images (Qwen3.5 vision) | Hugging Face's own Qwen3_5ForConditionalGeneration (PyTorch) on a tiny random model (`tests/tiny_vision.py`) | Image words ~7e-7 relative; a model reading images ~1e-4 (the same as its text-only difference) |
 | Hybrid Qwen3.5 | Plain NumPy implementation of Hugging Face's Qwen3_5 forward pass on a tiny random model written the way the converter writes it (`tests/tiny_qwen35.py`), also split between GPU and RAM | ~1e-5 relative with an f32 cache; deliberately wrong file conventions fail |
 | Tokenizers without models | Small tokenizers trained with Hugging Face `tokenizers` and `sentencepiece` (`tests/trained_tokenizers.py`) | Exact token IDs for GPT-2, Llama 3 and Qwen2 splitting and SentencePiece |
 | Splits | Every model split between one or two stand-in GPUs (ggml's RPC backend) and RAM at many VRAM sizes, by layers, by experts and with made-up hot-expert usage | Same results as unsplit (~1e-6 with an f32 cache) |

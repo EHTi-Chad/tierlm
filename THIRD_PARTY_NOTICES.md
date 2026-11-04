@@ -10,6 +10,7 @@ keep these notices and licence files with it.
 | [cpp-httplib](https://github.com/yhirose/cpp-httplib) v0.63.0 | Embedded HTTP server in `tierlm-server` | MIT, Copyright (c) 2017 yhirose | `third_party/httplib/LICENSE` |
 | [nlohmann/json](https://github.com/nlohmann/json) v3.12.0 | JSON parsing and output in `tierlm-server` | MIT, Copyright (c) 2013-2025 Niels Lohmann | `third_party/json/LICENSE.MIT` |
 | [KaTeX](https://github.com/KaTeX/KaTeX) v0.19.0 (`dist/katex.min.js`, unmodified) | Drawing maths in the chat page (as MathML, no fonts needed) | MIT, Copyright (c) 2013-2020 Khan Academy and other contributors | `web/vendor/katex-LICENSE.txt` |
+| [stb_image](https://github.com/nothings/stb) v2.30 (`stb_image.h`, unmodified) | Reading images (PNG, JPEG, GIF, BMP) for models that read images | Public domain or MIT, Copyright (c) 2017 Sean Barrett (your choice) | `third_party/stb/LICENSE` |
 | OpenAI's gpt-oss chat template, as copied in [llama.cpp](https://github.com/ggml-org/llama.cpp) (`models/templates/openai-gpt-oss-120b.jinja`) | Tests only: `tests/harmony_test.py` checks tierlm's harmony prompts against it | Apache-2.0 (gpt-oss), MIT (llama.cpp) | `tests/openai-gpt-oss.jinja` |
 
 ### Changes to ggml
@@ -30,6 +31,8 @@ its binaries.
 | [Hugging Face tokenizers](https://github.com/huggingface/tokenizers) | Reference token IDs for the tokenizer test | Apache 2.0 |
 | [gguf-py](https://pypi.org/project/gguf/) | Writing tiny test models | MIT |
 | [NumPy](https://numpy.org) | Reference implementation of the OLMoE math | BSD-3-Clause |
+| [PyTorch](https://pytorch.org) and [Hugging Face transformers](https://github.com/huggingface/transformers) | Reference Qwen3.5 vision and text model for the image test (`tests/tiny_vision.py`) | BSD-3-Clause, Apache 2.0 |
+| [Pillow](https://python-pillow.org) | Test images and the reference resize | MIT-CMU (HPND) |
 
 ## Models
 
