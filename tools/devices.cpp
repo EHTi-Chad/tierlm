@@ -48,6 +48,10 @@ int main() {
     for (size_t i = 0; i < ggml_backend_reg_count(); ++i) std::printf(" %s", ggml_backend_reg_name(ggml_backend_reg_get(i)));
     std::printf("\n(No CUDA here means no NVIDIA driver was found; no Vulkan means no Vulkan driver.)\n");
 #endif
+    if (!tierlm::cuda_built_for().empty()) std::printf("CUDA engine built for compute capability %s (and newer)\n", tierlm::cuda_built_for().c_str());
+    for (const auto& g : tierlm::skipped_cuda_gpus())
+        std::printf("NOTE: %s (compute capability %d.%d) isn't covered by this CUDA engine, so it is used through Vulkan.\n",
+                    g.name.c_str(), g.major, g.minor);
     try { std::printf("CPU engine uses: %s\n", tierlm::cpu_features().c_str()); } catch (const std::exception& e) { std::printf("%s\n", e.what()); }
 #ifdef GGML_USE_VULKAN
     std::printf("Vulkan backend: built in\n");

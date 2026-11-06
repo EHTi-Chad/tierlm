@@ -94,7 +94,7 @@ sudo apt install -y build-essential cmake git ninja-build
 sudo apt install -y libvulkan-dev glslc
 ```
 
-For CUDA, install the CUDA toolkit for your GPU. RTX 50-series (Blackwell, SM120) needs **CUDA 12.8 or newer**.
+For CUDA, install the CUDA toolkit for your GPU. RTX 50-series (Blackwell, SM120) needs **CUDA 12.8 or newer**. The release build (`scripts\package-windows.bat`) also covers the Tesla V100 (Volta, SM70), which CUDA 13 can't build for, so releases are built with **CUDA 12.8 or 12.9**.
 
 ### Build
 
@@ -169,6 +169,7 @@ python3 -m venv ~/tierlm-oracle
 
 # The hybrid Qwen3.5 / 3.8 architecture (Gated DeltaNet), against a NumPy version of Hugging Face's model
 ~/tierlm-oracle/bin/python tests/tiny_qwen35.py build/tierlm-logits
+~/tierlm-oracle/bin/python tests/tiny_deepseek.py build/tierlm-logits     # DeepSeek / Kimi, against transformers' own code
 
 # Tokenizers, without any model: trains small BPE and SentencePiece tokenizers and compares
 ~/tierlm-oracle/bin/pip install sentencepiece

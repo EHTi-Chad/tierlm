@@ -51,8 +51,10 @@
   .ricon svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   .ricon svg .fillbg { fill: var(--panel); }
   .ricon.on svg .fillbg { fill: var(--accent-soft); }
-  #panel { width: 330px; flex: 0 0 330px; background: var(--panel); border-right: 1px solid var(--line); overflow-y: auto; }
-  #app.collapsed #panel { display: none; }
+  #panel { width: var(--panelw, 330px); flex: 0 0 var(--panelw, 330px); background: var(--panel); border-right: 1px solid var(--line); overflow-y: auto; }
+  #app.collapsed #panel, #app.collapsed #panelsplit { display: none; }
+  #panelsplit { flex: 0 0 5px; margin-left: -3px; cursor: col-resize; z-index: 2; background: transparent; }
+  #panelsplit:hover, #panelsplit.drag { background: var(--accent); opacity: .6; }
   /* with the menu collapsed, a small speed number and context bar stay on the icon rail */
   #railstat { display: none; width: 46px; text-align: center; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; cursor: pointer; }
   #app.collapsed #railstat { display: block; }
@@ -148,6 +150,7 @@
     #rail { width: 100%; flex: 1 1 100%; flex-direction: row; justify-content: flex-start; padding: 6px 10px; border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
     #rail .grow { display: none; }
     #panel { width: 100%; flex: 1 1 100%; border-right: 0; }
+    #panelsplit { display: none; }
     #chat { flex: 1 1 100%; height: 70vh; border-width: 0 0 1px 0; }
   }
 
@@ -335,6 +338,34 @@
   .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
   .tag { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); color: var(--muted); }
   .tag.good { background: var(--accent-soft); color: var(--accent); }
+  /* ---- Get models: a big window over the page (or a browser window of its own: ?models) ---- */
+  #hfwin { position: fixed; inset: 0; z-index: 120; background: rgba(10, 12, 16, .5); }
+  #hfwin .hfbox { position: absolute; inset: 3vh 3vw; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line);
+                  border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,.35); overflow: hidden; }
+  body.hfalone #hfwin { background: var(--bg); } body.hfalone #hfwin .hfbox { inset: 0; border-radius: 0; border: 0; box-shadow: none; }
+  body.hfalone > *:not(#hfwin) { display: none !important; }
+  .hfhead { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .hfhead h2 { margin: 0; font-size: 16px; } .hfhead .sub { color: var(--muted); font-size: 12px; }
+  #hfq { flex: 1 1 280px; min-width: 200px; font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); }
+  #hfsort { font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); }
+  .hfbody { flex: 1; display: flex; min-height: 0; }
+  #hflist { width: 38%; min-width: 260px; overflow: auto; border-right: 1px solid var(--line); }
+  #hfrepo { flex: 1; overflow: auto; padding: 16px 20px; }
+  .hfitem { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink);
+            padding: 10px 14px; cursor: pointer; font: inherit; }
+  .hfitem:hover { background: var(--panel-2); } .hfitem.on { background: var(--accent-soft); }
+  .hfitem .own { color: var(--muted); font-size: 12px; } .hfitem .nm { font-weight: 600; word-break: break-word; }
+  .hfitem .st { color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .hfempty { color: var(--muted); padding: 30px 10px; text-align: center; }
+  .hfrepo h3 { margin: 0 0 4px; font-size: 18px; word-break: break-word; } .hfrepo .meta { color: var(--muted); font-size: 12.5px; margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; } .hfrepo .meta a { color: var(--accent); }
+  .hfq { width: 100%; border-collapse: collapse; margin: 6px 0 14px; } .hfq th, .hfq td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); font-size: 13px; vertical-align: middle; }
+  .hfq th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .4px; }
+  .hfq td.sz { white-space: nowrap; } .hfq td.act { text-align: right; white-space: nowrap; }
+  .hfextra { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 14px; font-size: 13px; }
+  #hfdl { border-top: 1px solid var(--line); padding: 10px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; background: var(--panel-2); }
+  #hfdl .bar { flex: 1 1 240px; height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; } #hfdl .bar i { display: block; height: 100%; background: var(--accent); width: 0; }
+  #hfdl .txt { font-size: 12.5px; color: var(--muted); }
+  @media (max-width: 760px) { .hfbody { flex-direction: column; } #hflist { width: auto; max-height: 38vh; border-right: 0; border-bottom: 1px solid var(--line); } #hfwin .hfbox { inset: 0; border-radius: 0; } }
   .tag.warn { background: rgba(224,160,67,.18); color: #a86a0c; }
   .tag.bad { background: rgba(224,122,95,.16); color: var(--danger); }
   @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .tag.warn { color: #e8b25a; } }
@@ -477,6 +508,7 @@
   <section class="card">
     <div class="head">
       <h2>2 · GGUF models</h2>
+      <button class="tiny primary hostonly" id="getmodels" style="margin-left:auto">Get models…</button>
       <div class="menuwrap">
         <button class="tiny ghost dots" id="mbtn" title="Models folder and downloads" aria-haspopup="true">⋯</button>
         <div class="menu" id="mmenu" hidden>
@@ -486,7 +518,7 @@
           <label class="mi"><input type="checkbox" id="m-rec"> Include subfolders</label>
           <button id="m-rescan">Rescan folder</button>
           <hr>
-          <a href="https://huggingface.co/models?library=gguf&amp;search=olmoe&amp;sort=trending" target="_blank" rel="noopener">Find GGUF models on Hugging Face ↗</a>
+          <button id="m-get">Get models from Hugging Face…</button>
         </div>
       </div>
     </div>
@@ -571,6 +603,11 @@
             <label for="splitsel">When the model doesn't fit in VRAM</label>
             <select id="splitsel"><option value="auto">Automatic (recommended)</option><option value="layers">Split by whole layers</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
             <div class="help">Automatic uses experts in RAM for mixture-of-experts models and whole layers for the rest. Experts in RAM: the GPU does all the attention and the CPU only the few experts each word picks, much faster for MoE models (Qwen3.6-35B-A3B on an RTX 3070 laptop: 33 against 13 tok/s). Whole layers: the GPU and CPU hand over once per word; best for dense models.</div>
+          </div>
+          <div>
+            <label for="ssdsel">SSD tier: where the part that doesn't fit in RAM goes</label>
+            <select id="ssdsel"><option value="">The model's own drive (read where the file is)</option></select>
+            <div class="help">For models bigger than your VRAM and RAM together. The parts used least (the rarely picked experts of a mixture-of-experts model) stay on the drive and are read as each word needs them, with recently read parts kept in spare RAM. Pick your fastest drive, an NVMe SSD if you have one: tierlm copies just those parts there once (the bar below shows how much). Much slower than RAM, but any size of model runs.</div>
           </div>
           <div>
             <label for="connsel">Connections (replies written at once)</label>
@@ -685,11 +722,11 @@
 
 <main id="app" hidden>
   <nav id="rail" aria-label="Side menu">
+    <button class="ricon" data-sec="model" aria-label="Model info" title="Model info"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="5" rx="1.5"/><rect x="4" y="11" width="16" height="4" rx="1.5"/><rect x="4" y="17" width="16" height="3" rx="1.5"/></svg></button>
     <button class="ricon" data-sec="settings" aria-label="Settings" title="Settings"><svg aria-hidden="true" viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="9" cy="6" r="2.2" class="fillbg"/><circle cx="15" cy="12" r="2.2" class="fillbg"/><circle cx="7" cy="18" r="2.2" class="fillbg"/></svg></button>
     <button class="ricon" data-sec="api" aria-label="API" title="API and other apps"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 7l-5 5 5 5"/><path d="M15 7l5 5-5 5"/></svg></button>
-    <button class="ricon" data-sec="console" aria-label="Console" title="Console"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><line x1="12" y1="15" x2="17" y2="15"/></svg></button>
-    <button class="ricon" data-sec="model" aria-label="Model info" title="Model info"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="5" rx="1.5"/><rect x="4" y="11" width="16" height="4" rx="1.5"/><rect x="4" y="17" width="16" height="3" rx="1.5"/></svg></button>
     <button class="ricon" data-sec="chats" aria-label="Chats" title="Chats and presets"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></svg></button>
+    <button class="ricon" data-sec="console" aria-label="Console" title="Console"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><line x1="12" y1="15" x2="17" y2="15"/></svg></button>
     <button class="ricon" data-sec="bench" aria-label="Benchmark" title="Benchmark"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="16" y2="11"/></svg></button>
     <span class="grow"></span>
     <div id="railstat" title="Speed and context"><b id="rtps">–</b><small>tok/s</small><div class="rbar"><div id="rctx"></div></div><small id="rctxt">ctx</small></div>
@@ -711,8 +748,7 @@
     </div>
     <div class="card">
       <div class="body">
-        <div class="ctitle">Context</div>
-        <div class="mid" id="ctxbig">0<small id="ctxof">/ – tokens</small></div>
+        <div class="chead"><div class="ctitle">Context</div><div class="big sm" id="ctxbig" title="">0<small id="ctxof">/ –</small></div></div>
         <div class="bar"><div id="ctxbar"></div></div>
         <div class="help" id="ctxwarn" hidden></div>
         <button class="tiny ghost hostonly" id="ctxchg" style="margin-top:8px">Change length…</button>
@@ -725,6 +761,71 @@
         </div>
       </div>
     </div>
+    </div>
+    <div class="sec" data-sec="model">
+      <button class="sechead" aria-expanded="false"><span>Model info</span><small>memory, experts</small></button>
+      <div class="secbody">
+        <div class="subhead" style="margin-top:4px">Embedding model</div>
+        <div class="lrow2" style="margin-top:4px">
+          <select id="embsel" aria-label="Embedding model" style="flex:1;min-width:0"><option value="">None</option></select>
+        </div>
+        <div class="lrow2" id="embdlrow" hidden style="margin-top:6px">
+          <button class="tiny" id="embdl">Download nomic-embed-text (146 MB)</button>
+          <span class="caption" id="embdlnote"></span>
+        </div>
+        <div class="help" id="embnote">A second, small model that turns text into numbers for search and document comparison. Apps use it
+          through <code>/v1/embeddings</code>, while the chat model stays loaded.</div>
+        <div class="subhead">Chat model</div>
+        <dl class="kv">
+          <dt>Model</dt><dd id="arch">–</dd>
+          <dt>Layers × experts</dt><dd id="lx">–</dd>
+          <dt>Active per token</dt><dd id="active">–</dd>
+          <dt>Reads images</dt><dd id="vis" title="">–</dd>
+        </dl>
+        <div class="tiers">
+          <div class="tier"><div class="name"><span class="sw" style="background:var(--vram)"></span>VRAM</div><div class="val" id="t-vram">–</div><div class="sub" id="t-vram-sub">–</div></div>
+          <div class="tier"><div class="name"><span class="sw" style="background:var(--ram)"></span>RAM</div><div class="val" id="t-ram">–</div><div class="sub" id="t-ram-sub">–</div></div>
+          <div class="tier"><div class="name"><span class="sw" style="background:var(--ssd)"></span>SSD</div><div class="val" id="t-ssd">0 GiB</div><div class="sub" id="t-ssd-sub">not needed</div></div>
+        </div>
+        <div class="note" id="devmem">–</div>
+        <div class="note" id="hotnote" hidden></div>
+        <button class="tiny ghost" id="hotforget" hidden>Forget what tierlm learned about this model</button>
+        <div class="note" id="densenote" hidden></div>
+        <div class="subhead">Memory right now</div>
+        <div id="minimem"></div>
+        <div id="mapcard">
+        <div class="maphead">
+          <span class="ctitle">Which experts are working</span>
+          <button class="qbtn" id="maphelpbtn" aria-label="What is this map?" aria-expanded="false" title="What is this map?">?</button>
+          <button class="qbtn" id="mapbig" aria-label="Enlarge the map" title="Enlarge">⤢</button>
+        </div>
+        <div class="maphelp" id="maphelp" hidden>
+          <p>This model is a <b>mixture of experts</b>: each of its <span class="hL">–</span> layers has <span class="hE">–</span> small specialist networks, and for every word a router picks just <span class="hK">–</span> of them.</p>
+          <p>Each <b>row</b> is a layer (top = first). In <b>Sorted</b> view each row lists its experts busiest first; <b>Brighter</b> = picked more often this session, and a <b>flash</b> = picked for the word just written. Hover for details.</p>
+          <p>The strip on the left shows where each layer's experts live: <span class="swatch v"></span> VRAM (fast) or <span class="swatch r"></span> RAM; a part-filled strip means only that layer's busiest experts are in VRAM, and those are <b>ringed</b>. When a few experts do most of the work, keeping those in VRAM makes the model faster, and tierlm learns which ones as you chat.</p>
+        </div>
+        <div class="row maptools">
+          <button class="tiny on" id="m-sorted">Sorted</button>
+          <button class="tiny" id="m-byid">By number</button>
+          <span class="grow"></span>
+          <button class="tiny" id="m-live" title="Show only the experts picked for the current word">Live only</button>
+          <button class="tiny ghost" id="m-reset">Reset</button>
+        </div>
+        <canvas id="map"></canvas>
+        <div class="legend">
+          <span><i style="background:linear-gradient(90deg,var(--heat-lo),#e0a043,#c2410c)"></i>more often</span>
+          <span><i style="background:var(--flash)"></i>this word</span>
+          <span id="picks">0 picks</span>
+        </div>
+        </div>
+        <div id="hitcard">
+          <div class="subhead">Hot-expert cache preview</div>
+          <label class="small">If each layer kept only <input id="slots" type="range" min="0" max="64" step="1" value="16"> <b id="slotsv">16</b> experts in VRAM…</label>
+          <div class="hitrow"><span>Hottest ones</span><div class="bar"><div id="hit"></div></div><span class="num" id="hitv">–</span></div>
+          <div class="hitrow base"><span>Random pick</span><div class="bar"><div id="hitbase"></div></div><span class="num" id="hitbasev">–</span></div>
+          <div class="note" id="hitnote">…this is how often the router's choice would already be in fast memory, based on this session. Chat for a while to collect data.</div>
+        </div>
+      </div>
     </div>
     <div class="sec" data-sec="settings">
       <button class="sechead" aria-expanded="false"><span>Settings</span><small>sampling, speculation</small></button>
@@ -772,6 +873,18 @@
       <button class="sechead" aria-expanded="false"><span>API</span><small>connect other apps</small></button>
       <div class="secbody" id="apihome"></div>
     </div>
+    <div class="sec" data-sec="chats">
+      <button class="sechead" aria-expanded="false"><span>Chats</span><small id="chatcount"></small></button>
+      <div class="secbody">
+        <button class="tiny" id="newchat2">+ New chat</button>
+        <div id="chatlist"></div>
+        <div class="subhead">System prompt presets</div>
+        <div id="presets" class="presets"></div>
+        <button class="tiny ghost" id="savepreset">Save the current system prompt as a preset…</button>
+        <button class="tiny ghost" id="chatsfolder" hidden>Open the chats folder</button>
+        <div class="help" id="chatshelp">Chats and presets are kept in this browser.</div>
+      </div>
+    </div>
     <div class="sec" data-sec="console">
       <button class="sechead" aria-expanded="false"><span>Console</span><small>what the engine is doing</small></button>
       <div class="secbody">
@@ -783,83 +896,6 @@
           <button class="tiny" id="c-wide" title="Show the console in the chat area, full size">Expand</button>
         </div>
         <pre id="console" aria-live="polite"></pre>
-      </div>
-    </div>
-    <div class="sec" data-sec="model">
-      <button class="sechead" aria-expanded="false"><span>Model info</span><small>memory, experts</small></button>
-      <div class="secbody">
-        <div class="subhead" style="margin-top:4px">Embedding model</div>
-        <div class="lrow2" style="margin-top:4px">
-          <select id="embsel" aria-label="Embedding model" style="flex:1;min-width:0"><option value="">None</option></select>
-        </div>
-        <div class="lrow2" id="embdlrow" hidden style="margin-top:6px">
-          <button class="tiny" id="embdl">Download nomic-embed-text (146 MB)</button>
-          <span class="caption" id="embdlnote"></span>
-        </div>
-        <div class="help" id="embnote">A second, small model that turns text into numbers for search and document comparison. Apps use it
-          through <code>/v1/embeddings</code>, while the chat model stays loaded.</div>
-        <div class="subhead">Chat model</div>
-        <dl class="kv">
-          <dt>Model</dt><dd id="arch">–</dd>
-          <dt>Layers × experts</dt><dd id="lx">–</dd>
-          <dt>Active per token</dt><dd id="active">–</dd>
-          <dt>Reads images</dt><dd id="vis" title="">–</dd>
-        </dl>
-        <div class="tiers">
-          <div class="tier"><div class="name"><span class="sw" style="background:var(--vram)"></span>VRAM</div><div class="val" id="t-vram">–</div><div class="sub" id="t-vram-sub">–</div></div>
-          <div class="tier"><div class="name"><span class="sw" style="background:var(--ram)"></span>RAM</div><div class="val" id="t-ram">–</div><div class="sub" id="t-ram-sub">–</div></div>
-          <div class="tier"><div class="name"><span class="sw" style="background:var(--ssd)"></span>SSD</div><div class="val" id="t-ssd">0 GiB</div><div class="sub">coming soon</div></div>
-        </div>
-        <div class="note" id="devmem">–</div>
-        <div class="note" id="hotnote" hidden></div>
-        <button class="tiny ghost" id="hotforget" hidden>Forget what tierlm learned about this model</button>
-        <div class="note" id="densenote" hidden></div>
-        <div class="subhead">Memory right now</div>
-        <div id="minimem"></div>
-        <div id="mapcard">
-        <div class="maphead">
-          <span class="ctitle">Which experts are working</span>
-          <button class="qbtn" id="maphelpbtn" aria-label="What is this map?" aria-expanded="false" title="What is this map?">?</button>
-          <button class="qbtn" id="mapbig" aria-label="Enlarge the map" title="Enlarge">⤢</button>
-        </div>
-        <div class="maphelp" id="maphelp" hidden>
-          <p>This model is a <b>mixture of experts</b>: each of its <span class="hL">–</span> layers has <span class="hE">–</span> small specialist networks, and for every word a router picks just <span class="hK">–</span> of them.</p>
-          <p>Each <b>row</b> is a layer (top = first). In <b>Sorted</b> view each row lists its experts busiest first; <b>Brighter</b> = picked more often this session, and a <b>flash</b> = picked for the word just written. Hover for details.</p>
-          <p>The strip on the left shows where each layer's experts live: <span class="swatch v"></span> VRAM (fast) or <span class="swatch r"></span> RAM; a part-filled strip means only that layer's busiest experts are in VRAM, and those are <b>ringed</b>. When a few experts do most of the work, keeping those in VRAM makes the model faster, and tierlm learns which ones as you chat.</p>
-        </div>
-        <div class="row maptools">
-          <button class="tiny on" id="m-sorted">Sorted</button>
-          <button class="tiny" id="m-byid">By number</button>
-          <span class="grow"></span>
-          <button class="tiny" id="m-live" title="Show only the experts picked for the current word">Live only</button>
-          <button class="tiny ghost" id="m-reset">Reset</button>
-        </div>
-        <canvas id="map"></canvas>
-        <div class="legend">
-          <span><i style="background:linear-gradient(90deg,var(--heat-lo),#e0a043,#c2410c)"></i>more often</span>
-          <span><i style="background:var(--flash)"></i>this word</span>
-          <span id="picks">0 picks</span>
-        </div>
-        </div>
-        <div id="hitcard">
-          <div class="subhead">Hot-expert cache preview</div>
-          <label class="small">If each layer kept only <input id="slots" type="range" min="0" max="64" step="1" value="16"> <b id="slotsv">16</b> experts in VRAM…</label>
-          <div class="hitrow"><span>Hottest ones</span><div class="bar"><div id="hit"></div></div><span class="num" id="hitv">–</span></div>
-          <div class="hitrow base"><span>Random pick</span><div class="bar"><div id="hitbase"></div></div><span class="num" id="hitbasev">–</span></div>
-          <div class="note" id="hitnote">…this is how often the router's choice would already be in fast memory, based on this session. Chat for a while to collect data.</div>
-        </div>
-      </div>
-    </div>
-    <div class="sec" data-sec="chats">
-      <button class="sechead" aria-expanded="false"><span>Chats</span><small id="chatcount"></small></button>
-      <div class="secbody">
-        <button class="tiny" id="newchat2">+ New chat</button>
-        <div id="chatlist"></div>
-        <div class="subhead">System prompt presets</div>
-        <div id="presets" class="presets"></div>
-        <button class="tiny ghost" id="savepreset">Save the current system prompt as a preset…</button>
-        <button class="tiny ghost" id="chatsfolder" hidden>Open the chats folder</button>
-        <div class="help" id="chatshelp">Chats and presets are kept in this browser.</div>
       </div>
     </div>
     <div class="sec" data-sec="bench">
@@ -876,6 +912,7 @@
       </div>
     </div>
   </aside>
+  <div id="panelsplit" role="separator" aria-orientation="vertical" aria-label="Resize the menu" title="Drag to resize; double-click for the usual width" tabindex="0"></div>
 
   <section class="card" id="chat">
     <div id="bigconsole" hidden>
@@ -933,6 +970,22 @@
 </main>
 <div id="tip"></div>
 
+<div id="hfwin" hidden role="dialog" aria-modal="true" aria-label="Get models">
+  <div class="hfbox">
+    <div class="hfhead">
+      <h2>Get models</h2><span class="sub">GGUF files from Hugging Face</span>
+      <input id="hfq" type="search" placeholder="Search: qwen 35b, kimi, gpt-oss, deepseek…" spellcheck="false" autocomplete="off">
+      <select id="hfsort" aria-label="Sort"><option value="downloads">Most downloaded</option><option value="trendingScore">Trending</option><option value="likes">Most liked</option><option value="lastModified">Recently updated</option></select>
+      <button class="tiny ghost" id="hfpop" title="Open Get models in a browser window of its own">Open in its own window</button>
+      <button class="tiny ghost" id="hfclose" aria-label="Close" title="Close">✕</button>
+    </div>
+    <div class="hfbody">
+      <div id="hflist"><div class="hfempty">Search for a model, or browse the most downloaded.</div></div>
+      <div id="hfrepo"><div class="hfempty">Pick a model on the left to see its files: which ones this PC can run, and how they'd fit.</div></div>
+    </div>
+    <div id="hfdl" hidden></div>
+  </div>
+</div>
 <script>
 // Every request to tierlm goes through api(): when tierlm has an API key and this page is opened from another
 // device, it asks for the key once, remembers it in this browser, and sends it with each request.
@@ -960,6 +1013,14 @@ async function api(url, opts = {}) {
 let keyAsk = null;
 
 const $ = id => document.getElementById(id);
+// Token counts: in full up to 100,000, then K and M (1,048,576 is 1M: binary when it's a whole number of 1024s)
+const fmtTok = n => {
+  if (!(n >= 100000)) return (n || 0).toLocaleString();
+  const k = n % 1024 === 0 ? n / 1024 : n / 1000;
+  if (k < 1000) return (k >= 100 ? Math.round(k) : k.toFixed(1)) + "K";
+  const m = n % 1048576 === 0 ? n / 1048576 : n / 1e6;
+  return (Number.isInteger(m) ? m : m.toFixed(2)) + "M";
+};
 const fmtGiB = b => !b ? "0 GiB" : b < 1073741824 ? Math.max(0.1, b / 1048576).toFixed(b < 10485760 ? 1 : 0) + " MiB" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 1 : 2) + " GiB";
 let info = null, L = 16, E = 64, K = 8;
 let counts = new Float64Array(L * E), flash = new Float64Array(L * E), totalPicks = 0;
@@ -1110,7 +1171,8 @@ async function loadInfo() {
     ". High suits scanned pages and small text; Low is quick for photos and screenshots.";
   $("vis").title = info.vision ? info.vision_file + " (up to " + (info.image_tokens || 0).toLocaleString() + " image words per image)"
                                : "Qwen3.5 / 3.6 read images when their mmproj file is in the same folder";
-  $("ctxof").textContent = "/ " + info.ctx.toLocaleString() + " tokens";
+  $("ctxof").textContent = "/ " + fmtTok(info.ctx);
+  $("ctxbig").title = info.ctx.toLocaleString() + " tokens of context";
   setContext(info.n_past);
   const w = info.weights_bytes, kv = info.kv_bytes;
   const vw = info.vram_weights || 0, rw = info.ram_weights || 0;
@@ -1138,11 +1200,16 @@ async function loadInfo() {
     (info.device_type === "igpu" ? " · an integrated GPU shares system RAM, so its 'VRAM' is borrowed memory" : "") +
     " · KV cache " + info.kv_type + ", flash attention " + (info.flash_attn ? "on" : "off") +
     (info.experts_used !== info.experts_default ? " · " + info.experts_used + " active experts (model default " + info.experts_default + ")" : "") +
-    (rw > 0 && !info.all_on_gpu ? " · split between VRAM and RAM" : "") + " · SSD tier comes next";
+    (rw > 0 && !info.all_on_gpu ? " · split between VRAM and RAM" : "") + (info.ssd_weights > 0 ? " and SSD" : "");
+  const sw = info.ssd_weights || 0;
+  $("t-ssd").textContent = fmtGiB(sw);
+  $("t-ssd-sub").textContent = sw <= 0 ? "not needed" : (info.ssd_ngram ? "the n-gram table" + (info.ssd_layers ? " + " : "") : "") +
+    (info.ssd_layers ? info.ssd_layers + " of " + L + (E ? " expert layers" : " layers") : "") +
+    ", read from the drive as they're used" + (info.ssd_file ? " (" + info.ssd_file + ")" : "");
   resizeCanvases();
 }
 function setContext(n) {
-  $("ctxbig").firstChild.nodeValue = n.toLocaleString();
+  $("ctxbig").firstChild.nodeValue = fmtTok(n);
   const f = info ? n / info.ctx : 0;
   $("ctxbar").style.width = Math.min(100, 100 * f) + "%";
   $("ctxbar").classList.toggle("warn", f >= 0.9 && f < 0.995);
@@ -1783,6 +1850,46 @@ function gpuGroup(first) {
 // Where the model will go, as the tier loader will place it: the model's weights and its context (KV cache),
 // in VRAM first and the rest in RAM. "layers" moves whole layers with their part of the context; "experts" puts
 // all of the context (and attention) in VRAM first, then as many experts as fit.
+// What doesn't fit in RAM either (less the margin the tier loader keeps for Windows and other programs) is read
+// from the SSD tier's drive as it's needed.
+function withSsd(p) {
+  if (!p.cpu) return { ...p, ssd: 0 };
+  const margin = Math.max(1.5 * 1073741824, 0.12 * (p.cpu.total || 0)) + 1073741824;
+  const ramRoom = Math.max(0, p.ramFree - margin);
+  const ssd = Math.max(0, Math.min(p.wr, p.wr + p.kvr - ramRoom));
+  return { ...p, wr: p.wr - ssd, ssd };
+}
+function ssdDrive() {                               // the drive the SSD tier would use, as {label, total, free}, or null
+  if (!drives) return null;
+  const dir = drives.ssd_dir || "";
+  const root = d => (d.path || "").toLowerCase();
+  const pick = dir ? (drives.drives || []).filter(d => dir.toLowerCase().startsWith(root(d))).sort((a, b) => root(b).length - root(a).length)[0] : null;
+  return pick ? { label: pick.path + (pick.label && !pick.label.startsWith("/dev/") ? " " + pick.label : ""), total: pick.total, free: pick.free } : null;
+}
+let drives = null;
+async function loadDrives() {
+  try { drives = await (await api("/api/drives")).json(); } catch (e) { drives = null; return; }
+  const sel = $("ssdsel"), cur = drives.ssd_dir || "";
+  sel.innerHTML = `<option value="">The model's own drive (read where the file is)</option>`;
+  for (const d of drives.drives || []) {
+    const o = document.createElement("option");
+    o.value = d.path;
+    o.textContent = d.path + (d.label && !d.label.startsWith("/dev/") ? " " + d.label : "") + " · " + fmtGiB(d.free) + " free of " + fmtGiB(d.total);
+    sel.appendChild(o);
+  }
+  let match = "";
+  for (const d of drives.drives || []) if (cur && cur.toLowerCase().startsWith(d.path.toLowerCase()) && d.path.length > match.length) match = d.path;
+  if (cur && !match) { const o = document.createElement("option"); o.value = cur; o.textContent = cur; sel.appendChild(o); match = cur; }
+  sel.value = match;
+}
+$("ssdsel").onchange = async () => {
+  try {
+    const r = await api("/api/ssd", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dir: $("ssdsel").value }) });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); { $("loadmsg").textContent = j.error?.message || j.error || "Couldn't use that drive."; $("loadmsg").className = "err"; } }
+  } catch (e) {}
+  await loadDrives();
+  renderSetup();
+};
 function plan() {
   const ctx = ctxValue() || defCtx;
   const W = selModel ? selModel.bytes || 0 : 0;
@@ -1792,7 +1899,7 @@ function plan() {
   const ramFree = cpu ? cpu.free + held.ram : 0;
   const base = { W, KV, gpu, cpu, held, ramFree };
   if ($("forcecpu").checked || !gpu)
-    return { ...base, dev: cpu, wv: 0, kvv: 0, wr: W, kvr: KV, why: $("forcecpu").checked ? "forced" : "nogpu" };
+    return withSsd({ ...base, dev: cpu, wv: 0, kvv: 0, wr: W, kvr: KV, why: $("forcecpu").checked ? "forced" : "nogpu" });
   const lim = +$("vramlim").value > 0 ? +$("vramlim").value * 1073741824 : Infinity;
   const group = $("allgpus").checked ? gpuGroup(gpu) : [gpu];
   const rooms = group.map((g, i) => Math.max(0, Math.min(g.free + (i === 0 ? held.vram : 0), lim) - WORK));
@@ -1808,9 +1915,17 @@ function plan() {
     const f = wv + kvv > 0 ? take / (wv + kvv) : 0;
     return { dev: g, wv: wv * f, kvv: kvv * f };
   }).filter((x, i) => i === 0 || x.wv + x.kvv > 0);
-  return { ...base, dev: gpu, gpus, wv, kvv, wr: W - wv, kvr: KV - kvv, room, why: !selModel || W + KV <= room ? "fits" : "split" };
+  return withSsd({ ...base, dev: gpu, gpus, wv, kvv, wr: W - wv, kvr: KV - kvv, room, why: !selModel || W + KV <= room ? "fits" : "split" });
 }
 // One memory bar: the device's whole memory, with what tierlm would put there, what other programs use, and what's free.
+function ssdNote(p) {
+  if (!(p.ssd > 0)) return "";
+  const dr = ssdDrive();
+  const room = dr ? dr.free : Infinity;
+  return ` ${fmtGiB(p.ssd)} of it doesn't fit in RAM either, so it stays on the SSD (${dr ? dr.label : "the model's own drive"}) and is read as each word needs it.` +
+    ` Any size of model runs this way, but replies are much slower: the drive's speed decides.` +
+    (dr && p.ssd > room ? ` Warning: that drive has only ${fmtGiB(room)} free.` : "");
+}
 function memBar(title, sub, total, parts) {
   const used = parts.reduce((t, x) => t + x.v, 0);
   const all = [...parts, { v: Math.max(0, total - used), c: "transparent", l: "Free" }];
@@ -1822,7 +1937,7 @@ function memBar(title, sub, total, parts) {
 async function loadSetup() {
   $("loadmsg").textContent = ""; $("loadmsg").className = "";
   try {
-    const [dv, m] = await Promise.all([api("/api/devices").then(r => r.json()), api("/api/models").then(r => r.json())]);
+    const [dv, m] = await Promise.all([api("/api/devices").then(r => r.json()), api("/api/models").then(r => r.json()), loadDrives()]);
     // The same NVIDIA card can be reachable through CUDA and Vulkan: show it once, as its CUDA device.
     devices = dv.devices.filter(d => !d.same_gpu_as);
     for (const d of devices) d.alsoVulkan = dv.devices.some(x => x.same_gpu_as === d.id);
@@ -1935,6 +2050,8 @@ function renderWarnings() {
         <pre></pre><div style="margin-top:6px">Then sign out of Windows and back in, and restart tierlm.</div>`;
       d.querySelector(".m").textContent = x.message + " Value: " + x.value + ". To remove it, run this in a command prompt:";
       d.querySelector("pre").textContent = `reg delete HKCU\\Environment /v ${x.variable} /f`;
+    } else if (x.code === "cuda_skip") {
+      d.innerHTML = `<b>Running on Vulkan instead of CUDA</b><span class="m"></span>`; d.querySelector(".m").textContent = x.message;
     } else {
       d.innerHTML = `<b>No GPU found</b><span class="m"></span>`; d.querySelector(".m").textContent = x.message;
     }
@@ -1990,6 +2107,12 @@ function renderSetup() {
         { v: p.kvr, c: "var(--kv)", l: "Context (KV cache)" },
         { v: other(p.cpu), c: "var(--other)", h: true, l: "Windows and other programs" }]);
     }
+    if (p.ssd > 0) {
+      const dr = ssdDrive();
+      html += memBar("SSD", dr ? dr.label + " · " + fmtGiB(dr.total) : "the model's own drive", dr ? dr.total : p.ssd, [
+        { v: p.ssd, c: "var(--ssd)", l: "Model (read as needed)", always: true },
+        { v: dr ? Math.max(0, dr.total - dr.free) : 0, c: "var(--other)", h: true, l: "Other files" }]);
+    }
     const otherG = p.gpu ? other(p.gpu) : 0;
     if (p.why === "split" && otherG > 1.5 * 1073741824)
       html += `<div class="memnote">Other programs are using <b>${fmtGiB(otherG)}</b> of VRAM (another tierlm window, LM Studio, a game?). Closing them gives tierlm more room; then click <b>Rescan</b>.</div>`;
@@ -2001,9 +2124,9 @@ function renderSetup() {
                          (splitMode() === "experts" ? "the context and as much of the model as fits go in VRAM, the rest of the model in RAM, computed by the CPU."
                                                             : "as many layers as fit (with their part of the context) go in VRAM, the rest in RAM, computed by the CPU.") +
                          " Expect speed between all-GPU and CPU-only." +
-                         (ram > p.ramFree ? ` Warning: that needs more RAM than is free (${fmtGiB(p.ramFree)}); the SSD tier isn't built yet, so close other programs, pick a shorter context, or a smaller model.` : ""),
-                  forced: "Force CPU is on, so everything runs on the CPU, in system RAM.",
-                  nogpu: "No GPU found, so everything runs on the CPU, in system RAM." }[p.why];
+                         ssdNote(p),
+                  forced: "Force CPU is on, so everything runs on the CPU, in system RAM." + ssdNote(p),
+                  nogpu: "No GPU found, so everything runs on the CPU, in system RAM." + ssdNote(p) }[p.why];
     pl.querySelector(".lbl").textContent = "Where this model will go: " + msg;
   }
   // models
@@ -2047,13 +2170,13 @@ function renderSetup() {
   }
   // summary
   if (!selModel) {
-    $("rec").textContent = models.length ? "None of the models in this folder are supported yet. tierlm runs OLMoE models so far." : "";
+    $("rec").textContent = models.length ? "None of the models in this folder are supported yet. This version of tierlm doesn't run their kind of model yet." : "";
   } else if (p.dev) {
     $("rec").innerHTML = "";
     const b = document.createElement("b"); b.textContent = selModel.name || selModel.file;
     $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description + (p.wr + p.kvr > 0 ? " and system RAM" : "")}, needing about ${fmtGiB(p.W + p.KV)} ` +
       `(${fmtGiB(p.W)} model + ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context${(+$("connsel").value || 1) > 1 ? ` for each of ${$("connsel").value} connections` : ""}).` +
-      (p.wr + p.kvr > p.ramFree ? " That's more than is free, so loading may fail; try a shorter context or close other programs." : ""));
+      (p.ssd > 0 ? ` ${fmtGiB(p.ssd)} of the model will be read from the SSD as it's needed.` : ""));
   }
   $("ctxhelp").textContent = "How much conversation the model can remember, up to what this model was trained for (" +
     (selModel && selModel.ctx_train ? selModel.ctx_train.toLocaleString() + " tokens" : "unknown") + "). Longer uses more memory, shown next to each size.";
@@ -2626,6 +2749,211 @@ function cardDiff(card, diff) {
     span.textContent = line + "\n"; pre.append(span);
   }
   card.append(pre);
+}
+
+// ---------- Get models: search Hugging Face and download ----------
+// A big window over the page (or, with ?models, a browser window of its own). The server does the talking to
+// Hugging Face (/api/hf/*); this lists what it finds, says how each file would fit this PC, and shows the download.
+const hfq = $("hfq");
+let hfTimer = null, hfPoll = null, hfCur = null, hfSeq = 0;
+const esc2 = t => String(t ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+async function hfOpen() {
+  $("hfwin").hidden = false;
+  document.body.style.overflow = "hidden";
+  if (!devices.length) { try { devices = (await (await api("/api/devices")).json()).devices || []; } catch (e) {} }
+  if (!$("hflist").querySelector(".hfitem")) hfSearch();
+  hfq.focus();
+  hfWatch();
+}
+function hfClose() {
+  if (document.body.classList.contains("hfalone")) { window.close(); return; }
+  $("hfwin").hidden = true;
+  document.body.style.overflow = "";
+}
+$("getmodels").onclick = hfOpen;
+$("m-get").onclick = () => { $("mmenu").hidden = true; hfOpen(); };
+$("hfclose").onclick = hfClose;
+$("hfpop").onclick = () => { window.open(location.origin + "/?models", "tierlm-models", "width=1300,height=880"); hfClose(); };
+$("hfwin").addEventListener("keydown", e => { if (e.key === "Escape") hfClose(); });
+hfq.oninput = () => { clearTimeout(hfTimer); hfTimer = setTimeout(hfSearch, 350); };
+hfq.onkeydown = e => { if (e.key === "Enter") { clearTimeout(hfTimer); hfSearch(); } };
+$("hfsort").onchange = hfSearch;
+async function hfSearch() {
+  const seq = ++hfSeq, list = $("hflist");
+  list.innerHTML = `<div class="hfempty">Searching…</div>`;
+  let j;
+  try {
+    const r = await api("/api/hf/search?q=" + encodeURIComponent(hfq.value.trim()) + "&sort=" + $("hfsort").value);
+    j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || j.error || "search failed");
+  } catch (e) { if (seq === hfSeq) list.innerHTML = `<div class="hfempty">${esc2(e.message)}</div>`; return; }
+  if (seq !== hfSeq) return;
+  const ms = j.models || [];
+  if (!ms.length) { list.innerHTML = `<div class="hfempty">No GGUF models found for that. Try fewer words, or a family name (qwen, llama, gpt-oss).</div>`; return; }
+  list.innerHTML = "";
+  for (const m of ms) {
+    const b = document.createElement("button");
+    b.className = "hfitem" + (m.id === hfCur ? " on" : "");
+    const [own, nm] = m.id.includes("/") ? m.id.split("/") : ["", m.id];
+    const when = m.updated ? new Date(m.updated).toLocaleDateString() : "";
+    b.innerHTML = `<div class="own">${esc2(own)}</div><div class="nm">${esc2(nm)}</div>` +
+      `<div class="st">↓ ${(m.downloads || 0).toLocaleString()} · ♥ ${(m.likes || 0).toLocaleString()}${when ? " · " + esc2(when) : ""}</div>`;
+    b.onclick = () => { for (const x of list.querySelectorAll(".hfitem")) x.classList.remove("on"); b.classList.add("on"); hfShowRepo(m.id); };
+    list.appendChild(b);
+  }
+}
+// How a file of this size would sit on this PC (the weights only; the context comes on top).
+function hfFit(size) {
+  const g = bestGpu(), c = cpuDev();
+  const vram = g ? Math.max(0, g.free - 1.5 * 1073741824) : 0;
+  const ram = c ? Math.max(0, c.free - Math.max(1.5 * 1073741824, 0.12 * (c.total || 0)) - 1073741824) : 0;
+  if (g && size <= vram) return { cls: "good", t: "Fits in VRAM" };
+  if (size <= vram + ram) return { cls: "warn", t: g ? fmtGiB(size - vram) + " in RAM" : "In RAM (no GPU)" };
+  return { cls: "bad", t: "SSD tier: " + fmtGiB(size - vram - ram) + " on the drive" };
+}
+async function hfShowRepo(id) {
+  hfCur = id;
+  const pane = $("hfrepo");
+  pane.innerHTML = `<div class="hfempty">Reading ${esc2(id)}…</div>`;
+  let j;
+  try {
+    const r = await api("/api/hf/repo?id=" + encodeURIComponent(id));
+    j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || j.error || "couldn't read that model");
+  } catch (e) { if (hfCur === id) pane.innerHTML = `<div class="hfempty">${esc2(e.message)}</div>`; return; }
+  if (hfCur !== id) return;
+  const ok = j.supported !== false, quants = j.quants || [];
+  const kind = j.kind === "embedding" ? "Embedding model" : j.kind === "draft" ? "Draft add-on" : "";
+  let h = `<div class="hfrepo"><h3>${esc2(id)}</h3><div class="meta">` +
+    (j.arch ? `<span class="tag ${ok ? "good" : "bad"}">${esc2(j.arch)}${ok ? " · runs in tierlm" : " · not yet"}</span>` : "") +
+    (kind ? `<span class="tag">${kind}</span>` : "") +
+    (j.layers ? `<span>${j.layers} layers${j.experts ? `, ${j.experts} experts (${j.experts_used} per word)` : ""}</span>` : "") +
+    (j.ctx_train ? `<span>context up to ${Number(j.ctx_train).toLocaleString()} tokens</span>` : "") +
+    `<a href="https://huggingface.co/${encodeURI(id)}" target="_blank" rel="noopener">Model page ↗</a></div>`;
+  if (!ok) h += `<div class="note">${esc2(j.reason || "This version of tierlm doesn't run this kind of model yet.")}</div>`;
+  if (j.gated) h += `<div class="note">This model needs its license accepted on huggingface.co and a sign-in, which Get models doesn't do yet.</div>`;
+  if (!quants.length) h += `<div class="hfempty">No GGUF model files in this repo.</div>`;
+  else {
+    h += `<table class="hfq"><thead><tr><th>File</th><th>Size</th><th>On this PC</th><th></th></tr></thead><tbody>`;
+    quants.forEach((q, i) => {
+      const f = hfFit(q.size), parts = q.files.length;
+      h += `<tr><td><b>${esc2(q.label)}</b>${parts > 1 ? ` <span class="caption">${parts} files</span>` : ""}<div class="caption">${esc2(q.files[0].path)}</div></td>` +
+        `<td class="sz">${fmtGiB(q.size)}</td><td><span class="tag ${f.cls}">${f.t}</span></td>` +
+        `<td class="act"><button class="tiny ${i === hfBestIdx(quants) ? "primary" : ""}" data-q="${i}"${ok && !j.gated ? "" : " disabled"}>Download</button></td></tr>`;
+    });
+    h += `</tbody></table>`;
+    const extras = [...(j.vision || []).map(v => ({ ...v, why: "Vision file, so the model can read images" })), ...(j.draft || []).map(v => ({ ...v, why: "Draft file for speculative decoding (faster replies)" }))];
+    if (extras.length) {
+      h += `<div class="hfextra">`;
+      extras.forEach((x, k) => {
+        // vision: one is enough (the F16 one if there is, else the first); draft files: yes
+        const vis = j.vision || [], pref = Math.max(0, vis.findIndex(v => /^f16$/i.test(v.label)));
+        const pick = x.kind !== "vision" || vis.indexOf(vis.find(v => v.files[0].path === x.files[0].path)) === pref;
+        h += `<label><input type="checkbox" data-x="${k}"${pick ? " checked" : ""}> Also download ${esc2(x.files[0].path)} (${fmtGiB(x.size)}): ${x.why}</label>`;
+      });
+      h += `</div>`;
+    }
+    h += `<div class="caption">Sizes are the weights; the context (set when you load) takes some VRAM or RAM on top. Files go into tierlm's own models folder, in models\\${esc2(id.replace("/", "\\"))}, and are listed whichever folder you browse.</div>`;
+    pane.innerHTML = h + `</div>`;
+    pane.querySelectorAll("button[data-q]").forEach(b => b.onclick = () => {
+      const q = quants[+b.dataset.q];
+      const files = q.files.map(f => f.path);
+      pane.querySelectorAll("input[data-x]:checked").forEach(c => { for (const f of extras[+c.dataset.x].files) files.push(f.path); });
+      hfDownload(id, files);
+    });
+    return;
+  }
+  pane.innerHTML = h + `</div>`;
+}
+// The biggest quant that fits in VRAM, else the biggest that fits in VRAM + RAM, else the smallest: highlighted.
+function hfBestIdx(quants) {
+  let best = -1;
+  for (const cls of ["good", "warn"]) {
+    quants.forEach((q, i) => { if (hfFit(q.size).cls === cls) best = i; });
+    if (best >= 0) return best;
+  }
+  return 0;
+}
+async function hfDownload(id, files) {
+  try {
+    const r = await api("/api/hf/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, files }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || j.error || "couldn't start the download");
+  } catch (e) { hfSeen = true; hfBar({ state: "error", error: e.message, files: [] }); return; }
+  hfSeen = true;
+  hfWatch();
+}
+let hfLastDone = 0, hfLastT = 0, hfRate = 0, hfSeen = false;   // hfSeen: a download ran while this page was open
+function hfWatch() {
+  clearInterval(hfPoll);
+  const tick = async () => {
+    let j;
+    try { j = await (await api("/api/hf/download")).json(); } catch (e) { return; }
+    if (j.state === "downloading") hfSeen = true;
+    if (j.state === "downloading" || hfSeen) hfBar(j); else $("hfdl").hidden = true;   // (not an old result)
+    if (j.state !== "downloading") {
+      clearInterval(hfPoll);
+      if (j.state === "done") {                                       // the new files show up in the model list
+        try { window.opener?.loadSetup?.(); } catch (e) {}
+        if (!$("setup").hidden) loadSetup();
+      }
+    }
+  };
+  tick();
+  hfPoll = setInterval(tick, 1000);
+}
+function hfBar(j) {
+  const bar = $("hfdl");
+  if (!j || j.state === "idle") { bar.hidden = true; return; }
+  bar.hidden = false;
+  const now = Date.now();
+  if (hfLastT && j.done >= hfLastDone) hfRate = 0.7 * hfRate + 0.3 * ((j.done - hfLastDone) / Math.max(0.001, (now - hfLastT) / 1000));
+  hfLastDone = j.done; hfLastT = now;
+  const cur = (j.files || []).find(f => f.state === "downloading" || f.state === "checking");
+  const pct = j.total ? Math.min(100, 100 * j.done / j.total) : 0;
+  let txt;
+  if (j.state === "downloading") {
+    const left = hfRate > 1 ? Math.round((j.total - j.done) / hfRate) : 0;
+    txt = (cur ? (cur.state === "checking" ? "Checking " : "Downloading ") + esc2(cur.path) : "Starting") +
+      ` · ${fmtGiB(j.done)} of ${fmtGiB(j.total)}` + (hfRate > 1 ? ` · ${(hfRate / 1048576).toFixed(1)} MB/s` : "") +
+      (left > 0 ? ` · about ${left >= 3600 ? Math.floor(left / 3600) + " h " + Math.round(left % 3600 / 60) + " min" : left >= 60 ? Math.round(left / 60) + " min" : left + " s"} left` : "");
+  } else if (j.state === "done") txt = `Done: ${esc2(j.id)} is in tierlm's models folder, checked. Pick it in <b>GGUF models</b> to load it.`;
+  else if (j.state === "cancelled") txt = `Stopped. What was downloaded is kept; download it again to continue where it left off.`;
+  else txt = `<span style="color:var(--danger)">${esc2(j.error || "The download failed.")}</span>`;
+  bar.innerHTML = `<div class="txt" style="flex:1 1 100%">${txt}</div>` + (j.state === "downloading" ? `<div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div><button class="tiny" id="hfcancel">Cancel</button>` : "") +
+    (j.state !== "downloading" ? `<button class="tiny ghost" id="hfhide">OK</button>` : "");
+  const c = $("hfcancel"); if (c) c.onclick = () => api("/api/hf/cancel", { method: "POST" });
+  const o = $("hfhide"); if (o) o.onclick = () => { bar.hidden = true; };
+}
+if (new URLSearchParams(location.search).has("models")) {            // Get models in a window of its own
+  document.body.classList.add("hfalone");
+  document.title = "Get models · tierlm";
+  $("hfpop").hidden = true;
+  hfOpen();
+}
+
+// ---------- the menu's width: drag the edge (kept per browser); double-click for the usual 330 px ----------
+{
+  const MIN = 260, MAX = 640, DEF = 330;
+  const setW = w => { w = Math.round(Math.min(MAX, Math.max(MIN, w))); $("app").style.setProperty("--panelw", w + "px"); return w; };
+  try { const w = +localStorage.getItem("tierlm.panelw"); if (w) setW(w); } catch (e) {}
+  const save = w => { try { localStorage.setItem("tierlm.panelw", String(w)); } catch (e) {} requestAnimationFrame(resizeCanvases); };
+  const sp = $("panelsplit");
+  sp.addEventListener("pointerdown", ev => {
+    ev.preventDefault();
+    const left = $("panel").getBoundingClientRect().left;
+    sp.classList.add("drag"); sp.setPointerCapture(ev.pointerId);
+    let w = DEF;
+    const move = e => { w = setW(e.clientX - left); resizeCanvases(); };
+    const up = () => { sp.classList.remove("drag"); sp.removeEventListener("pointermove", move); sp.removeEventListener("pointerup", up); save(w); };
+    sp.addEventListener("pointermove", move); sp.addEventListener("pointerup", up);
+  });
+  sp.addEventListener("dblclick", () => save(setW(DEF)));
+  sp.addEventListener("keydown", e => {                                // keyboard: arrows resize
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    const now = $("panel").getBoundingClientRect().width;
+    save(setW(now + (e.key === "ArrowRight" ? 20 : -20)));
+  });
 }
 
 // ---------- the preview pane ----------

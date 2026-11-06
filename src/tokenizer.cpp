@@ -6,6 +6,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -170,15 +171,18 @@ std::vector<std::pair<size_t, size_t>> pretokenize_llama3(const std::string& s, 
 // Words split where lower case turns to upper case ("HelloWorld" -> "Hello", "World"), and a word may carry its
 // contraction. "U" below is the first class (upper case, plus letters without case, plus marks), "L" the second
 // (lower case, plus the same caseless letters and marks).
-std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s) {
+// kimi: Kimi K2's variant (tiktoken): runs of Chinese characters (the Han script) are pieces of their own and are
+// not letters for the word rules, and a punctuation run takes newlines after it but not slashes.
+std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s, bool kimi = false) {
     const auto cps = utf8_decode(s);
     const size_t n = cps.size();
     std::vector<std::pair<size_t, size_t>> out;
     auto C = [&](size_t k) { return cps[k].cp; };
     auto lowerc = [](uint32_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
     auto nl = [](uint32_t c) { return c == '\r' || c == '\n'; };
-    auto up = [&](uint32_t c) { return (is_letter(c) && !in(uni::kLower, c)) || is_mark(c); };      // Lu Lt Lm Lo M
-    auto lo = [&](uint32_t c) { return (is_letter(c) && !in(uni::kUpper, c)) || is_mark(c); };      // Ll Lm Lo M
+    auto han = [&](uint32_t c) { return kimi && in(uni::kHan, c); };
+    auto up = [&](uint32_t c) { return ((is_letter(c) && !in(uni::kLower, c)) || is_mark(c)) && !han(c); };      // Lu Lt Lm Lo M
+    auto lo = [&](uint32_t c) { return ((is_letter(c) && !in(uni::kUpper, c)) || is_mark(c)) && !han(c); };      // Ll Lm Lo M
     auto prefix_ok = [&](uint32_t c) { return !nl(c) && !is_letter(c) && !is_number(c); };          // [^\r\n\p{L}\p{N}]
     auto emit = [&](size_t a, size_t b) {
         size_t off = cps[a].off, end = cps[b - 1].off + cps[b - 1].len;
@@ -214,6 +218,11 @@ std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s) {
     };
     size_t i = 0;
     while (i < n) {
+        if (han(C(i))) {                                    // Kimi: \p{Han}+
+            size_t k = i + 1;
+            while (k < n && han(C(k))) ++k;
+            emit(i, k); i = k; continue;
+        }
         // 1 and 2: words, each with an optional leading character, tried with it first (the ? is greedy)
         size_t e = 0;
         for (int br = 0; br < 2 && !e; ++br)
@@ -235,7 +244,7 @@ std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s) {
             if (other(C(j))) {
                 size_t k = j + 1;
                 while (k < n && other(C(k))) ++k;
-                while (k < n && (nl(C(k)) || C(k) == '/')) ++k;
+                while (k < n && (nl(C(k)) || (C(k) == '/' && !kimi))) ++k;
                 emit(i, k); i = k; continue;
             }
         }
@@ -249,6 +258,81 @@ std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s) {
         else if (k - i >= 2)       { emit(i, k - 1); i = k - 1; }               // \s+(?!\S): leave one for the next word
         else                       { emit(i, k); i = k; }                       // \s+
     }
+    return out;
+}
+
+// DeepSeek V3 (and R1, V3.1, V3.2): Hugging Face's sequence of three splits, each keeping both the matches and the
+// text between them as pieces:
+//   1. \p{N}{1,3}                         digits, at most three together
+//   2. [一-龥぀-ゟ゠-ヿ]+                    runs of CJK ideographs and kana
+//   3. [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ |
+//       ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+std::vector<std::pair<size_t, size_t>> pretokenize_deepseek_v3(const std::string& s) {
+    const auto cps = utf8_decode(s);
+    const size_t n = cps.size();
+    std::vector<std::pair<size_t, size_t>> out;
+    auto C = [&](size_t k) { return cps[k].cp; };
+    auto emit = [&](size_t a, size_t b) { if (b > a) out.push_back({cps[a].off, cps[b - 1].off + cps[b - 1].len - cps[a].off}); };
+    auto nl = [](uint32_t c) { return c == '\r' || c == '\n'; };
+    auto cjk = [](uint32_t c) { return (c >= 0x4E00 && c <= 0x9FA5) || (c >= 0x3040 && c <= 0x309F) || (c >= 0x30A0 && c <= 0x30FF); };
+    auto P = [&](uint32_t c) { return in(uni::kPunctP, c); };
+    auto S = [&](uint32_t c) { return in(uni::kSymbol, c); };
+    auto LM = [&](uint32_t c) { return is_letter(c) || is_mark(c); };
+    auto ascii_punct = [](uint32_t c) { return c < 128 && std::strchr("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", (int)c) && c != 0; };
+    auto ascii_alpha = [](uint32_t c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); };
+    // split 3 within [a, b): matches and the gaps between them
+    auto third = [&](size_t a, size_t b) {
+        size_t i = a, gap = a;
+        while (i < b) {
+            size_t e = 0;
+            if (ascii_punct(C(i)) && i + 1 < b && ascii_alpha(C(i + 1))) {            // punctuation + ASCII word
+                e = i + 1; while (e < b && ascii_alpha(C(e))) ++e;
+            }
+            if (!e) {                                                                     // [^\r\n L P S]? [L M]+
+                const uint32_t c = C(i);
+                if (!nl(c) && !is_letter(c) && !P(c) && !S(c) && i + 1 < b && LM(C(i + 1))) { e = i + 2; while (e < b && LM(C(e))) ++e; }
+                else if (LM(c)) { e = i + 1; while (e < b && LM(C(e))) ++e; }
+            }
+            if (!e) {                                                                     // " ?[P S]+[\r\n]*"
+                const size_t j = C(i) == ' ' && i + 1 < b && (P(C(i + 1)) || S(C(i + 1))) ? i + 1 : i;
+                if (P(C(j)) || S(C(j))) { e = j + 1; while (e < b && (P(C(e)) || S(C(e)))) ++e; while (e < b && nl(C(e))) ++e; }
+            }
+            if (!e && is_space(C(i))) {                                                   // the whitespace rules
+                size_t k = i; while (k < b && is_space(C(k))) ++k;
+                size_t last_nl = b;
+                for (size_t m = i; m < k; ++m) if (nl(C(m))) last_nl = m;
+                if (last_nl != b) e = last_nl + 1;
+                else if (k == b) e = k;
+                else if (k - i >= 2) e = k - 1;
+                else e = k;
+            }
+            if (!e) { ++i; continue; }                                                    // not matched: part of a gap
+            emit(gap, i);
+            emit(i, e);
+            i = gap = e;
+        }
+        emit(gap, b);
+    };
+    auto second = [&](size_t a, size_t b) {                                               // CJK runs, then split 3
+        size_t i = a, gap = a;
+        while (i < b) {
+            if (!cjk(C(i))) { ++i; continue; }
+            size_t e = i + 1; while (e < b && cjk(C(e))) ++e;
+            if (i > gap) third(gap, i);
+            third(i, e);
+            i = gap = e;
+        }
+        if (b > gap) third(gap, b);
+    };
+    size_t i = 0, gap = 0;                                                                // digits, at most three together
+    while (i < n) {
+        if (!is_number(C(i))) { ++i; continue; }
+        size_t e = i + 1; while (e < n && e - i < 3 && is_number(C(e))) ++e;
+        if (i > gap) second(gap, i);
+        second(i, e);
+        i = gap = e;
+    }
+    if (n > gap) second(gap, n);
     return out;
 }
 
@@ -276,6 +360,8 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         else if (pre == "qwen2" || pre == "deepseek-r1-qwen" || pre == "megrez") t.pre_ = Pre::Qwen2;
         else if (pre == "qwen35") t.pre_ = Pre::Qwen35;
         else if (pre == "gpt-4o" || pre == "o200k") t.pre_ = Pre::O200k;
+        else if (pre == "kimi-k2") t.pre_ = Pre::Kimi;
+        else if (pre == "deepseek-v3") t.pre_ = Pre::DeepseekV3;
         else if (pre.empty() || pre == "default" || pre == "gpt-2" || pre == "olmo" || pre == "gpt2") t.pre_ = Pre::Gpt2;
         else {
             // Unknown splitter: most recent BPE models use the Llama 3 pattern or something close to it.
@@ -392,6 +478,8 @@ void Tokenizer::encode_plain(const std::string& text, std::vector<int32_t>& out,
     if (kind_ == Kind::Wpm) { wpm(text, out); return; }
     const auto parts = pre_ == Pre::Gpt2 ? pretokenize_gpt2(text)
                      : pre_ == Pre::O200k ? pretokenize_o200k(text)
+                     : pre_ == Pre::Kimi ? pretokenize_o200k(text, true)
+                     : pre_ == Pre::DeepseekV3 ? pretokenize_deepseek_v3(text)
                      : pretokenize_llama3(text, pre_ == Pre::Llama3 ? 3 : 1, pre_ == Pre::Qwen35);
     for (const auto& [off, len] : parts) bpe(text.substr(off, len), out);
 }

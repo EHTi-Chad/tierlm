@@ -7,6 +7,12 @@ No. tierlm runs on the CPU too; it's just slower. With a GPU that supports Vulka
 NVIDIA GeForce), replies are typically 1.5 to 2 times faster. The pill at the top-left of the page shows which
 device is in use.
 
+**Can I run a model bigger than my VRAM and RAM together?**
+Yes, with the SSD tier: the parts used least stay on a drive and are read as they're needed (see
+[Getting started](GETTING_STARTED.md#models-bigger-than-your-ram-the-ssd-tier)). Mixture-of-experts models suit it
+best, since each word reads only the few experts it picks. It's much slower than RAM; pick an NVMe SSD as its drive
+in the setup screen. The answers are the same as with everything in RAM.
+
 **Why is a dense model (like Qwen3.6-27B) so much slower than a bigger MoE model when it doesn't fit in VRAM?**
 A dense model reads all of its weights for every word. When most of them are in RAM, speed is limited by how fast
 RAM delivers them: a laptop's RAM gives roughly 40 GB/s, so 14 GB of weights in RAM means about 3 words per second.
@@ -163,8 +169,8 @@ with most of the model in RAM; ordinary dense models slow down a lot.
 
 **Which download do I need?**
 Both run on every PC; tierlm picks the fastest engine it has when it starts. `tierlm-<version>-windows.zip`
-(about 550 MB) includes NVIDIA's **CUDA** engine, the fastest option on GeForce RTX 20/30/40/50 cards: get it if
-you have one. `tierlm-<version>-windows-lite.zip` (about 20 MB) has only the **Vulkan** engine, which runs on
+(about 550 MB) includes NVIDIA's **CUDA** engine, the fastest option on GeForce RTX 20/30/40/50 cards and the
+Tesla V100 (and other NVIDIA cards from the V100 on): get it if you have one. `tierlm-<version>-windows-lite.zip` (about 20 MB) has only the **Vulkan** engine, which runs on
 Intel Arc, AMD Radeon and NVIDIA cards (slower than CUDA on NVIDIA). Without a GPU, either uses the CPU. With the
 full download on a PC without an NVIDIA card, the black window may say CUDA found no device; that's expected.
 
@@ -222,6 +228,13 @@ graphics, the GPU shares system memory, so other apps compete for it.
 **The black window closes immediately**
 Open a command prompt in the tierlm folder and run `start-tierlm.bat` from there, so you can read the error
 message.
+
+**"Running on Vulkan instead of CUDA" on an NVIDIA card**
+The full download's CUDA engine has code for NVIDIA cards from the Tesla V100 (Volta) on. An older card, such as a
+GTX 10-series, Tesla P40 or P100 (Pascal), can't run it, so tierlm uses that card through Vulkan instead, which works
+but is slower. The setup screen and **tierlm-devices.exe** say when this happens. In a PC with both kinds of card,
+the newer ones still use CUDA. (To choose the CUDA cards yourself, set `CUDA_VISIBLE_DEVICES`; tierlm then leaves
+the choice to you.)
 
 ## Still stuck?
 

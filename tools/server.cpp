@@ -118,12 +118,13 @@ std::string gguf_string(const std::string& path, const char* key) {
 
 // Chat formats. Each model family wraps a conversation in its own markers; the GGUF's chat template (and
 // failing that, its vocabulary) says which one. Control tokens are matched when encoding with parse_special.
-enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, Plain };
+enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, DeepSeek, Kimi, Plain };
 
 const char* chat_fmt_name(ChatFmt f) {
     switch (f) {
         case ChatFmt::Tulu: return "tulu"; case ChatFmt::ChatML: return "chatml";
         case ChatFmt::Llama3: return "llama3"; case ChatFmt::Mistral: return "mistral"; case ChatFmt::Harmony: return "harmony";
+        case ChatFmt::DeepSeek: return "deepseek"; case ChatFmt::Kimi: return "kimi";
         default: return "plain";
     }
 }
@@ -132,6 +133,8 @@ ChatFmt detect_chat(const Tokenizer& tok) {
     const std::string& t = tok.chat_template();
     auto has = [&](const char* s) { return t.find(s) != std::string::npos; };
     if (has("<|channel|>")) return ChatFmt::Harmony;                 // gpt-oss (OpenAI's harmony format)
+    if (has("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") || tok.find("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") >= 0) return ChatFmt::DeepSeek;   // <｜Assistant｜>
+    if (has("<|im_middle|>") || tok.find("<|im_middle|>") >= 0) return ChatFmt::Kimi;
     if (has("<|im_start|>")) return ChatFmt::ChatML;
     if (has("<|start_header_id|>")) return ChatFmt::Llama3;
     if (has("<|user|>")) return ChatFmt::Tulu;
@@ -195,6 +198,45 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
         for (const auto& m : messages)
             s += "<|im_start|>" + m.value("role", std::string("user")) + "\n" + m.value("content", std::string()) + "<|im_end|>\n";
         return s + "<|im_start|>assistant\n" + (think == 0 ? "<think>\n\n</think>\n\n" : think == 1 ? "<think>\n" : "");
+    case ChatFmt::DeepSeek: {                             // DeepSeek V3 / R1 / V3.1: <｜User｜>... <｜Assistant｜>...
+        const std::string U = "<\xEF\xBD\x9CUser\xEF\xBD\x9C>", A = "<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>";
+        const std::string bos = "<\xEF\xBD\x9C" "begin\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>";
+        const std::string eos = "<\xEF\xBD\x9C" "end\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>";
+        const std::string& ct = tok.chat_template();
+        if (tok.find(bos) >= 0) s = bos;
+        std::string sys;                                  // system prompts come first, joined
+        for (const auto& m : messages) if (m.value("role", "") == "system") sys += (sys.empty() ? "" : "\n\n") + m.value("content", std::string());
+        s += sys;
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", "");
+            std::string c = m.value("content", std::string());
+            if (role == "user") s += U + c;
+            else if (role == "assistant") {               // earlier answers without their reasoning, as the template does
+                const size_t e = c.rfind("</think>");
+                if (e != std::string::npos) c = c.substr(e + 8);
+                s += A + c + eos;
+            }
+        }
+        s += A;
+        if (ct.find("<think>\\n") != std::string::npos && ct.find("thinking") == std::string::npos) return s + "<think>\n";   // R1: always thinks
+        if (ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos)                         // V3.1: a switch
+            return s + (think == 1 ? "<think>" : "</think>");
+        return s;
+    }
+    case ChatFmt::Kimi: {                                 // Kimi K2: <|im_user|>user<|im_middle|>...<|im_end|>
+        const std::string& ct = tok.chat_template();
+        const char* kimi_sys = "You are Kimi, an AI assistant created by Moonshot AI.";
+        bool have_sys = false;
+        for (const auto& m : messages) have_sys |= m.value("role", "") == "system";
+        if (!have_sys && ct.find(kimi_sys) != std::string::npos) s += std::string("<|im_system|>system<|im_middle|>") + kimi_sys + "<|im_end|>";
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", std::string("user")), c = m.value("content", std::string());
+            if (role == "system") s += "<|im_system|>system<|im_middle|>" + c + "<|im_end|>";
+            else if (role == "assistant") s += "<|im_assistant|>assistant<|im_middle|>" + c + "<|im_end|>";
+            else s += "<|im_user|>user<|im_middle|>" + c + "<|im_end|>";
+        }
+        return s + "<|im_assistant|>assistant<|im_middle|>";
+    }
     case ChatFmt::Llama3:
         s = "<|begin_of_text|>";
         for (const auto& m : messages)
@@ -398,6 +440,11 @@ json hardware_warnings(bool have_gpu) {
                                  ". This forces Vulkan to use one specific driver and is usually left over from an old driver install. "
                                  "It can hide your GPU." }});
     }
+    for (const auto& g : skipped_cuda_gpus())
+        w.push_back({{"code", "cuda_skip"}, {"gpu", g.name}, {"cc", std::to_string(g.major) + "." + std::to_string(g.minor)},
+                     {"message", g.name + " is a generation (compute capability " + std::to_string(g.major) + "." + std::to_string(g.minor) +
+                                 ") that this tierlm's CUDA engine doesn't cover (it covers " + cuda_built_for() +
+                                 " and newer), so it runs through Vulkan instead. It works, just more slowly than CUDA would."}});
 #ifdef GGML_USE_VULKAN
     if (!have_gpu)
         w.push_back({{"code", "no_gpu"}, {"message", "No GPU was found, so the CPU will be used. If this computer has a GPU, update its driver; "
@@ -688,6 +735,8 @@ struct Engine {
     // each guessed token picks its own. So shorter there, longer when everything is in VRAM.
     int lookup_len() const {
         if (!model || lookup == 0) return 0;
+        // (Flash-Next: its n-gram convolution can't take back guessed tokens yet, so no guessing for it)
+        if (model->hparams().any_ple()) return 0;
         if (lookup > 0) return std::min(lookup, 16);
         if (model->hparams().is_moe() && model->placement().split()) return 4;
         if (model->hparams().hybrid) return 6;
@@ -734,14 +783,15 @@ struct Engine {
     }
 };
 
-// Header-only look at a GGUF file: what it is, how big, and whether tierlm can run it.
-json describe_model(const std::string& path) {
+// Header-only look at a GGUF file: what it is, how big, and whether tierlm can run it. header_only: the file is just
+// the first megabytes of a model's first file (Get models), so its other parts aren't looked for.
+json describe_model(const std::string& path, bool header_only = false) {
     json j = {{"file", std::filesystem::u8path(path).filename().u8string()}, {"supported", false}};
     std::error_code ec;
     j["bytes"] = (uint64_t)std::filesystem::file_size(std::filesystem::u8path(path), ec);
     // A model split over several files: count every part's size, and make sure they're all there.
     SplitInfo split;
-    try { split = gguf_split_info(path); } catch (const std::exception& e) { j["reason"] = e.what(); return j; }
+    if (!header_only) try { split = gguf_split_info(path); } catch (const std::exception& e) { j["reason"] = e.what(); return j; }
     if (split.count > 1) {
         uint64_t total = 0;
         for (const auto& p : split.paths) { std::error_code e2; auto n = std::filesystem::file_size(std::filesystem::u8path(p), e2); if (!e2) total += n; }
@@ -791,12 +841,14 @@ json describe_model(const std::string& path) {
         const std::string comp = mtp_companion(path);
         if (!comp.empty()) { j["mtp"] = true; j["mtp_file"] = fs::u8path(comp).filename().u8string(); }
     }
-    if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") {
+    if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp") {
         const int64_t interval = u32(arch + ".full_attention_interval") ? u32(arch + ".full_attention_interval") : 4;
         kv_layers = layers / interval;
         j["hybrid"] = true;
     }
     if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * kv_layers * (kv_heads ? kv_heads : heads) * head_dim * 2;
+    if (arch == "deepseek2" && layers)                    // latent attention: one compressed vector per token per layer
+        j["kv_bytes_per_token"] = kv_layers * (u32(arch + ".attention.kv_lora_rank") + u32(arch + ".rope.dimension_count")) * 2;
     const std::string tk = str("tokenizer.ggml.model");
     if (is_encoder_arch(arch)) {
         // An embedding model: it turns text into vectors for search and comparison, alongside a chat model.
@@ -1223,6 +1275,10 @@ int main(int argc, char** argv) {
     std::atomic<bool> loading{false};    // a model is being loaded (for the page's progress bar)
     std::atomic<float> load_progress{0.0f};
 
+    // tierlm's own models folder: "models" next to it (or --models). Downloads always go there, and its models are
+    // always listed (ids "@tierlm/<path>"), whichever folder is chosen for browsing (LM Studio's, say).
+    std::error_code own_ec;
+    const fs::path own_models = fs::absolute(fs::u8path(a.models_given ? a.models : std::string("models")), own_ec).lexically_normal();
     // The models folder: --models if given, else the one saved last time, else "models".
     json settings = read_settings(a.settings);
     bool recursive = settings.value("recursive", true);
@@ -1232,6 +1288,21 @@ int main(int argc, char** argv) {
         if (fs::is_directory(fs::u8path(saved), ec)) a.models = saved;
     }
     std::fprintf(stderr, "tierlm %s\nmodels folder: %s\n", TIERLM_VERSION, a.models.c_str());
+    // A model file's id: its path inside the chosen folder, or "@tierlm/" + its path inside tierlm's own folder.
+    auto model_key = [&](const std::string& p) -> std::string {
+        std::error_code ec;
+        const fs::path file = fs::weakly_canonical(fs::u8path(p), ec);
+        auto inside = [&](const fs::path& root, std::string& out) {
+            std::error_code e2;
+            const std::string r = file.lexically_relative(fs::weakly_canonical(root, e2)).generic_u8string();
+            if (e2 || r.empty() || r.compare(0, 2, "..") == 0) return false;
+            out = r; return true;
+        };
+        std::string r;
+        if (inside(fs::u8path(a.models), r)) return r;
+        if (inside(own_models, r)) return "@tierlm/" + r;
+        return fs::u8path(p).filename().u8string();
+    };
 
     // hot: keep the model's busiest experts in VRAM, from what tierlm learned about it before (MoE models, experts in RAM).
     auto load = [&](const std::string& path, const LoadOptions& opt, int threads, int seed, bool hot = true) {
@@ -1281,7 +1352,8 @@ int main(int argc, char** argv) {
         if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max);
         eng.spec_changed();
         // Its eyes: an mmproj (vision) file in the same folder, for models that read images (Qwen3.5 / 3.6).
-        if (eng.model->has_positions3()) {
+        // (Not Flash-Next yet: its images aren't tested, so it runs text only and doesn't say it reads images.)
+        if (eng.model->has_positions3() && !eng.model->hparams().any_ple()) {
             const fs::path vf = vision_file_for(path, eng.model->hparams().n_embd);
             if (!vf.empty()) {
                 try {
@@ -1306,9 +1378,13 @@ int main(int argc, char** argv) {
             eng.think_switch = eng.chat == ChatFmt::ChatML && ct.find("enable_thinking") != std::string::npos;
             eng.think_starts = eng.think_switch &&       // (its generation prompt: {{- '<think>\\n' }}, as Qwen3.5 and later)
                 std::regex_search(ct, std::regex(R"('<think>(\\n|\n)'\s*\}\})"));
+            if (eng.chat == ChatFmt::DeepSeek) {          // V3.1 has a thinking switch; R1 always starts by thinking
+                eng.think_switch = ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos;
+                eng.think_starts = eng.think_switch || ct.find("<think>\\n") != std::string::npos;
+            }
             const json ms = settings.value("models", json::object());
             std::error_code ec;
-            const auto rel = fs::u8path(path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec)).generic_u8string();
+            const std::string rel = model_key(path);
             const json saved = ms.contains(rel) && ms[rel].is_object() ? ms[rel] : json::object();
             eng.thinking = saved.value("thinking", true);
             eng.effort = saved.value("effort", std::string("medium"));
@@ -1360,6 +1436,10 @@ int main(int argc, char** argv) {
         o.mtp = body.value("speculative", false);      // load the MTP draft block for speculative decoding
         o.multi_gpu = body.value("multi_gpu", true);
         o.live_hot = body.value("live_experts", false);  // VRAM experts follow the conversation (see LoadOptions::live_hot)
+        // The SSD tier: the folder chosen in the setup screen (for every model), and whether to use it ("ssd": false
+        // keeps everything in RAM, as before 0.8.2).
+        o.ssd_dir = settings.value("ssd_dir", std::string());
+        if (body.contains("ssd")) o.ssd = body.value("ssd", true) ? -1 : 0;
         // Connections: replies written at once. The context length is per connection, so the cache holds that many.
         o.parallel = std::max(1, std::min(64, body.value("connections", 1)));
         if (o.parallel > 1 && o.max_ctx > 0) o.max_ctx *= o.parallel;
@@ -1433,6 +1513,8 @@ int main(int argc, char** argv) {
             {"mtp_loaded", eng.model->has_mtp()}, {"ffn_vram", eng.model->placement().ffn_vram},
             {"hot_experts", eng.model->placement().hot_experts}, {"hot_share", eng.hot_share}, {"hot", eng.model->placement().hot},
             {"live_experts", eng.model->live_hot()},
+            {"ssd_weights", eng.model->placement().ssd_weights}, {"ssd_layers", eng.model->placement().ssd_layers}, {"ssd_ngram", eng.model->placement().ssd_ngram},
+            {"ssd_file", eng.model->placement().ssd_file},
             {"live", [&] { const auto& s = eng.model->live_stats();
                            return json{{"picks", s.picks}, {"hits", s.hits}, {"swaps", s.swaps}, {"swap_ms", std::round(s.swap_ms)}}; }()},
             {"learned_tokens", [&] { double t = 0; for (float v : eng.usage) t += v; return hp.n_layer * hp.n_expert_used > 0 ? (long long)(t / (hp.n_layer * hp.n_expert_used)) : 0LL; }()},
@@ -1441,7 +1523,7 @@ int main(int argc, char** argv) {
             {"ram_free", [&] { size_t f = 0, t = 0; if (auto d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(d, &f, &t); return f; }()},
             {"tuned_tps", [&] {
                 std::error_code ec;
-                const std::string id = fs::u8path(eng.path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec)).generic_u8string();
+                const std::string id = model_key(eng.path);
                 const json& ms = settings.contains("models") ? settings["models"] : json::object();
                 if (!ms.contains(id) || !ms[id].contains("tuned")) return 0.0;
                 return ms[id]["tuned"].value("tps", 0.0);
@@ -1532,6 +1614,25 @@ int main(int argc, char** argv) {
             for (const auto& f : fs::directory_iterator(base, ec))
                 if (f.is_regular_file() && f.path().extension() == ".gguf" && !gguf_is_later_part(f.path().filename().u8string())) add(f.path());
         }
+        // tierlm's own folder (where Get models puts downloads), when it's another folder: always listed, subfolders too
+        std::set<std::string> seen;
+        for (const auto& m : list) { std::error_code e2; seen.insert(fs::weakly_canonical(fs::u8path(a.models) / fs::u8path(m.value("id", std::string())), e2).u8string()); }
+        std::error_code e3;
+        if (!fs::equivalent(own_models, base, e3) && fs::is_directory(own_models, e3)) {
+            auto it = fs::recursive_directory_iterator(own_models, fs::directory_options::skip_permission_denied, e3);
+            for (; !e3 && it != fs::recursive_directory_iterator() && list.size() < 800; it.increment(e3)) {
+                if (it.depth() > 4) { it.disable_recursion_pending(); continue; }
+                std::error_code e2;
+                if (!it->is_regular_file(e2) || it->path().extension() != ".gguf" || gguf_is_later_part(it->path().filename().u8string())) continue;
+                if (!seen.insert(fs::weakly_canonical(it->path(), e2).u8string()).second) continue;   // (the chosen folder is inside it)
+                json m = describe_model(it->path().u8string());
+                m["id"] = "@tierlm/" + it->path().lexically_relative(own_models).generic_u8string();
+                const std::string sub = it->path().parent_path().lexically_relative(own_models).generic_u8string();
+                m["folder"] = "tierlm models" + (sub == "." ? std::string() : "/" + sub);
+                m["own"] = true;
+                list.push_back(m);
+            }
+        }
         return list;
     };
     svr.Get("/api/models", [&](const httplib::Request&, httplib::Response& res) {
@@ -1618,10 +1719,13 @@ int main(int argc, char** argv) {
         if (ec || rel.empty() || rel.begin()->string() == ".." || !std::filesystem::is_regular_file(file, ec) || file.extension() != ".gguf") return {};
         return file;
     };
-    auto model_file = [&](const std::string& id) -> std::filesystem::path {
+    auto model_file = [&](const std::string& id_in) -> std::filesystem::path {
         std::error_code ec;
-        const auto base = std::filesystem::weakly_canonical(std::filesystem::u8path(a.models), ec);
-        const auto file = std::filesystem::weakly_canonical(std::filesystem::u8path(a.models) / std::filesystem::u8path(id), ec);
+        const bool own = id_in.rfind("@tierlm/", 0) == 0;                 // in tierlm's own folder
+        const std::string id = own ? id_in.substr(8) : id_in;
+        const fs::path root = own ? own_models : std::filesystem::u8path(a.models);
+        const auto base = std::filesystem::weakly_canonical(root, ec);
+        const auto file = std::filesystem::weakly_canonical(root / std::filesystem::u8path(id), ec);
         auto rel = file.lexically_relative(base);
         if (ec || rel.empty() || rel.begin()->string() == ".." || !std::filesystem::is_regular_file(file, ec)) return {};
         return file;
@@ -1680,7 +1784,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::shared_timed_mutex> lk(mu);
         if (!eng.model) return oai_error(res, 400, "no model is loaded");
         std::error_code ec;
-        const std::string id = fs::u8path(eng.path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec)).generic_u8string();
+        const std::string id = model_key(eng.path);
         if (body.contains("thinking") && body["thinking"].is_boolean()) {
             eng.thinking = body["thinking"].get<bool>();
             if (settings.contains("models") && settings["models"].contains(id)) settings["models"][id]["thinking"] = eng.thinking;
@@ -1735,6 +1839,38 @@ int main(int argc, char** argv) {
         const int want = req.has_param("ctx") ? std::atoi(req.get_param_value("ctx").c_str()) : 0;
         res.set_content(dump(context_plan(want > 0 ? want : (eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per))), "application/json");
     });
+    // ---- the SSD tier's drive ----
+    // GET: the drives it can use with their free space, and the folder chosen ("" = each model's own drive, where the
+    // file is read in place). POST {"dir": "D:\\"}: choose one (a drive's root gets a tierlm-ssd folder); used from
+    // the next load. Only on the computer running tierlm (remote_refused covers POST).
+    svr.Get("/api/drives", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!is_local(req)) return oai_error(res, 403, "only on the computer running tierlm");
+        json list = json::array();
+        for (const DriveInfo& d : list_drives())
+            list.push_back({{"path", d.path}, {"label", d.label}, {"free", d.free_bytes}, {"total", d.total_bytes}});
+        std::string dir = settings.value("ssd_dir", std::string());
+        unsigned long long fr = 0, tot = 0;
+        const bool known = !dir.empty() && drive_space(fs::u8path(dir).root_path().u8string(), fr, tot);
+        res.set_content(dump(json{{"drives", list}, {"ssd_dir", dir}, {"ssd_free", known ? fr : 0ull}}), "application/json");
+    });
+    svr.Post("/api/ssd", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        if (!body.is_object()) return oai_error(res, 400, "expected {\"dir\": ...}");
+        std::string dir = body.value("dir", std::string());
+        if (!dir.empty()) {
+            fs::path p = fs::u8path(dir);
+            if (p == p.root_path()) p /= "tierlm-ssd";             // a whole drive: our own folder on it
+            std::error_code ec;
+            fs::create_directories(p, ec);
+            if (!fs::is_directory(p, ec)) return oai_error(res, 400, "can't use " + p.u8string() + ": " + (ec ? ec.message() : "not a folder"));
+            dir = p.u8string();
+        }
+        settings["ssd_dir"] = dir;
+        write_settings(a.settings, settings);
+        std::fprintf(stderr, "SSD tier: %s (from the next load)\n", dir.empty() ? "each model's own drive" : dir.c_str());
+        res.set_content(dump(json{{"ok", true}, {"ssd_dir", dir}}), "application/json");
+    });
+
     svr.Post("/api/context", [&](const httplib::Request& req, httplib::Response& res) {
         const json body = json::parse(req.body, nullptr, false);
         const int want = body.is_object() ? body.value("ctx", 0) : 0;
@@ -1750,8 +1886,7 @@ int main(int argc, char** argv) {
         if (!eng.slots.empty()) eng.ctx_per = want;
         // (kept for next time with the other load settings of this model)
         std::error_code ec;
-        const auto rel = fs::u8path(eng.path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec));
-        const std::string id = rel.generic_u8string();               // (as loaded_id below)
+        const std::string id = model_key(eng.path);                  // (as loaded_id below)
         if (settings.contains("models") && settings["models"].contains(id) && settings["models"][id].is_object()) {
             settings["models"][id]["ctx"] = want;
             write_settings(a.settings, settings);
@@ -1824,7 +1959,7 @@ int main(int argc, char** argv) {
     static thread_local int tl_effort = 0;
     // How the assistant turn starts (format_chat's `think`), for the loaded model and this request.
     auto think_mode = [&]() -> int {
-        if (!eng.think_switch) return -1;
+        if (!eng.think_switch) return eng.think_starts ? 1 : -1;  // (DeepSeek R1: always thinks, its template opens the block)
         const bool on = tl_think >= 0 ? tl_think == 1 : eng.thinking;
         return on ? (eng.think_starts ? 1 : -1) : 0;
     };
@@ -2484,9 +2619,9 @@ int main(int argc, char** argv) {
                 }
                 double best = 0;
                 if (split) {
-                    // (hot experts: MoE models, and not yet for experts with biases, gpt-oss, or Flint's dense first layers)
+                    // (hot experts: MoE models, and not yet for experts with biases, gpt-oss)
                     const auto& hp_ = eng.model->hparams();
-                    const bool can_hot = hp_.is_moe() && !hp_.expert_bias && hp_.n_dense_lead == 0;
+                    const bool can_hot = hp_.is_moe() && !hp_.expert_bias;
                     const size_t n_gpus = eng.model->placement().gpus.size();
                     std::string gpu0 = n_gpus ? eng.model->placement().gpus[0].name : std::string();   // "CUDA0"...
                     if (ggml_backend_dev_t d = n_gpus ? ggml_backend_dev_by_name(gpu0.c_str()) : nullptr)
@@ -2828,9 +2963,7 @@ int main(int argc, char** argv) {
     auto loaded_id = [&]() -> std::string {
         if (eng.path.empty()) return {};
         std::error_code ec;
-        auto rel = fs::u8path(eng.path).lexically_relative(fs::weakly_canonical(fs::u8path(a.models), ec));
-        std::string r = rel.generic_u8string();
-        return r.empty() || r.compare(0, 2, "..") == 0 ? fs::u8path(eng.path).filename().u8string() : r;
+        return model_key(eng.path);
     };
 
     svr.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
@@ -2910,9 +3043,9 @@ int main(int argc, char** argv) {
             const bool embedding = m.value("kind", std::string()) == "embedding" && m.value("embedding", false);
             if (!embedding && !m.value("supported", false)) continue;
             std::string type = embedding ? "embeddings" : "llm";
-            if (!embedding) {                                 // a vision file next to it: it reads images once loaded
+            if (!embedding && m.value("arch", std::string()) != "qwen4exp") {   // a vision file next to it: it reads images once loaded
                 std::error_code ec;
-                const fs::path dir = (fs::u8path(a.models) / fs::u8path(id)).parent_path();
+                const fs::path dir = model_file(id).parent_path();
                 for (const auto& f : fs::directory_iterator(dir, ec)) {
                     const std::string n = f.path().filename().u8string();
                     std::string low = n; std::transform(low.begin(), low.end(), low.begin(), ::tolower);
@@ -2945,10 +3078,8 @@ int main(int argc, char** argv) {
         // only for apps on this computer: an app elsewhere uses the loaded model, as switching models is a setting)
         const bool other_model = !want.empty() && want != loaded_id() && is_local(req) && [&] {
             std::error_code ec;
-            const auto base = fs::weakly_canonical(fs::u8path(a.models), ec);
-            const auto file = fs::weakly_canonical(fs::u8path(a.models) / fs::u8path(want), ec);
-            const auto rel = file.lexically_relative(base);
-            return !ec && !rel.empty() && rel.begin()->string() != ".." && fs::is_regular_file(file, ec) && file.extension() == ".gguf";
+            const auto file = model_file(want);
+            return !file.empty() && file.extension() == ".gguf";
         }();
         auto lock = std::make_shared<Hold>();
         if (!line.enter_reply(mu, *lock, other_model ? std::function<std::atomic<int>*()>() : std::function<std::atomic<int>*()>(reply_slots),
@@ -2957,18 +3088,14 @@ int main(int argc, char** argv) {
         // The model asked for: the loaded one if the name matches it, or is unknown (many apps send a fixed
         // name such as "gpt-4o"); a different model in the models folder is loaded first, with its saved settings.
         if (other_model && want != loaded_id()) {
-            std::error_code ec;
-            const auto base = fs::weakly_canonical(fs::u8path(a.models), ec);
-            const auto file = fs::weakly_canonical(fs::u8path(a.models) / fs::u8path(want), ec);
-            const auto rel = file.lexically_relative(base);
-            const bool in_folder = !ec && !rel.empty() && rel.begin()->string() != ".." && fs::is_regular_file(file, ec) &&
-                                   file.extension() == ".gguf";
+            const auto file = model_file(want);
+            const bool in_folder = !file.empty() && file.extension() == ".gguf";
             if (in_folder) {
                 try {
-                    json saved = settings.value("models", json::object()).value(rel.generic_u8string(), json::object());
+                    json saved = settings.value("models", json::object()).value(model_key(file.u8string()), json::object());
                     eng.draft_max = std::min(8, std::max(0, saved.value("draft_max", 0)));
                     load(file.u8string(), load_options(saved), saved.value("threads", a.threads), saved.value("seed", -1), saved.value("hot_experts", false));
-                    settings["last_model"] = rel.generic_u8string();
+                    settings["last_model"] = model_key(file.u8string());
                     write_settings(a.settings, settings);
                 } catch (const std::exception& e) {
                     eng.spec.reset(); eng.look.reset(); eng.vision.reset(); eng.model.reset(); eng.path.clear();
@@ -3142,7 +3269,7 @@ int main(int argc, char** argv) {
         json j = json::parse(res.body, nullptr, false);
         if (!j.is_object()) return;
         j["remote"] = true;
-        for (const char* k : {"path", "vision_file"})
+        for (const char* k : {"path", "vision_file", "ssd_file"})
             if (j.contains(k) && j[k].is_string()) j[k] = fs::u8path(j[k].get<std::string>()).filename().u8string();
         res.set_content(dump(j), "application/json");
     });
@@ -3434,7 +3561,7 @@ int main(int argc, char** argv) {
         long long bytes = dl.bytes;
         if (dl.state == "downloading") {
             std::error_code ec;
-            const auto n = fs::file_size(fs::u8path(a.models) / (std::string(kNomicFile) + ".part"), ec);
+            const auto n = fs::file_size(own_models / (std::string(kNomicFile) + ".part"), ec);
             if (!ec) bytes = (long long)n;
         }
         res.set_content(dump({{"state", dl.state}, {"bytes", bytes}, {"total", (long long)dl.total}, {"error", dl.error},
@@ -3447,9 +3574,28 @@ int main(int argc, char** argv) {
             if (dl.running) { res.set_content(dump({{"state", dl.state}}), "application/json"); return; }
             dl.running = true; dl.state = "downloading"; dl.error.clear(); dl.file.clear(); dl.bytes = 0; dl.total = 0;
         }
-        const fs::path dir = fs::u8path(a.models);
+        const fs::path dir = own_models;                                 // downloads: always tierlm's own folder
+        // Already somewhere tierlm looks (its own folder, the chosen one, or LM Studio's built-ins): use that one
+        // instead of downloading another copy.
+        {
+            bool exists = false;
+            std::string found;
+            for (const auto& m : scan_models(exists)) {
+                std::string f = m.value("file", std::string()), low = f;
+                for (char& ch : low) ch = (char)std::tolower((unsigned char)ch);
+                if (low.rfind("nomic-embed-text-v1.5", 0) == 0 && m.value("embedding", false)) { found = m.value("id", std::string()); if (m.value("own", false)) break; }
+            }
+            if (!found.empty()) {
+                std::lock_guard<std::mutex> lk(dl_mu);
+                dl.running = false; dl.state = "done"; dl.file = found; dl.bytes = dl.total = 0;
+                std::fprintf(stderr, "download: nomic-embed-text v1.5 is already here (%s); not downloading another copy\n", found.c_str());
+                res.set_content(dump({{"state", "done"}, {"file", found}}), "application/json");
+                return;
+            }
+        }
         const std::string url = std::getenv("TIERLM_NOMIC_URL") ? std::getenv("TIERLM_NOMIC_URL") : kNomicUrl;   // (tests)
-        std::thread([dir, url] {
+        const std::string nomic_id = model_key((dir / kNomicFile).u8string());   // its id once saved
+        std::thread([dir, url, nomic_id] {
             auto fail = [](const std::string& why) {
                 std::lock_guard<std::mutex> lk(dl_mu);
                 dl.state = "error"; dl.error = why; dl.running = false;
@@ -3475,7 +3621,7 @@ int main(int argc, char** argv) {
             // Already here and intact: nothing to download.
             if (fs::exists(dest, ec) && (long long)fs::file_size(dest, ec) == size && download::sha256_file(dest) == sha) {
                 std::lock_guard<std::mutex> lk(dl_mu);
-                dl.state = "done"; dl.file = kNomicFile; dl.bytes = size; dl.running = false;
+                dl.state = "done"; dl.file = nomic_id; dl.bytes = size; dl.running = false;
                 return;
             }
             // 2. the file, to a .part name
@@ -3493,11 +3639,256 @@ int main(int argc, char** argv) {
             fs::rename(part, dest, ec);
             if (ec) { fs::remove(part, ec); return fail("couldn't save " + dest.u8string() + ": " + ec.message()); }
             std::lock_guard<std::mutex> lk(dl_mu);
-            dl.state = "done"; dl.file = kNomicFile; dl.running = false;
+            dl.state = "done"; dl.file = nomic_id; dl.running = false;
             std::fprintf(stderr, "download: %s saved and checked (SHA-256 %s)\n", dest.u8string().c_str(), sha.c_str());
         }).detach();
         res.set_content(dump({{"state", "downloading"}}), "application/json");
     });
+    // ---- Get models: search Hugging Face for GGUF models and download them ----
+    // Everything goes through curl (as the embedding model's download), to Hugging Face's public API: no account is
+    // needed for public models. Search lists GGUF repos; a repo's files are grouped into the model's quants (split
+    // files together), vision files (mmproj) and draft files (mtp-); the first model file's header is read (just
+    // its first megabytes) to say what it is and whether this tierlm runs it. A download goes into the models folder,
+    // in <owner>/<repo>/, each file to a .part name that resumes after an interruption, checked against Hugging
+    // Face's SHA-256 and size, then given its name. One download at a time. Only on the computer running tierlm.
+    // TIERLM_HF_BASE (tests): another address in place of https://huggingface.co.
+    static const std::string hf_base = std::getenv("TIERLM_HF_BASE") ? std::getenv("TIERLM_HF_BASE") : "https://huggingface.co";
+    auto url_enc = [](const std::string& v) {
+        std::string o; char b[4];
+        for (unsigned char ch : v) {
+            if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') o += (char)ch;
+            else { std::snprintf(b, sizeof b, "%%%02X", ch); o += b; }
+        }
+        return o;
+    };
+    auto path_enc = [url_enc](const std::string& p) {             // a repo file's path, its slashes kept
+        std::string o; size_t at = 0;
+        while (at <= p.size()) { size_t e = p.find('/', at); if (e == std::string::npos) e = p.size(); o += (o.empty() && at == 0 ? "" : "/") + url_enc(p.substr(at, e - at)); at = e + 1; }
+        return o;
+    };
+    auto valid_repo = [](const std::string& id) {                // owner/name, nothing that could leave the API
+        if (id.empty() || id.size() > 200 || std::count(id.begin(), id.end(), '/') != 1 || id.find("..") != std::string::npos) return false;
+        for (unsigned char ch : id) if (!(std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '/')) return false;
+        return true;
+    };
+    // curl to a temporary file; the body (or "" with *code set on failure)
+    auto hf_get = [](const std::string& url, int* code, const std::string& range = std::string()) {
+        std::error_code ec;
+        static std::atomic<int> seq{0};
+        const fs::path tmp = fs::temp_directory_path(ec) / ("tierlm-hf-" + std::to_string(++seq) + ".tmp");
+        std::vector<std::string> args = {download::curl_exe(), "-sS", "-f", "-L", "--max-time", "60", "-o", tmp.u8string()};
+        if (!range.empty()) { args.push_back("-r"); args.push_back(range); }
+        args.push_back(url);
+        const int rc = download::run(args);
+        std::string body;
+        { std::ifstream f(tmp, std::ios::binary); body.assign(std::istreambuf_iterator<char>(f), {}); }
+        fs::remove(tmp, ec);
+        if (code) *code = rc;
+        return body;
+    };
+    svr.Get("/api/hf/search", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!is_local(req)) return oai_error(res, 403, "only on the computer running tierlm");
+        const std::string q = req.get_param_value("q");
+        std::string sort = req.get_param_value("sort");
+        if (sort != "likes" && sort != "lastModified" && sort != "trendingScore") sort = "downloads";
+        int rc = 0;
+        const std::string body = hf_get(hf_base + "/api/models?filter=gguf&limit=60&sort=" + sort + "&direction=-1" +
+                                        (q.empty() ? std::string() : "&search=" + url_enc(q)), &rc);
+        const json j = json::parse(body, nullptr, false);
+        if (rc != 0 || !j.is_array()) return oai_error(res, 502, rc != 0 ? "couldn't reach huggingface.co (is this PC online?)" : "Hugging Face's answer wasn't understood");
+        json out = json::array();
+        for (const auto& m : j) {
+            if (!m.is_object()) continue;
+            out.push_back({{"id", m.value("id", std::string())}, {"downloads", m.value("downloads", 0LL)}, {"likes", m.value("likes", 0LL)},
+                           {"updated", m.value("lastModified", m.value("createdAt", std::string()))}});
+        }
+        res.set_content(dump(json{{"models", out}}), "application/json");
+    });
+    // The quant's name in a file name: UD-Q4_K_XL, Q4_K_M, IQ4_XS, Q8_0, BF16, MXFP4...
+    auto quant_of = [](const std::string& name) {
+        static const std::regex re(R"(((?:UD-)?(?:I?Q\d_[A-Z0-9_]+|Q\d_\d|BF16|F16|F32|MXFP4[A-Z0-9_]*|TQ\d_\d)))", std::regex::icase);
+        std::smatch m;
+        return std::regex_search(name, m, re) ? m.str(1) : fs::u8path(name).stem().u8string();
+    };
+    svr.Get("/api/hf/repo", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!is_local(req)) return oai_error(res, 403, "only on the computer running tierlm");
+        const std::string id = req.get_param_value("id");
+        if (!valid_repo(id)) return oai_error(res, 400, "not a Hugging Face model name (owner/name)");
+        int rc = 0;
+        const json j = json::parse(hf_get(hf_base + "/api/models/" + id + "?blobs=true", &rc), nullptr, false);
+        if (rc != 0 || !j.is_object() || !j.contains("siblings")) return oai_error(res, 502, rc != 0 ? "couldn't reach huggingface.co" : "Hugging Face didn't list that model's files");
+        // group the GGUF files
+        static const std::regex part_re(R"((.*)-(\d{5})-of-(\d{5})\.gguf$)", std::regex::icase);
+        std::map<std::string, json> groups;                      // key -> {kind, label, files, size}
+        for (const auto& f : j["siblings"]) {
+            const std::string path = f.value("rfilename", std::string());
+            if (path.size() < 5 || path.compare(path.size() - 5, 5, ".gguf") != 0) continue;
+            const std::string name = fs::u8path(path).filename().u8string();
+            std::string lower = name; for (char& ch : lower) ch = (char)std::tolower((unsigned char)ch);
+            const std::string kind = lower.rfind("mmproj", 0) == 0 ? "vision" : lower.rfind("mtp-", 0) == 0 ? "draft" : "model";
+            std::smatch m;
+            const std::string key = std::regex_match(path, m, part_re) ? m.str(1) : path.substr(0, path.size() - 5);
+            const long long size = f.contains("lfs") && f["lfs"].is_object() ? f["lfs"].value("size", f.value("size", 0LL)) : f.value("size", 0LL);
+            const std::string sha = f.contains("lfs") && f["lfs"].is_object() ? f["lfs"].value("sha256", std::string()) : std::string();
+            json& g = groups[kind + "\n" + key];
+            if (g.is_null()) g = {{"kind", kind}, {"label", quant_of(name)}, {"files", json::array()}, {"size", 0LL}};
+            g["files"].push_back({{"path", path}, {"size", size}, {"sha256", sha}});
+            g["size"] = g["size"].get<long long>() + size;
+        }
+        json quants = json::array(), vision = json::array(), draft = json::array();
+        for (auto& [k, g] : groups) {
+            auto& fl = g["files"];
+            std::sort(fl.begin(), fl.end(), [](const json& a, const json& b) { return a["path"].get<std::string>() < b["path"].get<std::string>(); });
+            (g["kind"] == "vision" ? vision : g["kind"] == "draft" ? draft : quants).push_back(g);
+        }
+        std::sort(quants.begin(), quants.end(), [](const json& a, const json& b) { return a["size"].get<long long>() < b["size"].get<long long>(); });
+        json out = {{"id", id}, {"quants", quants}, {"vision", vision}, {"draft", draft},
+                    {"gated", j.contains("gated") && !(j["gated"].is_boolean() && !j["gated"].get<bool>())},
+                    {"downloads", j.value("downloads", 0LL)}, {"likes", j.value("likes", 0LL)}};
+        if (j.contains("gguf") && j["gguf"].is_object()) {
+            out["arch"] = j["gguf"].value("architecture", std::string());
+            out["ctx_train"] = j["gguf"].value("context_length", 0LL);
+        }
+        // what it is, from the first model file's header (its first megabytes)
+        if (!quants.empty()) {
+            const std::string first = quants[0]["files"][0]["path"];
+            std::error_code ec;
+            const fs::path tmp = fs::temp_directory_path(ec) / "tierlm-hf-header.gguf";
+            for (const char* range : {"0-8388607", "0-67108863"}) {
+                int rc2 = 0;
+                const std::string head = hf_get(hf_base + "/" + id + "/resolve/main/" + path_enc(first), &rc2, range);
+                if (rc2 != 0 || head.size() < 16 || head.compare(0, 4, "GGUF") != 0) break;
+                { std::ofstream o(tmp, std::ios::binary); o.write(head.data(), (std::streamsize)head.size()); }
+                gguf_init_params ip{ true, nullptr };
+                gguf_context* g = gguf_init_from_file(tmp.u8string().c_str(), ip);
+                if (!g) continue;                                 // the header is longer: read more
+                gguf_free(g);
+                json d = describe_model(tmp.u8string(), true);
+                for (const char* k : {"arch", "supported", "reason", "kind", "kv_bytes_per_token", "layers", "experts", "experts_used", "ctx_train", "hybrid", "name"})
+                    if (d.contains(k)) out[k] = d[k];
+                break;
+            }
+            fs::remove(tmp, ec);
+        }
+        if (!out.contains("supported") && out.contains("arch")) out["supported"] = arch_supported(out["arch"].get<std::string>());
+        res.set_content(dump(out), "application/json");
+    });
+    struct HfFile { std::string path, sha; long long size = 0; std::string state = "waiting"; };
+    struct HfJob {
+        std::atomic<bool> running{false}, cancel{false};
+        std::string state = "idle", error, id, folder;              // (under hf_mu)
+        std::vector<HfFile> files;
+        int cur = -1;
+    };
+    static HfJob hf;
+    static std::mutex hf_mu;
+    svr.Get("/api/hf/download", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!is_local(req)) return oai_error(res, 403, "only on the computer running tierlm");
+        std::lock_guard<std::mutex> lk(hf_mu);
+        json files = json::array();
+        long long done = 0, total = 0;
+        for (size_t i = 0; i < hf.files.size(); ++i) {
+            const HfFile& f = hf.files[i];
+            long long have = f.state == "done" ? f.size : 0;
+            if (f.state == "downloading") {
+                std::error_code ec;
+                const auto n = fs::file_size(fs::u8path(hf.folder) / fs::u8path(f.path + ".part"), ec);
+                if (!ec) have = (long long)n;
+            }
+            if (f.state == "checking") have = f.size;
+            done += have; total += f.size;
+            files.push_back({{"path", f.path}, {"size", f.size}, {"done", have}, {"state", f.state}});
+        }
+        res.set_content(dump(json{{"state", hf.state}, {"id", hf.id}, {"error", hf.error}, {"files", files}, {"done", done}, {"total", total},
+                                  {"folder", hf.folder}}), "application/json");
+    });
+    svr.Post("/api/hf/cancel", [&](const httplib::Request&, httplib::Response& res) {
+        hf.cancel = true;
+        res.set_content(dump(json{{"ok", true}}), "application/json");
+    });
+    svr.Post("/api/hf/download", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        if (!body.is_object() || !body.contains("files") || !body["files"].is_array()) return oai_error(res, 400, "expected {\"id\": \"owner/name\", \"files\": [paths]}");
+        const std::string id = body.value("id", std::string());
+        if (!valid_repo(id)) return oai_error(res, 400, "not a Hugging Face model name (owner/name)");
+        if (hf.running) return oai_error(res, 409, "a download is already running; wait for it or cancel it");
+        // the files, as Hugging Face lists them (sizes and checksums from there, not from the request)
+        int rc = 0;
+        const json j = json::parse(hf_get(hf_base + "/api/models/" + id + "?blobs=true", &rc), nullptr, false);
+        if (rc != 0 || !j.is_object() || !j.contains("siblings")) return oai_error(res, 502, "couldn't reach huggingface.co");
+        std::vector<HfFile> want;
+        for (const auto& p : body["files"]) {
+            if (!p.is_string()) continue;
+            const std::string path = p.get<std::string>();
+            if (path.find("..") != std::string::npos || path.empty() || path[0] == '/' || path.find('\\') != std::string::npos) return oai_error(res, 400, "bad file name");
+            for (const auto& f : j["siblings"])
+                if (f.value("rfilename", std::string()) == path) {
+                    HfFile hfile; hfile.path = path;
+                    hfile.size = f.contains("lfs") && f["lfs"].is_object() ? f["lfs"].value("size", f.value("size", 0LL)) : f.value("size", 0LL);
+                    hfile.sha = f.contains("lfs") && f["lfs"].is_object() ? f["lfs"].value("sha256", std::string()) : std::string();
+                    want.push_back(hfile);
+                }
+        }
+        if (want.empty()) return oai_error(res, 400, "none of those files are in " + id);
+        const fs::path folder = own_models / fs::u8path(id);             // always tierlm's own folder
+        long long need = 0;
+        for (const auto& f : want) need += f.size;
+        {
+            std::error_code ec;
+            fs::create_directories(folder, ec);
+            unsigned long long fr = 0, tot = 0;
+            if (drive_space(folder.u8string(), fr, tot) && (long long)fr < need + (1LL << 30))
+                return oai_error(res, 507, "not enough room on the models folder's drive: needs " + std::to_string((need >> 30) + 1) + " GB, has " + std::to_string(fr >> 30) + " GB");
+        }
+        {
+            std::lock_guard<std::mutex> lk(hf_mu);
+            hf.running = true; hf.cancel = false; hf.state = "downloading"; hf.error.clear(); hf.id = id; hf.folder = folder.u8string(); hf.files = want; hf.cur = 0;
+        }
+        std::fprintf(stderr, "get models: %s, %zu files, %.1f GB, into %s\n", id.c_str(), want.size(), need / 1e9, folder.u8string().c_str());
+        std::thread([id, folder, path_enc] {
+            auto set = [](size_t i, const char* st) { std::lock_guard<std::mutex> lk(hf_mu); hf.files[i].state = st; };
+            auto finish = [](const std::string& state, const std::string& why) {
+                std::lock_guard<std::mutex> lk(hf_mu);
+                hf.state = state; hf.error = why; hf.running = false;
+                std::fprintf(stderr, "get models: %s%s%s\n", state.c_str(), why.empty() ? "" : ": ", why.c_str());
+            };
+            const std::string curl = download::curl_exe();
+            std::vector<HfFile> files;
+            { std::lock_guard<std::mutex> lk(hf_mu); files = hf.files; }
+            for (size_t i = 0; i < files.size(); ++i) {
+                const HfFile& f = files[i];
+                std::error_code ec;
+                const fs::path dest = folder / fs::u8path(f.path), part = folder / fs::u8path(f.path + ".part");
+                fs::create_directories(dest.parent_path(), ec);
+                { std::lock_guard<std::mutex> lk(hf_mu); hf.cur = (int)i; }
+                auto good = [&](const fs::path& p) {
+                    if ((long long)fs::file_size(p, ec) != f.size || ec) return false;
+                    if (f.sha.size() != 64) return true;
+                    set(i, "checking");
+                    return download::sha256_file(p) == f.sha;
+                };
+                if (fs::exists(dest, ec) && good(dest)) { set(i, "done"); continue; }     // already here and intact
+                set(i, "downloading");
+                const std::string url = hf_base + "/" + id + "/resolve/main/" + path_enc(f.path);
+                const int rc = download::run({curl, "-sS", "-f", "-L", "--retry", "5", "--retry-delay", "3", "-C", "-", "-o", part.u8string(), url}, &hf.cancel);
+                if (rc == -2) { set(i, "cancelled"); return finish("cancelled", "stopped; what was downloaded is kept and continues next time"); }
+                if (rc != 0) {
+                    set(i, "error");
+                    if ((long long)fs::file_size(part, ec) > f.size) fs::remove(part, ec);
+                    return finish("error", rc == 22 ? "Hugging Face refused " + f.path + " (a gated model needs its license accepted and a token, which tierlm doesn't do yet)"
+                                                    : "the download of " + f.path + " stopped (connection lost?); start it again to continue where it left off");
+                }
+                if (!good(part)) { fs::remove(part, ec); set(i, "error"); return finish("error", f.path + " didn't match Hugging Face's checksum, so it was deleted; try again"); }
+                fs::rename(part, dest, ec);
+                if (ec) { set(i, "error"); return finish("error", "couldn't save " + dest.u8string() + ": " + ec.message()); }
+                set(i, "done");
+                std::fprintf(stderr, "get models: %s saved and checked\n", dest.u8string().c_str());
+            }
+            finish("done", "");
+        }).detach();
+        res.set_content(dump(json{{"ok", true}, {"folder", folder.u8string()}}), "application/json");
+    });
+
     svr.Post("/api/embed/unload", [&](const httplib::Request&, httplib::Response& res) {
         { std::lock_guard<std::mutex> lk(emb.mu); emb.enc.reset(); emb.id.clear(); emb.path.clear(); emb.name.clear(); }
         save_embed_choice("");

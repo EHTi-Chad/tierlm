@@ -21,6 +21,13 @@ lower = ranges(lambda cp: cat(cp) == "Ll")
 punct = ranges(lambda cp: cat(cp).startswith("P") or (33 <= cp <= 47) or (58 <= cp <= 64) or (91 <= cp <= 96) or (123 <= cp <= 126))
 control = ranges(lambda cp: cat(cp).startswith("C") and cp not in (9, 10, 13))
 zspace = ranges(lambda cp: cat(cp) == "Zs" or cp in (9, 10, 13))
+# DeepSeek V3 and Kimi K2 splitting: Unicode punctuation (P) and symbols (S) exactly, and the Han script (Kimi
+# keeps runs of Chinese characters together); the script comes from the `regex` module (pip install regex)
+punct_p = ranges(lambda cp: cat(cp).startswith("P"))
+symbol = ranges(lambda cp: cat(cp).startswith("S"))
+import regex
+_han = regex.compile(r"\p{Han}")
+han = ranges(lambda cp: not (0xD800 <= cp <= 0xDFFF) and _han.match(chr(cp)) is not None)
 def fold(cp):
     if 0xD800 <= cp <= 0xDFFF: return None
     c = chr(cp)
@@ -31,7 +38,8 @@ folds = [(cp, f) for cp, f in folds if f is not None and not (0xAC00 <= cp <= 0x
 with open("src/unicode_tables.h", "w") as f:
     f.write("#pragma once\n#include <cstdint>\n\nnamespace tierlm::uni {\n\nstruct Range { uint32_t lo, hi; };\n\n")
     for name, rs in (("kLetter", letters), ("kNumber", numbers), ("kSpace", spaces), ("kMark", marks), ("kUpper", upper), ("kLower", lower),
-                     ("kPunct", punct), ("kControl", control), ("kZSpace", zspace)):
+                     ("kPunct", punct), ("kControl", control), ("kZSpace", zspace),
+                     ("kPunctP", punct_p), ("kSymbol", symbol), ("kHan", han)):
         f.write("inline constexpr Range %s[] = {\n" % name)
         for i in range(0, len(rs), 6):
             f.write("    " + " ".join("{0x%X,0x%X}," % r for r in rs[i:i+6]) + "\n")

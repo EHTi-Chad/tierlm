@@ -4,6 +4,18 @@
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 #if defined(_WIN32) && defined(GGML_BACKEND_DL)
 #include <algorithm>
 #include <filesystem>
@@ -19,6 +31,8 @@
 #endif
 
 namespace tierlm {
+
+namespace { bool g_cuda_none = false; }   // NVIDIA cards found, none the CUDA engine can run (see hide_unsupported_cuda)
 
 // ggml's log, minus one line per weight tensor when repacking (hundreds for a big model).
 static void log_filter(ggml_log_level level, const char* text, void*) {
@@ -113,6 +127,7 @@ bool load_backends_selectively() {
         if (!std::filesystem::exists(f) || !ggml_backend_load(f.string().c_str())) return false;
     }
     for (const char* gpu : {"cuda", "vulkan", "hip", "sycl", "opencl", "rpc", "blas"}) {
+        if (g_cuda_none && std::strcmp(gpu, "cuda") == 0) continue;   // no card it can run (see above)
         const std::filesystem::path f = dir / (std::string("ggml-") + gpu + ".dll");
         if (std::filesystem::exists(f)) ggml_backend_load(f.string().c_str());
     }
@@ -121,10 +136,149 @@ bool load_backends_selectively() {
 } // namespace
 #endif
 
+// ---- NVIDIA cards the CUDA engine can't run ----
+// A CUDA engine holds compiled code for the generations it was built for ("compute capabilities": 7.0 = Tesla V100,
+// 7.5 = RTX 20, 8.6 = RTX 30, 8.9 = RTX 40, 12.0 = RTX 50). On a card it has no code for, the first GPU step fails
+// and the program stops. So before the CUDA engine starts, tierlm asks NVIDIA's management library (NVML, installed
+// with the driver; asking it doesn't start CUDA) which generation each card is, and lists only the covered ones in
+// CUDA_VISIBLE_DEVICES. The others then appear only through Vulkan, and tierlm uses them there.
+// Not done when CUDA_VISIBLE_DEVICES is already set (the user chose), or with TIERLM_CUDA_CHECK=0.
+namespace {
+std::vector<SkippedGpu> g_skipped;
+
+struct Arch { int cc = 0; bool real = false, virt = false, exact = false; };
+std::vector<Arch> built_archs() {
+    std::vector<Arch> out;
+#ifdef TIERLM_CUDA_ARCHS
+    const std::string all = TIERLM_CUDA_ARCHS;                  // CMake's list, e.g. "70,75,86,89,120"
+    for (size_t p = 0; p <= all.size(); ) {
+        size_t q = all.find(',', p); if (q == std::string::npos) q = all.size();
+        std::string e = all.substr(p, q - p); p = q + 1;
+        if (e.empty()) continue;
+        Arch a;
+        size_t i = 0; while (i < e.size() && e[i] >= '0' && e[i] <= '9') ++i;
+        if (i == 0) continue;
+        a.cc = std::atoi(e.substr(0, i).c_str());
+        std::string rest = e.substr(i);
+        // ggml turns 12X into 12Xa (code for exactly that generation: its 4-bit tensor-core instructions)
+        if (a.cc >= 120 && a.cc < 130 && (rest.empty() || rest[0] == '-')) rest = "a" + rest;
+        if (!rest.empty() && (rest[0] == 'a' || rest[0] == 'f')) { a.exact = rest[0] == 'a'; rest = rest.substr(1); }
+        if (rest.empty()) a.real = a.virt = true;               // no suffix: compiled code and portable code
+        else if (rest == "-real") a.real = true;
+        else if (rest == "-virtual") a.virt = true;
+        out.push_back(a);
+    }
+#endif
+    return out;
+}
+// Compiled code runs on its own generation and later minor versions of it (8.6 code on an 8.9 card); with the
+// "a" ending only on exactly that one. Portable code (PTX) is compiled by the driver for any later card.
+bool covered(int major, int minor, const std::vector<Arch>& archs) {
+    const int cc = major * 10 + minor;
+    for (const Arch& a : archs) {
+        if (a.exact) { if (cc == a.cc) return true; continue; }
+        if (a.real && a.cc / 10 == major && a.cc <= cc) return true;
+        if (a.virt && a.cc <= cc) return true;
+    }
+    return false;
+}
+
+using nvml_fn0 = int (*)();
+using nvml_count = int (*)(unsigned*);
+using nvml_handle = int (*)(unsigned, void**);
+using nvml_cc = int (*)(void*, int*, int*);
+using nvml_str = int (*)(void*, char*, unsigned);
+void* open_nvml(const char*& why) {
+#ifdef _WIN32
+    HMODULE h = LoadLibraryA("nvml.dll");                        // System32 with current drivers
+    if (!h) {
+        char pf[MAX_PATH] = {0};
+        if (GetEnvironmentVariableA("ProgramFiles", pf, MAX_PATH))
+            h = LoadLibraryA((std::string(pf) + "\\NVIDIA Corporation\\NVSMI\\nvml.dll").c_str());
+    }
+    why = "nvml.dll not found";
+    return (void*)h;
+#else
+    void* h = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    why = "libnvidia-ml.so.1 not found";
+    return h;
+#endif
+}
+void* sym(void* lib, const char* name) {
+#ifdef _WIN32
+    return (void*)GetProcAddress((HMODULE)lib, name);
+#else
+    return dlsym(lib, name);
+#endif
+}
+void set_env(const char* k, const std::string& v) {
+#ifdef _WIN32
+    _putenv_s(k, v.c_str());
+    SetEnvironmentVariableA(k, v.c_str());
+#else
+    setenv(k, v.c_str(), 1);
+#endif
+}
+void hide_unsupported_cuda() {
+    const std::vector<Arch> archs = built_archs();
+    if (archs.empty()) return;                                   // not a CUDA build, or the list isn't known
+    if (std::getenv("CUDA_VISIBLE_DEVICES")) return;             // the user chose the cards
+    if (const char* v = std::getenv("TIERLM_CUDA_CHECK")) if (std::strcmp(v, "0") == 0) return;
+    const char* why = nullptr;
+    void* lib = open_nvml(why);
+    if (!lib) return;                                            // no NVIDIA driver: CUDA won't start anyway
+    auto init = (nvml_fn0)sym(lib, "nvmlInit_v2");
+    auto shut = (nvml_fn0)sym(lib, "nvmlShutdown");
+    auto count = (nvml_count)sym(lib, "nvmlDeviceGetCount_v2");
+    auto handle = (nvml_handle)sym(lib, "nvmlDeviceGetHandleByIndex_v2");
+    auto ccf = (nvml_cc)sym(lib, "nvmlDeviceGetCudaComputeCapability");
+    auto uuid = (nvml_str)sym(lib, "nvmlDeviceGetUUID");
+    auto namef = (nvml_str)sym(lib, "nvmlDeviceGetName");
+    if (!init || !shut || !count || !handle || !ccf || !uuid || !namef || init() != 0) return;
+    unsigned n = 0;
+    std::vector<std::string> keep;
+    std::vector<SkippedGpu> skip;
+    bool ok = count(&n) == 0;
+    for (unsigned i = 0; ok && i < n; ++i) {
+        void* h = nullptr;
+        int ma = 0, mi = 0;
+        char id[96] = {0}, name[96] = {0};
+        if (handle(i, &h) != 0 || ccf(h, &ma, &mi) != 0 || uuid(h, id, sizeof(id)) != 0) { ok = false; break; }
+        namef(h, name, sizeof(name));
+        if (covered(ma, mi, archs)) keep.push_back(id);
+        else skip.push_back({name, ma, mi});
+    }
+    shut();
+    if (!ok || skip.empty()) return;                             // unsure, or every card is covered: change nothing
+    std::string list;
+    for (const std::string& k : keep) { if (!list.empty()) list += ','; list += k; }
+    set_env("CUDA_VISIBLE_DEVICES", list.empty() ? std::string("-1") : list);   // -1: no cards for CUDA
+    g_skipped = skip;
+    g_cuda_none = keep.empty();
+    for (const SkippedGpu& g : skip)
+        std::fprintf(stderr, "tierlm: %s (compute capability %d.%d) isn't covered by this build's CUDA engine (%s): it runs through Vulkan instead\n",
+                     g.name.c_str(), g.major, g.minor, cuda_built_for().c_str());
+}
+} // namespace
+
+const std::vector<SkippedGpu>& skipped_cuda_gpus() { load_backends(); return g_skipped; }
+
+std::string cuda_built_for() {
+    std::string out;
+    for (const Arch& a : built_archs()) {
+        const std::string s = std::to_string(a.cc / 10) + "." + std::to_string(a.cc % 10);
+        if (out.find(s) != std::string::npos) continue;
+        if (!out.empty()) out += ", ";
+        out += s;
+    }
+    return out;
+}
+
 void load_backends() {
     static std::once_flag once;
     std::call_once(once, [] {
         ggml_log_set(log_filter, nullptr);
+        hide_unsupported_cuda();                                // before the CUDA engine starts
 #ifdef GGML_BACKEND_DL
 #ifdef _WIN32
         if (!load_backends_selectively())

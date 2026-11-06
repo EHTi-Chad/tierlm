@@ -5,6 +5,7 @@
 // this computer supports; a GPU engine whose driver is missing (CUDA on a PC without an NVIDIA card) is skipped.
 #include <mutex>
 #include <string>
+#include <vector>
 
 struct ggml_backend;
 struct ggml_backend_buffer_type;
@@ -13,6 +14,12 @@ namespace tierlm {
 
 // Loads the engine files next to the program (once; does nothing when the engines are built in).
 void load_backends();
+
+// NVIDIA cards that this build's CUDA engine has no code for (a generation it wasn't built for). Before the CUDA
+// engine starts, tierlm hides them from it, so they show up (and run) only through Vulkan instead of failing.
+struct SkippedGpu { std::string name; int major = 0, minor = 0; };
+const std::vector<SkippedGpu>& skipped_cuda_gpus();
+std::string cuda_built_for();   // e.g. "7.0, 7.5, 8.6, 8.9, 12.0"; empty when not known
 
 ggml_backend* cpu_backend_init();
 ggml_backend_buffer_type* cpu_buffer_type();

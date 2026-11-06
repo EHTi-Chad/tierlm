@@ -114,11 +114,13 @@ stale one can hide the GPU or crash Vulkan while it starts.
 Summarises a GGUF model from its header only (fast, reads no weights).
 
 ```
-tierlm-inspect model.gguf [--tensors]
+tierlm-inspect model.gguf [--tensors | --all]
 ```
 
 Works on split models too (give it part 1). Shows the architecture, layer and expert counts, total size, size and share by role (experts, attention,
-embedding, ...), and the per-layer size range. `--tensors` lists every tensor.
+embedding, ...), and the per-layer size range. `--tensors` lists every tensor. `--all` prints every setting in the
+file and every tensor with its type and shape (`[ne0, ne1, ne2, ne3]`, ggml's order): what to send when a new kind of
+model doesn't load.
 
 ## tierlm-plan
 
@@ -171,6 +173,8 @@ template...).
 | `tierlm-logits model.gguf [--step] id ...` | Prints last-position logits for token IDs; `--step` feeds one token per call through the KV cache. Used by `tests/tiny_models.py` |
 | `tierlm-logits model.gguf --mtp[-step] id ...` | The MTP draft layer's prediction after the ids (all at once, or one position at a time). Used by `tests/tiny_qwen35.py` |
 | `tierlm-logits model.gguf --rollback B KEEP id ...` | Evaluates the last B+1 ids as an undoable check, keeps KEEP of the B, then the last id: must match plain evaluation |
+| `python tests/tiny_flashnext.py build/tierlm-logits` | Qwen3.8 Flash-Next (`qwen4exp`): tiny random models built with transformers' own Flash-Next code, including long inputs past the sparse-attention budget, compared logit by logit whole, one token at a time and saved/restored (needs `pip install torch transformers gguf`) |
+| `python tests/tiny_deepseek.py build/tierlm-logits` | DeepSeek V2 / V3 / Kimi (`deepseek2`): tiny random models built with transformers' own DeepSeek code, written as GGUF in all three layouts real files use, compared logit by logit (needs `pip install torch transformers gguf`) |
 | `tierlm-logits model.gguf --gen[-spec] N id ...` | N tokens of greedy generation, without or with speculative decoding (prints token ids and, for `--gen-spec`, how many guesses were kept). `TIERLM_DRAFT_SCRIPT` / `TIERLM_DRAFT_CORRUPT` replace the draft layer with scripted, partly wrong guesses |
 
 See [BUILD.md](BUILD.md#running-the-tests).
@@ -183,6 +187,13 @@ See [BUILD.md](BUILD.md#running-the-tests).
 |---|---|
 | `TIERLM_NO_FA=1` | Use plain attention instead of flash attention |
 | `TIERLM_KV_F32=1` | Keep the KV cache in f32 instead of f16 (exact; used by the tests) |
+| `TIERLM_SSD=0` | Never use the SSD tier: everything that isn't in VRAM goes in RAM, as before 0.8.2 |
+| `TIERLM_SSD_LAYERS=N` | Tests: put exactly N groups of weights on the SSD tier (the least-used expert layers first), whatever fits |
+| `TIERLM_SSD_DIR=folder` | Where the SSD tier's copy goes when none is chosen in the setup screen (tests) |
+| `TIERLM_SSD_PREFETCH=0` | SSD tier: don't ask the drive for the chosen experts ahead of time (to measure what read-ahead gains) |
+| `TIERLM_SSD_LOG=1` | SSD tier: every 2 seconds, how much has been asked for ahead from the drive so far |
+| `TIERLM_CUDA_CHECK=0` | Don't check which NVIDIA cards the CUDA engine covers (normally a card it has no code for is hidden from CUDA and used through Vulkan instead; not done either when `CUDA_VISIBLE_DEVICES` is set) |
+| `TIERLM_TRACE=1` | Debugging: prints a summary (size, sum, RMS, first numbers) of each layer's main results as they're computed, to compare a model step by step with a reference |
 | `TIERLM_THREADS=N` | CPU threads for `tierlm-logits` and `tierlm-bench` |
 | `TIERLM_PROFILE=1` | Timing: `tierlm-run` prints a per-token breakdown and the number of graph splits; every tool and the server also print, every 64 reply steps, each device's input-copy and work time per step (`profile:` lines). Each split is waited for while it's on, so everything runs a little slower |
 | `TIERLM_BATCH_LOG=1` | Server, Connections above one: every 2 seconds, how many replies shared each model step, the compute time per step and the share of the time spent computing (`batcher:` lines). Close to the number of replies running means they share steps as they should |

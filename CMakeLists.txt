@@ -55,9 +55,15 @@ if(MSVC AND TIERLM_CUDA AND NOT GGML_BACKEND_DL)
   link_libraries(delayimp)
 endif()
 
-add_library(tierlm_core STATIC src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/model.cpp src/gguf_split.cpp src/speculate.cpp src/backends.cpp src/encoder.cpp src/vision.cpp src/image.cpp)
+add_library(tierlm_core STATIC src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/model.cpp src/mapped_file.cpp src/gguf_split.cpp src/speculate.cpp src/backends.cpp src/encoder.cpp src/vision.cpp src/image.cpp)
 target_include_directories(tierlm_core PUBLIC src)
 target_link_libraries(tierlm_core PUBLIC ggml)
+# Which NVIDIA generations this build's CUDA engine has code for, so tierlm can send a card it can't run to Vulkan
+# instead of failing (see hide_unsupported_cuda in src/backends.cpp). Unset (ggml's own default list): no check.
+if(TIERLM_CUDA AND CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_ARCHITECTURES MATCHES "native|all")
+  string(REPLACE ";" "," TIERLM_CUDA_ARCH_LIST "${CMAKE_CUDA_ARCHITECTURES}")
+  target_compile_definitions(tierlm_core PRIVATE TIERLM_CUDA_ARCHS="${TIERLM_CUDA_ARCH_LIST}")
+endif()
 
 foreach(tool inspect plan tok_test logits run bench embed vision)
   string(REPLACE "_" "-" name ${tool})

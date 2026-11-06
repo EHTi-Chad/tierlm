@@ -43,6 +43,13 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
    Download **all** of them into the same folder. tierlm shows them as one model ("3 files") and loads them
    together.
 
+Already running tierlm? **Get models…** (setup screen, GGUF models) searches Hugging Face for you: it shows each
+model's files with how they'd fit this PC (all in VRAM, part in RAM, or with the SSD tier), greys out the kinds of
+model this version doesn't run yet, and downloads the one you pick, with its vision file if it has one, into
+tierlm's own `models` folder. That folder is always listed, even when you browse another one (LM Studio's, say), so
+downloads never end up scattered. Downloads continue where they left off if stopped, and are checked against Hugging Face's checksums.
+**Open in its own window** gives it a browser window of its own.
+
 ## Step 3: Start it
 
 1. Double-click **`start-tierlm.bat`**.
@@ -191,6 +198,20 @@ in line; the top bar shows how many connections are busy. Speculative decoding i
 recommends the most that keeps every reply at or above **Slowest speed per reply** (5 tok/s unless you change it).
 It loads the model with that recommendation, and you can choose differently.
 
+### Models bigger than your RAM: the SSD tier
+
+When a model doesn't fit in VRAM and RAM together, tierlm keeps the parts used least on a drive and reads them as
+each word needs them: in a mixture-of-experts model, the experts the router rarely picks (each word reads only the
+few it picks, and Windows keeps the recently read ones in spare RAM, so busy experts are read once). It happens by
+itself: the setup screen's bars show an **SSD** part, and **Model info** shows how much of the model is on the drive.
+
+**SSD tier: where the part that doesn't fit in RAM goes** (setup screen, Settings) picks the drive. Pick your fastest
+one, an NVMe SSD if you have one: tierlm copies just those parts there once (to a `tierlm-ssd` folder on it) and
+reads them from the copy from then on. **The model's own drive** reads them straight from the model file instead.
+
+Any size of model runs this way, but replies are much slower than all in RAM: the drive's speed decides. The answers
+are exactly the same as with everything in RAM.
+
 ### Two models at once: an embedding model
 
 Search, document comparison and retrieval (RAG) tools need an **embedding model**: a small model that turns a text
@@ -298,7 +319,9 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | gpt-oss | `gpt-oss` | gpt-oss-20b, gpt-oss-120b, HyperNova-60B | Model math and chat format verified, real-model test pending |
 | Embedding models: BERT-style | `bert` | bge-small/base/large, all-MiniLM-L6-v2, e5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
 | Embedding models: Nomic | `nomic-bert` | nomic-embed-text v1, v1.5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
-| Gemma, Phi, DeepSeek, GLM, Nemotron, ... | various | | Not yet |
+| DeepSeek V3 / R1 / V3.1, Kimi K2 / K2.5 / K2.6, Moonlight, DeepSeek V2 / V2-Lite | `deepseek2` | DeepSeek-V3-0324, DeepSeek-R1, Kimi-K2-Instruct, Moonlight-16B-A3B, DeepSeek-V2-Lite | Early. Model math checked against Hugging Face's own code (latent attention, grouped routing, YaRN); tokenizers (DeepSeek V3, Kimi K2) checked against Hugging Face's tokenizers; real-model test pending. The big ones need the SSD tier |
+| Qwen3.8 Flash-Next | `qwen4exp` | Qwen3.8-Flash-Next (512 experts, 10 active) | Model math checked against Hugging Face's own code, including its hyper-connections, the n-gram embedding on layer 1 and its sparse attention past 2,048 tokens, and against llama.cpp; tested on the real model (Q4_K_M, 120 GB): 37 tok/s on an RTX 5090 with 64 GB RAM and the SSD tier. Text only for now (its vision file and draft file aren't used yet). Its 35 GB n-gram table is the first thing the SSD tier moves to the SSD |
+| Gemma, Phi, GLM, Nemotron, DeepSeek V4, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision file**: tierlm loads it with the model so it can read
 images (Qwen3.5 / 3.6; see [Reading images](#reading-images)). Checked against Hugging Face's code; tested with Qwen3.5-9B on an RTX 3070 laptop.

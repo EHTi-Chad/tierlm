@@ -1,7 +1,7 @@
 @echo off
 rem Builds a portable Windows release of tierlm and zips it into dist\.
-rem Run from a Visual Studio Developer Command Prompt, in the project folder, with the CUDA toolkit (12.8 or newer,
-rem for RTX 50-series) and the Vulkan SDK installed:
+rem Run from a Visual Studio Developer Command Prompt, in the project folder, with the CUDA toolkit (12.8 or 12.9:
+rem RTX 50-series needs 12.8+, the Tesla V100 needs 12.x) and the Vulkan SDK installed:
 rem     scripts\package-windows.bat 0.4.0
 rem One download for every PC: it contains both GPU engines and picks one at start-up. NVIDIA GeForce RTX cards
 rem use CUDA (fastest on NVIDIA); Intel Arc, AMD Radeon and older NVIDIA cards use Vulkan; with no GPU, the CPU.
@@ -22,12 +22,38 @@ if /i "%FLAVOR%"=="both" (
   exit /b 0
 )
 
+rem CUDA architectures for the full build. Volta (the V100) needs CUDA 12.8 or 12.9: CUDA 13 can't build for it, so a
+rem release stops here rather than ship without it. A developer build (version "dev") on CUDA 13 leaves the V100 out.
+rem (Worked out here, outside the bracketed block below: batch reads a whole block before running any of it.)
+set "ARCHS=70;75;86;89;120"
+if /i not "%FLAVOR%"=="full" goto archs_done
+nvcc --version | findstr /c:"release 12.8" /c:"release 12.9" >nul
+if errorlevel 1 goto archs_cuda13
+rem CUDA 12 accepts Visual Studio 2017-2022 only (version 17 or older): stop early with a clear message
+if defined VSCMD_VER for /f "tokens=1 delims=." %%v in ("%VSCMD_VER%") do if %%v GEQ 18 (
+  echo CUDA 12 needs Visual Studio 2022, but this prompt is set up for Visual Studio %VSCMD_VER%.
+  echo Run this from the "x64 Native Tools Command Prompt for VS 2022", or use scripts\dev-update.bat, which picks it.
+  exit /b 1
+)
+goto archs_done
+:archs_cuda13
+if /i not "%VER%"=="dev" goto archs_wrong
+echo NOTE: CUDA 13 found: this developer build leaves out the Tesla V100 ^(releases need CUDA 12.8 or 12.9^).
+set "ARCHS=75;86;89;120"
+goto archs_done
+:archs_wrong
+echo The release build needs CUDA 12.8 or 12.9 ^(CUDA 13 dropped the Tesla V100^). Found:
+nvcc --version | findstr /c:"release"
+echo Point CUDA_PATH and PATH at CUDA 12.9, or install it next to the current one.
+exit /b 1
+:archs_done
+
 if /i "%FLAVOR%"=="full" (
   set "NAME=tierlm-%VER%-windows"
   set "BDIR=build-release"
-  echo == Building ^(portable: a CPU engine for every x86 generation, static runtime, CUDA for RTX 20/30/40/50 + Vulkan^) ==
-  rem CUDA architectures: 75 = RTX 20, 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
-  cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_CUDA=ON -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=75;86;89;120" -DTIERLM_VERSION=%VER% || exit /b 1
+  echo == Building ^(portable: a CPU engine for every x86 generation, static runtime, CUDA for Tesla V100 and RTX 20/30/40/50 + Vulkan^) ==
+  rem CUDA architectures: 70 = Tesla V100 / Titan V (Volta), 75 = RTX 20, 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
+  cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_CUDA=ON -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=%ARCHS%" -DTIERLM_VERSION=%VER% || exit /b 1
 ) else if /i "%FLAVOR%"=="lite" (
   set "NAME=tierlm-%VER%-windows-lite"
   set "BDIR=build-release-vulkan"

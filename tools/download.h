@@ -22,6 +22,7 @@
 #endif
 #include <windows.h>
 #else
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -106,8 +107,8 @@ inline std::string sha256_file(const fs::path& p) {
 
 // ---- running curl ----
 // Runs a program with these arguments (no shell, so paths need no quoting); returns its exit code, -1 if it
-// couldn't start.
-inline int run(const std::vector<std::string>& args) {
+// couldn't start. With `cancel`: checked twice a second, and the program is stopped once it's set (returns -2).
+inline int run(const std::vector<std::string>& args, const std::atomic<bool>* cancel = nullptr) {
 #ifdef _WIN32
     auto wide = [](const std::string& s) {
         std::wstring w(MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0), L'\0');
@@ -131,7 +132,13 @@ inline int run(const std::vector<std::string>& args) {
     STARTUPINFOW si{}; si.cb = sizeof si;
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return -1;
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    while (WaitForSingleObject(pi.hProcess, cancel ? 500 : INFINITE) == WAIT_TIMEOUT)
+        if (cancel && cancel->load()) {
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            return -2;
+        }
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
@@ -144,7 +151,13 @@ inline int run(const std::vector<std::string>& args) {
     if (pid < 0) return -1;
     if (pid == 0) { execvp(argv[0], argv.data()); _exit(127); }
     int st = 0;
-    if (waitpid(pid, &st, 0) < 0) return -1;
+    for (;;) {
+        const pid_t r = waitpid(pid, &st, cancel ? WNOHANG : 0);
+        if (r < 0) return -1;
+        if (r == pid) break;
+        if (cancel && cancel->load()) { kill(pid, SIGTERM); waitpid(pid, &st, 0); return -2; }
+        usleep(500 * 1000);
+    }
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 #endif
 }

@@ -16,7 +16,8 @@ for f in glob.glob(os.path.join(here, "..", "docs", "*.md")) + glob.glob(os.path
     corpus += open(f, encoding="utf-8").read().splitlines()
 corpus += ["Ça va? Être naïve, déjà vu — café crème.", "日本語のテキストと中文文本。", "Привет, как дела?",
            "Numbers 1234567 and 3.14159 and 2026-10-27, 10,000,000.", "I'M HERE, YOU'RE THERE, WE'LL SEE, THEY'D GO.",
-           "emoji 😀🎉👍🏽 and symbols ©®™ ±×÷", "\t\ttabs\tand  double  spaces   triple", "line1\nline2\r\nline3\n\n\nend"] * 20
+           "emoji 😀🎉👍🏽 and symbols ©®™ ±×÷", "\t\ttabs\tand  double  spaces   triple", "line1\nline2\r\nline3\n\n\nend",
+           "中文分词测试，标点符号。日本語のひらがなとカタカナ。", "Kimi模型很好用，DeepSeek也不错！"] * 20
 
 CASES = ["Hello world", "Hello, world! How's it going?", "I'M HERE and you're THERE; we'll see, they'd go.",
          "  leading spaces", "trailing spaces   ", "multiple   spaces   between", "tabs\tand\ttabs\t\t",
@@ -25,7 +26,9 @@ CASES = ["Hello world", "Hello, world! How's it going?", "I'M HERE and you're TH
          "Ça va? Être naïve, déjà vu.", "日本語のテキスト", "Привет мир", "emoji 😀🎉👍🏽!", "'quoted' and \"double\"",
          "a'b'c 's 't", "<|im_start|>user\nhi<|im_end|>", "", " ", "\n", "...!!!???", "URL: https://example.com/a?b=c&d=e",
          "mixed123abc456", "ALLCAPS and lowercase And Title", "x  \n  y", "word\n", "über straße", "١٢٣ arabic digits",
-         "cafe\u0301 nai\u0308ve", "हिन्दी भाषा", "ภาษาไทย ทดสอบ", "\u0301x .\u0301 a\u0301\u0301b"]
+         "cafe\u0301 nai\u0308ve", "हिन्दी भाषा", "ภาษาไทย ทดสอบ", "\u0301x .\u0301 a\u0301\u0301b",
+         "中文和日本語のカタカナ混合 text", "数字123456和中文。标点，符号！", "a.com .b ,c ;D x/y //z", "Kimi说：你好！Hello世界", "价格$100元 ¥200 €3,50",
+         "漢字テスト ㄅㄆ 한국어 텍스트", "math ∑∫√ ≤≥ → ←", "x\u200dy \u200b z", "tab\t中\n文\r\n"]
 
 def write_gguf(path, pre, tokens, types, merges=None, scores=None, model="gpt2", bos=None, eos=None):
     w = gguf.GGUFWriter(path, "llama")
@@ -58,11 +61,17 @@ PATTERNS = {
     "llama-bpe": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
     "qwen2":     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
     "qwen35":    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    # DeepSeek V3 / R1: three splits in a row
+    "deepseek-v3": [r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+",
+                    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"],
+    # Kimi K2: OpenAI's o200k words with Chinese characters on their own
+    "kimi-k2":   r"\p{Han}+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 }
 for pre, pat in PATTERNS.items():
     tk = Tokenizer(models.BPE())
-    tk.pre_tokenizer = pre_tokenizers.Sequence([pre_tokenizers.Split(Regex(pat), behavior="isolated", invert=False),
-                                                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
+    pats = pat if isinstance(pat, list) else [pat]
+    tk.pre_tokenizer = pre_tokenizers.Sequence([pre_tokenizers.Split(Regex(x), behavior="isolated", invert=False) for x in pats] +
+                                               [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
     tk.decoder = decoders.ByteLevel()
     tr = trainers.BpeTrainer(vocab_size=1500, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False,
                              special_tokens=[AddedToken("<|im_start|>", special=True), AddedToken("<|im_end|>", special=True)])

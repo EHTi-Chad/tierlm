@@ -1,4 +1,6 @@
 #pragma once
+#include "mapped_file.h"
+#include "ngram.h"
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -66,6 +68,34 @@ struct Hparams {
     bool mrope = false;
     int mrope_sections[4] = {0, 0, 0, 0};
     float rope_attn_factor = 1.0f;
+    // DeepSeek V2/V3, Kimi K2, Moonlight (deepseek2): multi-head latent attention. Each token's keys and values are
+    // kept as one small compressed vector (kv_lora numbers, normalised) plus a shared rotated key part (n_rot); the
+    // cache holds just those, kv_lora + n_rot numbers per token per layer, and attention runs on them directly (each
+    // head's query is turned into that space first). q_lora: queries are compressed too (0: one plain projection).
+    bool mla = false;
+    int q_lora = 0, kv_lora = 0, nope = 0, v_dim = 0;   // nope: the unrotated part of each head's key; v_dim: value size
+    float kq_scale = 0.0f;            // attention scale (0: 1/sqrt(head_dim)); MLA: 1/sqrt(nope + n_rot), YaRN-scaled
+    // Expert routing by groups (DeepSeek V3): experts come in n_group groups; only the topk_group best groups (by
+    // the sum of their two best scores, or by their best score with softmax routing as in V2) may be picked from.
+    int n_group = 0, topk_group = 0;
+    bool group_sum2 = true;
+    // Qwen3.8 Flash-Next (qwen4exp): hyper-connections. The residual stream is hc copies of the width (4 x 2560),
+    // mixed into one input for each block and added back to every copy with its own weight. hc = 0: one stream.
+    int hc = 0;
+    // ...and its per-layer embedding (PLE) on some layers: each token's hashed 2- and 3-grams look up rows of one
+    // big table (ple_dim numbers per row, ngram.heads() rows per token), gated by the streams and smoothed by a
+    // dilated causal convolution (ple_kernel taps, ngram_size apart).
+    std::vector<bool> ple_layer;
+    int ple_dim = 0, ple_kernel = 4;
+    NgramHash ngram;
+    bool any_ple() const { for (bool b : ple_layer) if (b) return true; return false; }
+    int ple_state_len() const { return (ple_kernel - 1) * ngram.ngram; }   // inputs the convolution keeps
+    // QSA (Qwen Sparse Attention, Flash-Next's attention layers): past qsa_budget tokens, each query attends only to
+    // the blocks of qsa_ratio tokens an indexer ranks highest. Within the budget it is plain attention.
+    int qsa_budget = 0;
+    std::vector<int> qsa_ratio;       // per layer: tokens per indexed block (0: not a QSA layer)
+    int qsa_heads = 0, qsa_dim = 0;   // the indexer's query heads and their size (one key head)
+    int32_t ple_image_tok = -1;       // the token an image's words count as in the n-grams
     bool is_moe() const { return n_expert > 0; }
     // Hybrid (qwen35): Gated DeltaNet layers
     bool hybrid = false;
@@ -74,6 +104,7 @@ struct Hparams {
     int ssm_state = 0;                // head size of the linear attention (128)
     int ssm_k_heads = 0, ssm_v_heads = 0;
     bool v_grouped = false;
+    bool dn_sigmoid_gate = false;   // Flash-Next: DeltaNet's output gate is sigmoid(z), not Qwen3.5's silu(z)
     int n_nextn = 0;                  // multi-token-prediction draft blocks in the file (after the n_layer layers)           // value heads grouped by key head (Qwen3-Next) instead of tiled (Qwen3.5)
     bool is_recurrent(int il) const { return hybrid && il < (int)recurrent.size() && recurrent[il]; }
     int ssm_conv_dim() const { return 2 * ssm_k_heads * ssm_state + ssm_v_heads * ssm_state; }
@@ -116,7 +147,20 @@ struct LoadOptions {
     // RAM between steps, a few per step). Needs expert_usage. The RAM part keeps a copy of every expert (more RAM:
     // the VRAM experts are in both), so any expert can come or go without reading the file again.
     bool live_hot = false;
+    // The SSD tier: when the weights left for RAM don't fit in it, the least-used expert layers (then, for models
+    // without experts, the first layers) are read from a drive as the model needs them instead of loaded (a memory
+    // map, see MappedFile). ssd_dir: the folder on the drive to use; tierlm keeps a copy of those weights there
+    // (<model>.tierlm-ssd, written once). Empty: they are read from the model's own file, where it is.
+    std::string ssd_dir;
+    // 1 always (as much as ram_budget_mb allows: the tests), 0 never (everything left goes in RAM, as before), -1 when
+    // RAM is too small (the default).
+    int ssd = -1;
+    // Most RAM for weights; 0 = what's free less a margin for Windows and other programs (1.5 GB, or 12% of RAM if more).
+    long long ram_budget_mb = 0;
 };
+
+// The SSD tier's read-ahead for one layer: its expert tensors on the drive (see prefetch_experts in model.cpp).
+struct SsdPrefetch { const ggml_tensor* parts[4] = {}; long long n_expert = 0; };
 
 // Where the time goes, accumulated over every eval_batch call (for profiling).
 struct EvalStats {
@@ -141,6 +185,10 @@ struct Placement {
     std::vector<std::vector<int>> hot;           // per layer: experts kept in VRAM by the hot-expert placement (all of
                                                  // them when ffn_vram is set; empty when none or not used)
     int hot_experts = 0;                         // experts in VRAM through the hot-expert placement, all layers
+    uint64_t ssd_weights = 0;                    // bytes of weights read from the drive as needed (the SSD tier)
+    int ssd_layers = 0;                          // layers with weights there (expert layers, in MoE models)
+    bool ssd_ngram = false;                      // Flash-Next's n-gram table is there
+    std::string ssd_file;                        // the file they're read from
     // Every layer (attention, feed-forward/experts and its cache) in VRAM: only the token embedding table, which
     // is looked up by row and costs nothing per step, may be in RAM.
     bool all_on_gpu() const { return gpu_weights > 0 && layers > 0 && attn_gpu == layers && ffn_gpu == layers && kv_on_gpu; }
@@ -192,7 +240,9 @@ public:
     // this one can come back without being read again: the keys and values of its n_past positions in every
     // attention layer (and the MTP draft block), and the running memories of DeltaNet layers.
     struct Snapshot { int n_past = 0; std::vector<std::vector<uint8_t>> parts; size_t bytes = 0;
-                      std::vector<std::array<int, 3>> rope; };   // (images) each position's 3-part position
+                      std::vector<std::array<int, 3>> rope;     // (images) each position's 3-part position
+                      std::vector<int32_t> tok;                 // (Flash-Next) the tokens, for its n-grams
+                      std::vector<std::vector<float>> qsa; };   // (Flash-Next) each indexed layer's indexer keys
     Snapshot save() const;
     // Live hot experts (LoadOptions::live_hot): how well VRAM is serving the router's picks.
     struct LiveStats { long long picks = 0, hits = 0, swaps = 0; double swap_ms = 0; };
@@ -272,6 +322,8 @@ private:
         ggml_tensor *h_in = nullptr;             // MTP head: the target model's hidden states, as input
         ggml_tensor *cells = nullptr;            // where each token's key and value go in the cache
         ggml_tensor *out_idx = nullptr;          // several conversations: the tokens whose logits are wanted
+        ggml_tensor *ngram = nullptr;            // Flash-Next: each token's n-gram rows in the PLE table [heads * n_tok]
+        std::vector<std::pair<int, ggml_tensor*>> qsa_k;   // QSA: per indexed layer, this batch's indexer keys
         int n_tok = 0;
         // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
@@ -288,6 +340,7 @@ private:
                 const std::vector<SeqGroup>* groups = nullptr);
     struct Layer;
     ggml_tensor* attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
+    ggml_tensor* attn_mla(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
     ggml_tensor* ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing);
     void pin_cpu_layers(const Graph& g);        // keep every op of a RAM layer on the CPU
     std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
@@ -316,6 +369,23 @@ private:
         ggml_tensor *router_b = nullptr, *gate_xb = nullptr, *up_xb = nullptr, *down_xb = nullptr;   // gpt-oss: biases
         bool rope = true;                        // rotates positions (see Hparams::rope_layer)
         int index = 0;                           // the layer's number
+        const SsdPrefetch* ssd = nullptr;        // its experts are on the drive (the SSD tier): read them ahead
+        // MLA (deepseek2): query compression (or plain wq), the compressed key/value projection with its norm, and
+        // per head: k_b [nope, kv_lora] (a query's unrotated part into the compressed space), v_b [kv_lora, v_dim].
+        ggml_tensor *wq_a = nullptr, *q_a_norm = nullptr, *wq_b = nullptr, *wkv_a = nullptr, *kv_a_norm = nullptr;
+        ggml_tensor *wk_b = nullptr, *wv_b = nullptr;
+        ggml_tensor* exp_probs_b = nullptr;      // router bias used only to choose experts (DeepSeek V3)
+        // Flash-Next: the hyper-connection mixers before attention and before the experts (norm over each copy of
+        // the width, low-rank mixing weights, and how much of the block's output each copy gets)...
+        ggml_tensor *hc_a_norm = nullptr, *hc_a_down = nullptr, *hc_a_up = nullptr, *hc_a_inj = nullptr;
+        ggml_tensor *hc_f_norm = nullptr, *hc_f_down = nullptr, *hc_f_up = nullptr, *hc_f_inj = nullptr;
+        // ...and the per-layer embedding (on the layers that have one), with its convolution's saved inputs per
+        // conversation ([hc * n_embd, ple_state_len] each)
+        ggml_tensor *ple_key = nullptr, *ple_value = nullptr, *ple_norm_key = nullptr, *ple_norm_query = nullptr;
+        ggml_tensor *ple_norm_conv = nullptr, *ple_conv = nullptr;
+        std::vector<ggml_tensor*> ple_states;
+        ggml_tensor *idx_q = nullptr, *idx_k = nullptr, *idx_q_norm = nullptr, *idx_k_norm = nullptr;   // QSA indexer
+        int qsa = -1;                            // its entry in qsa_
         bool swa = false;                                                     // sliding-window layer
         ggml_tensor *ffn_norm = nullptr;
         ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;          // dense FFN
@@ -348,6 +418,8 @@ private:
     ggml_context* wctx_ = nullptr;               // weight tensor descriptors
     ggml_context* kvctx_ = nullptr;              // KV cache tensor descriptors
     std::vector<ggml_backend_buffer*> wbufs_;    // weight memory: one buffer in VRAM, one in system RAM
+    std::vector<SsdPrefetch> ssd_pf_;            // per layer (sized at load, so Layer::ssd pointers stay valid)
+    std::vector<std::unique_ptr<MappedFile>> maps_;   // the SSD tier's files (outlive wbufs_, freed in ~Model)
     Placement place_;
     EvalStats stats_;
     std::vector<ggml_backend_buffer*> kvbufs_;   // KV cache memory: VRAM part and RAM part
@@ -359,6 +431,26 @@ private:
     std::vector<uint8_t> graph_mem_[3];
     std::vector<uint8_t>& graph_mem(int kind) { return graph_mem_[kind]; }
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
+    ggml_tensor *ple_embd_ = nullptr;            // Flash-Next: the PLE n-gram table [ple_dim, rows]
+    ggml_tensor *out_hc_norm_ = nullptr, *out_hc_down_ = nullptr, *out_hc_up_ = nullptr;   // the last stream mixer
+    std::vector<std::vector<int32_t>> seq_tok_;  // Flash-Next: each conversation's tokens (for the n-grams)
+    // QSA (Flash-Next's sparse attention): each indexed layer's raw indexer keys, per conversation, by position
+    // (qsa_dim numbers each), and that layer's norm weights; kept in RAM, read by the mask-making op.
+public:
+    struct QsaCall { const Model* m; int i; };
+    struct QsaLayer { int layer = -1, ratio = 0; std::vector<float> qn, kn; std::vector<std::vector<float>> keys;
+                      std::vector<std::vector<float>> blocks; };   // per conversation: finished blocks' keys, normed and rotated
+    struct QsaBatch {                           // the step being computed: each token's conversation, position, rotation
+        std::vector<int> seq, pos; std::vector<std::array<int, 3>> rope; std::map<std::pair<int, int>, int> at;   // (seq, pos) -> token
+    };
+    const QsaLayer& qsa_layer(int i) const { return qsa_[i]; }
+    void qsa_block_key(const QsaLayer& Q, const float* const* raw, const std::array<int, 3>& pos, float* out) const;
+    void qsa_mask(const QsaLayer& Q, const ggml_tensor* mask, const ggml_tensor* q, const ggml_tensor* k, ggml_tensor* dst, int ith, int nth) const;
+private:
+    std::vector<QsaLayer> qsa_;
+    std::vector<QsaCall> qsa_calls_;            // the mask-making op's userdata, one per indexed layer
+    QsaBatch qsa_batch_;
+    bool qsa_long_ = false;                      // this step has a query past the budget: build the sparse masks
     std::vector<Layer> layers_;
     std::unique_ptr<Layer> mtp_;                 // the MTP draft block, when loaded
     std::vector<bool> layer_kv_gpu_;             // per layer: KV cache in VRAM

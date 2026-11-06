@@ -357,6 +357,37 @@ Changes the context length while the model stays loaded: the cache is made again
 - `POST /api/context {"ctx": N}`: does it (409 with the reason if it can't), and saves N as this model's context for
   next time. `{"ok": true, "ctx": N, "seconds": ...}`. Waits for running replies to finish. On this computer only.
 
+### Get models (`/api/hf`)
+
+Searching Hugging Face for GGUF models and downloading them (the setup screen's **Get models…** window). The server
+asks Hugging Face's public API through curl (Windows 10 and 11 include it). On this computer only.
+
+- `GET /api/hf/search?q=...&sort=downloads|trendingScore|likes|lastModified`: `{"models": [{"id", "downloads", "likes", "updated"}]}`.
+- `GET /api/hf/repo?id=owner/name`: its GGUF files grouped: `"quants"` (each `{"label", "size", "files": [{"path", "size", "sha256"}]}`,
+  split files together, smallest first), `"vision"` (mmproj files), `"draft"` (mtp- files); and what the model is, from the
+  first model file's header (its first megabytes): `"arch"`, `"supported"`, `"reason"`, `"kind"`, `"layers"`, `"experts"`,
+  `"kv_bytes_per_token"`, `"ctx_train"`; `"gated"` when it needs a license accepted and a sign-in (not supported yet).
+- `POST /api/hf/download {"id": "owner/name", "files": ["path", ...]}`: downloads them into tierlm's own `models`
+  folder (next to it, whichever folder is chosen for browsing), in `owner\name\`. Sizes and checksums come from Hugging Face, not the request. Each file goes to a `.part` name that
+  continues where it left off after an interruption, is checked against Hugging Face's SHA-256, then gets its name.
+  One download at a time (409 while one runs); 507 when the drive hasn't room.
+- `GET /api/hf/download`: `{"state": "idle|downloading|done|cancelled|error", "id", "error", "files": [{"path", "size", "done", "state"}], "done", "total", "folder"}`.
+- `POST /api/hf/cancel`: stops it; what was downloaded is kept.
+
+`TIERLM_HF_BASE` (tests) points all of this at another address in place of `https://huggingface.co`.
+
+### GET /api/drives, POST /api/ssd
+
+The SSD tier's drive (see [Getting started](GETTING_STARTED.md#models-bigger-than-your-ram-the-ssd-tier)).
+
+- `GET /api/drives`: `{"drives": [{"path", "label", "free", "total"}], "ssd_dir", "ssd_free"}`: the drives the SSD tier
+  can use (fixed drives on Windows) and the folder chosen (`""`: each model's own drive, read where the file is).
+- `POST /api/ssd {"dir": "D:\\"}`: choose one. A drive's root gets a `tierlm-ssd` folder; `""` goes back to the
+  model's own drive. Saved; used from the next load. On this computer only.
+
+`/api/info` says what's there: `ssd_weights` (bytes), `ssd_layers`, `ssd_file`. `/api/load` takes `"ssd": false` to
+keep everything in RAM for that load.
+
 ### POST /api/unload
 
 Frees the model and everything that belongs to it (its vision file, draft block and the replies' caches), so its VRAM
