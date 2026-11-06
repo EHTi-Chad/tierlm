@@ -30,7 +30,7 @@ serves your other apps.
 step, with diagrams, code and an honest comparison with llama.cpp. New user? Start with
 **[Getting started](docs/GETTING_STARTED.md)**.
 
-> **Status: early.** VRAM and RAM tiering works, down to individual experts; the SSD tier is next. Not every model
+> **Status: early.** VRAM, RAM and SSD tiering works, down to individual experts. Not every model
 > family is supported yet. See [Supported models](#supported-models) and the [roadmap](#roadmap).
 
 ## Why
@@ -46,7 +46,7 @@ fastest memory**, and that is what tierlm is built around (the tiering idea was 
 |---|---|---|
 | **VRAM** (GPU) | Attention, the router and the context (KV cache) of every layer, then as many experts or layers as fit | Used for every word, and the GPU reads its memory fastest |
 | **System RAM** (CPU) | The rest: experts of an MoE model, or whole layers of a dense one | Needed less often; the CPU works on them with the best instructions it has (AVX2, AVX-512) |
-| **SSD** (soon) | Rarely used experts, streamed on demand | For models bigger than VRAM and RAM together |
+| **SSD** (NVMe) | Rarely used experts and lookup tables, read as each word needs them | For models bigger than VRAM and RAM together: Qwen3.8 Flash-Next (120 GB) runs at 37 tok/s on a 32 GB GPU with 64 GB of RAM |
 
 It makes a large difference: the 17 GB Qwen3.6-35B-A3B on an 8 GB laptop GPU runs at 13 tok/s split by whole layers,
 33 tok/s with attention and context in VRAM and only the experts in RAM, and 35 tok/s with speculative decoding.
@@ -54,7 +54,8 @@ It makes a large difference: the 17 GB Qwen3.6-35B-A3B on an 8 GB laptop GPU run
 How tierlm keeps it fast, at any size:
 
 - **Size is about memory.** Any model that fits in VRAM plus RAM runs (about 10 GB is needed for Windows, the
-  context and working memory). The SSD tier, coming soon, will stream rarely used experts and push past RAM.
+  context and working memory), and the SSD tier goes past that: the parts used least stay on the drive and are read
+  as each word needs them.
 - **Each part goes where it's fastest.** For mixture-of-experts models, attention and the context stay on the GPU and
   only the experts go to RAM, so the CPU reads just the few experts each token picks; dense models are split by whole
   layers. tierlm picks the split itself.
@@ -448,7 +449,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Qwen3-Next / Qwen3-Coder-Next (both GGUF layouts), verified against a NumPy reference
 - [x] gpt-oss: attention sinks, sliding-window layers, exact YaRN, MXFP4 experts with biases, OpenAI's harmony chat format and tool calls
 - [x] Tier loader, first version: models bigger than VRAM split between VRAM and RAM (whole layers or experts), VRAM limit setting
-- [ ] SSD tier (stream rarely used weights from disk)
+- [x] SSD tier (rarely used weights read from the drive as needed; 0.8.2)
 - [ ] Search and download GGUF models from Hugging Face inside tierlm
 - [x] OpenAI-compatible API, with an Allow other devices switch and optional API key
 - [x] Tool (function) calling in the API, for coding agents (opencode, Cline, Continue agent, Cursor agent mode)

@@ -159,7 +159,8 @@ image. PDFs aren't read yet: turn their pages into images first (your document t
 Automatically. It uses a dedicated GPU if the model fits in its memory, then integrated graphics, then the CPU
 (the one marked **Will be used**). If a laptop has both Intel and NVIDIA graphics, the NVIDIA one is used. To
 run on the CPU anyway, open **Advanced** on the setup screen and tick **Force CPU**. A model too big for the
-GPU is split automatically: as much as fits goes in GPU memory, the rest in RAM. (An SSD tier is next.)
+GPU is split automatically: as much as fits goes in GPU memory, the rest in RAM, and what doesn't fit in RAM either
+stays on a drive you pick (the SSD tier), read as each word needs it.
 
 **How much RAM do I need?**
 At least 32 GB to run models bigger than your GPU, and 64 GB or more is better. The model has to fit in GPU
