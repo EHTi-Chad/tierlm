@@ -5,3 +5,9 @@ dist/
 tierlm-settings.json
 scripts/dev-test*
 scripts/dev-update*
+scripts/perf*
+scripts/b5.bat
+scripts/go5.bat
+scripts/t5-runs*.bat
+scripts/watch5.bat
+scripts/watchL.bat

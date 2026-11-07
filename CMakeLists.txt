@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
 endif()
-project(tierlm VERSION 0.8.1 LANGUAGES C CXX)
+project(tierlm VERSION 0.8.3 LANGUAGES C CXX)
 set(TIERLM_VERSION "${PROJECT_VERSION}" CACHE STRING "Version shown in the app")
 # A developer build (scripts\dev-update.bat passes "dev") shows which version it is a development copy of.
 if(TIERLM_VERSION STREQUAL "dev")
@@ -44,6 +44,10 @@ set(GGML_CUDA   ${TIERLM_CUDA}   CACHE BOOL "" FORCE)
 # off outside llama.cpp). tierlm's graphs keep their shapes from token to token, which this needs (see kv_span).
 set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 set(GGML_VULKAN ${TIERLM_VULKAN} CACHE BOOL "" FORCE)
+# CPU threads: OpenMP (the default), or ggml's own thread pool, which tierlm keeps ready between the many small CPU
+# steps of a split model (see set_n_threads in src/backends.cpp). OFF to try the thread pool.
+option(TIERLM_OPENMP "CPU threads through OpenMP (OFF: ggml's thread pool, kept ready between steps)" ON)
+set(GGML_OPENMP ${TIERLM_OPENMP} CACHE BOOL "" FORCE)
 add_subdirectory(third_party/ggml)
 
 # Windows builds with CUDA load NVIDIA's driver DLL (nvcuda.dll) only when it is first needed, which is only

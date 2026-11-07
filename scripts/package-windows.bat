@@ -22,6 +22,12 @@ if /i "%FLAVOR%"=="both" (
   exit /b 0
 )
 
+rem CPU threads: OpenMP unless TIERLM_OPENMP=OFF is set (a test of ggml's thread pool, kept ready between steps).
+rem Releases always use the default; set it again each time, so a test setting doesn't stay in the build folder.
+set "OMP=ON"
+if /i "%TIERLM_OPENMP%"=="OFF" set "OMP=OFF"
+if /i not "%VER%"=="dev" set "OMP=ON"
+echo CPU threads: OpenMP %OMP%
 rem CUDA architectures for the full build. Volta (the V100) needs CUDA 12.8 or 12.9: CUDA 13 can't build for it, so a
 rem release stops here rather than ship without it. A developer build (version "dev") on CUDA 13 leaves the V100 out.
 rem (Worked out here, outside the bracketed block below: batch reads a whole block before running any of it.)
@@ -53,12 +59,12 @@ if /i "%FLAVOR%"=="full" (
   set "BDIR=build-release"
   echo == Building ^(portable: a CPU engine for every x86 generation, static runtime, CUDA for Tesla V100 and RTX 20/30/40/50 + Vulkan^) ==
   rem CUDA architectures: 70 = Tesla V100 / Titan V (Volta), 75 = RTX 20, 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
-  cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_CUDA=ON -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=%ARCHS%" -DTIERLM_VERSION=%VER% || exit /b 1
+  cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_CUDA=ON -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=%ARCHS%" -DTIERLM_OPENMP=%OMP% -DTIERLM_VERSION=%VER% || exit /b 1
 ) else if /i "%FLAVOR%"=="lite" (
   set "NAME=tierlm-%VER%-windows-lite"
   set "BDIR=build-release-vulkan"
   echo == Building ^(portable: a CPU engine for every x86 generation, static runtime, Vulkan only^) ==
-  cmake -S . -B build-release-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON -DTIERLM_VERSION=%VER% || exit /b 1
+  cmake -S . -B build-release-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release -DTIERLM_VULKAN=ON -DTIERLM_PORTABLE=ON -DTIERLM_OPENMP=%OMP% -DTIERLM_VERSION=%VER% || exit /b 1
 ) else ( echo unknown option "%FLAVOR%": leave it out, or use lite or both & exit /b 1 )
 cmake --build %BDIR% || exit /b 1
 

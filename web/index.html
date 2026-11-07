@@ -12,6 +12,7 @@
     --vram: #0f7b6c; --ram: #b8730a; --ssd: #b4472b; --kv: #6a55c8; --work: #7d8799; --other: #c3c8d2; --heat-lo: #eef0f3; --flash: #10b39c;
     --user: #1e3a5f; --user-ink: #ffffff; --danger: #b4472b;
     --radius: 10px; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    color-scheme: light;   /* the browser's own parts (scrollbars, form controls) follow the theme too */
   }
   /* Theme: Auto follows the system; Light and Dark (the switch in the top bar) override it. */
   @media (prefers-color-scheme: dark) {
@@ -20,6 +21,7 @@
       --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35;
       --vram: #2bb39e; --ram: #e0a043; --ssd: #e07a5f; --kv: #a08cf5; --work: #7a8396; --other: #3c4250; --heat-lo: #232834; --flash: #6ff0dc;
       --user: #2f5d93; --user-ink: #ffffff; --danger: #e07a5f;
+      color-scheme: dark;
     }
   }
   :root[data-theme="dark"] {
@@ -27,7 +29,14 @@
       --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35;
       --vram: #2bb39e; --ram: #e0a043; --ssd: #e07a5f; --kv: #a08cf5; --work: #7a8396; --other: #3c4250; --heat-lo: #232834; --flash: #6ff0dc;
       --user: #2f5d93; --user-ink: #ffffff; --danger: #e07a5f;
+      color-scheme: dark;
   }
+  /* Scrollbars in the theme's colours: a thin thumb in the line colour on the panel. */
+  * { scrollbar-color: var(--line) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--faint); background-clip: padding-box; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
   body { background: var(--bg); color: var(--ink); font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif; }
@@ -1923,7 +1932,8 @@ function ssdNote(p) {
   const dr = ssdDrive();
   const room = dr ? dr.free : Infinity;
   return ` ${fmtGiB(p.ssd)} of it doesn't fit in RAM either, so it stays on the SSD (${dr ? dr.label : "the model's own drive"}) and is read as each word needs it.` +
-    ` Any size of model runs this way, but replies are much slower: the drive's speed decides.` +
+    ` Any size of model runs this way. A mixture-of-experts model stays fast, since each word reads only the few experts it picks;` +
+    ` a dense one reads all of itself for every word, so the drive's speed decides.` +
     (dr && p.ssd > room ? ` Warning: that drive has only ${fmtGiB(room)} free.` : "");
 }
 function memBar(title, sub, total, parts) {
@@ -1964,7 +1974,31 @@ async function loadSetup() {
   renderSetup();
 }
 // Settings are remembered per model (by the server, in tierlm-settings.json).
+// The last Find the fastest settings for the picked model: its results, when, with which tierlm and on what PC.
+let tuning = false;
+function showSavedTune() {
+  if (tuning) return;
+  const t = selModel && md.saved && md.saved[selModel.id] && md.saved[selModel.id].tuned;
+  const box = $("tunebox"), list = $("tunelist"), done = $("tunedone");
+  if (!t || !(t.results || []).length) { box.hidden = true; return; }
+  box.hidden = false;
+  $("tunetitle").textContent = "Fastest settings for this PC, last measured";
+  const bits = [t.when ? new Date(t.when.replace(" ", "T")).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "earlier",
+                t.version ? "tierlm " + t.version : "", t.pc || ""].filter(Boolean);
+  $("tunestat").textContent = bits.join(" · ");
+  list.innerHTML = "";
+  let marked = false;
+  for (const r of t.results) {
+    const li = document.createElement("li");
+    li.innerHTML = `${esc(r.label || "")}: <b>${(+r.tps || 0).toFixed(1)}</b> tok/s`;
+    if (!marked && Math.abs((+r.tps || 0) - t.tps) < 0.05) { li.classList.add("best"); marked = true; }
+    list.appendChild(li);
+  }
+  done.hidden = false;
+  done.innerHTML = `<span>Fastest: <b>${(+t.tps).toFixed(1)} tok/s</b>, in use for this model. <b>Find the fastest settings</b> measures again (after a tierlm update, say).</span>`;
+}
 function applySaved() {
+  showSavedTune();
   const s = (selModel && md.saved && md.saved[selModel.id]) || {};
   $("thr").value = s.threads || defThreads; $("thrv").textContent = $("thr").value;
   $("kvsel").value = s.kv_type || "f16";
@@ -2360,6 +2394,7 @@ $("tunebtn").onclick = async () => {
   if (!selModel || !p.dev) return;
   const btns = [$("loadbtn"), $("tunebtn")], msg = $("loadmsg"), list = $("tunelist"), done = $("tunedone");
   btns.forEach(b => b.disabled = true);
+  tuning = true;
   msg.className = ""; msg.textContent = "";
   $("tunebox").hidden = false; $("tunetitle").textContent = "Finding the fastest settings"; list.innerHTML = ""; done.hidden = true; done.innerHTML = "";
   $("tunestat").textContent = "Loading " + selModel.file + "… about a minute, longer for big models.";
@@ -2410,6 +2445,7 @@ $("tunebtn").onclick = async () => {
     $("tunestat").textContent = ""; watchProgress(false);
     msg.className = "err"; msg.textContent = "Could not finish: " + e.message;
   }
+  tuning = false;
   btns.forEach(b => b.disabled = false);
 };
 

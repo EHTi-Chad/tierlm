@@ -141,7 +141,7 @@ Vision::~Vision() {
     if (wbuf_) ggml_backend_buffer_free(wbuf_);
     if (xbuf_) ggml_backend_buffer_free(xbuf_);
     if (main_ && main_ != cpu_) ggml_backend_free(main_);
-    if (cpu_) ggml_backend_free(cpu_);
+    if (cpu_) { forget_cpu_backend(cpu_); ggml_backend_free(cpu_); }
     if (wctx_) ggml_free(wctx_);
     if (xctx_) ggml_free(xctx_);
     if (gguf_) gguf_free(gguf_);

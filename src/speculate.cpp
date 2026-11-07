@@ -12,6 +12,9 @@ std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_th
     const int E = m_.hparams().n_embd, end = (int)toks.size();
     if (end == 0) return {};
     const int n0 = m_.n_past();                       // tokens [0, n0) are in the cache and unchanged
+    if (m_.has_mtp() && n0 > 0 && h_pos_ != n0 - 1 && ck_.h_pos == n0 - 1 && !ck_.h_last.empty()) {
+        h_last_ = ck_.h_last; h_pos_ = ck_.h_pos;    // the model went back to its checkpoint: so do we
+    }
     // The draft block's entry at position p needs token p and the model's hidden state at p - 1. Entries before
     // c are still right. To redo the rest we need the hidden state at c - 1: kept from last time, or recomputed.
     const int c = std::min(mtp_valid_, n0);

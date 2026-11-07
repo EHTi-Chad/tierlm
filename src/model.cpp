@@ -32,12 +32,13 @@ static constexpr int kGraphSize = 16384;
 
 Model::~Model() {
     release_pending();
+    drop_reuse();
     if (sched_) ggml_backend_sched_free(sched_);
     free_kv();
     for (auto* b : wbufs_) if (b) ggml_backend_buffer_free(b);
     if (wctx_) ggml_free(wctx_);
     for (auto* b : gpus_) if (b && b != cpu_) ggml_backend_free(b);
-    if (cpu_) ggml_backend_free(cpu_);
+    if (cpu_) { forget_cpu_backend(cpu_); ggml_backend_free(cpu_); }
 }
 
 // A separate MTP draft file for this model (Unsloth publishes the draft block as "mtp-<model>.gguf"): a GGUF in the
@@ -71,7 +72,43 @@ std::string mtp_companion(const std::string& model_path) {
     return {};
 }
 
+// Loads, then checks the VRAM left for the GPU's working memory against what this model, context and batch really
+// need (measured: the compute buffers the scheduler reserved, plus room for the GPU engine's scratch memory and the
+// driver). Too little: loads again with that much kept free, and notes it in opt.vram_note for next time, so it
+// happens once per model and context size.
 std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& opt) {
+    LoadOptions o = opt;
+    // (per context, batch, connections and placement kind: the hot-expert split needs more than whole layers)
+    const std::string key = std::to_string(opt.max_ctx) + " " + std::to_string(opt.batch) + " " + std::to_string(opt.parallel) + " " +
+                            opt.split_mode + (opt.expert_usage.empty() ? "" : "+hot") + (opt.live_hot ? "+live" : "") + " ";
+    if (o.vram_reserve_mb <= 0 && !o.vram_note.empty()) {
+        std::ifstream f(std::filesystem::u8path(o.vram_note));
+        for (std::string line; std::getline(f, line); )
+            if (line.compare(0, key.size(), key) == 0) o.vram_reserve_mb = std::atoi(line.c_str() + key.size());
+    }
+    auto m = load_once(path, o);
+    const int used = m->place_.vram_reserve_mb;
+    const int runtime = []{ const char* e = std::getenv("TIERLM_VRAM_SCRATCH_MB"); return e ? std::atoi(e) : 640; }();
+    const int need = (int)(m->place_.compute_gpu >> 20) + runtime;
+    const bool tight = m->place_.compute_gpu > 0 && need > used + 64 && opt.vram_budget_mb <= 0 && !std::getenv("TIERLM_VRAM_BYTES");
+    if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && need > o.vram_reserve_mb) {   // remember it (the most seen: no reload back and forth)
+        std::vector<std::string> keep;
+        { std::ifstream f(std::filesystem::u8path(o.vram_note)); for (std::string line; std::getline(f, line); ) if (line.compare(0, key.size(), key) != 0 && !line.empty()) keep.push_back(line); }
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::u8path(o.vram_note).parent_path(), ec);
+        std::ofstream f(std::filesystem::u8path(o.vram_note), std::ios::trunc);
+        for (const auto& l : keep) f << l << "\n";
+        f << key << std::max(need, 768) << "\n";
+    }
+    if (!tight) return m;
+    std::fprintf(stderr, "VRAM: this model needs %d MB free for the GPU's working memory and %d MB was kept; loading again "
+                         "with %d MB kept, so replies don't slow down when VRAM runs out (once: it's remembered)\n", need, used, need);
+    m.reset();
+    o.vram_reserve_mb = need;
+    return load_once(path, o);
+}
+
+std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptions& opt) {
     std::unique_ptr<Model> m(new Model());
     const std::string& device = opt.device;
     const int max_ctx = opt.max_ctx;
@@ -540,7 +577,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             ggml_backend_dev_memory(ggml_backend_get_device(m->gpus_[d]), &free, &total);
             size_t avail = free;
             if (opt.vram_budget_mb > 0) avail = std::min(avail, (size_t)opt.vram_budget_mb << 20);
-            const size_t reserve = (size_t)768 << 20;      // compute scratch memory and driver overhead
+            const size_t reserve = (size_t)(opt.vram_reserve_mb > 0 ? opt.vram_reserve_mb : 768) << 20;   // compute memory, scratch, driver
+            m->place_.vram_reserve_mb = (int)(reserve >> 20);
             budgets[d] = avail > reserve ? avail - reserve : 0;
             if (!forced.empty()) budgets[d] = forced[std::min((size_t)d, forced.size() - 1)];
         }
@@ -592,7 +630,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // cache are placed, the VRAM left goes to the most-used individual experts rather than to whole expert layers.
     // A layer whose chosen experts are only some of its experts is split in two (see Layer::map_hot).
     struct HotSplit { ggml_tensor *orig, *hot, *cold; };
-    struct HotLayer { std::vector<int> ids; std::vector<HotSplit> parts; ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *mask = nullptr; };
+    struct HotLayer { std::vector<int> ids; std::vector<HotSplit> parts; ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *mask = nullptr;
+                      bool cold_mapped = false; };
     std::map<int, HotLayer> hot_layers;
     const int E = hp.n_expert;
     std::vector<float> usage_env;                                     // tests: TIERLM_EXPERT_USAGE=<seed> makes up usage counts
@@ -606,7 +645,6 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     hp.expert_bias = ggml_get_tensor(m->wctx_, "blk.0.ffn_down_exps.bias") != nullptr;
     const bool use_hot = G == 1 && !by_layer && hp.is_moe() && !hp.expert_bias && usage.size() == (size_t)hp.n_layer * E;
     bool live = use_hot && (opt.live_hot || std::getenv("TIERLM_LIVE_EXPERTS"));
-    const size_t budget0 = budget;                                    // VRAM for weights before anything is placed
     std::vector<std::vector<int>> hot_ids(hp.n_layer);
     bool hot_decided = false;
     auto choose_hot = [&]() {
@@ -661,28 +699,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 if (!hot_decided) {
                     choose_hot();
                     hot_decided = true;
-                    // Live: the RAM part keeps a second copy of every VRAM expert. Only if RAM has room for it with
-                    // plenty to spare (8 GB, or 15% of RAM if more): close to full, Windows starts moving memory to
-                    // disk and everything slows down (an RTX 5090 PC with 64 GB went from 67 to 19 tok/s, and stayed
-                    // slow until restarted). Otherwise the fixed set, which is just as fast as hot experts.
-                    if (live) {
-                        size_t all = 0, extra = 0, free_ram = 0, total_ram = 0;
-                        for (const Group& g2 : groups) all += g2.bytes;
-                        for (const Group& g2 : groups)
-                            if (g2.prio == 4 && g2.layer >= 0 && g2.layer < hp.n_layer) {
-                                const size_t H2 = hot_ids[g2.layer].size();
-                                if (H2 > 0 && (int)H2 < E) extra += g2.bytes / E * H2;
-                            }
-                        if (ggml_backend_dev_t cd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))
-                            ggml_backend_dev_memory(cd, &free_ram, &total_ram);
-                        const size_t spare = std::max((size_t)8 << 30, (size_t)(total_ram * 0.15));
-                        const size_t need = (all > budget0 ? all - budget0 : 0) + extra + spare;
-                        if (free_ram && need > free_ram) {
-                            std::fprintf(stderr, "live hot experts: off, RAM is too small for the second copy of the VRAM experts "
-                                         "(needs about %.1f GB, %.1f GB free); using the fixed set\n", need / 1e9, free_ram / 1e9);
-                            live = false;
-                        }
-                    }
+                    // Live: an expert moving into VRAM trades places with the one it replaces, which goes into
+                    // its RAM slot, so the RAM part stays the size of the fixed set's (no second copy).
                 }
                 const int H = (int)hot_ids[gr.layer].size();
                 if (H == E || H == 0) { for (ggml_tensor* t : gr.t) (H ? on_gpu : on_cpu).push_back(t); continue; }
@@ -691,7 +709,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 for (ggml_tensor* t : gr.t) {
                     const std::string nm = ggml_get_name(t);
                     ggml_tensor* th = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], H + 1);
-                    ggml_tensor* tc = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], live ? E + 1 : E - H + 1);
+                    ggml_tensor* tc = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], E - H + 1);
                     ggml_set_name(th, (nm + ".hot").c_str());
                     ggml_set_name(tc, (nm + ".cold").c_str());
                     on_gpu.push_back(th);
@@ -770,6 +788,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // whose experts are split for the hot-expert placement keeps its RAM part in RAM (that part isn't laid out as
     // in the file). TIERLM_SSD_LAYERS=n (tests): exactly n groups go to the drive, whatever fits.
     std::vector<ggml_tensor*> on_ssd;
+    std::vector<ggml_tensor*> cold_inplace;                 // split layers' RAM parts read from the model file (RAM short)
     {
         std::map<const ggml_tensor*, const Source*> src_of;
         for (const Source& s : sources) src_of[s.t] = &s;
@@ -790,7 +809,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         int forced = -1;
         if (const char* e = std::getenv("TIERLM_SSD_LAYERS")) forced = std::atoi(e);
         const char* off_env = std::getenv("TIERLM_SSD");             // TIERLM_SSD=0: never (tests)
-        const bool want = opt.ssd != 0 && !(off_env && std::string(off_env) == "0") && (forced > 0 || (opt.ssd == 1 && ram_budget && ram_need > ram_budget) ||
+        const int force_cold = std::getenv("TIERLM_COLD_MAPPED") ? std::atoi(std::getenv("TIERLM_COLD_MAPPED")) : -1;   // tests
+        const bool want = opt.ssd != 0 && !(off_env && std::string(off_env) == "0") && (forced > 0 || force_cold > 0 || (opt.ssd == 1 && ram_budget && ram_need > ram_budget) ||
                                            (opt.ssd < 0 && ram_budget && ram_need > ram_budget));
         if (want) {
             // Groups that can go: per layer, its expert tensors (MoE), else all of its weights; in the file's layout.
@@ -830,7 +850,11 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             std::set<int> ssd_layer_set;
             int taken = 0;
             for (const Cand& c : order) {
-                if (forced >= 0 ? taken >= forced : ram_need <= ram_budget) break;
+                // Tables looked up by row (the n-gram table) go to the drive once RAM is short; expert layers only when
+                // they can't fit at all (more than the PC's RAM less 3 GB): Windows makes room for weights a little over
+                // the budget above, and running them from RAM is much faster (see the RAM parts of split layers below).
+                const size_t relaxed = total_ram > ((size_t)3 << 30) ? total_ram - ((size_t)3 << 30) : 0;
+                if (forced >= 0 ? taken >= forced : ram_need <= (c.layer < 0 ? ram_budget : std::max(ram_budget, relaxed))) break;
                 for (ggml_tensor* t : c.t) { moved.insert(t); on_ssd.push_back(t); ram_need -= std::min(ram_need, ggml_backend_buft_get_alloc_size(cpu_buft, t)); }
                 if (c.layer >= 0) ssd_layer_set.insert(c.layer); else m->place_.ssd_ngram = true;
                 ++taken;
@@ -839,6 +863,50 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 std::vector<ggml_tensor*> keep;
                 for (ggml_tensor* t : on_cpu) if (!moved.count(t)) keep.push_back(t);
                 on_cpu.swap(keep);
+            }
+            // Still too much, and the layers are split between VRAM and RAM (their RAM parts are made at load, so they
+            // aren't in the file to read from): the least-used layers' RAM parts become the file's own expert tensors,
+            // read where they are, as used. The picks still go to the experts in VRAM first; the ones in RAM are read
+            // from the file, which Windows keeps in spare RAM and can drop when short (without writing it to its page
+            // file, as it would the RAM part's memory: that is what slowed a 64 GB PC down to a crawl).
+            // Only when it can't fit at all (more than the PC's RAM less 3 GB): measured on a 64 GB PC with Flash-Next, RAM parts
+            // 10 GB over the usual budget still ran at 48 tok/s held in RAM (Windows makes room), against 31 read from the file.
+            const bool cannot_fit = total_ram && ram_need + ((size_t)3 << 30) > total_ram;
+            if (((forced < 0 && cannot_fit && force_cold != 0) || force_cold > 0) && !hot_layers.empty()) {   // (TIERLM_COLD_MAPPED=0: never)
+                struct Cold { float use; int layer; size_t bytes; };
+                std::vector<Cold> cs;
+                for (auto& [l, hl] : hot_layers) {
+                    bool ok = true;
+                    size_t bytes = 0;
+                    for (const HotSplit& sp : hl.parts) {
+                        auto it = src_of.find(sp.orig);
+                        if (it == src_of.end() || it->second->offset % 32 != 0) ok = false;
+                        bytes += ggml_backend_buft_get_alloc_size(cpu_buft, sp.cold);
+                    }
+                    if (!ok) continue;
+                    float use = 0;
+                    std::vector<char> hot(E, 0);
+                    for (int e : hl.ids) hot[e] = 1;
+                    for (int e = 0; e < E; ++e) if (!hot[e]) use += usage[(size_t)l * E + e];
+                    cs.push_back({use, l, bytes});
+                }
+                std::stable_sort(cs.begin(), cs.end(), [](const Cold& a, const Cold& b) { return a.use < b.use; });
+                std::set<const ggml_tensor*> gone;
+                for (const Cold& c : cs) {
+                    if (force_cold > 0 ? m->place_.cold_mapped_layers >= force_cold : ram_need <= ram_budget) break;
+                    HotLayer& hl = hot_layers[c.layer];
+                    for (HotSplit& sp : hl.parts) { gone.insert(sp.cold); cold_inplace.push_back(sp.orig); sp.cold = sp.orig; }
+                    hl.cold_mapped = true;
+                    ram_need -= std::min(ram_need, c.bytes);
+                    ++m->place_.cold_mapped_layers;
+                }
+                if (!gone.empty()) {
+                    std::vector<ggml_tensor*> keep;
+                    for (ggml_tensor* t : on_cpu) if (!gone.count(t)) keep.push_back(t);
+                    on_cpu.swap(keep);
+                    std::fprintf(stderr, "RAM: the experts in RAM of %d split layers are read from the model's file as used "
+                                 "(RAM is too small to hold them all)\n", m->place_.cold_mapped_layers);
+                }
             }
             m->place_.ssd_layers = (int)ssd_layer_set.size();
             if (forced < 0 && ram_need > ram_budget)
@@ -944,65 +1012,99 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 for (ggml_tensor* t : on_ssd) by_part[src_of.at(t)->part].push_back({t, src_of.at(t)->offset});
                 for (auto& [part, at] : by_part) map_into(paths.at(part), at);
             } else {
-                // The copy: a text header naming each tensor, then the tensors, each at a 4 KB boundary.
+                // The copies: a text header naming each tensor, then the tensors, each at a 4 KB boundary. Tables looked
+                // up by row (Flash-Next's n-gram table, 35 GB) get a file of their own, written once; the expert layers
+                // another, named after which layers it holds, so trying other settings (Find the fastest settings)
+                // doesn't rewrite tens of GB each time. The last few layer sets are kept.
                 const std::string dir = ssd_dir.empty() ? std::filesystem::u8path(path).parent_path().u8string() : ssd_dir;
-                const std::string file = (std::filesystem::u8path(dir) / (std::filesystem::u8path(path).stem().u8string() + ".tierlm-ssd")).u8string();
+                const std::string stem = std::filesystem::u8path(path).stem().u8string();
                 unsigned long long model_bytes = 0;
                 for (const auto& pp : paths) { std::error_code ec; model_bytes += std::filesystem::file_size(std::filesystem::u8path(pp), ec); }
-                std::string head = "tierlm-ssd 1\nmodel " + std::filesystem::u8path(path).filename().u8string() + " " + std::to_string(model_bytes) + "\n";
-                std::vector<std::pair<ggml_tensor*, size_t>> at;
-                size_t off = 0;
-                for (ggml_tensor* t : on_ssd) { head += std::string(ggml_get_name(t)) + " " + std::to_string(ggml_nbytes(t)) + "\n"; }
-                head += "end\n";
-                off = GGML_PAD(head.size(), 4096);
-                for (ggml_tensor* t : on_ssd) { at.push_back({t, off}); off = GGML_PAD(off + ggml_nbytes(t), 4096); }
-                const size_t want_size = off;
-                bool ok = false;
-                {
-                    std::error_code ec;
-                    if (std::filesystem::file_size(std::filesystem::u8path(file), ec) == want_size && !ec) {
-                        std::ifstream f(std::filesystem::u8path(file), std::ios::binary);
-                        std::string got(head.size(), '\0');
-                        ok = f.read(got.data(), (std::streamsize)got.size()) && got == head;
-                    }
-                }
-                if (!ok) {
-                    std::error_code ec;
-                    std::filesystem::create_directories(std::filesystem::u8path(dir), ec);
-                    unsigned long long fr = 0, tot = 0;
-                    if (drive_space(dir, fr, tot) && fr < want_size + ((unsigned long long)1 << 30))
-                        throw std::runtime_error("the SSD tier needs " + std::to_string((want_size + (1ull << 30) - 1) >> 30) + " GB free on the drive of " +
-                                                 dir + "; it has " + std::to_string(fr >> 30) + " GB");
-                    std::fprintf(stderr, "SSD tier: copying %.1f GB of weights to %s (once)\n", want_size / 1e9, file.c_str());
-                    const std::string tmp = file + ".part";
+                std::vector<ggml_tensor*> tables, layers;
+                for (ggml_tensor* t : on_ssd) (std::string(ggml_get_name(t)) == "per_layer_token_embd.weight" ? tables : layers).push_back(t);
+                size_t want_all = 0;
+                for (ggml_tensor* t : on_ssd) want_all += ggml_nbytes(t);
+                bool wrote = false;
+                auto use_copy = [&](const std::vector<ggml_tensor*>& ts, bool is_tables) {
+                    std::string head = "tierlm-ssd 1\nmodel " + std::filesystem::u8path(path).filename().u8string() + " " + std::to_string(model_bytes) + "\n";
+                    for (ggml_tensor* t : ts) head += std::string(ggml_get_name(t)) + " " + std::to_string(ggml_nbytes(t)) + "\n";
+                    head += "end\n";
+                    uint64_t hsh = 1469598103934665603ull;                     // FNV-1a of the header: which tensors
+                    for (unsigned char ch : head) { hsh ^= ch; hsh *= 1099511628211ull; }
+                    char tag[24];
+                    std::snprintf(tag, sizeof tag, "%08llx", (unsigned long long)(hsh & 0xffffffffull));
+                    const std::string file = (std::filesystem::u8path(dir) / (stem + (is_tables ? ".tables" : std::string(".") + tag) + ".tierlm-ssd")).u8string();
+                    std::vector<std::pair<ggml_tensor*, size_t>> at;
+                    size_t off = GGML_PAD(head.size(), 4096);
+                    for (ggml_tensor* t : ts) { at.push_back({t, off}); off = GGML_PAD(off + ggml_nbytes(t), 4096); }
+                    const size_t want_size = off;
+                    bool ok = false;
                     {
-                        std::ofstream o(std::filesystem::u8path(tmp), std::ios::binary | std::ios::trunc);
-                        if (!o) throw std::runtime_error("cannot write " + tmp);
-                        std::vector<char> pad(4096, 0), buf((size_t)64 << 20);
-                        o.write(head.data(), (std::streamsize)head.size());
-                        size_t pos = head.size();
-                        std::vector<std::ifstream> in;
-                        for (const auto& pp : paths) in.emplace_back(std::filesystem::u8path(pp), std::ios::binary);
-                        for (auto [t, toff] : at) {
-                            o.write(pad.data(), (std::streamsize)(toff - pos)); pos = toff;
-                            const Source* sr = src_of.at(t);
-                            auto& f = in.at(sr->part);
-                            f.seekg((std::streamoff)sr->offset);
-                            for (size_t left = ggml_nbytes(t); left; ) {
-                                const size_t n = std::min(left, buf.size());
-                                if (!f.read(buf.data(), (std::streamsize)n)) throw std::runtime_error("short read on " + paths.at(sr->part));
-                                o.write(buf.data(), (std::streamsize)n);
-                                left -= n; pos += n; copy_total += n;
-                                if (opt.progress) opt.progress(0.5f * (float)((double)copy_total / (double)want_size));
-                            }
+                        std::error_code ec;
+                        if (std::filesystem::file_size(std::filesystem::u8path(file), ec) == want_size && !ec) {
+                            std::ifstream f(std::filesystem::u8path(file), std::ios::binary);
+                            std::string got(head.size(), '\0');
+                            ok = f.read(got.data(), (std::streamsize)got.size()) && got == head;
                         }
-                        o.write(pad.data(), (std::streamsize)(want_size - pos));
-                        if (!o) throw std::runtime_error("writing " + tmp + " failed (drive full?)");
                     }
-                    std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(file), ec);
-                    if (ec) throw std::runtime_error("cannot rename " + tmp + ": " + ec.message());
-                }
-                map_into(file, at);
+                    if (!ok) {
+                        std::error_code ec;
+                        std::filesystem::create_directories(std::filesystem::u8path(dir), ec);
+                        // room: the old single-file copy (tierlm 0.8.2) and the oldest layer sets go first
+                        std::filesystem::remove(std::filesystem::u8path(dir) / (stem + ".tierlm-ssd"), ec);
+                        if (!is_tables) {
+                            std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> olds;
+                            for (const auto& de : std::filesystem::directory_iterator(std::filesystem::u8path(dir), ec)) {
+                                const std::string fn = de.path().filename().u8string();
+                                if (fn.size() > stem.size() + 12 && fn.compare(0, stem.size() + 1, stem + ".") == 0 &&
+                                    fn.find(".tables.") == std::string::npos && fn.size() >= 11 && fn.compare(fn.size() - 11, 11, ".tierlm-ssd") == 0)
+                                    olds.push_back({de.last_write_time(ec), de.path()});
+                            }
+                            std::sort(olds.begin(), olds.end());
+                            while (olds.size() > 2) { std::filesystem::remove(olds.front().second, ec); olds.erase(olds.begin()); }
+                        }
+                        unsigned long long fr = 0, tot = 0;
+                        if (drive_space(dir, fr, tot) && fr < want_size + ((unsigned long long)1 << 30))
+                            throw std::runtime_error("the SSD tier needs " + std::to_string((want_size + (1ull << 30) - 1) >> 30) + " GB free on the drive of " +
+                                                     dir + "; it has " + std::to_string(fr >> 30) + " GB");
+                        std::fprintf(stderr, "SSD tier: copying %.1f GB of weights to %s (once)\n", want_size / 1e9, file.c_str());
+                        const std::string tmp = file + ".part";
+                        {
+                            std::ofstream o(std::filesystem::u8path(tmp), std::ios::binary | std::ios::trunc);
+                            if (!o) throw std::runtime_error("cannot write " + tmp);
+                            std::vector<char> pad(4096, 0), buf((size_t)64 << 20);
+                            o.write(head.data(), (std::streamsize)head.size());
+                            size_t pos = head.size();
+                            std::vector<std::ifstream> in;
+                            for (const auto& pp : paths) in.emplace_back(std::filesystem::u8path(pp), std::ios::binary);
+                            for (auto [t, toff] : at) {
+                                o.write(pad.data(), (std::streamsize)(toff - pos)); pos = toff;
+                                const Source* sr = src_of.at(t);
+                                auto& f = in.at(sr->part);
+                                f.seekg((std::streamoff)sr->offset);
+                                for (size_t left = ggml_nbytes(t); left; ) {
+                                    const size_t n = std::min(left, buf.size());
+                                    if (!f.read(buf.data(), (std::streamsize)n)) throw std::runtime_error("short read on " + paths.at(sr->part));
+                                    o.write(buf.data(), (std::streamsize)n);
+                                    left -= n; pos += n; copy_total += n;
+                                    if (opt.progress) opt.progress(0.5f * (float)((double)copy_total / (double)std::max<size_t>(want_all, 1)));
+                                }
+                            }
+                            o.write(pad.data(), (std::streamsize)(want_size - pos));
+                            if (!o) throw std::runtime_error("writing " + tmp + " failed (drive full?)");
+                        }
+                        // On the drive now, not later: Windows would otherwise write it out over the next minutes,
+                        // while the model runs (and is measured), slowing down everything that reads the drives.
+                        flush_to_disk(tmp);
+                        std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(file), ec);
+                        if (ec) throw std::runtime_error("cannot rename " + tmp + ": " + ec.message());
+                        wrote = true;
+                    }
+                    map_into(file, at);
+                };
+                if (!tables.empty()) use_copy(tables, true);
+                if (!layers.empty()) use_copy(layers, false);
+                (void)wrote;
             }
         } catch (...) { gguf_free(g); throw; }
         std::fprintf(stderr, "SSD tier: %s%d layers, %.1f GB, read as needed from %s\n", m->place_.ssd_ngram ? "the n-gram table + " : "", m->place_.ssd_layers,
@@ -1019,7 +1121,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                 ggml_tensor* t = ggml_get_tensor(m->wctx_, (b + n).c_str());
                 return t && vram.count(t) > 0;
             };
-            m->place_.attn_gpu += in_vram("attn_norm.weight");
+            m->place_.attn_gpu += in_vram("attn_norm.weight") || in_vram("hc_attn_norm.weight");   // (Flash-Next: its mixer's norm)
             const bool f = hp.n_expert > 0 ? in_vram("ffn_down_exps.weight") : in_vram("ffn_up.weight");
             m->place_.ffn_gpu += f;
             m->place_.ffn_vram.push_back(f);
@@ -1033,6 +1135,27 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         }
     }
 
+    if (!cold_inplace.empty()) {                            // (see "RAM: ..." above) mapped from the model's own file
+        std::map<const ggml_tensor*, const Source*> src_of;
+        for (const Source& s : sources) src_of[s.t] = &s;
+        std::map<int, std::vector<std::pair<ggml_tensor*, size_t>>> by_part;
+        for (ggml_tensor* t : cold_inplace) by_part[src_of.at(t)->part].push_back({t, src_of.at(t)->offset});
+        try {
+            for (auto& [part, at] : by_part) {
+                auto mf = std::make_unique<MappedFile>();
+                mf->open(paths.at(part));
+                ggml_backend_buffer_t b = ggml_backend_cpu_buffer_from_ptr((void*)mf->data(), mf->size());
+                if (!b) throw std::runtime_error("cannot map " + paths.at(part));
+                ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                for (auto [t, off] : at) {
+                    if (off + ggml_nbytes(t) > mf->size()) throw std::runtime_error(paths.at(part) + " is shorter than expected");
+                    ggml_backend_tensor_alloc(b, t, (char*)mf->data() + off);
+                }
+                m->wbufs_.push_back(b);
+                m->maps_.push_back(std::move(mf));
+            }
+        } catch (...) { gguf_free(g); throw; }
+    }
     // ---- stream every tensor's data from its file into wherever the tier loader put it ----
     std::vector<std::ifstream> files;
     for (const auto& p : paths) {
@@ -1051,7 +1174,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         std::vector<char> is_hot(E, 0);
         for (int k = 0; k < H; ++k) { mh[hl.ids[k]] = k; mk[hl.ids[k]] = 1.0f; is_hot[hl.ids[k]] = 1; }
         for (int e = 0; e < E; ++e) if (!is_hot[e]) mc[e] = ci++;
-        if (live) for (int e = 0; e < E; ++e) mc[e] = is_hot[e] ? E : e;   // live: the RAM part holds every expert at its own index
+        // read from the file: every expert at its own index, and no zero expert (E: none, see skip_zero_ids)
+        if (hl.cold_mapped) for (int e = 0; e < E; ++e) mc[e] = is_hot[e] ? E : e;
         ggml_backend_tensor_set(hl.map_hot, mh.data(), 0, ggml_nbytes(hl.map_hot));
         ggml_backend_tensor_set(hl.map_cold, mc.data(), 0, ggml_nbytes(hl.map_cold));
         ggml_backend_tensor_set(hl.mask, mk.data(), 0, ggml_nbytes(hl.mask));
@@ -1075,11 +1199,10 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             std::vector<char> hb(ggml_nbytes(sp.hot), 0), cb(ggml_nbytes(sp.cold), 0);   // the last expert of each stays zero
             std::vector<char> is_hot(E, 0);
             for (int k = 0; k < (int)hl.ids.size(); ++k) { std::memcpy(hb.data() + (size_t)k * per, chunk.data() + (size_t)hl.ids[k] * per, per); is_hot[hl.ids[k]] = 1; }
-            if (live) std::memcpy(cb.data(), chunk.data(), (size_t)E * per);
-            else for (int e = 0, ci = 0; e < E; ++e)
+            for (int e = 0, ci = 0; e < E; ++e)
                 if (!is_hot[e]) std::memcpy(cb.data() + (size_t)ci++ * per, chunk.data() + (size_t)e * per, per);
             ggml_backend_tensor_set(sp.hot, hb.data(), 0, hb.size());
-            ggml_backend_tensor_set(sp.cold, cb.data(), 0, cb.size());
+            if (!hl.cold_mapped) ggml_backend_tensor_set(sp.cold, cb.data(), 0, cb.size());   // (mapped: the file is it)
             report(total_bytes ? (float)((double)done_bytes / total_bytes) : 1.0f);
             continue;
         }
@@ -1184,13 +1307,16 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             else if (nm.find("ffn_down_exps") != std::string::npos) { L.down_xh = sp.hot; L.down_xc = sp.cold; }
         }
         L.map_hot = it->second.map_hot; L.map_cold = it->second.map_cold; L.hot_mask = it->second.mask;
-        if (live) {                                                   // the starting set; adapt_hot moves experts from here
+        L.cold_mapped = it->second.cold_mapped;
+        if (live && !it->second.cold_mapped) {                        // the starting set; adapt_hot moves experts from here
             LiveLayer ll;
             ll.layer = i;
             ll.H = (int)it->second.ids.size();
             ll.slot_of.assign((size_t)std::max(E, 0), -1);
+            ll.cold_of.assign((size_t)std::max(E, 0), -1);
             ll.in_slot = it->second.ids;
             for (int k = 0; k < ll.H; ++k) ll.slot_of[ll.in_slot[k]] = k;
+            for (int e = 0, ci = 0; e < E; ++e) if (ll.slot_of[e] < 0) ll.cold_of[e] = ci++;   // (as load lays the RAM part out)
             // Learned use as the starting score, scaled so the busiest expert counts as a few recent picks: the
             // conversation takes over within a few dozen tokens.
             float mx = 0;
@@ -1371,8 +1497,25 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // Layer split: pin each layer's ops to its device (RAM layers to the CPU; with several GPUs, each layer to its
     // GPU too, so ops without weights don't wander to another card).
     m->pin_layers_ = m->main_ != m->cpu_ && m->place_.mode == "layers" && (m->place_.kv_gpu_layers < hp.n_layer || G > 1);
-    m->sched_ = ggml_backend_sched_new(backends.data(), nullptr, n_backends, m->graph_size_, false, offload);
+    // The CPU's working memory in pinned (page-locked) host memory from the first GPU's engine, when that's CUDA:
+    // the GPU-to-CPU and CPU-to-GPU copies of each split layer's numbers (two per layer per word) then skip
+    // the driver's staging copy. TIERLM_PINNED=0 uses plain memory, =1 pinned with any GPU engine that offers it.
+    std::vector<ggml_backend_buffer_type_t> sched_bufts;
+    for (ggml_backend_t b : backends) sched_bufts.push_back(ggml_backend_get_default_buffer_type(b));
+    {
+        const char* e = std::getenv("TIERLM_PINNED");
+        ggml_backend_dev_t gd = G > 0 ? ggml_backend_get_device(m->gpus_[0]) : nullptr;
+        const bool cuda = gd && std::strncmp(ggml_backend_dev_name(gd), "CUDA", 4) == 0;
+        const bool want = e ? std::strcmp(e, "0") != 0 : cuda;
+        ggml_backend_buffer_type_t host = gd && want ? ggml_backend_dev_host_buffer_type(gd) : nullptr;
+        if (host && ggml_backend_supports_buft(m->cpu_, host)) sched_bufts.back() = host;
+    }
+    m->sched_ = ggml_backend_sched_new(backends.data(), sched_bufts.data(), n_backends, m->graph_size_, false, offload);
     if (!m->sched_) throw std::runtime_error("failed to create the scheduler");
+    // CPU and GPU at once on split expert layers (TIERLM_OVERLAP=0: one after the other, as before)
+    // (TIERLM_OVERLAP=2, for tests: the same graph, but each step still waits for the one before)
+    { const char* e = std::getenv("TIERLM_OVERLAP"); m->overlap_ = !(e && !std::strcmp(e, "0")); }
+    ggml_backend_sched_set_overlap(m->sched_, m->overlap_ && !(std::getenv("TIERLM_OVERLAP") && !std::strcmp(std::getenv("TIERLM_OVERLAP"), "2")));
     for (auto& gm : m->graph_mem_) gm.resize(ggml_tensor_overhead() * m->graph_size_ + ggml_graph_overhead_custom(m->graph_size_, false));
 
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
@@ -1383,6 +1526,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
     ggml_free(worst.ctx);
     if (!ok) throw std::runtime_error("failed to reserve compute memory");
+    if (!m->gpus_.empty()) m->place_.compute_gpu = ggml_backend_sched_get_buffer_size(m->sched_, m->gpus_[0]);
     return m;
 }
 
@@ -1555,12 +1699,46 @@ void Model::reset() {
     n_past_ = 0;
     free_cells_from(0, 0);
     if (hp_.hybrid) clear_state(0);                             // clear the running memory
+    ckpt_ok_ = false;
+}
+
+void Model::checkpoint() {
+    if (!hp_.hybrid) return;
+    release_pending();
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    ckpt_ = Snapshot();
+    ckpt_.n_past = n_past_;
+    auto grab = [&](ggml_tensor* t) {
+        ckpt_.parts.emplace_back(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, ckpt_.parts.back().data(), 0, ggml_nbytes(t));
+        ckpt_.bytes += ggml_nbytes(t);
+    };
+    for (const auto& L : layers_) {
+        if (L.conv_state) { grab(L.conv_state); grab(L.ssm_state_t); }
+        if (!L.ple_states.empty()) grab(L.ple_states[0]);
+    }
+    if (mtp_ && mtp_->conv_state) { grab(mtp_->conv_state); grab(mtp_->ssm_state_t); }
+    ckpt_ok_ = true;
 }
 
 void Model::truncate(int n) {
     release_pending();
     if (n >= n_past_) return;
-    if (hp_.hybrid) { reset(); return; }                        // the running memory can't be rewound
+    if (hp_.hybrid) {                                           // the running memory can't be rewound...
+        if (!ckpt_ok_ || n < ckpt_.n_past || ckpt_.n_past > n_past_) { reset(); return; }
+        std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+        n_past_ = ckpt_.n_past;                                 // ...but it can go back to the checkpoint
+        free_cells_from(0, n_past_);
+        rope_truncate(0, n_past_);
+        size_t i = 0;
+        auto put = [&](ggml_tensor* t) { const auto& p = ckpt_.parts.at(i++); ggml_backend_tensor_set(t, p.data(), 0, p.size()); };
+        for (const auto& L : layers_) {
+            if (L.conv_state) { put(L.conv_state); put(L.ssm_state_t); }
+            if (!L.ple_states.empty()) put(L.ple_states[0]);
+        }
+        if (mtp_ && mtp_->conv_state) { put(mtp_->conv_state); put(mtp_->ssm_state_t); }
+        return;
+    }
     n_past_ = n < 0 ? 0 : n;
     free_cells_from(0, n_past_);
 }
@@ -1610,6 +1788,7 @@ Model::Snapshot Model::save() const {
 
 void Model::restore(const Snapshot& s) {
     release_pending();
+    ckpt_ok_ = false;
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
     n_past_ = 0;
     free_cells_from(0, 0);
@@ -1939,10 +2118,12 @@ static void distinct_ids(ggml_tensor* dst, const ggml_tensor* a, int ith, int nt
     for (int64_t t = 0; t < n_tok; ++t) {
         const int32_t* in = (const int32_t*)((const char*)a->data + t * a->nb[1]);
         int32_t* out = (int32_t*)((char*)dst->data + t * dst->nb[1]);
-        const int32_t n_part = (int32_t)(intptr_t)userdata;
+        // userdata: the part's size; negative for a RAM part read from the file, whose "no expert here" is the size
+        // itself (out of range: it has no zero expert), moved to an unused expert like a repeat (its weight is 0)
+        const int32_t n_part = std::abs((int32_t)(intptr_t)userdata);
         for (int64_t k = 0; k < n_used; ++k) out[k] = in[k];
         for (int64_t k = 0; k < n_used; ++k) {
-            bool dup = false;
+            bool dup = out[k] < 0 || out[k] >= n_part;
             for (int64_t j = 0; j < k; ++j) if (out[j] == out[k]) { dup = true; break; }
             if (!dup) continue;
             for (int32_t cand = 0; cand < n_part; ++cand) {
@@ -1960,7 +2141,8 @@ static void distinct_ids(ggml_tensor* dst, const ggml_tensor* a, int ith, int nt
 static void skip_zero_ids(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void* userdata) {
     if (ith != 0) return;
     (void)nth;
-    const int32_t zero = (int32_t)(intptr_t)userdata - 1;
+    const int32_t u = (int32_t)(intptr_t)userdata;
+    const int32_t zero = u > 0 ? u - 1 : -u;                  // negative: read from the file, no zero expert (see distinct_ids)
     for (int64_t t = 0; t < a->ne[1]; ++t) {
         const int32_t* in = (const int32_t*)((const char*)a->data + t * a->nb[1]);
         int32_t* out = (int32_t*)((char*)dst->data + t * dst->nb[1]);
@@ -2002,7 +2184,8 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
     const Hparams& hp = hp_;
         if (!L.router) {
             // ---- dense SwiGLU feed-forward (dense models, and Flint's first layers) ----
-            ggml_tensor* act = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, L.gate, h)), ggml_mul_mat(c, L.up, h));
+            // one SwiGLU step (not silu, then multiply): the GPU then does both multiplies and it in one kernel
+            ggml_tensor* act = ggml_swiglu_split(c, ggml_mul_mat(c, L.gate, h), ggml_mul_mat(c, L.up, h));
             return ggml_mul_mat(c, L.down, act);
         }
         // ---- mixture of experts ----
@@ -2051,25 +2234,25 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         }
         if (hp.expert_scale != 0.0f && hp.expert_scale != 1.0f) w = ggml_scale(c, w, hp.expert_scale);
         ggml_tensor* h3    = ggml_reshape_3d(c, h, hp.n_embd, 1, n_tok);
+        ggml_tensor* xin   = h3;                                            // what the experts read (see overlap below)
         // The chosen experts' outputs, weighted and summed: [n_embd, n_tok]. ids: [n_used, n_tok] into these tensors.
         auto experts = [&](ggml_tensor* gate_up_x, ggml_tensor* gate_x, ggml_tensor* up_x, ggml_tensor* down_x,
                            ggml_tensor* ids, ggml_tensor* wt, bool biases = false) {
             ggml_tensor *up, *gate;
             if (gate_up_x) {                                                 // [2*n_ff_exp, n_used, n_tok]: gate, then up
-                ggml_tensor* gu = ggml_mul_mat_id(c, gate_up_x, h3, ids);
+                ggml_tensor* gu = ggml_mul_mat_id(c, gate_up_x, xin, ids);
                 const int64_t f = gu->ne[0] / 2;
                 gate = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
                 up   = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], f * gu->nb[0]);
             } else {
-                up   = ggml_mul_mat_id(c, up_x, h3, ids);                    // [n_ff_exp, n_used, n_tok]
-                gate = ggml_mul_mat_id(c, gate_x, h3, ids);
+                up   = ggml_mul_mat_id(c, up_x, xin, ids);                    // [n_ff_exp, n_used, n_tok]
+                gate = ggml_mul_mat_id(c, gate_x, xin, ids);
             }
             if (biases && L.up_xb)   up   = ggml_add_id(c, up, L.up_xb, ids);   // each pick gets its own expert's bias
             if (biases && L.gate_xb) gate = ggml_add_id(c, gate, L.gate_xb, ids);
             ggml_tensor* act  = hp.swiglu_oai ? ggml_swiglu_oai(c, gate_up_x ? ggml_cont(c, gate) : gate,
                                                                 gate_up_x ? ggml_cont(c, up) : up, 1.702f, 7.0f)
-                              : gate_up_x ? ggml_swiglu_split(c, gate, up)  // works on the two halves in place
-                                          : ggml_mul(c, ggml_silu(c, gate), up);
+                              : ggml_swiglu_split(c, gate, up);   // one step (gate_up: on the two halves in place)
             ggml_tensor* down = ggml_mul_mat_id(c, down_x, act, ids);        // [n_embd, n_used, n_tok]
             if (biases && L.down_xb) down = ggml_add_id(c, down, L.down_xb, ids);
             down = ggml_mul(c, down, wt);                                    // weight each expert's output
@@ -2081,6 +2264,13 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             return sum;
         };
         ggml_tensor* moe;
+        ggml_tensor* sh_early = nullptr;                                     // the shared expert, if made before the RAM experts
+        auto shared_expert = [&]() {
+            ggml_tensor* sh = ggml_swiglu_split(c, ggml_mul_mat(c, L.gate_s, h), ggml_mul_mat(c, L.up_s, h));
+            sh = ggml_mul_mat(c, L.down_s, sh);                              // [n_embd, n_tok]
+            if (L.gate_inp_s) sh = ggml_mul(c, sh, ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h)));   // gate: [1, n_tok]
+            return sh;
+        };
         if (L.map_hot) {
             // Hot-expert split: each pick is computed by the part that holds it (VRAM or RAM); in the other part it
             // goes to the all-zero expert with weight 0, so it adds nothing. The sum is the same as unsplit.
@@ -2102,7 +2292,8 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             auto remap = [&](ggml_tensor* map, const ggml_tensor* part, bool distinct) {
                 ggml_tensor* ids = ggml_cont(c, lookup(map));
                 g.cpu_ops.push_back(ids);
-                return ggml_map_custom1(c, ids, distinct ? distinct_ids : skip_zero_ids, 1, (void*)(intptr_t)part->ne[2]);
+                const int64_t n_part = part == L.down_xc && L.cold_mapped ? -part->ne[2] : part->ne[2];
+                return ggml_map_custom1(c, ids, distinct ? distinct_ids : skip_zero_ids, 1, (void*)(intptr_t)n_part);
             };
             // All the bookkeeping runs on the CPU, next to the RAM experts, so the work changes device only twice
             // per layer (to the CPU after the router, back to the GPU for the VRAM experts), as with whole layers.
@@ -2124,8 +2315,26 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             };
             on_cpu(w, 0);
             ggml_build_forward_expand(g.gf, w_cold);                        // weights first, then the lookups: one hand-off
-            ggml_tensor* cold = experts(L.gate_up_xc, L.gate_xc, L.up_xc, L.down_xc, ids_c, w_cold);
-            ggml_tensor* hot  = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_hot);
+            ggml_tensor *cold, *hot;
+            if (overlap_) {
+                // CPU and GPU at once: all the bookkeeping first (CPU), then the VRAM experts and the shared expert
+                // (GPU: the scheduler starts them and goes on), then the RAM experts (CPU, while the GPU works).
+                // The sum is the same as below, in the same order, so the result doesn't change.
+                // The RAM experts' input is copied to the CPU with the bookkeeping, so their own step has nothing
+                // to fetch from the GPU and needn't wait for it.
+                ggml_tensor* h_cpu = ggml_cont(c, h3);
+                g.cpu_ops.push_back(h_cpu);
+                for (ggml_tensor* t : {w_hot, ids_c, ids_h, h_cpu}) ggml_build_forward_expand(g.gf, t);
+                hot = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_hot);
+                ggml_build_forward_expand(g.gf, hot);
+                if (L.up_s) { sh_early = shared_expert(); ggml_build_forward_expand(g.gf, sh_early); }
+                xin = h_cpu;
+                cold = experts(L.gate_up_xc, L.gate_xc, L.up_xc, L.down_xc, ids_c, w_cold);
+                xin = h3;
+            } else {
+                cold = experts(L.gate_up_xc, L.gate_xc, L.up_xc, L.down_xc, ids_c, w_cold);
+                hot  = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_hot);
+            }
             moe = ggml_add(c, cold, hot);                                   // cold first: the graph runs the RAM part, then the VRAM part
         } else {
             ggml_tensor* ids = sel;
@@ -2137,12 +2346,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             }
             moe = experts(L.gate_up_x, L.gate_x, L.up_x, L.down_x, ids, w, true);
         }
-        if (L.up_s) {                                                        // shared expert
-            ggml_tensor* sh = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, L.gate_s, h)), ggml_mul_mat(c, L.up_s, h));
-            sh = ggml_mul_mat(c, L.down_s, sh);                              // [n_embd, n_tok]
-            if (L.gate_inp_s) sh = ggml_mul(c, sh, ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h)));   // gate: [1, n_tok]
-            moe = ggml_add(c, moe, sh);
-        }
+        if (L.up_s) moe = ggml_add(c, moe, sh_early ? sh_early : shared_expert());   // shared expert
         return moe;
 }
 
@@ -2161,10 +2365,16 @@ void Model::profile_step(int n_tok, double prep_ms, double compute_ms, double ou
                  prof_.graphs, prof_.tokens / n, (prof_.prep + prof_.compute + prof_.out) / n, prof_.prep / n, prof_.compute / n, prof_.out / n);
     std::vector<ggml_backend_t> bs(gpus_.begin(), gpus_.end());
     bs.push_back(cpu_);
+    double accounted = 0;
     for (size_t i = 0; i < bs.size() && i < 16; ++i)
-        if (splits[i])
+        if (splits[i]) {
             std::fprintf(stderr, "profile:   %-10s %5.1f splits, %6.1f inputs: copy in %6.2f ms, work %6.2f ms per graph\n",
                          ggml_backend_name(bs[i]), splits[i] / n, inputs[i] / n, copy[i] / 1000.0 / n, work[i] / 1000.0 / n);
+            accounted += (copy[i] + work[i]) / 1000.0 / n;
+        }
+    // what's left of the compute time: starting each split, waiting for it, switching devices
+    std::fprintf(stderr, "profile:   between splits (starting, waiting, switching) %.2f ms per graph; CPU threads %d\n",
+                 std::max(0.0, prof_.compute / n - accounted), n_threads_last_);
     prof_ = {};
 }
 
@@ -2177,6 +2387,7 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     const std::vector<SeqGroup>& grp = groups ? *groups : single;
     const int hd = hp.head_dim;
 
+    drop_reuse();                                                  // (its memory is about to be built over)
     Graph g;
     std::vector<uint8_t>& gm = graph_mem(n_tok == 1 ? 0 : 1);
     ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
@@ -2497,6 +2708,7 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     release_pending();
     const Hparams& hp = hp_;
     Graph g = build_mtp(n_tok, pos0);
+    drop_reuse();
     ggml_backend_sched_reset(sched_);
     if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) { ggml_free(g.ctx); throw std::runtime_error("failed to allocate compute memory"); }
     std::vector<int32_t> positions(n_tok);
@@ -2684,6 +2896,7 @@ void Model::resize_ctx(int new_ctx) {
     const int n_res = std::min(batch_, max_ctx_);
     Graph worst = build(n_res, max_ctx_, true);
     pin_cpu_layers(worst);
+    drop_reuse();
     ggml_backend_sched_reset(sched_);
     const bool ok = ggml_backend_sched_reserve(sched_, worst.gf);
     ggml_free(worst.ctx);
@@ -2755,6 +2968,11 @@ std::vector<std::vector<float>> Model::eval_seqs(const std::vector<SeqInput>& in
                 out[which[k]].assign(r.logits.begin() + k * V, r.logits.begin() + (k + 1) * V);
     }
     return out;
+}
+
+void Model::drop_reuse() {
+    if (reuse_.ctx) ggml_free(reuse_.ctx);
+    reuse_ = Graph();
 }
 
 Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
@@ -2832,14 +3050,26 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             if ((tok_pos[t] + 1) / rmin > hp.qsa_budget / rmin) qsa_long_ = true;
         }
     }
-    Graph g = build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups);
+    // Replies, one token at a time, make the same graph over and over: positions, cache cells and masks are inputs,
+    // and the cache span grows in steps of 256. So it is built, placed and allocated once and then run again, until
+    // something about it changes (any other graph, or a new span). Saves ~3 ms a token. TIERLM_REUSE=0: always build.
+    static const bool reuse_on = !(std::getenv("TIERLM_REUSE") && !std::strcmp(std::getenv("TIERLM_REUSE"), "0")) &&
+                                 !std::getenv("TIERLM_DUMP_SCHED");
+    const bool cacheable = reuse_on && n_tok == 1 && !groups && !any_image && snapshots <= 1;
+    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden};
+    const bool reuse = cacheable && reuse_.ctx && key == reuse_key_;
+    Graph built;
+    if (!reuse) built = build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups);
+    Graph& g = reuse ? reuse_ : built;
     build_images_ = build_mrope_ = false;
     g.n_tok = n_tok;
     auto t1 = clk::now();
 
-    ggml_backend_sched_reset(sched_);
-    pin_cpu_layers(g);
-    if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) { ggml_free(g.ctx); throw std::runtime_error("failed to allocate compute memory"); }
+    if (!reuse) {
+        ggml_backend_sched_reset(sched_);
+        pin_cpu_layers(g);
+        if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) { ggml_free(g.ctx); throw std::runtime_error("failed to allocate compute memory"); }
+    }
     auto t2 = clk::now();
     if (std::getenv("TIERLM_DUMP_SCHED") && n_tok == 1) {           // debugging: where the work switches device
         ggml_backend_t prev = nullptr;
@@ -2861,6 +3091,23 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
                          b ? ggml_backend_name(b) : "?", srcs.c_str());
         }
         std::fprintf(stderr, "splits %d\n", ggml_backend_sched_get_n_splits(sched_));
+        // TIERLM_DUMP_SCHED=2: also every step of layers 1-4 (op, where it runs, shape), and the step count per device
+        if (std::atoi(std::getenv("TIERLM_DUMP_SCHED")) >= 2) {
+            std::map<std::string, int> per_dev;
+            layer = -1;
+            for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) {
+                ggml_tensor* t = ggml_graph_node(g.gf, i);
+                if (t->op == GGML_OP_FLASH_ATTN_EXT || (t->op == GGML_OP_SOFT_MAX && !flash_attn_)) ++layer;
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched_, t);
+                const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
+                const std::string dev = b ? ggml_backend_name(b) : "?";
+                if (!view) per_dev[dev]++;
+                if (i < 400)
+                    std::fprintf(stderr, "node %4d %-8s %-16s %-28s %lld x %lld x %lld%s\n", i, dev.c_str(), ggml_op_desc(t), t->name,
+                                 (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], view ? " (view)" : "");
+            }
+            for (const auto& [d, n] : per_dev) std::fprintf(stderr, "steps on %s: %d per token\n", d.c_str(), n);
+        }
     }
 
     if (g.img) {                                                  // images: their words replace the embeddings
@@ -2909,6 +3156,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     }
     if (g.rope_ff) ggml_backend_tensor_set(g.rope_ff, hp.rope_ff.data(), 0, sizeof(float) * hp.rope_ff.size());
     set_n_threads(cpu_, n_threads);
+    n_threads_last_ = n_threads;
     auto t3 = clk::now();
 
     // TIERLM_TRACE=1: each named result's size, sum, RMS and the last token's first numbers, as it's computed
@@ -2933,7 +3181,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         }, nullptr);
     }
     if (ggml_backend_sched_graph_compute(sched_, g.gf) != GGML_STATUS_SUCCESS) {
-        ggml_free(g.ctx);
+        if (reuse) drop_reuse(); else ggml_free(g.ctx);
         throw std::runtime_error("graph compute failed");
     }
     auto t4 = clk::now();
@@ -2973,6 +3221,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         }
     }
     if (snapshots > 1) { pending_ = new Graph(g); }              // kept for accept()
+    else if (cacheable) { if (!reuse) { reuse_ = g; reuse_key_ = key; } }   // kept to run again
     else ggml_free(g.ctx);
     auto t5 = clk::now();
     stats_.calls++; stats_.tokens += n_tok;
@@ -3054,7 +3303,7 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     for (int j = 0; j < n && spent < budget_bytes; ++j) {
         LiveLayer& ll = live_[(start + j) % n];
         size_t per_expert = 0;
-        for (const LivePart& p : ll.parts) per_expert += p.hot->nb[2];
+        for (const LivePart& p : ll.parts) per_expert += 2 * p.hot->nb[2];   // (both ways)
         for (int s = 0; s < per_layer && spent + per_expert <= budget_bytes; ++s) {
             int in = -1, out = -1;                               // the best expert in RAM, the worst in VRAM
             for (int e = 0; e < E; ++e) {
@@ -3062,13 +3311,16 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
                 else if (out < 0 || ll.score[e] < ll.score[out]) out = e;
             }
             if (in < 0 || out < 0 || ll.score[in] <= (eager ? ll.score[out] : ll.score[out] * 1.3f + 0.5f)) break;
-            const int slot = ll.slot_of[out];
+            // Trade places: `in` from its RAM slot into out's VRAM slot, `out` back into that RAM slot.
+            const int slot = ll.slot_of[out], cs = ll.cold_of[in];
             for (const LivePart& p : ll.parts) {
                 const size_t per = p.hot->nb[2];
-                const char* src = (const char*)p.cold->data + (size_t)in * per;
-                ggml_backend_tensor_set(p.hot, src, (size_t)slot * per, per);
+                char* ram = (char*)p.cold->data + (size_t)cs * per;
+                swap_buf_.assign(ram, ram + per);
+                ggml_backend_tensor_get(p.hot, ram, (size_t)slot * per, per);
+                ggml_backend_tensor_set(p.hot, swap_buf_.data(), (size_t)slot * per, per);
             }
-            const int32_t h_in = slot, h_out = ll.H, c_in = E, c_out = out;
+            const int32_t h_in = slot, h_out = ll.H, c_in = E - ll.H, c_out = cs;
             const float m_in = 1.0f, m_out = 0.0f;
             ggml_backend_tensor_set(ll.map_hot, &h_in, sizeof(int32_t) * in, sizeof(int32_t));
             ggml_backend_tensor_set(ll.map_hot, &h_out, sizeof(int32_t) * out, sizeof(int32_t));
@@ -3077,6 +3329,7 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
             ggml_backend_tensor_set(ll.mask, &m_in, sizeof(float) * in, sizeof(float));
             ggml_backend_tensor_set(ll.mask, &m_out, sizeof(float) * out, sizeof(float));
             ll.slot_of[in] = slot; ll.slot_of[out] = -1; ll.in_slot[slot] = in;
+            ll.cold_of[out] = cs; ll.cold_of[in] = -1;
             spent += per_expert;
             live_stats_.swaps++;
             any = true;

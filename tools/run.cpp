@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -37,6 +38,17 @@ int main(int argc, char** argv) {
         Tokenizer tok = Tokenizer::from_gguf(argv[1]);
         LoadOptions o;
         o.max_ctx = n_ctx; o.device = device; o.split_mode = split; o.vram_budget_mb = vram_mb;
+        // TIERLM_USAGE=<file>: expert usage counts saved by tierlm-server (tierlm-usage/*.bin), so the busiest
+        // experts go to VRAM as in the app ("hot experts"); for speed tests outside the app.
+        if (const char* up = std::getenv("TIERLM_USAGE")) {
+            std::ifstream uf(up, std::ios::binary);
+            char magic[4]; int32_t ul = 0, ue = 0;
+            if (uf.read(magic, 4) && !std::memcmp(magic, "TLMU", 4) && uf.read((char*)&ul, 4) && uf.read((char*)&ue, 4) && ul > 0 && ue > 0) {
+                o.expert_usage.assign((size_t)ul * ue, 0.0f);
+                if (!uf.read((char*)o.expert_usage.data(), (std::streamsize)(o.expert_usage.size() * sizeof(float)))) o.expert_usage.clear();
+            }
+            std::fprintf(stderr, "expert usage from %s: %s\n", up, o.expert_usage.empty() ? "could not read it" : "read");
+        }
         auto model = Model::load(argv[1], o);
         const auto& hp = model->hparams();
         std::fprintf(stderr, "device: %s\nloaded in %.1fs | %d layers, %d experts (%d active), vocab %d, ctx %d, %d CPU threads\n",

@@ -17,7 +17,7 @@ Encoder::~Encoder() {
     if (sched_) ggml_backend_sched_free(sched_);
     if (wbuf_) ggml_backend_buffer_free(wbuf_);
     if (main_ && main_ != cpu_) ggml_backend_free(main_);
-    if (cpu_) ggml_backend_free(cpu_);
+    if (cpu_) { forget_cpu_backend(cpu_); ggml_backend_free(cpu_); }
     if (wctx_) ggml_free(wctx_);
     if (gguf_) gguf_free(gguf_);
 }

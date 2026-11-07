@@ -59,7 +59,9 @@ experts in VRAM did 71% of the expert work, but the plain split was still a litt
 settings** learns the experts right away, measures both, and turns it on only if it wins on your PC. You can also tick
 **Keep the busiest experts in VRAM** under **Advanced** on the setup screen yourself, and reset what it learned in
 **Model info**. With **Let the VRAM experts follow the conversation** also on, the experts in VRAM keep changing while
-you chat: ones the conversation keeps using move in, ones it stopped using move out (it uses a bit more RAM).
+you chat: ones the conversation keeps using move in, trading places with ones it stopped using (no extra RAM).
+On mixed subjects that was 12% faster on an RTX 5090 with Qwen3.8 Flash-Next and 18-25% on our RTX 3070 laptop with
+Qwen3.6-35B-A3B; **Find the fastest settings** measures it too.
 
 **Why is 0.5.0 so much faster on NVIDIA cards?**
 It uses **CUDA graphs**: each token's GPU work is recorded once and then replayed with a single launch, instead of
@@ -114,7 +116,8 @@ Bigger models are much more reliable.
 **Qwen3.5 / 3.8: why does editing an earlier message take longer?**
 These are hybrid models: most layers keep a fixed-size running memory instead of a KV cache. That's why long
 conversations are cheap for them, but the memory can't be rewound. Adding a message continues where the
-conversation was; editing or regenerating an earlier message means reading the conversation again from the start.
+conversation was (only the new message is read); regenerating the last reply goes back to just before it; editing
+an earlier message means reading the conversation again from the start.
 
 **Replies repeat themselves or go on forever**
 Raise **Repeat penalty** (next to Temperature) a little, for example to 1.15. Very small models loop more

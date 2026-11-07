@@ -155,6 +155,25 @@ Measured on Qwen3-0.6B on 2 CPU threads: a 2,500-token agent prompt, a side requ
 instead of about 45 s, the saved conversation copied back in 0.05 s, and the reply word for word the same as without
 the side request. The tests save every model family half way through a conversation, read a different one, restore
 the first and finish it, and compare with reading it straight through (identical, hybrid models included).
+
+**Follow-up messages on hybrid models.** A hybrid model can't rewind, so it could only reuse the cache if the new
+request repeated it token for token, and the last few tokens never did: the cache ends with the reply as the model
+wrote it, after the prompt's own `<|im_start|>assistant` header (with Thinking off, an empty `<think></think>` block),
+while the history came back as text without that block, and text can split into tokens differently from how the
+model wrote it. So every follow-up read the whole conversation again (2,234 tokens, about 20 s, on an RTX 5090 with
+Qwen3.8 Flash-Next). Three changes fix it:
+
+- **A point to go back to.** The prompt is read in two parts: everything before the reply's own turn starts, then
+  the turn's header. In between, `Model::checkpoint` copies the DeltaNet running memories (and the PLE and MTP
+  states) at that point, and `Model::truncate` can go back to it instead of starting over.
+- **History written as the model saw it.** With Thinking off, earlier replies are written back with the empty
+  thinking block they were generated after.
+- **The model's own tokens.** When the conversation's text continues all of the cache's text, the cache's tokens
+  are kept (the same text) and only what follows is split into tokens.
+
+Now a follow-up reads only the new message: 4,391 of 4,415 tokens reused on the RTX 5090, and on the laptop with
+Qwen3.6-35B-A3B 176 of 208 tokens (the reply and everything before it). `TIERLM_TRACE_CACHE=1` prints where a
+request stops matching the cache.
 The idea of keeping several conversations' prompt caches comes from other engines: llama.cpp's server keeps several
 slots, and Magnitude shares cached prompts between concurrent agent sessions.
 
@@ -362,15 +381,15 @@ different experts than an email. With **Let the VRAM experts follow the conversa
 `/api/load`, also tried by **Find the fastest settings** as a fourth split mode), the VRAM experts keep changing
 while the model runs:
 
-- **Everything stays in RAM too.** A split layer's RAM part keeps every expert at its own index, plus the zero
-  expert, instead of only the ones not in VRAM. This costs RAM (the VRAM experts are held twice), but any expert can
-  move into VRAM, or leave it, by one copy from RAM, without reading the model file again. The lookup tables just
-  change: an expert in VRAM points at its VRAM slot and at the RAM part's zero expert.
-- **Kept in the file's layout, and only if RAM has room.** The RAM part stays in the model file's layout (not
-  ggml's repacked one, which can't be read back), so each expert is one slice to copy. If RAM can't hold the second
-  copy with plenty to spare (8 GB, or 15% of RAM if more), the model loads with the fixed set instead and says so:
-  near full, Windows starts moving memory to disk and everything slows down (on a 64 GB RTX 5090 PC,
-  Qwen3-Coder-Next went from 67 to 19 tok/s that way, and stayed slow until tierlm was restarted).
+- **Experts trade places.** An expert moving into VRAM takes the slot of the one it replaces, and that one goes
+  into the RAM slot the newcomer left: three copies per expert tensor (the RAM slot to a buffer, the VRAM slot to the
+  RAM slot, the buffer to the VRAM slot). The RAM part stays exactly the size of the fixed set's, so the mode needs
+  no extra RAM and works on any PC that can load hot experts. (Up to 0.8.2 the RAM part held every expert, the VRAM
+  ones twice, and the mode was turned off when RAM couldn't spare that: on a 64 GB PC with Qwen3.8 Flash-Next it
+  never ran.) Each split layer keeps two maps, expert to VRAM slot and expert to RAM slot, and the lookup tables the
+  graph reads change with them; an expert not in a part points at that part's zero expert.
+- **Kept in the file's layout.** The RAM part stays in the model file's layout (not ggml's repacked one, which can't
+  be read back), so each expert is one slice to copy.
 - **Scores.** Each split layer keeps one score per expert. It starts from the learned counts (scaled so the busiest
   counts as about 3 recent picks; with nothing learned yet, every expert starts even, so live mode works from the
   first load). After every step each pick adds 1, and all scores fade by 3% per token, so the last few dozen tokens
@@ -387,11 +406,22 @@ while the model runs:
 - **Watching it.** `/api/info` reports `live`: picks, picks served from VRAM, swaps and time spent copying. Model
   info shows the share served from VRAM, and the expert map's rings move as experts come and go.
 
+Measured with four questions on different subjects (C++ templates, black holes, Ontario contract law, sourdough;
+500 tokens each, temperature 0), against the fixed set learned mostly from stories:
+
+| PC | Model | Fixed set | Following the conversation |
+|---|---|---|---|
+| RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000 | Qwen3.8 Flash-Next Q4_K_M (120 GB: attention and 7,260 of 24,576 experts in VRAM, the rest of the experts in RAM, the n-gram table on an NVMe drive) | 35.9 tok/s (31-43 by subject); VRAM experts did 35-69% of the expert work | 40.2 and 39.7 tok/s in two runs (38-41 by subject); 73-75% |
+| RTX 3070 Laptop (8 GB), 32 GB DDR4-3200 | Qwen3.6-35B-A3B UD-Q3_K_XL (attention and the busiest experts in VRAM, the rest in RAM), 6 threads, 300 tokens each, five subjects | 25.7 tok/s; 28-48% | 32.2 tok/s; 58-76% |
+
+Moving the experts cost about 1.2 s per 500-token reply on the RTX 5090 and 1.3-2.9 s per 300-token reply on the
+laptop, which is why the fixed set can still win by a little on a subject it already suits (43.1 against 41.0 on
+black holes). **Find the fastest settings** measures both.
+
 This is our own design, inspired by the expert VRAM cache that landed in llama.cpp this autumn (`--moe-cache-mib`,
 off by default there). The difference: theirs starts empty and fills from what's picked. Ours starts from what
-tierlm learned about the model, adds a fading score with a swap margin, and keeps the whole model in RAM so an
-expert can leave VRAM without any bookkeeping on the CPU side. Not done yet: having the CPU compute a step's RAM picks
-while the GPU computes its VRAM picks (see "CPU and GPU on the same layer at once" below).
+tierlm learned about the model, adds a fading score with a swap margin, and trades places with the expert leaving
+so nothing is held twice.
 
 ## Several conversations at once
 
@@ -467,8 +497,11 @@ part of that gap was the chat reading each layer's experts back from the GPU sep
 
 With plain experts in RAM there is little to overlap: in each layer the CPU's experts need the GPU's attention and
 router, and the GPU's next layer needs the experts' result. With hot experts, a split layer's VRAM experts (and the
-shared expert) could run on the GPU while the CPU computes the RAM experts. ggml's scheduler runs device splits one
-after another and waits at every hand-off, so this needs changes there.
+shared expert) run on the GPU while the CPU computes the RAM experts: the graph puts the GPU's work first, and our
+change to ggml's scheduler (Change 3 in [GGML_CHANGES.md](GGML_CHANGES.md)) lets the CPU start without waiting for
+the GPU to finish and batches the copies between them. Measured: +22-44% on an RTX 3070 laptop with Qwen3.6-35B-A3B,
++12% on an RTX 5080 with hot experts, about the same on an RTX 5090 (its GPU work is already short).
+`TIERLM_OVERLAP=0` turns it off.
 
 ## Verification
 
@@ -498,13 +531,12 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 
 ## What's next
 
-1. **CPU and GPU on the same layer at once**: with hot experts, a split layer's VRAM experts and RAM experts could run
-   in parallel; ggml's scheduler runs them one after the other today. Also moving experts between VRAM and RAM while
-   the model is loaded, as usage shifts, instead of at the next load.
-2. **SSD tier**: rarely used experts read from an NVMe drive when the router picks them, for models bigger than VRAM
-   and RAM together.
-3. **Usage-based precision** (rarely used experts stored at lower precision) and **expert-aware speculation** (guess
-   further ahead only while the guesses reuse experts that are already loaded).
-4. **More families and real-model tests**: Gemma 4, Phi, DeepSeek, gpt-oss; Qwen3-Coder-Next, Mixtral and Qwen2.5 on
-   real weights.
-5. The Zen 4 / AMX CPU engines on Windows.
+1. **Fewer, larger GPU steps.** On fast GPUs a token's time is mostly the ~2,400 small GPU kernels it launches, not
+   the arithmetic: fused kernels for DeltaNet, the expert path and Flash-Next's hyper-connections.
+2. **CPU and GPU across layers**: today they overlap within a split layer; the next layer's attention could start
+   while the CPU finishes the last one's RAM experts.
+3. **Cheaper expert moves** for the experts that follow the conversation: copies on their own GPU stream, overlapped
+   with the next step.
+4. **MTP drafting for Flash-Next** (Unsloth's separate MTP file) and faster CPU expert multiplies.
+5. **Usage-based precision** (rarely used experts stored at lower precision) and **expert-aware speculation**.
+6. **More families**: Gemma 4, Phi, DeepSeek V4 and more real-model tests.

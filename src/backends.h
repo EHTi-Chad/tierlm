@@ -24,6 +24,7 @@ std::string cuda_built_for();   // e.g. "7.0, 7.5, 8.6, 8.9, 12.0"; empty when n
 ggml_backend* cpu_backend_init();
 ggml_backend_buffer_type* cpu_buffer_type();
 void set_n_threads(ggml_backend* backend, int n_threads);   // for engines that use CPU threads
+void forget_cpu_backend(ggml_backend* backend);             // before freeing a CPU backend that set_n_threads saw
 
 // The CPU engine in use and the instruction sets it uses, e.g. "AVX2 FMA F16C" or "AVX512 AVX512_VNNI ...".
 std::string cpu_features();

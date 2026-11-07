@@ -124,6 +124,12 @@ struct LoadOptions {
     int batch = 0;                   // tokens per graph when reading a prompt; 0 = 256
     int experts_used = 0;            // override active experts per token (MoE); 0 = the model's value
     int vram_budget_mb = 0;          // most VRAM to use for weights + KV cache; 0 = whatever is free
+    // VRAM kept free for the GPU's working memory (compute buffers, scratch, the driver); 0 = what vram_note says, else
+    // 768 MB. After loading, tierlm measures what it really needs; if that's more, it loads again with that (once):
+    // VRAM that runs out mid-reply isn't an error on Windows, the driver moves memory to system RAM and the GPU slows
+    // down many times over.
+    int vram_reserve_mb = 0;
+    std::string vram_note;           // a file where that measured need is kept for the next load ("" = not kept)
     // How to split a model that doesn't fit in VRAM:
     //   "layers"   whole layers: the last ones (with their KV cache) in VRAM, the first ones in RAM.
     //              One GPU<->CPU hand-off per token; usually fastest, especially on Windows.
@@ -189,6 +195,9 @@ struct Placement {
     int ssd_layers = 0;                          // layers with weights there (expert layers, in MoE models)
     bool ssd_ngram = false;                      // Flash-Next's n-gram table is there
     std::string ssd_file;                        // the file they're read from
+    int cold_mapped_layers = 0;                  // split layers whose RAM experts are read from the model file as used
+    uint64_t compute_gpu = 0;                    // the first GPU's working memory (compute buffers), bytes
+    int vram_reserve_mb = 0;                     // VRAM kept free for it and the driver at this load
     // Every layer (attention, feed-forward/experts and its cache) in VRAM: only the token embedding table, which
     // is looked up by row and costs nothing per step, may be in RAM.
     bool all_on_gpu() const { return gpu_weights > 0 && layers > 0 && attn_gpu == layers && ffn_gpu == layers && kv_on_gpu; }
@@ -203,6 +212,7 @@ public:
     // device: "auto" (the biggest dedicated GPU, else an integrated one, else the CPU), "cpu", "gpu",
     // or a specific ggml device name such as "Vulkan0" or "CUDA0".
     static std::unique_ptr<Model> load(const std::string& path, const LoadOptions& opt);   // throws on failure
+    static std::unique_ptr<Model> load_once(const std::string& path, const LoadOptions& opt);
     static std::unique_ptr<Model> load(const std::string& path, int max_ctx = 0, const std::string& device = "auto") {
         LoadOptions o; o.max_ctx = max_ctx; o.device = device; return load(path, o);
     }
@@ -235,6 +245,12 @@ public:
     // Keep only the first n tokens. Hybrid models can't rewind their running memory, so for them anything
     // short of the whole conversation means starting over (n_past() tells the caller where it stands).
     void truncate(int n);
+    // Hybrid models (DeltaNet): their running memory can't be rewound, so truncate starts the conversation over...
+    // unless it goes back no further than the last checkpoint: a copy of the running memories at the end of a prompt.
+    // So the next message reuses the conversation up to there instead of reading it all again (the reply as stored
+    // in the history often differs a little from what was generated, e.g. without its empty thinking block).
+    void checkpoint();
+    int checkpoint_pos() const { return ckpt_ok_ ? ckpt_.n_past : -1; }   // where truncate can go back to (-1: none)
 
     // A conversation's memory, copied out to system RAM so another conversation can use the cache meanwhile and
     // this one can come back without being read again: the keys and values of its n_past positions in every
@@ -351,10 +367,11 @@ private:
     Graph build_mtp(int n_tok, int n_past);
     void* pending_ = nullptr;                    // Graph of the last undoable batch, until accept()
     // Live hot experts: per split layer, which expert each VRAM slot holds and how much each is wanted.
-    struct LivePart { ggml_tensor *hot, *cold; };   // an expert tensor's VRAM part and its RAM part (all experts)
+    struct LivePart { ggml_tensor *hot, *cold; };   // an expert tensor's VRAM part and its RAM part (the rest)
     struct LiveLayer {
         int layer = 0, H = 0;
         std::vector<int> slot_of, in_slot;       // expert -> VRAM slot (-1: not there); slot -> expert
+        std::vector<int> cold_of;                // expert -> RAM slot (-1: in VRAM)
         std::vector<float> score;                // learned use, then recent picks (fading)
         std::vector<LivePart> parts;
         ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *mask = nullptr;
@@ -362,6 +379,7 @@ private:
     std::vector<LiveLayer> live_;
     mutable LiveStats live_stats_;
     void adapt_hot(const std::vector<int32_t>& routing, int n_tok);
+    std::vector<char> swap_buf_;                 // (adapt_hot: one expert on its way)
     struct Layer {
         ggml_tensor *attn_norm = nullptr, *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
         ggml_tensor *bq = nullptr, *bk = nullptr, *bv = nullptr, *q_norm = nullptr, *k_norm = nullptr;
@@ -397,6 +415,7 @@ private:
         ggml_tensor *gate_xh = nullptr, *up_xh = nullptr, *down_xh = nullptr, *gate_up_xh = nullptr;
         ggml_tensor *gate_xc = nullptr, *up_xc = nullptr, *down_xc = nullptr, *gate_up_xc = nullptr;
         ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *hot_mask = nullptr;   // [1, n_expert]
+        bool cold_mapped = false;                // the RAM part is the file's whole expert tensor (see load: RAM short)
         ggml_tensor *up_s = nullptr, *gate_s = nullptr, *down_s = nullptr, *gate_inp_s = nullptr;   // shared expert
         ggml_tensor *k_cache = nullptr, *v_cache = nullptr;   // [head_dim, n_head_kv, max_ctx]
         // Hybrid models: Gated DeltaNet layer
@@ -459,6 +478,20 @@ private:
     // Attention covers the cache in steps of 256 positions (the extra ones are masked out), so the graph keeps the
     // same shapes from one token to the next and the GPU can replay it (CUDA graphs) instead of launching each op.
     int kv_span(int n) const { const int s = (n + 255) / 256 * 256; return s < max_ctx_ ? s : (n > max_ctx_ ? n : max_ctx_); }
+    // a reply's one-token graph, kept to run again (see step)
+    struct ReuseKey {
+        int n_kv = 0; bool routing = false; int n_logits = 0; bool qsa_long = false; bool hidden = false;
+        bool operator==(const ReuseKey& o) const {
+            return n_kv == o.n_kv && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden;
+        }
+    };
+    Graph reuse_;
+    ReuseKey reuse_key_;
+    void drop_reuse();
+    bool overlap_ = true;                                          // CPU and GPU at once on split expert layers
+    Snapshot ckpt_;                                                // (see checkpoint)
+    bool ckpt_ok_ = false;
+    int n_threads_last_ = 0;                                       // (for the profile)
     void profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms);
     bool pin_layers_ = false;                    // layer split: RAM layers must run entirely on the CPU
     std::string device_name_;

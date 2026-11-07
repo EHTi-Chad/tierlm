@@ -2,6 +2,8 @@
 #include "ggml-backend.h"
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <cstdlib>
@@ -299,12 +301,62 @@ ggml_backend* cpu_backend_init() { return ggml_backend_dev_init(cpu_dev(), nullp
 
 ggml_backend_buffer_type* cpu_buffer_type() { return ggml_backend_dev_buffer_type(cpu_dev()); }
 
+// CPU threads. A model split between GPU and RAM runs dozens of small CPU steps per word (one per layer), with the
+// GPU working in between. Built with OpenMP (the default), each step wakes OpenMP's threads. Built without it
+// (TIERLM_OPENMP=OFF), each CPU backend gets its own ggml thread pool here, whose threads keep checking for work
+// for a while after each step (TIERLM_CPU_POLL, 0-100, default 50: how long they spin before sleeping), so the next
+// step starts without waking them. Without a pool ggml would start new threads for every step.
+namespace {
+struct CpuPool { ggml_threadpool* tp = nullptr; int n = 0; };
+std::map<ggml_backend*, CpuPool>& cpu_pools() { static std::map<ggml_backend*, CpuPool> m; return m; }
+std::mutex& cpu_pools_mu() { static std::mutex m; return m; }
+bool cpu_has_openmp(ggml_backend_reg_t reg) {
+    auto fn = (ggml_backend_get_features_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    if (!fn) return true;
+    for (const ggml_backend_feature* f = fn(reg); f && f->name; ++f)
+        if (std::strcmp(f->name, "OPENMP") == 0) return std::strcmp(f->value, "1") == 0;
+    return false;
+}
+} // namespace
+
 void set_n_threads(ggml_backend* backend, int n_threads) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     if (!reg) return;
     auto fn = (ggml_backend_set_n_threads_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
     if (fn) fn(backend, n_threads);
+    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) return;
+    static const bool openmp = cpu_has_openmp(reg);
+    if (openmp || n_threads < 1) return;
+    using tp_new_t = ggml_threadpool* (*)(ggml_threadpool_params*);
+    using tp_free_t = void (*)(ggml_threadpool*);
+    using tp_set_t = void (*)(ggml_backend_t, ggml_threadpool*);
+    auto tp_new = (tp_new_t)ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    auto tp_free = (tp_free_t)ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+    auto tp_set = (tp_set_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+    if (!tp_new || !tp_free || !tp_set) return;
+    std::lock_guard<std::mutex> lk(cpu_pools_mu());
+    CpuPool& p = cpu_pools()[backend];
+    if (p.tp && p.n == n_threads) return;
+    static const int poll = [] { const char* e = std::getenv("TIERLM_CPU_POLL"); return e ? std::clamp(std::atoi(e), 0, 100) : 50; }();
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+    tpp.poll = (uint32_t)poll;
+    ggml_threadpool* tp = tp_new(&tpp);
+    if (!tp) return;
+    tp_set(backend, tp);
+    if (p.tp) tp_free(p.tp);
+    p.tp = tp; p.n = n_threads;
+}
+
+void forget_cpu_backend(ggml_backend* backend) {              // before the backend is freed: its pool goes too
+    std::lock_guard<std::mutex> lk(cpu_pools_mu());
+    auto it = cpu_pools().find(backend);
+    if (it == cpu_pools().end()) return;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto tp_free = reg ? (void (*)(ggml_threadpool*))ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free") : nullptr;
+    if (tp_free && it->second.tp) tp_free(it->second.tp);
+    cpu_pools().erase(it);
 }
 
 std::string cpu_features() {

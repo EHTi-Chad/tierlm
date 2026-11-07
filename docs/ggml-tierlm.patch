@@ -1,23 +1,35 @@
 diff --git a/include/ggml-backend.h b/include/ggml-backend.h
-index 7a65d81..c045df8 100644
+index 7a65d812..86d91d2c 100644
 --- a/include/ggml-backend.h
 +++ b/include/ggml-backend.h
-@@ -369,6 +369,10 @@ extern "C" {
+@@ -369,6 +369,12 @@ extern "C" {
      // The correct way to use this API is to discard the deallocated tensors and create new ones.
      GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
  
 +    // tierlm: split timing collected while TIERLM_PROFILE is set; arrays have 16 entries (GGML_SCHED_MAX_BACKENDS),
 +    // indexed like the backends given to ggml_backend_sched_new. Any pointer may be NULL.
++    // tierlm: a CPU split that needs nothing copied from the GPU split before it starts at once (both work together)
++    GGML_API void                 ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool overlap);
 +    GGML_API void                 ggml_backend_sched_profile(double * copy_us, double * compute_us, int64_t * splits, int64_t * inputs, int64_t * graphs, bool reset);
 +
      // Set a callback to be called for each resulting node during graph compute
      GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
  
 diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
-index ffbcba3..0f8271a 100644
+index ffbcba36..b8ef83b6 100644
 --- a/src/ggml-backend.cpp
 +++ b/src/ggml-backend.cpp
-@@ -1862,16 +1862,37 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -977,6 +977,9 @@ struct ggml_backend_sched {
+ 
+     bool op_offload;
+ 
++    // tierlm: let a CPU split that needs nothing copied from the GPU start while the GPU is still busy
++    bool overlap;
++
+     int debug;
+ 
+     // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
+@@ -1862,20 +1865,52 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
      }
  }
  
@@ -27,6 +39,10 @@ index ffbcba3..0f8271a 100644
 +    double  copy_us[GGML_SCHED_MAX_BACKENDS], compute_us[GGML_SCHED_MAX_BACKENDS];
 +    int64_t splits[GGML_SCHED_MAX_BACKENDS], inputs[GGML_SCHED_MAX_BACKENDS], graphs;
 +} g_sched_prof;
++
++void ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool overlap) {
++    sched->overlap = overlap;
++}
 +
 +void ggml_backend_sched_profile(double * copy_us, double * compute_us, int64_t * splits, int64_t * inputs, int64_t * graphs, bool reset) {
 +    for (int i = 0; i < GGML_SCHED_MAX_BACKENDS; ++i) {
@@ -55,7 +71,79 @@ index ffbcba3..0f8271a 100644
  
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
-@@ -1896,11 +1917,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++        // tierlm (overlap): a CPU split right after a GPU split, reading nothing from it, doesn't wait for it, so
++        // both work at once. Safe: the CPU never touches GPU memory, and anything it needs from the GPU arrives as
++        // an input, which waits; the CPU's own results go back to the GPU through inputs of a later split, which
++        // wait for the GPU first (ggml_backend_sched_copy_input).
++        const bool cpu_after_gpu = sched->overlap && prev_backend_id >= 0 &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++            ggml_backend_dev_type(ggml_backend_get_device(sched->backends[prev_backend_id])) != GGML_BACKEND_DEVICE_TYPE_CPU;
++        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !cpu_after_gpu) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+@@ -1885,10 +1920,57 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+         // copy the input tensors to the split backend
+         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
++        // tierlm (overlap): a CPU split's inputs that come from a GPU are fetched together, with one wait for all of
++        // them, instead of a wait for each (each wait costs tens of microseconds, and there are several per layer)
++        // The same the other way: a GPU split's inputs from the CPU are sent together (from pinned memory they don't
++        // wait for each other), then waited for once, so the CPU can reuse that memory right after.
++        ggml_backend_t fetched[GGML_SCHED_MAX_BACKENDS];
++        int n_fetched = 0;
++        const bool cpu_split = sched->overlap &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
++        const bool gpu_split = sched->overlap && !cpu_split && split_backend->iface.set_tensor_async != NULL;
++        bool sent = false;
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+-            if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++            struct ggml_tensor * input = split->inputs[input_id];
++            if (ggml_backend_sched_is_host_weight(input)) {
++                continue;
++            }
++            if (cpu_split && !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
++                ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, input);
++                ggml_backend_buffer_t ibuf = input->view_src ? input->view_src->buffer : input->buffer;
++                if (ib && ib != split_backend && ib->iface.get_tensor_async && ibuf &&
++                    ggml_backend_buffer_get_type(ibuf) == ggml_backend_get_default_buffer_type(ib)) {
++                    struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
++                    ggml_backend_tensor_get_async(ib, input, input_cpy->data, 0, ggml_nbytes(input));
++                    bool seen = false;
++                    for (int f = 0; f < n_fetched; f++) seen = seen || fetched[f] == ib;
++                    if (!seen) fetched[n_fetched++] = ib;
++                    continue;
++                }
+             }
++            if (gpu_split && !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
++                ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, input);
++                ggml_backend_buffer_t ibuf = input->view_src ? input->view_src->buffer : input->buffer;
++                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
++                ggml_backend_buffer_t cbuf = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
++                if (ib && ggml_backend_dev_type(ggml_backend_get_device(ib)) == GGML_BACKEND_DEVICE_TYPE_CPU && ibuf &&
++                    ggml_backend_buffer_is_host(ibuf) && cbuf &&
++                    ggml_backend_buffer_get_type(cbuf) == ggml_backend_get_default_buffer_type(split_backend)) {
++                    if (!sent) {
++                        ggml_backend_synchronize(split_backend);   // done with the copies' last contents
++                        sent = true;
++                    }
++                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++                    continue;
++                }
++            }
++            ggml_backend_sched_copy_input(sched, split, input);
++        }
++        for (int f = 0; f < n_fetched; f++) {
++            ggml_backend_synchronize(fetched[f]);
++        }
++        if (sent) {
++            ggml_backend_synchronize(split_backend);
+         }
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+@@ -1896,11 +1978,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -81,7 +169,7 @@ index ffbcba3..0f8271a 100644
              // similar to ggml_backend_compare_graph_backend
              for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index ab82e3d..a8344c7 100644
+index ab82e3d6..a804be3f 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -1652,7 +1652,12 @@ static void ggml_compute_forward_mul_mat_id(
@@ -98,8 +186,56 @@ index ab82e3d..a8344c7 100644
  
                  MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                  matrix_row_counts[i02] += 1;
+@@ -3098,6 +3103,17 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++// tierlm (diagnostic, TIERLM_CPU_OP_TIMES=1): time per op kind on thread 0, each op including the wait for the
++// other threads after it; printed every 4000 CPU graphs. Off: one test per graph.
++static double tlm_op_us[GGML_OP_COUNT];
++static int64_t tlm_op_n[GGML_OP_COUNT];
++static int64_t tlm_graphs;
++static int tlm_op_times(void) {
++    static int v = -1;
++    if (v < 0) v = getenv("TIERLM_CPU_OP_TIMES") != NULL;
++    return v;
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3140,6 +3156,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
++        const int64_t tlm_t0 = (state->ith == 0 && tlm_op_times()) ? ggml_time_us() : 0;
++        const int tlm_node = node_n;
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+         if (n_fused > 0) {
+             node_n += n_fused;
+@@ -3156,6 +3174,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++        if (tlm_t0) {
++            tlm_op_us[cgraph->nodes[tlm_node]->op] += (double)(ggml_time_us() - tlm_t0);
++            tlm_op_n[cgraph->nodes[tlm_node]->op]++;
++        }
++    }
++    if (state->ith == 0 && tlm_op_times() && ++tlm_graphs % 4000 == 0) {
++        double tot = 0;
++        for (int o = 0; o < GGML_OP_COUNT; o++) tot += tlm_op_us[o];
++        fprintf(stderr, "cpu op times over %lld graphs (%.1f ms):", (long long)4000, tot / 1000.0);
++        for (int o = 0; o < GGML_OP_COUNT; o++) {
++            if (tlm_op_n[o]) fprintf(stderr, " %s %.1fms/%lld", ggml_op_name((enum ggml_op)o), tlm_op_us[o] / 1000.0, (long long)tlm_op_n[o]);
++            tlm_op_us[o] = 0; tlm_op_n[o] = 0;
++        }
++        fprintf(stderr, "\n");
+     }
+ 
+ #ifdef GGML_USE_OPENMP
 diff --git a/src/ggml-cpu/repack.cpp b/src/ggml-cpu/repack.cpp
-index 2632ae3..3f5f71a 100644
+index 2632ae3a..3f5f71a7 100644
 --- a/src/ggml-cpu/repack.cpp
 +++ b/src/ggml-cpu/repack.cpp
 @@ -4855,7 +4855,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR

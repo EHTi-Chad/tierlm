@@ -196,6 +196,11 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_TRACE=1` | Debugging: prints a summary (size, sum, RMS, first numbers) of each layer's main results as they're computed, to compare a model step by step with a reference |
 | `TIERLM_THREADS=N` | CPU threads for `tierlm-logits` and `tierlm-bench` |
 | `TIERLM_PROFILE=1` | Timing: `tierlm-run` prints a per-token breakdown and the number of graph splits; every tool and the server also print, every 64 reply steps, each device's input-copy and work time per step (`profile:` lines). Each split is waited for while it's on, so everything runs a little slower |
+| `TIERLM_OVERLAP=0` | Turns off CPU and GPU working at once on layers split between VRAM and RAM (and the batched copies between them). `2`: the same order of work, but every step waits for the one before (a test: the output must not change) |
+| `TIERLM_REUSE=0` | Builds the graph for every reply token instead of building it once and running it again (about 3 ms a token) |
+| `TIERLM_USAGE=<file>` | `tierlm-run`: read expert usage counts saved by the app (`tierlm-usage/*.bin`), so the busiest experts go to VRAM as in the app; for speed tests outside it |
+| `TIERLM_VRAM_SCRATCH_MB=n` | VRAM kept free beyond the measured compute buffers, for the GPU engine's scratch memory and the driver (default 640). tierlm measures the compute buffers after loading, and if VRAM is short it loads again once with more kept free, and remembers it per model (`tierlm-usage/*.vram`), because on Windows VRAM that runs out doesn't fail, the driver quietly moves memory to system RAM and the GPU slows down many times over |
+| `TIERLM_COLD_MAPPED=n` | Tests: read the RAM part of the n least-used split expert layers straight from the model file instead of RAM (`0`: never). By default only when the weights can't fit in RAM at all (more than the PC's RAM less 3 GB): held in RAM they run much faster (Flash-Next on a 64 GB PC: about 50 tok/s, against 31 read from the file) |
 | `TIERLM_BATCH_LOG=1` | Server, Connections above one: every 2 seconds, how many replies shared each model step, the compute time per step and the share of the time spent computing (`batcher:` lines). Close to the number of replies running means they share steps as they should |
 | `TIERLM_DUMP_SCHED=1` | Debugging: prints each point where the work switches between CPU and GPU |
 | `TIERLM_CPU_OPS=MUL_MAT,...` | Debugging: runs the listed ggml operation types on the CPU, to find which GPU kernel differs |
@@ -208,6 +213,7 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_EXPERT_USAGE=seed` | Tests: made-up expert usage counts, so models load with hot experts (some layers whole, some split) |
 | `TIERLM_SHOW_PLACEMENT=1` | `tierlm-logits`: print where the model was placed (per GPU, and the hot-expert count), and with live hot experts the picks served from VRAM and the swaps |
 | `TIERLM_LIVE_EXPERTS=1` | Load with live hot experts (as `live_experts` in `/api/load`); needs hot experts (usage counts) |
+| `TIERLM_TRACE_CACHE=1` | `tierlm-server`: for each request, how much of the prompt cache it reuses and where it stops matching |
 | `TIERLM_LIVE_MB=32` / `TIERLM_LIVE_PER_LAYER=2` | Live hot experts: most MB copied into VRAM per step, most swaps per layer per step |
 | `TIERLM_LIVE_EAGER=1` | Tests: live hot experts swap at every chance (no margin), to exercise swapping |
 | `TIERLM_TEST_FRACS="0.4 0.6"` | `tests/tiny_models.py`: the VRAM sizes (fractions of the model) for split tests |

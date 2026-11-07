@@ -53,6 +53,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -195,8 +196,13 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
         return s + "<|assistant|>\n";
     }
     case ChatFmt::ChatML:                                 // Qwen, and many others
-        for (const auto& m : messages)
-            s += "<|im_start|>" + m.value("role", std::string("user")) + "\n" + m.value("content", std::string()) + "<|im_end|>\n";
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", std::string("user")), c = m.value("content", std::string());
+            // With thinking off, earlier replies were written after an empty thinking block: show them the same way,
+            // so the conversation reads exactly as the model saw it and the cache carries on through the last reply.
+            const bool empty_think = think == 0 && role == "assistant" && c.compare(0, 7, "<think>") != 0;
+            s += "<|im_start|>" + role + "\n" + (empty_think ? "<think>\n\n</think>\n\n" : "") + c + "<|im_end|>\n";
+        }
         return s + "<|im_start|>assistant\n" + (think == 0 ? "<think>\n\n</think>\n\n" : think == 1 ? "<think>\n" : "");
     case ChatFmt::DeepSeek: {                             // DeepSeek V3 / R1 / V3.1: <｜User｜>... <｜Assistant｜>...
         const std::string U = "<\xEF\xBD\x9CUser\xEF\xBD\x9C>", A = "<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>";
@@ -762,12 +768,17 @@ struct Engine {
     bool usage_dirty = false;
     Clock::time_point usage_saved;
     int hot_E = 0, hot_L = 0;
+    std::vector<uint8_t> in_vram;        // [layer * E + expert]: in VRAM (hot experts or a whole layer), for the share below
+    long long picks = 0, picks_vram = 0; // the router's picks since the last reply line, and how many VRAM served
     void add_usage(const std::vector<int32_t>& routing, int K) {
         std::lock_guard<std::mutex> lk(usage_mu);
         if (usage.empty() || K <= 0) return;
         for (size_t i = 0; i < routing.size(); ++i) {
             const size_t l = (i / K) % hot_L;
-            if (routing[i] >= 0 && routing[i] < hot_E) usage[l * hot_E + routing[i]] += 1.0f;
+            if (routing[i] >= 0 && routing[i] < hot_E) {
+                usage[l * hot_E + routing[i]] += 1.0f;
+                if (!in_vram.empty()) { ++picks; picks_vram += in_vram[l * hot_E + routing[i]]; }
+            }
         }
         usage_dirty = true;
     }
@@ -782,6 +793,8 @@ struct Engine {
         usage_saved = Clock::now();
     }
 };
+
+static std::string threads_text(int n) { return std::to_string(n) + (n == 1 ? " CPU thread" : " CPU threads"); }
 
 // Header-only look at a GGUF file: what it is, how big, and whether tierlm can run it. header_only: the file is just
 // the first megabytes of a model's first file (Get models), so its other parts aren't looked for.
@@ -1056,7 +1069,7 @@ void oai_error(httplib::Response& res, int status, const std::string& msg, const
                const char* code = nullptr) {
     res.status = status;
     json e = {{"message", msg}, {"type", type}, {"param", nullptr}, {"code", code ? json(code) : json(nullptr)}};
-    res.set_content(json({{"error", e}}).dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+    res.set_content(json({{"error", e}}).dump(-1, ' ', false, json::error_handler_t::replace), "application/json; charset=utf-8");
 }
 
 // A request from this computer: a loopback address, and not passed on by a tunnel or proxy (Cloudflare Tunnel,
@@ -1333,6 +1346,8 @@ int main(int argc, char** argv) {
             }
             eng.usage_saved = Clock::now();
         }
+        // the VRAM this model needs beyond its weights, measured at the first load (see LoadOptions::vram_reserve_mb)
+        if (o.vram_note.empty()) o.vram_note = usage_file(a.settings, path) + ".vram";
         o.progress = [&](float f) { load_progress = f; };
         load_progress = 0.0f;
         loading = true;
@@ -1386,7 +1401,7 @@ int main(int argc, char** argv) {
             std::error_code ec;
             const std::string rel = model_key(path);
             const json saved = ms.contains(rel) && ms[rel].is_object() ? ms[rel] : json::object();
-            eng.thinking = saved.value("thinking", true);
+            eng.thinking = saved.value("thinking", false);   // off unless turned on (quicker replies; apps can still ask)
             eng.effort = saved.value("effort", std::string("medium"));
         }
         eng.path = path;
@@ -1418,6 +1433,12 @@ int main(int argc, char** argv) {
                     for (int e : pl.hot[l]) in_vram += eng.usage[(size_t)l * uE + e];
             }
             eng.hot_share = all > 0 ? in_vram / all : 0;
+            eng.in_vram.assign((size_t)uL * uE, 0);
+            for (int l = 0; l < uL && (size_t)l < pl.hot.size(); ++l) {
+                if (l < (int)pl.ffn_vram.size() && pl.ffn_vram[l]) for (int e = 0; e < uE; ++e) eng.in_vram[(size_t)l * uE + e] = 1;
+                else for (int e : pl.hot[l]) if (e >= 0 && e < uE) eng.in_vram[(size_t)l * uE + e] = 1;
+            }
+            eng.picks = eng.picks_vram = 0;
             std::fprintf(stderr, "hot experts: %d of %d experts in VRAM, chosen from earlier use (%d layers split between VRAM and RAM); "
                          "they did %.0f%% of the expert work so far\n", pl.hot_experts, uL * uE, split, 100 * eng.hot_share);
         }
@@ -1481,9 +1502,9 @@ int main(int argc, char** argv) {
         if (!lk.owns_lock()) {
             json j = last_info; j["busy"] = true; j["waiting"] = line.waiting();
             if (!eng.slots.empty()) j["active"] = (int)eng.slots.size() - eng.free_slots.load();   // replies running now
-            res.set_content(dump(j), "application/json"); return;
+            res.set_content(dump(j), "application/json; charset=utf-8"); return;
         }
-        if (!eng.model) { last_info = {{"loaded", false}, {"version", TIERLM_VERSION}}; res.set_content(dump(last_info), "application/json"); return; }
+        if (!eng.model) { last_info = {{"loaded", false}, {"version", TIERLM_VERSION}}; res.set_content(dump(last_info), "application/json; charset=utf-8"); return; }
         const auto& hp = eng.model->hparams();
         size_t free = 0, total = 0;
         eng.model->device_memory(free, total);
@@ -1530,7 +1551,7 @@ int main(int argc, char** argv) {
             }()},
         };
         last_info = j;
-        res.set_content(dump(j), "application/json");
+        res.set_content(dump(j), "application/json; charset=utf-8");
     });
 
     // Hardware the engine can use, with memory, for the setup screen.
@@ -1564,7 +1585,7 @@ int main(int argc, char** argv) {
         json j = {{"devices", list}, {"threads", a.threads}, {"hw_threads", (int)std::thread::hardware_concurrency()},
                   {"cpu_features", cpu_features()},
                   {"warnings", hardware_warnings(have_gpu)}, {"version", TIERLM_VERSION}};
-        res.set_content(dump(j), "application/json");
+        res.set_content(dump(j), "application/json; charset=utf-8");
     });
 
     // Models in the models folder (and, if enabled, its subfolders, as LM Studio stores them), read from
@@ -1655,13 +1676,13 @@ int main(int argc, char** argv) {
                   {"can_pick", false},
 #endif
         };
-        res.set_content(dump(j), "application/json");
+        res.set_content(dump(j), "application/json; charset=utf-8");
     });
 
     // Change the models folder. Saved for next time.
     svr.Post("/api/folder", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) { res.status = 400; res.set_content(dump({{"error", "bad request"}}), "application/json"); return; }
+        if (body.is_discarded()) { res.status = 400; res.set_content(dump({{"error", "bad request"}}), "application/json; charset=utf-8"); return; }
         std::lock_guard<std::shared_timed_mutex> lk(mu);
         if (body.contains("recursive")) recursive = body.value("recursive", true);
         if (body.contains("folder")) {
@@ -1671,7 +1692,7 @@ int main(int argc, char** argv) {
             std::error_code ec;
             if (f.empty() || !fs::is_directory(fs::u8path(f), ec)) {
                 res.status = 400;
-                res.set_content(dump({{"error", "folder not found: " + f}}), "application/json");
+                res.set_content(dump({{"error", "folder not found: " + f}}), "application/json; charset=utf-8");
                 return;
             }
             a.models = fs::absolute(fs::u8path(f), ec).make_preferred().u8string();
@@ -1679,7 +1700,7 @@ int main(int argc, char** argv) {
         }
         settings["recursive"] = recursive;
         write_settings(a.settings, settings);
-        res.set_content(dump({{"ok", true}, {"folder", a.models}, {"recursive", recursive}}), "application/json");
+        res.set_content(dump({{"ok", true}, {"folder", a.models}, {"recursive", recursive}}), "application/json; charset=utf-8");
     });
 
     // Native folder picker. It opens on the computer running tierlm, so only answer local requests.
@@ -1687,16 +1708,16 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
         if (req.remote_addr != "127.0.0.1" && req.remote_addr != "::1") {
             res.status = 403;
-            res.set_content(dump({{"error", "the folder picker only works from the computer running tierlm"}}), "application/json");
+            res.set_content(dump({{"error", "the folder picker only works from the computer running tierlm"}}), "application/json; charset=utf-8");
             return;
         }
         bool cancelled = true;
         std::string f = pick_folder_windows(a.models, cancelled);
-        res.set_content(dump({{"cancelled", cancelled}, {"folder", f}}), "application/json");
+        res.set_content(dump({{"cancelled", cancelled}, {"folder", f}}), "application/json; charset=utf-8");
 #else
         (void)req;
         res.status = 501;
-        res.set_content(dump({{"error", "type the folder path instead (the picker is Windows only)"}}), "application/json");
+        res.set_content(dump({{"error", "type the folder path instead (the picker is Windows only)"}}), "application/json; charset=utf-8");
 #endif
     });
 
@@ -1735,19 +1756,19 @@ int main(int argc, char** argv) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("model")) {
             res.status = 400;
-            res.set_content("{\"error\":\"expected {\\\"model\\\": \\\"...\\\"}\"}", "application/json");
+            res.set_content("{\"error\":\"expected {\\\"model\\\": \\\"...\\\"}\"}", "application/json; charset=utf-8");
             return;
         }
         if (!line.enter(mu, req.is_connection_closed)) {             // waits for replies already in line
             res.status = 503;
-            res.set_content("{\"error\":\"busy: waited too long for earlier replies to finish\"}", "application/json");
+            res.set_content("{\"error\":\"busy: waited too long for earlier replies to finish\"}", "application/json; charset=utf-8");
             return;
         }
         std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
         const auto file = model_file(body.value("model", std::string()));
         if (file.empty()) {
             res.status = 400;
-            res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json");
+            res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json; charset=utf-8");
             return;
         }
         try {
@@ -1763,7 +1784,7 @@ int main(int argc, char** argv) {
             settings["models"][id] = saved;
             settings["last_model"] = id;
             write_settings(a.settings, settings);
-            res.set_content(dump({{"ok", true}, {"device", eng.model->device_name()}, {"load_s", eng.load_s}}), "application/json");
+            res.set_content(dump({{"ok", true}, {"device", eng.model->device_name()}, {"load_s", eng.load_s}}), "application/json; charset=utf-8");
         } catch (const std::exception& e) {
             eng.spec.reset();
             eng.look.reset();
@@ -1771,7 +1792,7 @@ int main(int argc, char** argv) {
             eng.model.reset();
             eng.path.clear();
             res.status = 500;
-            res.set_content(dump({{"error", e.what()}}), "application/json");
+            res.set_content(dump({{"error", e.what()}}), "application/json; charset=utf-8");
         }
     });
 
@@ -1797,7 +1818,7 @@ int main(int argc, char** argv) {
         }
         write_settings(a.settings, settings);
         std::fprintf(stderr, "thinking: %s\n", eng.chat == ChatFmt::Harmony ? ("reasoning effort " + eng.effort).c_str() : eng.thinking ? "on" : "off");
-        res.set_content(dump({{"ok", true}, {"thinking", eng.thinking}, {"effort", eng.effort}}), "application/json");
+        res.set_content(dump({{"ok", true}, {"thinking", eng.thinking}, {"effort", eng.effort}}), "application/json; charset=utf-8");
     });
 
     // ---- live context length: the cache made again at another size, without loading the model again ----
@@ -1837,7 +1858,7 @@ int main(int argc, char** argv) {
         std::shared_lock<std::shared_timed_mutex> lk(mu);
         if (!eng.model) return oai_error(res, 400, "no model is loaded");
         const int want = req.has_param("ctx") ? std::atoi(req.get_param_value("ctx").c_str()) : 0;
-        res.set_content(dump(context_plan(want > 0 ? want : (eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per))), "application/json");
+        res.set_content(dump(context_plan(want > 0 ? want : (eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per))), "application/json; charset=utf-8");
     });
     // ---- the SSD tier's drive ----
     // GET: the drives it can use with their free space, and the folder chosen ("" = each model's own drive, where the
@@ -1851,7 +1872,7 @@ int main(int argc, char** argv) {
         std::string dir = settings.value("ssd_dir", std::string());
         unsigned long long fr = 0, tot = 0;
         const bool known = !dir.empty() && drive_space(fs::u8path(dir).root_path().u8string(), fr, tot);
-        res.set_content(dump(json{{"drives", list}, {"ssd_dir", dir}, {"ssd_free", known ? fr : 0ull}}), "application/json");
+        res.set_content(dump(json{{"drives", list}, {"ssd_dir", dir}, {"ssd_free", known ? fr : 0ull}}), "application/json; charset=utf-8");
     });
     svr.Post("/api/ssd", [&](const httplib::Request& req, httplib::Response& res) {
         const json body = json::parse(req.body, nullptr, false);
@@ -1868,7 +1889,7 @@ int main(int argc, char** argv) {
         settings["ssd_dir"] = dir;
         write_settings(a.settings, settings);
         std::fprintf(stderr, "SSD tier: %s (from the next load)\n", dir.empty() ? "each model's own drive" : dir.c_str());
-        res.set_content(dump(json{{"ok", true}, {"ssd_dir", dir}}), "application/json");
+        res.set_content(dump(json{{"ok", true}, {"ssd_dir", dir}}), "application/json; charset=utf-8");
     });
 
     svr.Post("/api/context", [&](const httplib::Request& req, httplib::Response& res) {
@@ -1894,7 +1915,7 @@ int main(int argc, char** argv) {
         const double s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "context: %d tokens%s, changed in %.2f s without loading again\n", want,
                      conns > 1 ? (" per connection (" + std::to_string(conns) + " connections)").c_str() : "", s_);
-        res.set_content(dump({{"ok", true}, {"ctx", want}, {"seconds", s_}}), "application/json");
+        res.set_content(dump({{"ok", true}, {"ctx", want}, {"seconds", s_}}), "application/json; charset=utf-8");
     });
 
     // The embedding model's slot (see "The embedding model" below).
@@ -1927,7 +1948,7 @@ int main(int argc, char** argv) {
         if (had || emb_freed)
             std::fprintf(stderr, "ejected: %s%s; %s memory is free again\n", had ? "the model" : "",
                          emb_freed ? (had ? " and the embedding model" : "the embedding model") : "", had && emb_freed ? "their" : "its");
-        res.set_content("{\"ok\":true}", "application/json");
+        res.set_content("{\"ok\":true}", "application/json; charset=utf-8");
     });
 
     svr.Post("/api/reset", [&](const httplib::Request&, httplib::Response& res) {
@@ -1935,7 +1956,7 @@ int main(int argc, char** argv) {
         eng.save_current();                                      // a new chat: the old one may be opened again
         if (eng.model) eng.model->reset();
         eng.cached.clear();
-        res.set_content("{\"ok\":true}", "application/json");
+        res.set_content("{\"ok\":true}", "application/json; charset=utf-8");
     });
 
     // One reply, shared by the web page and the OpenAI-compatible API. The caller holds `mu`.
@@ -2064,6 +2085,30 @@ int main(int argc, char** argv) {
             return n;
         };
         size_t common = prefix(cached);
+        // The last reply comes back as text, and text can split into tokens differently from how the model wrote
+        // it. When the conversation's text still continues everything in the cache, keep the model's own tokens
+        // (it's the same text) so nothing has to be read again; hybrid models couldn't go back that far at all.
+        if (!par && !has_pics && common < cached.size() && cached.size() < toks.size()) {
+            try {
+                const std::string a = tok.decode(std::vector<int32_t>(cached.begin() + common, cached.end()), false);
+                const std::string b = tok.decode(std::vector<int32_t>(toks.begin() + common, toks.end()), false);
+                if (!a.empty() && b.size() > a.size() && b.compare(0, a.size(), a) == 0) {
+                    std::vector<int32_t> joined(cached.begin(), cached.end());
+                    const std::vector<int32_t> rest = tok.encode(b.substr(a.size()), true);
+                    joined.insert(joined.end(), rest.begin(), rest.end());
+                    if (tok.decode(joined, false) == tok.decode(toks, false)) { toks.swap(joined); common = cached.size(); }
+                }
+                if (std::getenv("TIERLM_TRACE_CACHE")) {
+                    size_t d = 0;
+                    while (d < a.size() && d < b.size() && a[d] == b[d]) ++d;
+                    std::fprintf(stderr, "cache trace: tokens differ at %zu of %zu cached; text %s; first difference at char %zu:\n  cache: [%s]\n  now:   [%s]\n",
+                                 prefix(cached), cached.size(), common == cached.size() ? "continues the cache" : "differs",
+                                 d, a.substr(d > 20 ? d - 20 : 0, 60).c_str(), b.substr(d > 20 ? d - 20 : 0, 60).c_str());
+                }
+            } catch (const std::exception&) {}
+        }
+        if (std::getenv("TIERLM_TRACE_CACHE"))
+            std::fprintf(stderr, "cache trace: reuse %zu, cached %zu, n_past %d, checkpoint %d\n", common, cached.size(), npast(), model->checkpoint_pos());
         if (!par) {
             // A saved conversation that this request continues further than the cache does: swap it in (saving the
             // cache's own conversation first). Hybrid models can't rewind, so for them it must continue all of it.
@@ -2085,8 +2130,10 @@ int main(int argc, char** argv) {
                 common = prefix(cached);
                 std::fprintf(stderr, "cache: brought back a saved %zu-token conversation in %.2f s\n", cached.size(), since(t0));
                 eng.saved.push_front(std::move(c));                    // (kept: the conversation may branch here again)
-            } else if (cached.size() >= common + 256) {
+            } else if (cached.size() >= common + 256 &&
+                       !(hp.hybrid && model->checkpoint_pos() >= 0 && common >= (size_t)model->checkpoint_pos())) {
                 eng.save_current();                                      // about to be overwritten: keep it
+                                                                         // (not when a hybrid model just goes back to its checkpoint)
             }
         }
         if (common == toks.size()) common = toks.size() - 1;      // must evaluate at least one token
@@ -2099,8 +2146,31 @@ int main(int argc, char** argv) {
         std::vector<float> lg;
         // (speculation: one conversation only, and not with images: the draft block reads text only)
         Speculator* const spx = par || has_pics ? nullptr : eng.active_spec();
-        if (spx) { lg = spx->prompt(toks, eng.threads, &routing); spx->reset_stats(); }   // also feeds the draft block
-        else lg = evalm(suffix, &routing);
+        // Hybrid models can't rewind, so they keep one point to go back to: the start of this reply's own turn. The
+        // next message repeats everything before it word for word (the turn itself is written differently in the
+        // history: no empty thinking block), so it carries on from there instead of reading the conversation again.
+        size_t split = 0;
+        if (!par && hp.hybrid) {
+            static const char* const marks[] = {"<|im_start|>", "<start_of_turn>", "<|start_header_id|>", "<|start|>"};
+            int32_t mark = -1;
+            for (const char* m : marks) if ((mark = tok.find(m)) >= 0) break;
+            if (mark >= 0) for (size_t i = toks.size(); i-- > common + 1;) if (toks[i] == mark) { split = i; break; }
+        }
+        if (split > common) {
+            const std::vector<int32_t> head(toks.begin(), toks.begin() + split);
+            std::vector<int32_t> rest_routing;
+            if (spx) spx->prompt(head, eng.threads, &routing);
+            else evalm(std::vector<int32_t>(head.begin() + common, head.end()), &routing);
+            model->checkpoint();
+            if (spx) spx->mark();
+            if (spx) { lg = spx->prompt(toks, eng.threads, &rest_routing); spx->reset_stats(); }
+            else lg = evalm(std::vector<int32_t>(toks.begin() + split, toks.end()), &rest_routing);
+            routing.insert(routing.end(), rest_routing.begin(), rest_routing.end());
+        } else {
+            if (spx) { lg = spx->prompt(toks, eng.threads, &routing); spx->reset_stats(); }   // also feeds the draft block
+            else lg = evalm(suffix, &routing);
+            if (!par && hp.hybrid && common == 0) { model->checkpoint(); if (spx) spx->mark(); }
+        }
         r.prompt_s = since(p0);
         std::fprintf(stderr, "chat: %zu prompt tokens, %zu reused from the cache, %zu read at %.0f tok/s\n", toks.size(), (size_t)common,
                      toks.size() - common, (toks.size() - common) / std::max(r.prompt_s, 1e-9));
@@ -2234,12 +2304,29 @@ int main(int argc, char** argv) {
         r.n_gen = out.size();
         r.gen_s = since(g0);
         eng.save_usage();
+        std::string vram_note;                                   // how much of this reply's expert work VRAM did
+        {
+            std::lock_guard<std::mutex> lk(eng.usage_mu);
+            if (eng.picks > 0) vram_note = "; VRAM experts did " + std::to_string((int)std::lround(100.0 * eng.picks_vram / eng.picks)) + "% of this reply's expert work";
+            eng.picks = eng.picks_vram = 0;
+        }
+        if (model->live_hot()) {                                 // the VRAM set moves: count where each pick really was
+            const Model::LiveStats ls = model->live_stats();
+            if (ls.picks > 0) {
+                char b[160];
+                std::snprintf(b, sizeof b, "; VRAM experts did %d%% of this reply's expert work (%lld moved into VRAM, %.0f ms)",
+                              (int)std::lround(100.0 * ls.hits / ls.picks), ls.swaps, ls.swap_ms);
+                vram_note = b;
+            }
+            model->reset_live_stats();
+        }
         if (r.checks > 0 && r.drafted > 0)
             std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s); speculative: %.1f tokens per check, %zu of %zu guesses kept"
                          " (prompt lookup: %zu of %zu)\n", r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str(),
                          (double)r.n_gen / r.checks, r.accepted, r.drafted, r.look_ok, r.looked);
         else
             std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s)\n", r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str());
+        if (!vram_note.empty()) std::fprintf(stderr, "reply: %s\n", vram_note.c_str() + 2);
         return r;
     };
 
@@ -2287,7 +2374,7 @@ int main(int argc, char** argv) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array()) {
             res.status = 400;
-            res.set_content("{\"error\":\"expected {\\\"messages\\\": [...]}\"}", "application/json");
+            res.set_content("{\"error\":\"expected {\\\"messages\\\": [...]}\"}", "application/json; charset=utf-8");
             return;
         }
         auto lock = std::make_shared<Hold>();                              // held until the stream ends
@@ -2450,6 +2537,11 @@ int main(int argc, char** argv) {
         eng.seed = 4242;
         double toks = 0, secs = 0;
         try {
+            {   // a short untimed answer first: right after a load the experts are still coming off the drive into RAM
+                eng.model->reset();
+                eng.cached.clear();
+                generate(json::array({json{{"role", "user"}, {"content", questions[0]}}}), meas_sp, std::max(4, n / 2), {}, nullptr, nullptr);
+            }
             for (const char* q : questions) {
                 eng.model->reset();
                 eng.cached.clear();
@@ -2505,18 +2597,18 @@ int main(int argc, char** argv) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("model")) {
             res.status = 400;
-            res.set_content("{\"error\":\"expected {\\\"model\\\": \\\"...\\\"}\"}", "application/json");
+            res.set_content("{\"error\":\"expected {\\\"model\\\": \\\"...\\\"}\"}", "application/json; charset=utf-8");
             return;
         }
         const auto file = model_file(body.value("model", std::string()));
         if (file.empty()) {
             res.status = 400;
-            res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json");
+            res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json; charset=utf-8");
             return;
         }
         if (!mu.try_lock_for(std::chrono::seconds(3))) {
             res.status = 409;
-            res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
+            res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json; charset=utf-8");
             return;
         }
         auto lock = std::make_shared<std::unique_lock<std::shared_timed_mutex>>(mu, std::adopt_lock);
@@ -2656,7 +2748,7 @@ int main(int argc, char** argv) {
                         }
                         if (!status("Measuring " + label)) throw std::runtime_error("cancelled");
                         const double t = measure(n_gen, 0);
-                        if (!record(label + ", " + std::to_string(eng.threads) + " CPU threads, no speculative decoding", {{"split_mode", m}}, t))
+                        if (!record(label + ", " + threads_text(eng.threads) + ", no speculative decoding", {{"split_mode", m}}, t))
                             throw std::runtime_error("cancelled");
                         if (t > best) { best = t; mode = m; mode_text = label; }
                     }
@@ -2669,22 +2761,24 @@ int main(int argc, char** argv) {
                     if (!status("Measuring")) throw std::runtime_error("cancelled");
                     best = measure(n_gen, 0);
                     mode_text = eng.model->on_gpu() ? "All on the GPU" : "CPU only";
-                    record(mode_text + (cpu_work ? ", " + std::to_string(t0) + " CPU threads" : "") + ", no speculative decoding", json::object(), best);
+                    record(mode_text + (cpu_work ? ", " + threads_text(t0) : "") + ", no speculative decoding", json::object(), best);
                     mode = "auto";
                 }
 
                 // ---- 2. CPU threads (when the CPU does part of the work) ----
                 int threads = t0;
                 if (cpu_work) {
-                    std::vector<int> cands = {t0, std::max(1, t0 * 3 / 4), std::min(hw, (t0 * 3 + 1) / 2)};
+                    // (half too: with most of a big model's experts in RAM, fewer threads can be faster, they fight less over RAM:
+                    // Flash-Next on a 9950X3D ran best at 8-18 of its 32)
+                    std::vector<int> cands = {std::max(1, t0 / 2), t0, std::max(1, t0 * 3 / 4), std::min(hw, (t0 * 3 + 1) / 2)};
                     std::sort(cands.begin(), cands.end());
                     cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
                     for (int c : cands) {
                         if (c == t0) continue;               // measured above
                         eng.threads = c;
-                        if (!status("Measuring " + std::to_string(c) + " CPU threads")) throw std::runtime_error("cancelled");
+                        if (!status("Measuring " + threads_text(c))) throw std::runtime_error("cancelled");
                         const double t = measure(n_gen, 0);
-                        if (!record(mode_text + ", " + std::to_string(c) + " CPU threads, no speculative decoding", {{"threads", c}}, t)) throw std::runtime_error("cancelled");
+                        if (!record(mode_text + ", " + threads_text(c) + ", no speculative decoding", {{"threads", c}}, t)) throw std::runtime_error("cancelled");
                         if (t > best * 1.02) { best = t; threads = c; }   // a clear win only: the default is a safe choice
                     }
                     eng.threads = threads;
@@ -2698,7 +2792,7 @@ int main(int argc, char** argv) {
                         if (!status("Measuring speculative decoding, " + std::to_string(d) + (d == 1 ? " guess" : " guesses") + " per check"))
                             throw std::runtime_error("cancelled");
                         const double t = measure(n_gen, d);
-                        if (!record(mode_text + (cpu_work ? ", " + std::to_string(eng.threads) + " CPU threads" : "") + ", speculative decoding " +
+                        if (!record(mode_text + (cpu_work ? ", " + threads_text(eng.threads) : "") + ", speculative decoding " +
                                     std::to_string(d) + (d == 1 ? " guess" : " guesses"), {{"draft_max", d}}, t))
                             throw std::runtime_error("cancelled");
                         if (t > best) { best = t; draft = d; }
@@ -2802,7 +2896,27 @@ int main(int argc, char** argv) {
                 if (draft > 0) saved["draft_max"] = draft;
                 saved["settings_v"] = 2;
                 if (want_conn > 1) { saved["connections"] = conns; saved["min_tps"] = floor_tps; }
-                saved["tuned"] = {{"tps", std::round(best * 10) / 10}, {"results", results}};
+                // when, with which tierlm and on what hardware: shown with the results next time this model is picked
+                std::string pc;
+                for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+                    ggml_backend_dev_t dv = ggml_backend_dev_get(d);
+                    if (ggml_backend_dev_type(dv) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+                    const std::string nm = ggml_backend_dev_description(dv);
+                    if (pc.find(nm) != std::string::npos) continue;      // (the same card through CUDA and Vulkan)
+                    if (!pc.empty()) pc += " + ";
+                    pc += nm;
+                }
+                {
+                    size_t fr = 0, tot = 0;
+                    if (ggml_backend_dev_t cd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(cd, &fr, &tot);
+                    if (!pc.empty()) pc += ", ";
+                    pc += std::to_string((tot + (512ull << 20)) >> 30) + " GB RAM";
+                }
+                const std::time_t now = std::time(nullptr);
+                char when[32] = {0};
+                std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", std::localtime(&now));
+                saved["tuned"] = {{"tps", std::round(best * 10) / 10}, {"results", results}, {"when", when},
+                                  {"version", TIERLM_VERSION}, {"pc", pc}};
                 settings["models"][id] = saved;
                 settings["last_model"] = id;
                 write_settings(a.settings, settings);
@@ -2821,11 +2935,11 @@ int main(int argc, char** argv) {
     svr.Post("/api/bench", [&](const httplib::Request& req, httplib::Response& res) {
         if (!mu.try_lock_for(std::chrono::seconds(3))) {
             res.status = 409;
-            res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json");
+            res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json; charset=utf-8");
             return;
         }
         std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
-        if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
+        if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json; charset=utf-8"); return; }
         try {
             std::fprintf(stderr, "benchmark: reading 512 tokens, then answering three questions like a chat\n");
             const json bb = json::parse(req.body.empty() ? std::string("{}") : req.body, nullptr, false);
@@ -2838,34 +2952,34 @@ int main(int argc, char** argv) {
             eng.cached.clear();
             std::fprintf(stderr, "benchmark: prompt %.1f tok/s, generation %.1f tok/s\n", p, g);
             res.set_content(dump({{"prompt_tps", std::round(p * 10) / 10}, {"gen_tps", std::round(g * 10) / 10},
-                                  {"speculative", draft > 0}, {"draft_max", draft}, {"threads", eng.threads}}), "application/json");
+                                  {"speculative", draft > 0}, {"draft_max", draft}, {"threads", eng.threads}}), "application/json; charset=utf-8");
         } catch (const std::exception& e) {
             res.status = 500;
-            res.set_content(dump({{"error", e.what()}}), "application/json");
+            res.set_content(dump({{"error", e.what()}}), "application/json; charset=utf-8");
         }
     });
 
     // ---------------- Speculative decoding on/off without reloading (when the draft layer is loaded) ----------------
     svr.Post("/api/spec", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) { res.status = 400; res.set_content("{\"error\":\"bad request\"}", "application/json"); return; }
+        if (body.is_discarded()) { res.status = 400; res.set_content("{\"error\":\"bad request\"}", "application/json; charset=utf-8"); return; }
         // A quick change: waits in line behind a running reply instead of answering "busy".
-        if (!line.enter(mu, req.is_connection_closed)) { res.status = 503; res.set_content("{\"error\":\"busy\"}", "application/json"); return; }
+        if (!line.enter(mu, req.is_connection_closed)) { res.status = 503; res.set_content("{\"error\":\"busy\"}", "application/json; charset=utf-8"); return; }
         std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
-        if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json"); return; }
+        if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json; charset=utf-8"); return; }
         // Prompt lookup alone changes nothing in the model's cache: no need to start over.
         if (body.contains("lookup") && body["lookup"].is_number_integer()) eng.lookup = std::max(-1, std::min(16, body["lookup"].get<int>()));
         if (!body.contains("speculative") && !body.contains("draft_max")) {
             eng.spec_changed();                                 // the next reply brings lookup up to date with the cache
             std::fprintf(stderr, "prompt lookup: %s\n", eng.lookup_len() > 0 ? ("up to " + std::to_string(eng.lookup_len()) + " tokens per check").c_str() : "off");
-            res.set_content(dump({{"ok", true}, {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}}), "application/json");
+            res.set_content(dump({{"ok", true}, {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}}), "application/json; charset=utf-8");
             return;
         }
         const bool on = body.value("speculative", eng.spec != nullptr);
         const int d = std::min(8, std::max(1, body.value("draft_max", eng.draft_max > 0 ? eng.draft_max : 2)));
         if (on && !eng.model->has_mtp()) {
             res.status = 409;
-            res.set_content(dump({{"error", "this model was loaded without its draft layer: turn on Speculative decoding on the setup screen and load it again"}}), "application/json");
+            res.set_content(dump({{"error", "this model was loaded without its draft layer: turn on Speculative decoding on the setup screen and load it again"}}), "application/json; charset=utf-8");
             return;
         }
         eng.draft_max = d;
@@ -2876,7 +2990,7 @@ int main(int argc, char** argv) {
         eng.model->reset();
         std::fprintf(stderr, "speculative decoding %s%s\n", on ? "on, " : "off", on ? (std::to_string(d) + (d == 1 ? " guess per check" : " guesses per check")).c_str() : "");
         if (eng.lookup_len() > 0) std::fprintf(stderr, "prompt lookup: up to %d tokens per check\n", eng.lookup_len());
-        res.set_content(dump({{"ok", true}, {"speculative", on}, {"draft_max", d}, {"lookup", eng.lookup_len()}}), "application/json");
+        res.set_content(dump({{"ok", true}, {"speculative", on}, {"draft_max", d}, {"lookup", eng.lookup_len()}}), "application/json; charset=utf-8");
     });
 
     // ---------------- Forget what was learned about the loaded model's experts ----------------
@@ -2887,12 +3001,12 @@ int main(int argc, char** argv) {
         if (!eng.usage_path.empty()) fs::remove(fs::u8path(eng.usage_path), ec);
         eng.usage_dirty = false;
         std::fprintf(stderr, "expert usage for this model forgotten; the next load places whole expert layers again\n");
-        res.set_content("{\"ok\":true}", "application/json");
+        res.set_content("{\"ok\":true}", "application/json; charset=utf-8");
     });
 
     // ---------------- Loading progress and the console (no lock: they answer while a model loads) ----------------
     svr.Get("/api/progress", [&](const httplib::Request&, httplib::Response& res) {
-        res.set_content(dump({{"loading", loading.load()}, {"progress", load_progress.load()}}), "application/json");
+        res.set_content(dump({{"loading", loading.load()}, {"progress", load_progress.load()}}), "application/json; charset=utf-8");
     });
     svr.Get("/api/log", [&](const httplib::Request& req, httplib::Response& res) {
         long long after = -1;
@@ -2905,7 +3019,7 @@ int main(int argc, char** argv) {
             for (const auto& [n, t] : g_log.lines)
                 if (n > after) lines.push_back({{"n", n}, {"text", t}, {"v", verbose_line(t)}});
         }
-        res.set_content(dump({{"lines", lines}, {"next", next}}), "application/json");
+        res.set_content(dump({{"lines", lines}, {"next", next}}), "application/json; charset=utf-8");
     });
 
     // ---------------- The embedding model (a second model, next to the chat model) ----------------
@@ -2989,7 +3103,7 @@ int main(int argc, char** argv) {
             if (!m.value("supported", false) || m.value("id", std::string()) == cur) continue;
             data.push_back({{"id", m["id"]}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", false}});
         }
-        res.set_content(dump({{"object", "list"}, {"data", data}}), "application/json");
+        res.set_content(dump({{"object", "list"}, {"data", data}}), "application/json; charset=utf-8");
     });
 
     // LM Studio's own REST API (/api/v0): apps written for LM Studio list the models here, with what each one is
@@ -3057,12 +3171,12 @@ int main(int argc, char** argv) {
         return data;
     };
     svr.Get("/api/v0/models", [&](const httplib::Request&, httplib::Response& res) {
-        res.set_content(dump({{"object", "list"}, {"data", v0_models()}}), "application/json");
+        res.set_content(dump({{"object", "list"}, {"data", v0_models()}}), "application/json; charset=utf-8");
     });
     svr.Get(R"(/api/v0/models/(.+))", [&](const httplib::Request& req, httplib::Response& res) {
         const std::string want = req.matches[1].str();
         for (const auto& m : v0_models())
-            if (m["id"] == want) return res.set_content(dump(m), "application/json");
+            if (m["id"] == want) return res.set_content(dump(m), "application/json; charset=utf-8");
         oai_error(res, 404, "no model \"" + want + "\" in the models folder", "invalid_request_error", "model_not_found");
     });
 
@@ -3193,7 +3307,7 @@ int main(int argc, char** argv) {
                     {"choices", json::array({{{"index", 0}, {"message", msg},
                                               {"logprobs", nullptr}, {"finish_reason", fin}}})},
                     {"usage", {{"prompt_tokens", g.n_prompt}, {"completion_tokens", g.n_gen}, {"total_tokens", g.n_prompt + g.n_gen}}}}),
-                    "application/json");
+                    "application/json; charset=utf-8");
             } catch (const std::exception& e) {
                 oai_error(res, 500, e.what(), "server_error");
             }
@@ -3271,7 +3385,7 @@ int main(int argc, char** argv) {
         j["remote"] = true;
         for (const char* k : {"path", "vision_file", "ssd_file"})
             if (j.contains(k) && j[k].is_string()) j[k] = fs::u8path(j[k].get<std::string>()).filename().u8string();
-        res.set_content(dump(j), "application/json");
+        res.set_content(dump(j), "application/json; charset=utf-8");
     });
 
     svr.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
@@ -3320,7 +3434,7 @@ int main(int argc, char** argv) {
         return j;
     };
     svr.Get("/api/network", [&](const httplib::Request& req, httplib::Response& res) {
-        res.set_content(dump(network_info(is_local(req))), "application/json");   // the key itself only to this computer
+        res.set_content(dump(network_info(is_local(req))), "application/json; charset=utf-8");   // the key itself only to this computer
     });
     // Change network access or the API key. Only from this computer: someone on the network mustn't be able to
     // open it wider or change the key.
@@ -3343,7 +3457,7 @@ int main(int argc, char** argv) {
             relisten = true;
             std::thread([&] { std::this_thread::sleep_for(std::chrono::milliseconds(300)); svr.stop(); }).detach();
         }
-        res.set_content(dump(network_info(true)), "application/json");
+        res.set_content(dump(network_info(true)), "application/json; charset=utf-8");
     });
 
     // ---------------- the workspace (tierlm's own chat page only) ----------------
@@ -3379,7 +3493,7 @@ int main(int argc, char** argv) {
                     }};
     };
     svr.Get("/api/workspace", [&](const httplib::Request& req, httplib::Response& res) {
-        res.set_content(dump(ws_info(req)), "application/json");
+        res.set_content(dump(ws_info(req)), "application/json; charset=utf-8");
     });
     svr.Post("/api/workspace", [&](const httplib::Request& req, httplib::Response& res) {    // {"folder": "C:\\code\\project"}
         if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
@@ -3395,14 +3509,14 @@ int main(int argc, char** argv) {
         settings["workspace_folder"] = folder;
         write_settings(a.settings, settings);
         std::fprintf(stderr, "workspace: %s\n", folder.empty() ? "none" : folder.c_str());
-        res.set_content(dump(ws_info(req)), "application/json");
+        res.set_content(dump(ws_info(req)), "application/json; charset=utf-8");
     });
     svr.Post("/api/workspace/pick", [&](const httplib::Request& req, httplib::Response& res) {
         if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
 #ifdef _WIN32
         bool cancelled = true;
         const std::string f = pick_folder_windows(settings.value("workspace_folder", std::string()), cancelled);
-        res.set_content(dump({{"cancelled", cancelled}, {"folder", f}}), "application/json");
+        res.set_content(dump({{"cancelled", cancelled}, {"folder", f}}), "application/json; charset=utf-8");
 #else
         oai_error(res, 501, "type the folder path instead (the picker is Windows only)");
 #endif
@@ -3424,9 +3538,9 @@ int main(int argc, char** argv) {
             json r = workspace::run(fs::u8path(folder), name, args, body.value("apply", false), body.value("hash", std::string()));
             if (r.contains("result") && (body.value("apply", false) || !workspace::changes_files(name)))
                 std::fprintf(stderr, "workspace: %s %s\n", name.c_str(), workspace::arg_str(args, "path").c_str());
-            res.set_content(dump(r), "application/json");
+            res.set_content(dump(r), "application/json; charset=utf-8");
         } catch (const std::exception& e) {
-            res.set_content(dump({{"error", e.what()}}), "application/json");
+            res.set_content(dump({{"error", e.what()}}), "application/json; charset=utf-8");
         }
     });
 
@@ -3465,11 +3579,11 @@ int main(int argc, char** argv) {
     // that browser instead.
     svr.Get("/api/chats", [&](const httplib::Request& req, httplib::Response& res) {
         if (const std::string why = ws_check(req, false); !why.empty()) return oai_error(res, 403, why, "permission_error");
-        res.set_content(dump({{"folder", chats_dir.u8string()}, {"chats", chats::list(chats_dir)}}), "application/json");
+        res.set_content(dump({{"folder", chats_dir.u8string()}, {"chats", chats::list(chats_dir)}}), "application/json; charset=utf-8");
     });
     svr.Get(R"(/api/chats/([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
         if (const std::string why = ws_check(req, false); !why.empty()) return oai_error(res, 403, why, "permission_error");
-        try { res.set_content(dump(chats::load(chats_dir, req.matches[1])), "application/json"); }
+        try { res.set_content(dump(chats::load(chats_dir, req.matches[1])), "application/json; charset=utf-8"); }
         catch (const std::exception& e) { oai_error(res, 404, e.what()); }
     });
     svr.Post(R"(/api/chats/([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
@@ -3481,12 +3595,12 @@ int main(int argc, char** argv) {
             const std::string wsf = c.is_object() && c.contains("workspace") && c["workspace"].is_string() ? c["workspace"].get<std::string>()
                                                                                                             : settings.value("workspace_folder", std::string());
             const fs::path f = chats::save(chats_dir, req.matches[1], c, wsf);
-            res.set_content(dump({{"ok", true}, {"folder", f.filename().u8string()}}), "application/json");
+            res.set_content(dump({{"ok", true}, {"folder", f.filename().u8string()}}), "application/json; charset=utf-8");
         } catch (const std::exception& e) { oai_error(res, 500, e.what()); }
     });
     svr.Delete(R"(/api/chats/([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
         if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
-        try { chats::remove(chats_dir, req.matches[1]); res.set_content("{\"ok\":true}", "application/json"); }
+        try { chats::remove(chats_dir, req.matches[1]); res.set_content("{\"ok\":true}", "application/json; charset=utf-8"); }
         catch (const std::exception& e) { oai_error(res, 500, e.what()); }
     });
     // An attached file, kept with the chat (so its link in chat.md works): {"name": "notes.txt", "text": "..."}.
@@ -3494,7 +3608,7 @@ int main(int argc, char** argv) {
         if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
         json b = json::parse(req.body, nullptr, false);
         if (!b.is_object() || !b.contains("name") || !b["text"].is_string()) return oai_error(res, 400, "expected {\"name\", \"text\"}");
-        try { chats::put_file(chats_dir, req.matches[1], b.value("name", std::string()), b["text"].get<std::string>()); res.set_content("{\"ok\":true}", "application/json"); }
+        try { chats::put_file(chats_dir, req.matches[1], b.value("name", std::string()), b["text"].get<std::string>()); res.set_content("{\"ok\":true}", "application/json; charset=utf-8"); }
         catch (const std::exception& e) { oai_error(res, 500, e.what()); }
     });
     svr.Get(R"(/api/chats/([A-Za-z0-9]+)/files/(.+))", [&](const httplib::Request& req, httplib::Response& res) {
@@ -3515,26 +3629,26 @@ int main(int argc, char** argv) {
         fs::create_directories(p, ec);
 #ifdef _WIN32
         ShellExecuteW(nullptr, L"open", p.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        res.set_content(dump({{"opened", true}, {"folder", p.u8string()}}), "application/json");
+        res.set_content(dump({{"opened", true}, {"folder", p.u8string()}}), "application/json; charset=utf-8");
 #else
-        res.set_content(dump({{"opened", false}, {"folder", p.u8string()}}), "application/json");
+        res.set_content(dump({{"opened", false}, {"folder", p.u8string()}}), "application/json; charset=utf-8");
 #endif
     });
 
     svr.Get("/api/embed", [&](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lk(emb.mu);
-        res.set_content(dump(embed_info()), "application/json");
+        res.set_content(dump(embed_info()), "application/json; charset=utf-8");
     });
     svr.Post("/api/embed/load", [&](const httplib::Request& req, httplib::Response& res) {
         const json body = json::parse(req.body, nullptr, false);
         const std::string id = body.is_object() ? body.value("model", std::string()) : std::string();
         auto file = model_file(id);
         if (file.empty()) file = bundled_file(id);
-        if (file.empty()) { res.status = 400; res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json"); return; }
+        if (file.empty()) { res.status = 400; res.set_content(dump({{"error", "model not found in the models folder"}}), "application/json; charset=utf-8"); return; }
         const json d = describe_model(file.u8string());
         if (!d.value("embedding", false)) {
             res.status = 400;
-            res.set_content(dump({{"error", d.value("kind", std::string()) == "embedding" ? d.value("reason", std::string()) : "that is not an embedding model"}}), "application/json");
+            res.set_content(dump({{"error", d.value("kind", std::string()) == "embedding" ? d.value("reason", std::string()) : "that is not an embedding model"}}), "application/json; charset=utf-8");
             return;
         }
         json info;
@@ -3544,10 +3658,10 @@ int main(int argc, char** argv) {
             info = embed_info();
         } catch (const std::exception& e) {
             std::fprintf(stderr, "embedding model: %s\n", e.what());
-            res.status = 500; res.set_content(dump({{"error", e.what()}}), "application/json"); return;
+            res.status = 500; res.set_content(dump({{"error", e.what()}}), "application/json; charset=utf-8"); return;
         }
         save_embed_choice(id);
-        res.set_content(dump(info), "application/json");
+        res.set_content(dump(info), "application/json; charset=utf-8");
     });
     // One click for an embedding model: nomic-embed-text v1.5 (Apache 2.0, about 140 MB), downloaded from Nomic's own
     // Hugging Face page into the models folder and checked (size and SHA-256, as Hugging Face states them), then
@@ -3565,13 +3679,13 @@ int main(int argc, char** argv) {
             if (!ec) bytes = (long long)n;
         }
         res.set_content(dump({{"state", dl.state}, {"bytes", bytes}, {"total", (long long)dl.total}, {"error", dl.error},
-                              {"file", dl.file}, {"size_hint", 146 * 1000 * 1000}}), "application/json");
+                              {"file", dl.file}, {"size_hint", 146 * 1000 * 1000}}), "application/json; charset=utf-8");
     });
     svr.Post("/api/embed/download", [&](const httplib::Request& req, httplib::Response& res) {
-        if (!is_local(req)) { res.status = 403; res.set_content(dump({{"error", "only the computer running tierlm can download models"}}), "application/json"); return; }
+        if (!is_local(req)) { res.status = 403; res.set_content(dump({{"error", "only the computer running tierlm can download models"}}), "application/json; charset=utf-8"); return; }
         {
             std::lock_guard<std::mutex> lk(dl_mu);
-            if (dl.running) { res.set_content(dump({{"state", dl.state}}), "application/json"); return; }
+            if (dl.running) { res.set_content(dump({{"state", dl.state}}), "application/json; charset=utf-8"); return; }
             dl.running = true; dl.state = "downloading"; dl.error.clear(); dl.file.clear(); dl.bytes = 0; dl.total = 0;
         }
         const fs::path dir = own_models;                                 // downloads: always tierlm's own folder
@@ -3589,7 +3703,7 @@ int main(int argc, char** argv) {
                 std::lock_guard<std::mutex> lk(dl_mu);
                 dl.running = false; dl.state = "done"; dl.file = found; dl.bytes = dl.total = 0;
                 std::fprintf(stderr, "download: nomic-embed-text v1.5 is already here (%s); not downloading another copy\n", found.c_str());
-                res.set_content(dump({{"state", "done"}, {"file", found}}), "application/json");
+                res.set_content(dump({{"state", "done"}, {"file", found}}), "application/json; charset=utf-8");
                 return;
             }
         }
@@ -3642,7 +3756,7 @@ int main(int argc, char** argv) {
             dl.state = "done"; dl.file = nomic_id; dl.running = false;
             std::fprintf(stderr, "download: %s saved and checked (SHA-256 %s)\n", dest.u8string().c_str(), sha.c_str());
         }).detach();
-        res.set_content(dump({{"state", "downloading"}}), "application/json");
+        res.set_content(dump({{"state", "downloading"}}), "application/json; charset=utf-8");
     });
     // ---- Get models: search Hugging Face for GGUF models and download them ----
     // Everything goes through curl (as the embedding model's download), to Hugging Face's public API: no account is
@@ -3702,7 +3816,7 @@ int main(int argc, char** argv) {
             out.push_back({{"id", m.value("id", std::string())}, {"downloads", m.value("downloads", 0LL)}, {"likes", m.value("likes", 0LL)},
                            {"updated", m.value("lastModified", m.value("createdAt", std::string()))}});
         }
-        res.set_content(dump(json{{"models", out}}), "application/json");
+        res.set_content(dump(json{{"models", out}}), "application/json; charset=utf-8");
     });
     // The quant's name in a file name: UD-Q4_K_XL, Q4_K_M, IQ4_XS, Q8_0, BF16, MXFP4...
     auto quant_of = [](const std::string& name) {
@@ -3771,7 +3885,7 @@ int main(int argc, char** argv) {
             fs::remove(tmp, ec);
         }
         if (!out.contains("supported") && out.contains("arch")) out["supported"] = arch_supported(out["arch"].get<std::string>());
-        res.set_content(dump(out), "application/json");
+        res.set_content(dump(out), "application/json; charset=utf-8");
     });
     struct HfFile { std::string path, sha; long long size = 0; std::string state = "waiting"; };
     struct HfJob {
@@ -3800,11 +3914,11 @@ int main(int argc, char** argv) {
             files.push_back({{"path", f.path}, {"size", f.size}, {"done", have}, {"state", f.state}});
         }
         res.set_content(dump(json{{"state", hf.state}, {"id", hf.id}, {"error", hf.error}, {"files", files}, {"done", done}, {"total", total},
-                                  {"folder", hf.folder}}), "application/json");
+                                  {"folder", hf.folder}}), "application/json; charset=utf-8");
     });
     svr.Post("/api/hf/cancel", [&](const httplib::Request&, httplib::Response& res) {
         hf.cancel = true;
-        res.set_content(dump(json{{"ok", true}}), "application/json");
+        res.set_content(dump(json{{"ok", true}}), "application/json; charset=utf-8");
     });
     svr.Post("/api/hf/download", [&](const httplib::Request& req, httplib::Response& res) {
         const json body = json::parse(req.body, nullptr, false);
@@ -3886,14 +4000,14 @@ int main(int argc, char** argv) {
             }
             finish("done", "");
         }).detach();
-        res.set_content(dump(json{{"ok", true}, {"folder", folder.u8string()}}), "application/json");
+        res.set_content(dump(json{{"ok", true}, {"folder", folder.u8string()}}), "application/json; charset=utf-8");
     });
 
     svr.Post("/api/embed/unload", [&](const httplib::Request&, httplib::Response& res) {
         { std::lock_guard<std::mutex> lk(emb.mu); emb.enc.reset(); emb.id.clear(); emb.path.clear(); emb.name.clear(); }
         save_embed_choice("");
         std::fprintf(stderr, "embedding model: unloaded\n");
-        res.set_content(dump({{"loaded", false}}), "application/json");
+        res.set_content(dump({{"loaded", false}}), "application/json; charset=utf-8");
     });
 
     // POST /v1/embeddings, as OpenAI's: {"input": "text" | ["text", ...] | [token ids] | [[token ids], ...],
@@ -3955,7 +4069,7 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "embeddings: %zu input%s, %zu tokens in %.2f s\n", inputs.size(), inputs.size() == 1 ? "" : "s", n_tok, since(t0));
             res.set_content(dump({{"object", "list"}, {"data", data}, {"model", emb.id},
-                                  {"usage", {{"prompt_tokens", n_tok}, {"total_tokens", n_tok}}}}), "application/json");
+                                  {"usage", {{"prompt_tokens", n_tok}, {"total_tokens", n_tok}}}}), "application/json; charset=utf-8");
         } catch (const std::exception& e) {
             return oai_error(res, 500, e.what(), "server_error");
         }

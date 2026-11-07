@@ -1,7 +1,7 @@
 # tierlm's changes to ggml, and what we learned about it
 
 tierlm runs on [ggml](https://github.com/ggml-org/ggml) (MIT license), the tensor library behind llama.cpp. We change
-very little of it: **50 lines in 4 files**, listed here in full so anyone can review them, reuse them, or offer them
+very little of it: **about 145 lines in 4 files**, listed here in full so anyone can review them, reuse them, or offer them
 upstream. This page also records three things about ggml that took us a while to find and that matter to anyone
 building on ggml directly rather than through llama.cpp.
 
@@ -14,6 +14,8 @@ building on ggml directly rather than through llama.cpp.
 |---|---|---|---|---|
 | 1 | The CPU expert multiply skips negative expert ids | `src/ggml-cpu/ggml-cpu.c`, `src/ggml-cpu/repack.cpp` | +12 −2 | Lets a MoE layer be split between VRAM and RAM by expert, without the CPU doing work for experts that are on the GPU |
 | 2 | Optional per-split timing in the scheduler | `src/ggml-backend.cpp`, `include/ggml-backend.h` | +38 | Shows where each token's time goes (GPU work, CPU work, copies between them) |
+| 3 | CPU and GPU at once, and fewer waits between them (opt-in) | `src/ggml-backend.cpp`, `include/ggml-backend.h` | +80 | A layer split between VRAM and RAM used to run its CPU half, then its GPU half; now both run together |
+| 4 | Optional time per op kind on the CPU | `src/ggml-cpu/ggml-cpu.c` | +27 | Shows which CPU ops a token's time goes to (`TIERLM_CPU_OP_TIMES=1`) |
 
 Nothing else in ggml is changed. tierlm also turns on one existing ggml build option (CUDA graphs, see Finding 1).
 
@@ -153,6 +155,74 @@ and a batch of at least 32 tokens (`GGML_OP_OFFLOAD_MIN_BATCH`) run on the GPU: 
 op. That is why reading a long prompt is fast even with experts in RAM. It also means a graph's RAM part is not always
 computed by the CPU, so anything that only the CPU accepts (like Change 1's negative ids) must not reach those ops
 for big batches. tierlm uses negative ids only for batches below that size, and distinct ids otherwise.
+
+---
+
+## Change 3: CPU and GPU at once, and fewer waits between them
+
+**What.** One new switch, off unless a program turns it on:
+
+```c
+// include/ggml-backend.h
+GGML_API void ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool overlap);
+```
+
+With it on, `ggml_backend_sched_compute_splits` changes in three ways:
+
+1. **A CPU split right after a GPU split, with nothing to copy in, starts at once.** Normally such a split first
+   waits for the GPU to finish everything queued ("the allocator may have reused buffer regions across splits").
+   Between a GPU split and a CPU split that wait protects nothing: the CPU never reads or writes GPU memory, so
+   whatever the CPU needs from the GPU reaches it as an input copy, which waits; and whatever the CPU makes goes back
+   to the GPU as an input copy of a later split, which waits for the GPU first. So the GPU keeps working on its queue
+   while the CPU computes.
+2. **A CPU split's inputs from a GPU are fetched together.** Each one used to wait for the GPU and then copy
+   (`cudaMemcpy` plus a stream wait, tens of microseconds on Windows). Now all of them are queued as asynchronous
+   reads (`ggml_backend_tensor_get_async`) and waited for once.
+3. **A GPU split's inputs from the CPU are sent together** (`ggml_backend_tensor_set_async`), then waited for once,
+   so the CPU may reuse that memory as soon as the next split starts.
+
+Inputs set by the program (`GGML_TENSOR_FLAG_INPUT`) and weights still go through the normal path.
+
+**How tierlm uses it.** A mixture-of-experts layer whose busiest experts are in VRAM and the rest in RAM ("hot
+experts") is built in this order: the GPU runs attention and the router; the CPU does the bookkeeping (which picks
+are in VRAM and which in RAM) and takes its own copy of the layer's input; the GPU is given the VRAM experts and the
+shared expert; the CPU then computes the RAM experts *while the GPU computes its part*; the GPU adds both. Before, the
+graph ran the RAM experts first and the VRAM experts after, so one device always waited for the other.
+`TIERLM_OVERLAP=0` turns all of this off; `TIERLM_OVERLAP=2` keeps the new order but waits at every step (a test: the
+output must be the same as with overlap on, and it is).
+
+**Measured** (RTX 3070 laptop, Qwen3.6-35B-A3B UD-Q3_K_XL, 6.1 GiB in VRAM and 9.7 GiB in RAM with hot experts,
+greedy, 200 tokens, 6 CPU threads; tierlm 0.8.3-dev):
+
+| | Generation |
+|---|---|
+| Before (one device after the other) | 22.0–23.0 tok/s |
+| This change | 32.2 tok/s |
+| This change, plus reusing the reply graph (a tierlm change, not ggml's) | 36.2–36.7 tok/s |
+
+It helps most where the CPU and the GPU each have real work per layer. On an RTX 5080 with a fast 9800X3D (little
+CPU work), "busiest experts in VRAM" went from 93.6 to 105.3 tok/s with this and the graph reuse together. On an
+RTX 5090 with Qwen3.8 Flash-Next (most of its time is attention and DeltaNet work that has to finish before the
+experts can start) it made no clear difference either way: about 50 tok/s with or without it.
+
+**Safety.** The output with overlap on is identical, token for token, to the same graph run with every wait in place
+(`TIERLM_OVERLAP=2`), across 200- and 300-token replies.
+
+---
+
+## Change 4: optional time per op kind on the CPU
+
+**What.** With `TIERLM_CPU_OP_TIMES=1`, the CPU backend's first thread notes how long each op takes, including the wait
+for the other threads after it, adds it up per op kind, and prints the totals every 4000 CPU graphs. Off, it costs
+one test per graph.
+
+```
+cpu op times over 4000 graphs (850.9 ms): ... MUL_MAT_ID 825.3ms/5925 CONT 4.6ms/7900 GET_ROWS 9.6ms/7950 ...
+```
+
+**What it found.** On a laptop with an RTX 3070, Qwen3.6-35B-A3B with its RAM experts on the CPU: 97% of the CPU's
+time is the expert multiplies, and the dozens of small bookkeeping ops per layer cost under 3%. So merging those
+small ops would gain nothing; the multiply itself is what to speed up.
 
 ---
 

@@ -35,5 +35,9 @@ private:
 struct DriveInfo { std::string path; std::string label; unsigned long long free_bytes = 0, total_bytes = 0; };
 std::vector<DriveInfo> list_drives();
 
+// Waits until a file just written is really on the drive (Windows otherwise writes it out in the background for
+// minutes afterwards, slowing everything else that reads the drive or needs RAM). False if it couldn't.
+bool flush_to_disk(const std::string& path);
+
 // Free space and total size of the drive holding `path` (a folder or file), in bytes; false if unknown.
 bool drive_space(const std::string& path, unsigned long long& free_bytes, unsigned long long& total_bytes);

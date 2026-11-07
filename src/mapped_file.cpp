@@ -127,3 +127,20 @@ bool drive_space(const std::string& path, unsigned long long& free_bytes, unsign
     free_bytes = s.available; total_bytes = s.capacity;
     return true;
 }
+
+bool flush_to_disk(const std::string& path) {
+#ifdef _WIN32
+    HANDLE h = CreateFileW(widen(path).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const bool ok = FlushFileBuffers(h) != 0;
+    CloseHandle(h);
+    return ok;
+#else
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+#endif
+}
