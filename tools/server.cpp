@@ -38,6 +38,7 @@
 #include "gguf.h"
 #include "ggml-backend.h"
 #include <list>
+#include <map>
 #include "httplib.h"
 #include "json.hpp"
 #include "agent.h"
@@ -770,17 +771,20 @@ struct Engine {
     int hot_E = 0, hot_L = 0;
     std::vector<uint8_t> in_vram;        // [layer * E + expert]: in VRAM (hot experts or a whole layer), for the share below
     long long picks = 0, picks_vram = 0; // the router's picks since the last reply line, and how many VRAM served
+    // Off while Find the fastest settings measures: its test questions must not teach the busiest-experts set, or
+    // that set fits the test unusually well and wins against settings that serve real chats better.
+    bool learn = true;
     void add_usage(const std::vector<int32_t>& routing, int K) {
         std::lock_guard<std::mutex> lk(usage_mu);
         if (usage.empty() || K <= 0) return;
         for (size_t i = 0; i < routing.size(); ++i) {
             const size_t l = (i / K) % hot_L;
             if (routing[i] >= 0 && routing[i] < hot_E) {
-                usage[l * hot_E + routing[i]] += 1.0f;
+                if (learn) usage[l * hot_E + routing[i]] += 1.0f;
                 if (!in_vram.empty()) { ++picks; picks_vram += in_vram[l * hot_E + routing[i]]; }
             }
         }
-        usage_dirty = true;
+        if (learn) usage_dirty = true;
     }
     void save_usage(bool force = false) {
         std::lock_guard<std::mutex> lk(usage_mu);
@@ -2535,6 +2539,7 @@ int main(int argc, char** argv) {
         if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft);
         eng.spec_changed();
         eng.seed = 4242;
+        eng.learn = false;
         double toks = 0, secs = 0;
         try {
             {   // a short untimed answer first: right after a load the experts are still coming off the drive into RAM
@@ -2550,7 +2555,8 @@ int main(int argc, char** argv) {
                 toks += (double)g.n_gen;
                 secs += g.gen_s;
             }
-        } catch (...) { eng.spec = std::move(saved); eng.spec_changed(); eng.seed = saved_seed; throw; }
+        } catch (...) { eng.spec = std::move(saved); eng.spec_changed(); eng.seed = saved_seed; eng.learn = true; throw; }
+        eng.learn = true;
         eng.spec = std::move(saved);
         eng.spec_changed();
         eng.seed = saved_seed;
@@ -2645,7 +2651,9 @@ int main(int argc, char** argv) {
                     return send({{"type", "result"}, {"label", label}, {"tps", setting["tps"]}});
                 };
                 int n_gen = 48;                               // tokens per question, set from the first measurement
-                auto size_runs = [&](double tps) { n_gen = std::max(48, std::min(320, (int)std::lround(tps * 3))); };   // per question: about 3 s each
+                // per question: about 5 s each, so a setting that pays a cost early (VRAM experts that follow the
+                // conversation move in during the first words) is measured over a reply long enough to show what it earns
+                auto size_runs = [&](double tps) { n_gen = std::max(64, std::min(480, (int)std::lround(tps * 5))); };
 
                 // ---- 1. split mode (when the model doesn't fit in VRAM) ----
                 std::string mode = "auto";
@@ -2710,6 +2718,7 @@ int main(int argc, char** argv) {
                     size_runs(t);
                 }
                 double best = 0;
+                std::map<std::string, std::pair<double, std::string>> plain_of;   // split mode -> speed without guessing, label
                 if (split) {
                     // (hot experts: MoE models, and not yet for experts with biases, gpt-oss)
                     const auto& hp_ = eng.model->hparams();
@@ -2747,16 +2756,30 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         if (!status("Measuring " + label)) throw std::runtime_error("cancelled");
-                        const double t = measure(n_gen, 0);
+                        // (the busiest experts and the ones that follow the conversation: at least 160 tokens per
+                        // question even when whole layers set a short run, since moving experts in pays off over a reply)
+                        const double t = measure(base_m == "hot" || base_m == "live" ? std::max(n_gen, 160) : n_gen, 0);
                         if (!record(label + ", " + threads_text(eng.threads) + ", no speculative decoding", {{"split_mode", m}}, t))
                             throw std::runtime_error("cancelled");
+                        plain_of[m] = {t, label};
                         if (t > best) { best = t; mode = m; mode_text = label; }
                     }
                     if (loaded_mode != mode) {
                         if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
                         load_mode(mode);
                     }
+                    // Threads and guesses are measured with replies sized from the winner's speed; the winner is
+                    // measured again at that length first, so the comparisons after it are like for like (a short
+                    // reply and a long one don't run at the same speed).
+                    const int n_before = (mode == "hot" || mode == "live") ? std::max(n_gen, 160) : n_gen;
                     size_runs(best);
+                    if (n_gen != n_before) {
+                        if (!status("Measuring " + mode_text + " again with longer replies")) throw std::runtime_error("cancelled");
+                        best = measure(n_gen, 0);
+                        if (!record(mode_text + ", " + threads_text(eng.threads) + ", no speculative decoding (again, " +
+                                    std::to_string(n_gen) + "-token replies)", {{"split_mode", mode}}, best))
+                            throw std::runtime_error("cancelled");
+                    }
                 } else {
                     if (!status("Measuring")) throw std::runtime_error("cancelled");
                     best = measure(n_gen, 0);
@@ -2799,6 +2822,28 @@ int main(int argc, char** argv) {
                     }
                     if (draft > 0 && best < plain * 1.03) draft = 0;    // not worth it for a sliver
                     if (draft == 0) best = plain;
+                    // The busiest experts in VRAM and the VRAM experts that follow the conversation are close
+                    // relatives: the one that lost without guessing can win with it (guessed words reuse the experts
+                    // already moved in). Within 15%, the other one is measured with the same guesses too.
+                    const bool one = mode.size() > 2 && mode.compare(mode.size() - 2, 2, "@1") == 0;
+                    const std::string m0 = one ? mode.substr(0, mode.size() - 2) : mode;
+                    const std::string alt = (m0 == "hot" ? "live" : m0 == "live" ? "hot" : "") + std::string(one && (m0 == "hot" || m0 == "live") ? "@1" : "");
+                    if (draft > 0 && !alt.empty() && plain_of.count(alt) && plain_of.count(mode) &&
+                        plain_of[alt].first >= plain_of[mode].first * 0.85) {
+                        const std::string alt_label = plain_of[alt].second;
+                        if (!status("Loading with " + alt_label)) throw std::runtime_error("cancelled");
+                        load_mode(alt);
+                        if (!status("Measuring " + alt_label + ", speculative decoding")) throw std::runtime_error("cancelled");
+                        const double t = measure(n_gen, draft);
+                        if (!record(alt_label + (cpu_work ? ", " + threads_text(eng.threads) : "") + ", speculative decoding " +
+                                    std::to_string(draft) + (draft == 1 ? " guess" : " guesses"), {{"split_mode", alt}, {"draft_max", draft}}, t))
+                            throw std::runtime_error("cancelled");
+                        if (t > best) { best = t; mode = alt; mode_text = alt_label; }
+                        else {
+                            if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
+                            load_mode(mode);
+                        }
+                    }
                 }
 
                 // ---- 4. connections (asked for more than one): how fast each reply is with 1, 2, 4... at once ----

@@ -340,6 +340,16 @@ limited by RAM speed either way. The embedding table, looked up by row rather th
 - **Routing capture.** When asked, each layer's expert ranking (`argsort` of router probabilities) is marked
   as an output and read back after the step. This is what feeds the dashboard's expert map, and it will feed
   the hot-expert cache.
+- **VRAM kept free.** On Windows a GPU that runs out of memory quietly borrows system RAM through the driver, and
+  the work on it gets about 20 times slower (Qwen3.8 Flash-Next fell to 1.2-1.7 tok/s on an RTX 5090). So the
+  loader keeps VRAM free for the GPU's working memory: after loading, it reads how big the scheduler's compute
+  buffers really are, adds scratch for the GPU engine and the driver (1/32 of the card, 192 to 640 MB:
+  `TIERLM_VRAM_SCRATCH_MB`), and if that is more than it kept, loads once more with that much kept, remembering it
+  per model, context, batch and split kind next to the learned expert use (`<usage>.vram`). Up to 0.8.3 the scratch
+  was 640 MB on every card; on an RTX 3070 Laptop (8 GB) with Qwen3.6-35B-A3B, 400 MB kept in all (296 of it the
+  compute buffers) never used shared memory over a 1,500-token reply (the process's shared GPU memory stayed at
+  98 MB, the card still had 1 GB free) and fit 2,865 VRAM experts instead of 2,459 with 936 MB kept: 40.0 against
+  38.7 tok/s.
 
 ## Hot experts (adaptive tiering)
 
@@ -396,9 +406,20 @@ while the model runs:
   matter most.
 - **Swapping.** After each step, the best-scoring expert in RAM replaces the worst-scoring one in VRAM if it
   clearly beats it (more than 1.3x its score + 0.5). Without that margin, two experts of about equal use would
-  keep trading places. At most 2 swaps per layer and 32 MB of copying per step (`TIERLM_LIVE_PER_LAYER`,
-  `TIERLM_LIVE_MB`); each step starts at a different layer, so every layer gets its turn. The copy happens after the
-  step's work has finished and under the device lock, so no running graph is reading the slot.
+  keep trading places. At most 2 swaps per layer per step (`TIERLM_LIVE_PER_LAYER`); each step starts at a different
+  layer, so every layer gets its turn. The copy happens after the step's work has finished and under the device
+  lock, so no running graph is reading the slot. The copies are queued on the GPU with one wait at the end of the
+  step, not one per copy.
+- **How much to move.** Moving costs time on every word, so each step may spend about 8% of a step's time on it
+  (`TIERLM_LIVE_SHARE`), worked out from how long recent steps took and how fast recent moves went, at most 32 MB
+  (`TIERLM_LIVE_MB`); a prompt, being a long step, may move up to that limit. Up to 0.8.3 the limit was a flat 32 MB
+  per word, which on an RTX 3070 laptop spent a quarter of the time moving experts: on five subjects with
+  Qwen3.6-35B-A3B (300 tokens each, no speculative decoding) that ran at 28.1 tok/s, slower than the fixed set's
+  30.7. Measured budgets, in later runs on the same laptop: 4 MB per word 40.2 tok/s, 8 MB 40.5, 16 MB 38.4,
+  against 35.7-38.4 for the fixed set; then the share of the step's time: 5% 40.5, 8% 40.7, 12% 40.6, fixed set
+  38.0-38.4. On the RTX 5090 with Qwen3.8 Flash-Next (four subjects, 500 tokens each, two runs each): 8% of the
+  time 38.8 and 38.8 tok/s with 0.9-1.1 s of moving per reply, 0.8.3's 32 MB per word 35.6 and 39.2 with 1.3-1.8 s,
+  the fixed set 31.5 and 33.8.
 - **Same answers.** Each pick is still computed in whichever part holds it, so the result equals the unsplit
   model, whichever experts are in VRAM at the time. The tests run every MoE model (and Qwen3.5/Qwen3-Next with
   speculation and saved conversations) with `TIERLM_LIVE_EAGER=1`, which swaps at every chance, and compare with the
@@ -415,8 +436,10 @@ Measured with four questions on different subjects (C++ templates, black holes, 
 | RTX 3070 Laptop (8 GB), 32 GB DDR4-3200 | Qwen3.6-35B-A3B UD-Q3_K_XL (attention and the busiest experts in VRAM, the rest in RAM), 6 threads, 300 tokens each, five subjects | 25.7 tok/s; 28-48% | 32.2 tok/s; 58-76% |
 
 Moving the experts cost about 1.2 s per 500-token reply on the RTX 5090 and 1.3-2.9 s per 300-token reply on the
-laptop, which is why the fixed set can still win by a little on a subject it already suits (43.1 against 41.0 on
-black holes). **Find the fastest settings** measures both.
+laptop (0.8.3, before the budget became a share of each step's time, about 0.5 s on the laptop since), which is why
+the fixed set can still win by a little on a subject it already suits (43.1 against 41.0 on black holes on the
+5090). **Find the fastest settings** measures both, without letting its own test questions teach the fixed set,
+with replies of at least 160 tokens, and with speculative decoding on the runner-up when it was within 15%.
 
 This is our own design, inspired by the expert VRAM cache that landed in llama.cpp this autumn (`--moe-cache-mib`,
 off by default there). The difference: theirs starts empty and fills from what's picked. Ours starts from what

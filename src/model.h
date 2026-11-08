@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include "mapped_file.h"
 #include "ngram.h"
 #include <cstdint>
@@ -379,7 +380,10 @@ private:
     std::vector<LiveLayer> live_;
     mutable LiveStats live_stats_;
     void adapt_hot(const std::vector<int32_t>& routing, int n_tok);
-    std::vector<char> swap_buf_;                 // (adapt_hot: one expert on its way)
+    std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way)
+    double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
+    std::chrono::steady_clock::time_point live_last_{};
+    size_t live_credit_ = 0;                     // (adapt_hot: moving budget left unused by earlier steps)
     struct Layer {
         ggml_tensor *attn_norm = nullptr, *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
         ggml_tensor *bq = nullptr, *bk = nullptr, *bv = nullptr, *q_norm = nullptr, *k_norm = nullptr;

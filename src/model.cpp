@@ -79,7 +79,8 @@ std::string mtp_companion(const std::string& model_path) {
 std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& opt) {
     LoadOptions o = opt;
     // (per context, batch, connections and placement kind: the hot-expert split needs more than whole layers)
-    const std::string key = std::to_string(opt.max_ctx) + " " + std::to_string(opt.batch) + " " + std::to_string(opt.parallel) + " " +
+    // ("v2": 0.8.4 sizes the scratch to the card; a note from 0.8.3 held 640 MB of scratch on every card, so isn't read)
+    const std::string key = "v2 " + std::to_string(opt.max_ctx) + " " + std::to_string(opt.batch) + " " + std::to_string(opt.parallel) + " " +
                             opt.split_mode + (opt.expert_usage.empty() ? "" : "+hot") + (opt.live_hot ? "+live" : "") + " ";
     if (o.vram_reserve_mb <= 0 && !o.vram_note.empty()) {
         std::ifstream f(std::filesystem::u8path(o.vram_note));
@@ -88,7 +89,14 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     }
     auto m = load_once(path, o);
     const int used = m->place_.vram_reserve_mb;
-    const int runtime = []{ const char* e = std::getenv("TIERLM_VRAM_SCRATCH_MB"); return e ? std::atoi(e) : 640; }();
+    // Scratch beyond the measured compute buffers (the GPU engine's own scratch memory, the driver): a share of the
+    // card, 192 to 640 MB. Measured on an RTX 3070 Laptop (8 GB) with Qwen3.6-35B-A3B: 400 MB kept free in all (100
+    // of it scratch) never touched shared memory over a 1,500-token reply, with 1 GB of the card still free, and fit
+    // 2,865 VRAM experts instead of 2,459 with 936 MB kept (40.0 against 38.7 tok/s). 640 on a 20 GB+ card, as before.
+    size_t vram_total = 0;
+    if (!m->gpus_.empty()) { size_t fr = 0; ggml_backend_dev_memory(ggml_backend_get_device(m->gpus_[0]), &fr, &vram_total); }
+    const int runtime = [&]{ const char* e = std::getenv("TIERLM_VRAM_SCRATCH_MB");
+                             return e ? std::atoi(e) : std::clamp((int)(vram_total >> 20) / 32, 192, 640); }();
     const int need = (int)(m->place_.compute_gpu >> 20) + runtime;
     const bool tight = m->place_.compute_gpu > 0 && need > used + 64 && opt.vram_budget_mb <= 0 && !std::getenv("TIERLM_VRAM_BYTES");
     if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && need > o.vram_reserve_mb) {   // remember it (the most seen: no reload back and forth)
@@ -98,7 +106,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         std::filesystem::create_directories(std::filesystem::u8path(o.vram_note).parent_path(), ec);
         std::ofstream f(std::filesystem::u8path(o.vram_note), std::ios::trunc);
         for (const auto& l : keep) f << l << "\n";
-        f << key << std::max(need, 768) << "\n";
+        f << key << std::max(need, 512) << "\n";
     }
     if (!tight) return m;
     std::fprintf(stderr, "VRAM: this model needs %d MB free for the GPU's working memory and %d MB was kept; loading again "
@@ -577,7 +585,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             ggml_backend_dev_memory(ggml_backend_get_device(m->gpus_[d]), &free, &total);
             size_t avail = free;
             if (opt.vram_budget_mb > 0) avail = std::min(avail, (size_t)opt.vram_budget_mb << 20);
-            const size_t reserve = (size_t)(opt.vram_reserve_mb > 0 ? opt.vram_reserve_mb : 768) << 20;   // compute memory, scratch, driver
+            const size_t reserve = (size_t)(opt.vram_reserve_mb > 0 ? opt.vram_reserve_mb : 512) << 20;   // compute memory, scratch, driver (measured after: see load)
             m->place_.vram_reserve_mb = (int)(reserve >> 20);
             budgets[d] = avail > reserve ? avail - reserve : 0;
             if (!forced.empty()) budgets[d] = forced[std::min((size_t)d, forced.size() - 1)];
@@ -3273,9 +3281,27 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
 void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     const Hparams& hp = hp_;
     const int E = hp.n_expert, K = hp.n_expert_used, NL = hp.n_layer;
-    static const size_t budget_bytes = [] { const char* e = std::getenv("TIERLM_LIVE_MB"); return (size_t)(e ? std::atof(e) : 32.0) * 1024 * 1024; }();
-    static const int per_layer = [] { const char* e = std::getenv("TIERLM_LIVE_PER_LAYER"); return e ? std::max(0, std::atoi(e)) : 2; }();
+    // How much to move per step: a share of the step's own time (TIERLM_LIVE_SHARE, default 8%), from how long the
+    // last steps took and how fast moves went, at most TIERLM_LIVE_MB (default 32). Measured on an RTX 3070 laptop with
+    // Qwen3.6-35B-A3B over five subjects: a fixed 32 MB per word spent a quarter of the time moving experts and ran
+    // slower than not moving them at all (28.1 against 30.7 tok/s); 8 MB, about 8% of the time, was the fastest (33.1),
+    // 4 MB as fast (fewer moves, a lower VRAM share), 16 MB a little slower.
+    static const size_t cap_bytes = [] { const char* e = std::getenv("TIERLM_LIVE_MB"); return (size_t)((e ? std::atof(e) : 32.0) * 1024 * 1024); }();
+    static const double share = [] { const char* e = std::getenv("TIERLM_LIVE_SHARE"); return e ? std::atof(e) : 0.08; }();
     static const bool eager = std::getenv("TIERLM_LIVE_EAGER") != nullptr;   // tests: swap at every chance
+    const auto now0 = std::chrono::steady_clock::now();
+    const bool prompt = n_tok > 16;                                             // (a speculative check is a few tokens: a word's step)
+    if (!prompt && live_last_.time_since_epoch().count() != 0) {
+        const double step = std::chrono::duration<double, std::milli>(now0 - live_last_).count();
+        if (step > 0 && step < 5000) live_step_ms_ = live_step_ms_ > 0 ? 0.8 * live_step_ms_ + 0.2 * step : step;
+    }
+    // (what a step may spend adds up while unused, so a budget smaller than one expert still moves one now and then)
+    size_t allowance = (size_t)8 << 20;                                         // (until moves have been timed)
+    if (live_step_ms_ > 0 && live_ms_per_mb_ > 0) allowance = (size_t)(share * live_step_ms_ / live_ms_per_mb_ * 1024 * 1024);
+    size_t budget_bytes = std::min(cap_bytes, live_credit_ + allowance);
+    if (prompt || eager) budget_bytes = cap_bytes;                              // a prompt: a long step (tests: every chance)
+    static const int per_layer = [] { const char* e = std::getenv("TIERLM_LIVE_PER_LAYER"); return e ? std::max(0, std::atoi(e)) : 2; }();
+    static const float margin = [] { const char* e = std::getenv("TIERLM_LIVE_MARGIN"); return e ? (float)std::atof(e) : 1.3f; }();
     if ((int)routing.size() < n_tok * NL * K) return;
     // The RAM parts are kept in the file's layout in plain host memory (see the repack choice in load), so an expert
     // is one contiguous slice to copy. Anything else is never read back (a repacked buffer can't be).
@@ -3297,6 +3323,12 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     const auto t0 = std::chrono::steady_clock::now();
     size_t spent = 0;
     const int n = (int)live_.size();
+    // The copies go on the GPU's queue without waiting for each (one wait at the end): the incoming expert's bytes are
+    // staged first, since its RAM slot receives the outgoing one. (TIERLM_LIVE_SYNC=1: wait for each copy, as before.)
+    static const bool sync_each = std::getenv("TIERLM_LIVE_SYNC") != nullptr;
+    ggml_backend* gpu = sync_each || gpus_.empty() ? nullptr : gpus_[0];
+    swap_buf_.clear();
+    if (gpu && swap_buf_.capacity() < budget_bytes + ((size_t)64 << 20)) swap_buf_.reserve(budget_bytes + ((size_t)64 << 20));
     static int start = 0;
     start = n ? (start + 1) % n : 0;
     bool any = false;
@@ -3310,15 +3342,23 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
                 if (ll.slot_of[e] < 0) { if (in < 0 || ll.score[e] > ll.score[in]) in = e; }
                 else if (out < 0 || ll.score[e] < ll.score[out]) out = e;
             }
-            if (in < 0 || out < 0 || ll.score[in] <= (eager ? ll.score[out] : ll.score[out] * 1.3f + 0.5f)) break;
+            if (in < 0 || out < 0 || ll.score[in] <= (eager ? ll.score[out] : ll.score[out] * margin + 0.5f)) break;
             // Trade places: `in` from its RAM slot into out's VRAM slot, `out` back into that RAM slot.
             const int slot = ll.slot_of[out], cs = ll.cold_of[in];
             for (const LivePart& p : ll.parts) {
                 const size_t per = p.hot->nb[2];
                 char* ram = (char*)p.cold->data + (size_t)cs * per;
-                swap_buf_.assign(ram, ram + per);
-                ggml_backend_tensor_get(p.hot, ram, (size_t)slot * per, per);
-                ggml_backend_tensor_set(p.hot, swap_buf_.data(), (size_t)slot * per, per);
+                if (gpu && p.hot->buffer && ggml_backend_buffer_get_type(p.hot->buffer) == ggml_backend_get_default_buffer_type(gpu)) {
+                    if (swap_buf_.size() + per > swap_buf_.capacity()) { ggml_backend_synchronize(gpu); swap_buf_.clear(); }
+                    const size_t off = swap_buf_.size();
+                    swap_buf_.insert(swap_buf_.end(), ram, ram + per);          // (capacity reserved: never moves)
+                    ggml_backend_tensor_get_async(gpu, p.hot, ram, (size_t)slot * per, per);
+                    ggml_backend_tensor_set_async(gpu, p.hot, swap_buf_.data() + off, (size_t)slot * per, per);
+                } else {
+                    swap_buf_.assign(ram, ram + per);
+                    ggml_backend_tensor_get(p.hot, ram, (size_t)slot * per, per);
+                    ggml_backend_tensor_set(p.hot, swap_buf_.data(), (size_t)slot * per, per);
+                }
             }
             const int32_t h_in = slot, h_out = ll.H, c_in = E - ll.H, c_out = cs;
             const float m_in = 1.0f, m_out = 0.0f;
@@ -3340,7 +3380,16 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
             }
         }
     }
-    if (any) live_stats_.swap_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (any && gpu) ggml_backend_synchronize(gpu);                // the outgoing experts are in RAM before the CPU's next step
+    const auto t1 = std::chrono::steady_clock::now();
+    if (any) {
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        live_stats_.swap_ms += ms;
+        const double mb = spent / (1024.0 * 1024.0);
+        if (mb > 0) live_ms_per_mb_ = live_ms_per_mb_ > 0 ? 0.8 * live_ms_per_mb_ + 0.2 * (ms / mb) : ms / mb;
+    }
+    live_last_ = t1;
+    live_credit_ = prompt || eager ? 0 : budget_bytes - std::min(spent, budget_bytes);
 }
 
 }
