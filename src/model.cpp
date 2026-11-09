@@ -570,6 +570,12 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     ggml_backend_buffer_type_t cpu_buft = cpu_buffer_type();
     std::vector<ggml_backend_buffer_type_t> bufts(G);
     std::vector<size_t> budgets(G, 0);                     // VRAM each GPU can give to weights and the KV cache
+    // Integrated graphics (Intel Arc / Iris in a laptop, AMD Radeon in an APU) have no memory of their own: their
+    // "VRAM" is borrowed from system RAM, and the driver reports up to about half of RAM as available. Counting that
+    // as VRAM and then giving the rest of the model the same RAM again overcommitted memory (a laptop with Intel Arc
+    // graphics locked up). So an integrated GPU gets at most 40% of the RAM that's free, and what it takes comes off
+    // the RAM budget below.
+    size_t igpu_taken = 0;
     {
         std::vector<size_t> forced;                        // tests: TIERLM_VRAM_BYTES=n[,n...] per GPU
         if (const char* e = std::getenv("TIERLM_VRAM_BYTES")) {
@@ -586,11 +592,18 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(m->gpus_[d]), &free, &total);
             size_t avail = free;
+            const bool igpu = ggml_backend_dev_type(ggml_backend_get_device(m->gpus_[d])) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+            if (igpu) {
+                size_t fr = 0, tr = 0;
+                if (ggml_backend_dev_t cd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(cd, &fr, &tr);
+                if (fr) avail = std::min(avail, (size_t)(fr * 0.4));
+            }
             if (opt.vram_budget_mb > 0) avail = std::min(avail, (size_t)opt.vram_budget_mb << 20);
             const size_t reserve = (size_t)(opt.vram_reserve_mb > 0 ? opt.vram_reserve_mb : 512) << 20;   // compute memory, scratch, driver (measured after: see load)
             m->place_.vram_reserve_mb = (int)(reserve >> 20);
             budgets[d] = avail > reserve ? avail - reserve : 0;
             if (!forced.empty()) budgets[d] = forced[std::min((size_t)d, forced.size() - 1)];
+            if (igpu) igpu_taken += budgets[d] + reserve;
         }
     }
     size_t budget = G ? budgets[0] : 0;
@@ -809,6 +822,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         for (ggml_tensor* t : on_cpu) ram_need += ggml_backend_buft_get_alloc_size(cpu_buft, t);
         size_t free_ram = 0, total_ram = 0;
         if (ggml_backend_dev_t cd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(cd, &free_ram, &total_ram);
+        free_ram = free_ram > igpu_taken ? free_ram - igpu_taken : 0;   // what integrated graphics borrow is RAM too
         size_t ram_budget = 0;
         if (opt.ram_budget_mb > 0) ram_budget = (size_t)opt.ram_budget_mb << 20;
         else if (free_ram) {
