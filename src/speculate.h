@@ -27,6 +27,7 @@ struct SpecStats {
     int accepted = 0;      // guesses the model agreed with
     int looked = 0;        // of the guesses, those from prompt lookup
     int look_ok = 0;       // prompt-lookup guesses the model agreed with
+    double guess_s = 0, check_s = 0, catch_s = 0;   // time guessing, checking, and bringing the draft block up to date
 };
 
 class Speculator {

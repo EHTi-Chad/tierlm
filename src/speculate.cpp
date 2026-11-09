@@ -130,6 +130,8 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
         if (agree) { drafts = look; from_lookup = (int)look.size(); }
     }
     const int k = (int)drafts.size();
+    using sclk = std::chrono::steady_clock;
+    const auto t1 = sclk::now();
 
     // ---- 2. check all guesses in one pass ----
     std::vector<int32_t> batch(1, x);
@@ -148,6 +150,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     m_.accept(1 + m);                                 // x and the m accepted guesses stay; the rest are undone
     if (routing && !routing->empty()) routing->resize(routing->size() / (size_t)(k + 1) * (size_t)(1 + m));
 
+    const auto t2 = sclk::now();
     // ---- 4. bring the draft block up to date with what was kept ----
     if (m_.has_mtp()) {
         std::vector<float> hrows((size_t)(m + 1) * E);
@@ -158,6 +161,10 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     h_last_.assign(out.hidden.begin() + (size_t)m * E, out.hidden.begin() + (size_t)(m + 1) * E);
     h_pos_ = P + m;
     mtp_valid_ = P + m + 1;
+    const auto t3 = sclk::now();
+    st_.guess_s += std::chrono::duration<double>(t1 - t0).count();
+    st_.check_s += std::chrono::duration<double>(t2 - t1).count();
+    st_.catch_s += std::chrono::duration<double>(t3 - t2).count();
     st_.steps++; st_.drafted += k; st_.accepted += m;
     if (from_lookup > 0) {
         st_.looked += k; st_.look_ok += m;

@@ -457,8 +457,15 @@ private:
     void free_kv();
     // Scratch for building graphs, one per kind (one token; several tokens; the MTP draft block): the GPU keeps a
     // recorded replay (CUDA graph) per graph, found by where it was built, so each kind keeps its own.
-    std::vector<uint8_t> graph_mem_[3];
-    std::vector<uint8_t>& graph_mem(int kind) { return graph_mem_[kind]; }
+    // Each size of a few-token step (speculative checks, the draft block's steps) gets its own, too: the replay is
+    // kept only while the graph built there stays the same, and checks of different sizes take turns.
+    std::map<std::pair<int, int>, std::vector<uint8_t>> graph_mem_;
+    size_t graph_mem_size_ = 0;
+    std::vector<uint8_t>& graph_mem(int kind, int n_tok) {
+        std::vector<uint8_t>& v = graph_mem_[{kind, n_tok <= 16 ? n_tok : 0}];
+        if (v.size() < graph_mem_size_) v.resize(graph_mem_size_);
+        return v;
+    }
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
     ggml_tensor *ple_embd_ = nullptr;            // Flash-Next: the PLE n-gram table [ple_dim, rows]
     ggml_tensor *out_hc_norm_ = nullptr, *out_hc_down_ = nullptr, *out_hc_up_ = nullptr;   // the last stream mixer
@@ -484,7 +491,7 @@ private:
     std::unique_ptr<Layer> mtp_;                 // the MTP draft block, when loaded
     std::vector<bool> layer_kv_gpu_;             // per layer: KV cache in VRAM
     std::vector<int> layer_dev_;                 // per layer: the GPU (index into gpus_) holding its KV cache, or -1 for RAM
-    struct { int graphs = 0; double tokens = 0, prep = 0, compute = 0, out = 0; } prof_;   // TIERLM_PROFILE
+    struct { int graphs = 0; double tokens = 0, prep = 0, build = 0, alloc = 0, compute = 0, out = 0; } prof_;   // TIERLM_PROFILE
     // Attention covers the cache in steps of 256 positions (the extra ones are masked out), so the graph keeps the
     // same shapes from one token to the next and the GPU can replay it (CUDA graphs) instead of launching each op.
     int kv_span(int n) const { const int s = (n + 255) / 256 * 256; return s < max_ctx_ ? s : (n > max_ctx_ ? n : max_ctx_); }
@@ -502,7 +509,7 @@ private:
     Snapshot ckpt_;                                                // (see checkpoint)
     bool ckpt_ok_ = false;
     int n_threads_last_ = 0;                                       // (for the profile)
-    void profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms);
+    void profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms, double build_ms = 0, double alloc_ms = 0);
     bool pin_layers_ = false;                    // layer split: RAM layers must run entirely on the CPU
     std::string device_name_;
     int max_ctx_ = 0, n_past_ = 0;               // n_past_: conversation 0's tokens (seq_cells_[0].size())

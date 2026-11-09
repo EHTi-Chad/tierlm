@@ -667,6 +667,7 @@ struct Engine {
     std::mutex usage_mu;                // expert usage is learned from every reply, which may run at once
     std::unique_ptr<Speculator> spec;   // speculative decoding with the model's MTP draft block, when turned on
     int draft_max = 0;                  // most tokens the draft block guesses per check (0: 2 for MoE models, 3 for dense)
+    float draft_p_min = 0.0f;           // stop guessing once the draft block is less sure than this (0: always guess draft_max)
     // Prompt lookup (guesses copied from earlier in the conversation): most tokens guessed per check; -1 chooses
     // for the model and how it's placed, 0 turns it off. `look` does it alone when the draft block is off.
     int lookup = -1;
@@ -1382,7 +1383,7 @@ int main(int argc, char** argv) {
         // Each guess an MoE model checks pulls in its own experts, so shorter guesses pay off there
         // (Qwen3.6-35B-A3B, RTX 3070 laptop: 35 tok/s with 1 or 2, 28 with 3); dense models do best with 3.
         if (eng.draft_max <= 0) eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
-        if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max);
+        if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max, eng.draft_p_min);
         eng.spec_changed();
         // Its eyes: an mmproj (vision) file in the same folder, for models that read images (Qwen3.5 / 3.6).
         // (Not Flash-Next yet: its images aren't tested, so it runs text only and doesn't say it reads images.)
@@ -1981,7 +1982,7 @@ int main(int argc, char** argv) {
     //   on_prompt  once, after the conversation has been read
     //   on_token   for each piece of new text (with the experts each layer picked); return false to stop
     // `stops` are strings that end the reply (OpenAI's "stop"); text that might be the start of one is held back.
-    struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0, drafted = 0, accepted = 0, checks = 0, looked = 0, look_ok = 0; double prompt_s = 0, gen_s = 0;
+    struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0, drafted = 0, accepted = 0, checks = 0, looked = 0, look_ok = 0; double prompt_s = 0, gen_s = 0, guess_ms = 0, check_ms = 0, catch_ms = 0;
                  std::string stop = "length", text, full; };
     // The tool calls in a reply, in the model's own format.
     auto parse_calls = [&](const std::string& full, const agent::ojson& tools) {
@@ -2313,6 +2314,7 @@ int main(int argc, char** argv) {
             }
             const SpecStats& st = spx->stats();
             r.drafted = st.drafted; r.accepted = st.accepted; r.checks = st.steps; r.looked = st.looked; r.look_ok = st.look_ok;
+            r.guess_ms = st.guess_s * 1e3; r.check_ms = st.check_s * 1e3; r.catch_ms = st.catch_s * 1e3;
         }
         if (r.stop != "stop") r.full = harm ? raw : visible;
         if (r.stop != "stop" && r.stop != "abort") {                                  // release held-back text
@@ -2340,8 +2342,10 @@ int main(int argc, char** argv) {
         }
         if (r.checks > 0 && r.drafted > 0)
             std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s); speculative: %.1f tokens per check, %zu of %zu guesses kept"
-                         " (prompt lookup: %zu of %zu)\n", r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str(),
-                         (double)r.n_gen / r.checks, r.accepted, r.drafted, r.look_ok, r.looked);
+                         " (prompt lookup: %zu of %zu); per check: guessing %.1f ms, checking %.1f ms, draft block catching up %.1f ms\n",
+                         r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str(),
+                         (double)r.n_gen / r.checks, r.accepted, r.drafted, r.look_ok, r.looked,
+                         r.guess_ms / r.checks, r.check_ms / r.checks, r.catch_ms / r.checks);
         else
             std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s)\n", r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str());
         if (!vram_note.empty()) std::fprintf(stderr, "reply: %s\n", vram_note.c_str() + 2);
@@ -2552,7 +2556,7 @@ int main(int argc, char** argv) {
         };
         std::unique_ptr<Speculator> saved = std::move(eng.spec);
         const int saved_seed = eng.seed;
-        if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft);
+        if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft, eng.draft_p_min);
         eng.spec_changed();
         eng.seed = 4242;
         eng.learn = false;
@@ -2940,7 +2944,7 @@ int main(int argc, char** argv) {
                 // ---- the winner: keep it loaded and remember it ----
                 eng.draft_max = draft > 0 ? draft : 0;
                 eng.spec.reset();
-                if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft);
+                if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft, eng.draft_p_min);
                 else eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
                 eng.spec_changed();
                 eng.model->reset();
@@ -3038,6 +3042,7 @@ int main(int argc, char** argv) {
             res.set_content(dump({{"ok", true}, {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}}), "application/json; charset=utf-8");
             return;
         }
+        if (body.contains("draft_p_min") && body["draft_p_min"].is_number()) eng.draft_p_min = std::max(0.0f, std::min(1.0f, body["draft_p_min"].get<float>()));
         const bool on = body.value("speculative", eng.spec != nullptr);
         const int d = std::min(8, std::max(1, body.value("draft_max", eng.draft_max > 0 ? eng.draft_max : 2)));
         if (on && !eng.model->has_mtp()) {
@@ -3047,7 +3052,7 @@ int main(int argc, char** argv) {
         }
         eng.draft_max = d;
         eng.spec.reset();
-        if (on) eng.spec = std::make_unique<Speculator>(*eng.model, d);
+        if (on) eng.spec = std::make_unique<Speculator>(*eng.model, d, eng.draft_p_min);
         eng.spec_changed();
         eng.cached.clear();                                     // the draft block's cache starts over with the next reply
         eng.model->reset();

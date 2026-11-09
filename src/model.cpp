@@ -617,7 +617,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             if (layer >= nl_all) continue;                               // draft (MTP) blocks: only when speculating
             const std::string rest = name.substr(name.find('.', 4) + 1);
             if (by_layer) prio = 2;                                      // the whole layer moves together
-            else if (rest.find("_exps") != std::string::npos) prio = 4;
+            else if (rest.find("_exps") != std::string::npos)
+                // (the draft block's experts: TIERLM_MTP_VRAM=1 places them before the model's, so guessing runs
+                // wholly on the GPU)
+                prio = layer == hp.n_layer && std::getenv("TIERLM_MTP_VRAM") ? 3 : 4;
             else if (rest.compare(0, 9, "ffn_gate.") == 0 || rest.compare(0, 7, "ffn_up.") == 0 || rest.compare(0, 9, "ffn_down.") == 0) prio = 3;
             else own = true;
         } else { prio = 0; own = true; }
@@ -1534,7 +1537,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // (TIERLM_OVERLAP=2, for tests: the same graph, but each step still waits for the one before)
     { const char* e = std::getenv("TIERLM_OVERLAP"); m->overlap_ = !(e && !std::strcmp(e, "0")); }
     ggml_backend_sched_set_overlap(m->sched_, m->overlap_ && !(std::getenv("TIERLM_OVERLAP") && !std::strcmp(std::getenv("TIERLM_OVERLAP"), "2")));
-    for (auto& gm : m->graph_mem_) gm.resize(ggml_tensor_overhead() * m->graph_size_ + ggml_graph_overhead_custom(m->graph_size_, false));
+    m->graph_mem_size_ = ggml_tensor_overhead() * m->graph_size_ + ggml_graph_overhead_custom(m->graph_size_, false);
 
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
     // of the context), so it is not re-planned on every token.
@@ -2372,15 +2375,17 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
 // Only a description: the scheduler allocates its memory on the right device later.
 // TIERLM_PROFILE=1: every 64 graphs of up to 8 tokens (replies, not prompts), prints where the time per graph
 // went: preparing it, and per device the input copies and the work. Each split is waited for while this is on.
-void Model::profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms) {
+void Model::profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms, double build_ms, double alloc_ms) {
     if (n_tok > 8) { ggml_backend_sched_profile(nullptr, nullptr, nullptr, nullptr, nullptr, true); prof_ = {}; return; }
     prof_.graphs++; prof_.tokens += n_tok; prof_.prep += prep_ms; prof_.compute += compute_ms; prof_.out += out_ms;
+    prof_.build += build_ms; prof_.alloc += alloc_ms;
     if (prof_.graphs < 64) return;
     double copy[16], work[16]; int64_t splits[16], inputs[16], graphs = 0;
     ggml_backend_sched_profile(copy, work, splits, inputs, &graphs, true);
     const double n = (double)prof_.graphs;
-    std::fprintf(stderr, "profile: %d graphs, %.1f tokens each: %.2f ms each = prepare %.2f + compute %.2f + read out %.2f\n",
-                 prof_.graphs, prof_.tokens / n, (prof_.prep + prof_.compute + prof_.out) / n, prof_.prep / n, prof_.compute / n, prof_.out / n);
+    std::fprintf(stderr, "profile: %d graphs, %.1f tokens each: %.2f ms each = prepare %.2f (build %.2f, place %.2f) + compute %.2f + read out %.2f\n",
+                 prof_.graphs, prof_.tokens / n, (prof_.prep + prof_.compute + prof_.out) / n, prof_.prep / n, prof_.build / n,
+                 prof_.alloc / n, prof_.compute / n, prof_.out / n);
     std::vector<ggml_backend_t> bs(gpus_.begin(), gpus_.end());
     bs.push_back(cpu_);
     double accounted = 0;
@@ -2407,7 +2412,7 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
 
     drop_reuse();                                                  // (its memory is about to be built over)
     Graph g;
-    std::vector<uint8_t>& gm = graph_mem(n_tok == 1 ? 0 : 1);
+    std::vector<uint8_t>& gm = graph_mem(n_tok == 1 ? 0 : 1, n_tok);
     ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
     ggml_context* c = g.ctx = ggml_init(ip);
     g.gf = ggml_new_graph_custom(c, graph_size_, false);
@@ -2705,7 +2710,7 @@ Model::Graph Model::build_mtp(int n_tok, int n_past) {
     const Layer& L = *mtp_;
     const int n_kv = kv_span(n_past + n_tok);
     Graph g;
-    std::vector<uint8_t>& gm = graph_mem(2);
+    std::vector<uint8_t>& gm = graph_mem(2, n_tok);
     ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
     ggml_context* c = g.ctx = ggml_init(ip);
     g.gf = ggml_new_graph_custom(c, kGraphSize, false);
@@ -3262,9 +3267,44 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             return true;
         }, nullptr);
     }
+    // TIERLM_OPPROF=1 (developers): time per kind of step (op and device), each one waited for, so the totals are
+    // slower than a real run but show what grows with the number of tokens in a step. Printed every 32 steps of a size.
+    static const bool opprof = std::getenv("TIERLM_OPPROF") != nullptr;
+    struct OpProf { Model* m; clk::time_point last; std::map<std::string, double>* acc; };
+    static std::map<int, std::pair<int, std::map<std::string, double>>> opstats;
+    OpProf op_state{this, clk::now(), &opstats[n_tok].second};
+    if (opprof && !trace) {
+        ggml_backend_sched_set_eval_callback(sched_, [](ggml_tensor* t, bool ask, void* ud) -> bool {
+            const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+                              t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
+            if (ask) return !view;
+            auto* st = (OpProf*)ud;
+            const auto now = clk::now();
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(st->m->sched_, t);
+            std::string key = std::string(b ? ggml_backend_name(b) : "?") + " " + ggml_op_desc(t);
+            if (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT) key += std::string(" ") + ggml_type_name(t->src[0]->type);
+            (*st->acc)[key] += std::chrono::duration<double, std::milli>(now - st->last).count();
+            st->last = now;
+            return true;
+        }, &op_state);
+    }
     if (ggml_backend_sched_graph_compute(sched_, g.gf) != GGML_STATUS_SUCCESS) {
         if (reuse) drop_reuse(); else ggml_free(g.ctx);
         throw std::runtime_error("graph compute failed");
+    }
+    if (opprof && !trace) {
+        ggml_backend_sched_set_eval_callback(sched_, nullptr, nullptr);
+        auto& [cnt, acc] = opstats[n_tok];
+        if (++cnt == 32) {
+            std::vector<std::pair<double, std::string>> v;
+            double tot = 0;
+            for (auto& [k, ms] : acc) { v.push_back({ms / cnt, k}); tot += ms / cnt; }
+            std::sort(v.rbegin(), v.rend());
+            std::fprintf(stderr, "opprof: %d-token steps, %.2f ms each (each step waited for):", n_tok, tot);
+            for (size_t i = 0; i < v.size() && i < 14; ++i) std::fprintf(stderr, "%s %s %.2f", i ? "," : "", v[i].second.c_str(), v[i].first);
+            std::fprintf(stderr, "\n");
+            cnt = 0; acc.clear();
+        }
     }
     auto t4 = clk::now();
     EvalOut res;
@@ -3339,7 +3379,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             }
         }
     n_past_ = seq_past(0);
-    if (std::getenv("TIERLM_PROFILE")) profile_step(n_tok, ms(t0, t3), ms(t3, t4), ms(t4, t5));
+    if (std::getenv("TIERLM_PROFILE")) profile_step(n_tok, ms(t0, t3), ms(t3, t4), ms(t4, t5), ms(t0, t1), ms(t1, t2));
     return res;
 }
 
