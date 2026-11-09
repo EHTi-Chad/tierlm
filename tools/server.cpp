@@ -756,8 +756,6 @@ struct Engine {
     // each guessed token picks its own. So shorter there, longer when everything is in VRAM.
     int lookup_len() const {
         if (!model || lookup == 0) return 0;
-        // (Flash-Next: its n-gram convolution can't take back guessed tokens yet, so no guessing for it)
-        if (model->hparams().any_ple()) return 0;
         if (lookup > 0) return std::min(lookup, 16);
         if (model->hparams().is_moe() && model->placement().split()) return 4;
         if (model->hparams().hybrid) return 6;

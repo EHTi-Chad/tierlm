@@ -272,8 +272,8 @@ Each step (`src/speculate.cpp`):
    token is kept and the rest are undone (`Model::accept`): attention layers just forget the extra keys and
    values; DeltaNet layers, whose running memory can't be rewound, restore it from a per-token snapshot that
    ggml's `gated_delta_net` op keeps for exactly this, along with the convolution's last inputs. Flash-Next's
-   per-layer embedding keeps a short convolution of its own, rewound the same way (0.8.5: before that, a guess that
-   wasn't kept left its input in that convolution, so output with prompt lookup drifted from the model's own).
+   per-layer embedding keeps a short convolution of its own, rewound the same way (since 0.8.5; until then
+   Flash-Next didn't guess at all).
 4. **Catch up.** The draft layer re-reads the kept tokens with the model's real hidden states, so its own cache
    matches what the model saw.
 
