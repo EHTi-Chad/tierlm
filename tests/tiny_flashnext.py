@@ -174,5 +174,20 @@ for ci, (name, over) in enumerate(CASES.items()):
         passed = worst < tol and top
         ok &= passed
         print(f"{name:12s} {label:7s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {top}  ->  {'ok' if passed else 'FAIL'}")
+        # Speculative decoding (scripted guesses wrong at different depths, and prompt lookup): greedy output must not
+        # change, so undoing the guesses that weren't kept restores every running state (DeltaNet's, the PLE
+        # convolution's, the n-gram history, QSA's keys). The prompt is past the QSA budget in the qsa cases.
+        prompt = [str(x) for x in long_ids[:40]]
+        def gen(mode, extra=None):
+            r = subprocess.run([exe, path, mode, "50", *prompt], capture_output=True, text=True, env={**os.environ, **env, **(extra or {})})
+            if r.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
+            return r.stdout.split()
+        plain = gen("--gen")
+        checks = [gen("--gen-spec", {"TIERLM_DRAFT_N": n, "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k})
+                  for n, k in (("1", "1"), ("3", "3"), ("3", "5"), ("8", "2"), ("8", "7"))]
+        checks.append(gen("--gen-spec", {"TIERLM_LOOKUP": "8"}))
+        same = all(c == plain for c in checks)
+        ok &= same
+        print(f"{name:12s} {label:7s}: greedy output with speculation {'identical' if same else 'DIFFERENT'}  ->  {'ok' if same else 'FAIL'}")
     os.remove(path)
 sys.exit(0 if ok else 1)

@@ -120,8 +120,9 @@ conversation was (only the new message is read); regenerating the last reply goe
 an earlier message means reading the conversation again from the start.
 
 **Replies repeat themselves or go on forever**
-Raise **Repeat penalty** (next to Temperature) a little, for example to 1.15. Very small models loop more
-easily, especially on vague prompts.
+Raise **Repeat penalty** (next to Temperature) a little, for example to 1.15, or **Presence penalty** (just below
+it): Qwen suggests 1.5 for its models with thinking off. Very small models loop more easily, especially on vague
+prompts.
 
 ## Problems
 

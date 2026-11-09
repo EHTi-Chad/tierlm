@@ -843,6 +843,8 @@
         <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.7" class="full">
         <label class="lrow" for="rpen" title="Makes words used in the last 64 tokens less likely, so the model doesn't loop. 1.00 = off.">Repeat penalty <b id="rpenv">1.10</b></label>
         <input id="rpen" type="range" min="1" max="1.5" step="0.01" value="1.1" class="full">
+        <label class="lrow" for="ppen" title="Takes a fixed amount off every word used in the last 64 tokens, so the model moves on instead of repeating itself. Qwen suggests 1.5 for its models with thinking off. 0 = off.">Presence penalty <b id="ppenv">0.0</b></label>
+        <input id="ppen" type="range" min="0" max="2" step="0.1" value="0" class="full">
         <label class="lrow" for="maxtok" title="Longest reply. Thinking models (Qwen3.x) can use thousands of tokens before they answer.">Max reply <b id="maxv">No limit</b></label>
         <input id="maxtok" type="range" min="0" max="8" step="1" value="8" class="full">
         <div id="lspecrow" class="lrow2">
@@ -1429,7 +1431,7 @@ async function streamReply(useWs) {
       body: JSON.stringify({ messages: withSystem(history), temperature: +$("temp").value, max_tokens: maxTokens(), workspace: useWs,
         chat_id: chatFiles && curChat ? curChat.id : undefined, overflow: curChat?.autoArchive ? "archive" : undefined,
         image_tokens: +$("picdetail").value || undefined,
-        top_p: +$("topp").value, top_k: +$("topk").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value }),
+        top_p: +$("topp").value, top_k: +$("topk").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, presence_penalty: +$("ppen").value }),
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
     const reader = res.body.getReader(), dec = new TextDecoder();
@@ -2015,7 +2017,8 @@ function applySaved() {
   $("seed").value = s.seed ?? -1;
   $("topk").value = s.top_k ?? 40; $("topp").value = s.top_p ?? 0.9; $("minp").value = s.min_p ?? 0.05;
   if (s.repeat_penalty) $("rpen").value = s.repeat_penalty;
-  for (const id of ["topk", "topp", "minp", "rpen"]) $(id).oninput();
+  $("ppen").value = s.presence_penalty ?? 0;
+  for (const id of ["topk", "topp", "minp", "rpen", "ppen"]) $(id).oninput();
   $("forcecpu").checked = !!s.force_cpu;
   $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb / 1024).toFixed(1) : 0;
   // Settings saved before "Automatic" existed (no settings_v) had whole layers as the default: treat as Automatic.
@@ -2266,6 +2269,7 @@ $("topk").oninput = () => $("topkv").textContent = +$("topk").value || "off";
 $("topp").oninput = () => $("toppv").textContent = (+$("topp").value).toFixed(2);
 $("minp").oninput = () => $("minpv").textContent = (+$("minp").value).toFixed(2);
 $("rpen").oninput = () => $("rpenv").textContent = (+$("rpen").value).toFixed(2);
+$("ppen").oninput = () => $("ppenv").textContent = (+$("ppen").value).toFixed(1);
 $("setupbtn").onclick = () => { if (!busy) showSetup(); };
 // ---- live context length: the cache made again at another size, without loading the model again ----
 // The slider steps through common lengths up to the model's own; the number box takes any. Each change asks the
@@ -2375,7 +2379,7 @@ $("loadbtn").onclick = async () => {
 // The /api/load body for the settings on the setup screen.
 // The chat's sampling settings, so speed tests measure what a chat does.
 function samplingBody() {
-  return { temperature: +$("temp").value, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value };
+  return { temperature: +$("temp").value, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, presence_penalty: +$("ppen").value };
 }
 function loadBody(p) {
   const exp = +$("experts").value;
@@ -2383,7 +2387,7 @@ function loadBody(p) {
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value, lookup: +$("llook").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, multi_gpu: $("allgpus").checked, connections: +$("connsel").value || 1, min_tps: +$("mintps").value || 5, hot_experts: $("hotexp").checked || $("liveexp").checked, live_experts: $("liveexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, temperature: +$("temp").value };
+                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, multi_gpu: $("allgpus").checked, connections: +$("connsel").value || 1, min_tps: +$("mintps").value || 5, hot_experts: $("hotexp").checked || $("liveexp").checked, live_experts: $("liveexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, presence_penalty: +$("ppen").value, temperature: +$("temp").value };
   if ($("forcecpu").checked) body.device = "cpu";
   return body;
 }

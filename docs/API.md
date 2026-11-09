@@ -85,6 +85,7 @@ store and `search_query: ` for what you search with.
 | `stream` | `true` streams `chat.completion.chunk` events, ending with `data: [DONE]`. `stream_options: {"include_usage": true}` adds a final chunk with token counts. |
 | `max_tokens`, `max_completion_tokens` | Longest reply. Left out: no limit (until the model finishes or the context is full). |
 | `temperature`, `top_p`, `seed`, `stop` | As in OpenAI. `stop` is a string or a list of strings; the reply ends just before one. |
+| `presence_penalty`, `frequency_penalty` | As in OpenAI: taken off the logit of a token used in the last 64 tokens (`repeat_last_n`), once, or once per use. Off (0) unless given. Qwen suggests `presence_penalty: 1.5` for its models with thinking off. |
 | `top_k`, `min_p`, `repeat_penalty` | Extras, as in LM Studio and llama.cpp. `repeat_penalty` is off (1.0) unless given, because it harms code. |
 
 The reply includes `usage` (`prompt_tokens`, `completion_tokens`). `finish_reason` is `stop` (the model

@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
             for (int s = 0; s < K; ++s) for (float v : last[s]) std::printf("%.6g\n", v);
             return 0;
         } else if (mtp || mtp_step) {
-            const int n = (int)ids.size(), E = m->hparams().n_embd;
+            const int n = (int)ids.size(), E = m->hparams().hidden_width();
             std::vector<float> hid;
             for (int off = 0; off < n; off += m->batch()) {
                 const int k = std::min(m->batch(), n - off);

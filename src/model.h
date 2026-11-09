@@ -83,6 +83,9 @@ struct Hparams {
     // Qwen3.8 Flash-Next (qwen4exp): hyper-connections. The residual stream is hc copies of the width (4 x 2560),
     // mixed into one input for each block and added back to every copy with its own weight. hc = 0: one stream.
     int hc = 0;
+    // The width of the hidden state the MTP draft block reads: the final-norm state (n_embd), or with
+    // hyper-connections the hc copies before the last stream mixer (hc x n_embd).
+    int hidden_width() const { return hc ? hc * n_embd : n_embd; }
     // ...and its per-layer embedding (PLE) on some layers: each token's hashed 2- and 3-grams look up rows of one
     // big table (ple_dim numbers per row, ngram.heads() rows per token), gated by the streams and smoothed by a
     // dilated causal convolution (ple_kernel taps, ngram_size apart).
@@ -230,7 +233,7 @@ public:
     // ---- speculative decoding ----
     struct EvalOut {
         std::vector<float> logits;                // n_logits x n_vocab: predictions for the last n_logits positions
-        std::vector<float> hidden;                // n_tok x n_embd final-norm hidden states (if asked for)
+        std::vector<float> hidden;                // n_tok x hidden_width() hidden states (if asked for), for the MTP block
     };
     // Like eval, for one batch of up to batch() tokens, with more outputs. snapshots > 1 makes the batch undoable:
     // accept(n_keep) then keeps only its first n_keep tokens (snapshots must be at least the batch size).
@@ -344,6 +347,8 @@ private:
         int n_tok = 0;
         // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
+        // Per PLE layer (Flash-Next): the convolution's kept inputs as they were d tokens back, ple_rollback[layer][d]
+        std::map<int, std::vector<ggml_tensor*>> ple_rollback;
         std::vector<ggml_tensor*> orders;        // each layer's chosen experts (when routing is wanted)
         std::vector<int> order_layers;           // the layer each of orders belongs to
         ggml_tensor* routing = nullptr;          // all of them joined: [n_used, n_tok * n_layer], one read
@@ -430,6 +435,7 @@ private:
         ggml_tensor *conv_state = nullptr;       // [ssm_conv - 1, conv_dim]: the last few inputs
         // MTP draft block only
         ggml_tensor *eh_proj = nullptr, *enorm = nullptr, *hnorm = nullptr, *mtp_embd = nullptr, *head_norm = nullptr, *head = nullptr;
+        ggml_tensor *hc_head_norm = nullptr, *hc_head_down = nullptr, *hc_head_up = nullptr;   // (Flash-Next's draft block: its own last mixer)
         ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
         std::vector<ggml_tensor*> conv_states, ssm_states;   // per conversation ([0]: conv_state, ssm_state_t)
     };

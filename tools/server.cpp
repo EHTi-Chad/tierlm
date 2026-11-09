@@ -17,7 +17,8 @@
 //                       "vram_limit_mb": 0, "split_mode": "auto|layers|experts"}
 //   POST /api/unload   frees the model
 //   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "top_k":40,
-//                     "min_p":0.05, "repeat_penalty":1.1, "repeat_last_n":64, "max_tokens":-1}
+//                     "min_p":0.05, "repeat_penalty":1.1, "repeat_last_n":64, "presence_penalty":0,
+//                     "frequency_penalty":0, "max_tokens":-1}
 //                     streams Server-Sent Events: one "prompt" event, a "token" event per token
 //                     (with the experts picked in every layer), then "done"
 //   POST /api/reset   clears the KV cache
@@ -273,22 +274,35 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
 // Sampling settings, as in LM Studio / llama.cpp.
 struct Sampling {
     float temperature = 0.7f, top_p = 0.9f, min_p = 0.05f, repeat_penalty = 1.1f;
+    float presence_penalty = 0.0f, frequency_penalty = 0.0f;   // OpenAI's: subtracted from a used token's logit
     int top_k = 40, repeat_last_n = 64;
 };
 
-// Repetition penalty, then temperature with top-k, top-p (nucleus) and min-p filtering.
+// Penalties for tokens already used, then temperature with top-k, top-p (nucleus) and min-p filtering. All three
+// penalties look at the last repeat_last_n tokens, as llama.cpp and LM Studio do: the repetition penalty divides a
+// used token's logit (multiplies a negative one), then the presence penalty is taken off once and the frequency
+// penalty once per use (Qwen recommends presence 1.5 for its instruct mode, to stop it repeating itself).
 // temperature <= 0 means always take the most likely token (after the penalty).
 // Only the top-k candidates matter, so one pass over the vocabulary keeps the best ones in a small heap, without
 // copying the logits or computing every probability (gpt-oss has 201,088 tokens: that pass is most of the cost).
 int32_t sample(const float* lg, size_t nv, const Sampling& s, const std::vector<int32_t>& recent, std::mt19937& rng) {
     // Tokens used in the last repeat_last_n positions, with their penalised logits (each token once).
     std::vector<std::pair<int32_t, float>> pen;
-    if (s.repeat_penalty > 0.0f && s.repeat_penalty != 1.0f) {
+    const bool rep = s.repeat_penalty > 0.0f && s.repeat_penalty != 1.0f;
+    if (rep || s.presence_penalty != 0.0f || s.frequency_penalty != 0.0f) {
         const size_t n = std::min<size_t>(recent.size(), (size_t)std::max(0, s.repeat_last_n));
+        std::vector<std::pair<int32_t, int>> used;                 // each token once, with how often it was used
         for (size_t i = recent.size() - n; i < recent.size(); ++i) {
             const int32_t t = recent[i];
-            if (t < 0 || (size_t)t >= nv || std::any_of(pen.begin(), pen.end(), [t](auto& q) { return q.first == t; })) continue;
-            pen.push_back({t, lg[t] > 0 ? lg[t] / s.repeat_penalty : lg[t] * s.repeat_penalty});
+            if (t < 0 || (size_t)t >= nv) continue;
+            auto it = std::find_if(used.begin(), used.end(), [t](auto& q) { return q.first == t; });
+            if (it != used.end()) ++it->second; else used.push_back({t, 1});
+        }
+        for (const auto& [t, cnt] : used) {
+            float v = lg[t];
+            if (rep) v = v > 0 ? v / s.repeat_penalty : v * s.repeat_penalty;
+            v -= s.presence_penalty + s.frequency_penalty * (float)cnt;
+            pen.push_back({t, v});
         }
     }
     const bool greedy = s.temperature <= 0.0f;
@@ -845,8 +859,10 @@ json describe_model(const std::string& path, bool header_only = false) {
     int64_t kv_layers = layers;
     // A multi-token-prediction (MTP) draft block, in the file or in a separate "mtp-" file next to it, makes
     // speculative decoding possible. A file that holds only a draft block is an add-on, not a model.
-    const bool mtp_arch = arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next";
-    const bool draft_only = u32(arch + ".nextn_predict_layers") > 0 && gguf_find_tensor(g, "blk.0.attn_norm.weight") < 0;
+    const bool mtp_arch = arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp";
+    bool has_layer0 = false;                             // any layer-0 tensor (Flash-Next's layers have no attn_norm)
+    for (int64_t k = 0; k < gguf_get_n_tensors(g) && !has_layer0; ++k) has_layer0 = std::strncmp(gguf_get_tensor_name(g, k), "blk.0.", 6) == 0;
+    const bool draft_only = u32(arch + ".nextn_predict_layers") > 0 && !has_layer0;
     if (draft_only) {
         j["kind"] = "draft";
         j["reason"] = "Draft add-on (MTP) that speeds up its model with speculative decoding; not a model on its own";
@@ -2407,6 +2423,8 @@ int main(int argc, char** argv) {
                 sp.top_k = body.value("top_k", sp.top_k);
                 sp.min_p = body.value("min_p", sp.min_p);
                 sp.repeat_penalty = body.value("repeat_penalty", sp.repeat_penalty);
+                sp.presence_penalty = body.value("presence_penalty", sp.presence_penalty);
+                sp.frequency_penalty = body.value("frequency_penalty", sp.frequency_penalty);
                 sp.repeat_last_n = body.value("repeat_last_n", sp.repeat_last_n);
                 // Longest reply in tokens; 0 or less (the default) means no limit: the reply ends when the model
                 // finishes or the context window is full. Thinking models (Qwen3.x) need thousands of tokens.
@@ -2571,6 +2589,8 @@ int main(int argc, char** argv) {
         sp.top_k = b.value("top_k", sp.top_k);
         sp.min_p = b.value("min_p", sp.min_p);
         sp.repeat_penalty = b.value("repeat_penalty", sp.repeat_penalty);
+        sp.presence_penalty = b.value("presence_penalty", sp.presence_penalty);
+        sp.frequency_penalty = b.value("frequency_penalty", sp.frequency_penalty);
         return sp;
     };
     // Prompt reading speed (tokens/second): about n tokens of text read in one go, as a long prompt would be.
@@ -3271,6 +3291,8 @@ int main(int argc, char** argv) {
         sp.top_k = body.value("top_k", sp.top_k);
         sp.min_p = body.value("min_p", sp.min_p);
         sp.repeat_penalty = body.value("repeat_penalty", 1.0f);   // off unless asked: it harms code, where repeats are normal
+        sp.presence_penalty = body.value("presence_penalty", sp.presence_penalty);
+        sp.frequency_penalty = body.value("frequency_penalty", sp.frequency_penalty);
         sp.repeat_last_n = body.value("repeat_last_n", sp.repeat_last_n);
         int max_tokens = -1;
         if (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()) max_tokens = body["max_completion_tokens"].get<int>();

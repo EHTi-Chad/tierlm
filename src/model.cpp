@@ -53,7 +53,8 @@ std::string mtp_companion(const std::string& model_path) {
         auto u = [&](const std::string& k) { int64_t id = gguf_find_key(g, k.c_str()); return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g, id) : 0u; };
         arch = s("general.architecture");
         embd = u(arch + ".embedding_length"); nextn = u(arch + ".nextn_predict_layers"); blocks = u(arch + ".block_count");
-        has_layer0 = gguf_find_tensor(g, "blk.0.attn_norm.weight") >= 0;
+        has_layer0 = false;                              // any layer-0 tensor (Flash-Next's layers have no attn_norm)
+        for (int64_t k = 0; k < gguf_get_n_tensors(g) && !has_layer0; ++k) has_layer0 = std::strncmp(gguf_get_tensor_name(g, k), "blk.0.", 6) == 0;
         gguf_free(g);
         return true;
     };
@@ -1472,6 +1473,15 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         L.mtp_embd  = T(b + "nextn.embed_tokens.weight", false);     // usually shared with the model
         L.head_norm = T(b + "nextn.shared_head_norm.weight", false);
         L.head      = T(b + "nextn.shared_head_head.weight", false);
+        if (hp.hc) {
+            // Flash-Next: the draft block ends in its own stream mixer (the model's last mixer stands in for the final
+            // norm, so the block has one too). Its attention runs without the QSA indexer: the same as with it within
+            // the token budget; past it, the draft block attends to everything (a guess, checked anyway).
+            L.hc_head_norm = T(b + "nextn.hc_head_norm.weight");
+            L.hc_head_down = T(b + "nextn.hc_head_down.weight");
+            L.hc_head_up   = T(b + "nextn.hc_head_up.weight");
+            L.idx_q = L.idx_k = L.idx_q_norm = L.idx_k_norm = nullptr;
+        }
         m->mtp_ = std::make_unique<Layer>(L);
     }
 
@@ -2498,6 +2508,16 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
             ggml_tensor* cur = n == n_tok ? gvn : ggml_view_2d(c, gvn, C, n, gvn->nb[1], (size_t)t0 * gvn->nb[1]);
             ggml_tensor* xc = ggml_concat(c, st, cur, 1);                                    // [C, SL + n]
             ggml_build_forward_expand(g.gf, ggml_cpy(c, ggml_view_2d(c, xc, C, SL, xc->nb[1], (size_t)n * xc->nb[1]), st));
+            if (snapshots > 1) {
+                // For dropping the last d tokens: the inputs kept as they were before them (as DeltaNet's rollback).
+                auto& rb = g.ple_rollback[(int)(&L - layers_.data())];
+                rb.assign(std::min(snapshots, n), nullptr);
+                for (int d = 1; d < (int)rb.size(); ++d) {
+                    rb[d] = ggml_cont(c, ggml_view_2d(c, xc, C, SL, xc->nb[1], (size_t)(n - d) * xc->nb[1]));
+                    ggml_set_output(rb[d]);
+                    ggml_build_forward_expand(g.gf, rb[d]);
+                }
+            }
             ggml_tensor* sum = nullptr;
             for (int k = 0; k < K; ++k) {
                 ggml_tensor* tap = ggml_mul(c, ggml_view_2d(c, xc, C, n, xc->nb[1], (size_t)k * DIL * xc->nb[1]), w[k]);
@@ -2653,10 +2673,13 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
         g.routing = r;
     }
 
+    if (want_hidden && HC) {                                                // [HC * E, n_tok]: the copies, for the MTP block
+        g.hidden = ggml_cont(c, x); ggml_set_output(g.hidden); ggml_build_forward_expand(g.gf, g.hidden);
+    }
     x = HC ? ggml_cont(c, hc_mix(x, out_hc_norm_, out_hc_down_, out_hc_up_, nullptr, nullptr))   // the last mixer
            : ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), out_norm_);
     tr(x, "final", -1);
-    if (want_hidden) { g.hidden = x; ggml_set_output(x); }                  // [n_embd, n_tok]: what the MTP head reads
+    if (want_hidden && !HC) { g.hidden = x; ggml_set_output(x); }          // [n_embd, n_tok]: what the MTP head reads
     ggml_tensor* last;
     if (groups) {                                                           // several conversations: each one's last token
         g.out_idx = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t)grp.size());
@@ -2689,8 +2712,55 @@ Model::Graph Model::build_mtp(int n_tok, int n_past) {
     g.n_tok = n_tok;
     g.inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);  ggml_set_input(g.inp);
     g.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);  ggml_set_input(g.pos);
-    g.h_in = ggml_new_tensor_2d(c, GGML_TYPE_F32, hp.n_embd, n_tok);  ggml_set_input(g.h_in);
+    g.h_in = ggml_new_tensor_2d(c, GGML_TYPE_F32, hp.hidden_width(), n_tok);  ggml_set_input(g.h_in);
     if (flash_attn_) { g.mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok); ggml_set_input(g.mask); }
+    if (hp.hc) {
+        // Flash-Next: the model's hc copies (before its last mixer) are normed one by one; each copy, beside the
+        // normed embedding, goes through eh_proj, which gives the block's own hc copies. Then one full-attention
+        // block with its stream mixers, as in the model, and the block's own last mixer before the output head.
+        // Its copies stand in for the model's, to draft further ahead.
+        const int HC = hp.hc, E = hp.n_embd;
+        auto gnorm = [&](ggml_tensor* t, ggml_tensor* w) {                  // RMS norm over each copy, times w
+            ggml_tensor* r = ggml_rms_norm(c, ggml_reshape_3d(c, t, E, HC, n_tok), hp.rms_eps);
+            return ggml_mul(c, ggml_reshape_2d(c, r, (int64_t)E * HC, n_tok), w);
+        };
+        auto mix = [&](ggml_tensor* X, ggml_tensor* nw, ggml_tensor* down, ggml_tensor* up, ggml_tensor* injw, ggml_tensor** inj) {
+            ggml_tensor* xn = gnorm(X, nw);
+            ggml_tensor* mw = ggml_sigmoid(c, ggml_mul_mat(c, up, ggml_silu(c, ggml_scale(c, ggml_mul_mat(c, down, xn), 1.0f / HC))));
+            ggml_tensor* p = ggml_mul(c, mw, xn);
+            ggml_tensor* s = nullptr;
+            for (int k = 0; k < HC; ++k) {
+                ggml_tensor* v = ggml_view_2d(c, p, E, n_tok, p->nb[1], (size_t)k * E * ggml_element_size(p));
+                s = s ? ggml_add(c, s, v) : v;
+            }
+            s = ggml_scale(c, s, 1.0f / HC);
+            if (inj) *inj = ggml_scale(c, ggml_sigmoid(c, ggml_scale(c, ggml_mul_mat(c, injw, xn), 1.0f / HC)), 2.0f);
+            return s;
+        };
+        auto add = [&](ggml_tensor* X, ggml_tensor* y, ggml_tensor* inj) {
+            ggml_tensor* y3 = ggml_reshape_3d(c, ggml_cont(c, y), E, 1, n_tok);
+            ggml_tensor* r = ggml_mul(c, ggml_repeat_4d(c, y3, E, HC, n_tok, 1), ggml_reshape_3d(c, inj, 1, HC, n_tok));
+            return ggml_add(c, X, ggml_reshape_2d(c, r, (int64_t)E * HC, n_tok));
+        };
+        ggml_tensor* e = ggml_get_rows(c, L.mtp_embd ? L.mtp_embd : tok_embd_, g.inp);
+        e = ggml_mul(c, ggml_rms_norm(c, e, hp.rms_eps), L.enorm);                                   // [E, n_tok]
+        ggml_tensor* e3 = ggml_repeat_4d(c, ggml_reshape_3d(c, e, E, 1, n_tok), E, HC, n_tok, 1);   // [E, HC, n_tok]
+        ggml_tensor* hn = ggml_reshape_3d(c, gnorm(g.h_in, L.hnorm), E, HC, n_tok);
+        ggml_tensor* x = ggml_mul_mat(c, L.eh_proj, ggml_concat(c, e3, hn, 0));                      // [E, HC, n_tok]
+        x = ggml_reshape_2d(c, x, (int64_t)E * HC, n_tok);
+        ggml_tensor* inj = nullptr;
+        ggml_tensor* h = mix(x, L.hc_a_norm, L.hc_a_down, L.hc_a_up, L.hc_a_inj, &inj);
+        x = add(x, attn_block(c, g, L, h, n_tok, n_past), inj);
+        h = mix(x, L.hc_f_norm, L.hc_f_down, L.hc_f_up, L.hc_f_inj, &inj);
+        x = add(x, ffn_block(c, g, L, h, n_tok, false), inj);
+        g.hidden = ggml_cont(c, x); ggml_set_output(g.hidden); ggml_build_forward_expand(g.gf, g.hidden);   // [HC * E, n_tok]
+        ggml_tensor* o = ggml_cont(c, mix(x, L.hc_head_norm, L.hc_head_down, L.hc_head_up, nullptr, nullptr));   // [E, n_tok]
+        ggml_tensor* last = ggml_view_2d(c, o, E, 1, o->nb[1], (size_t)(n_tok - 1) * o->nb[1]);
+        g.logits = ggml_mul_mat(c, L.head ? L.head : output_, last);
+        ggml_set_output(g.logits);
+        ggml_build_forward_expand(g.gf, g.logits);
+        return g;
+    }
 
     ggml_tensor* e = ggml_get_rows(c, L.mtp_embd ? L.mtp_embd : tok_embd_, g.inp);
     e = ggml_mul(c, ggml_rms_norm(c, e, hp.rms_eps), L.enorm);
@@ -2723,7 +2793,7 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     for (int i = 0; i < n_tok; ++i) positions[i] = pos0 + i;
     ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
     ggml_backend_tensor_set(g.pos, positions.data(), 0, sizeof(int32_t) * n_tok);
-    ggml_backend_tensor_set(g.h_in, h, 0, sizeof(float) * (size_t)hp.n_embd * n_tok);
+    ggml_backend_tensor_set(g.h_in, h, 0, sizeof(float) * (size_t)hp.hidden_width() * n_tok);
     if (g.mask) {
         const int n_kv = kv_span(pos0 + n_tok);                    // padded columns are future: -inf
         const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
@@ -2737,7 +2807,7 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     std::vector<float> out(hp.n_vocab);
     ggml_backend_tensor_get(g.logits, out.data(), 0, sizeof(float) * hp.n_vocab);
     if (h_out) {
-        h_out->resize((size_t)hp.n_embd * n_tok);
+        h_out->resize((size_t)hp.hidden_width() * n_tok);
         ggml_backend_tensor_get(g.hidden, h_out->data(), 0, sizeof(float) * h_out->size());
     }
     ggml_free(g.ctx);
@@ -2927,6 +2997,10 @@ void Model::accept(int n_keep) {
             Layer& L = layers_[li];
             ggml_backend_tensor_copy(rb[d].first, L.ssm_state_t);
             ggml_backend_tensor_copy(rb[d].second, L.conv_state);
+        }
+        for (auto& [li, rb] : g.ple_rollback) {                   // Flash-Next's PLE convolutions: their kept inputs too
+            if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
+            ggml_backend_tensor_copy(rb[d], layers_[li].ple_states[0]);
         }
     }
     release_pending();
@@ -3197,7 +3271,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     res.logits.resize((size_t)hp.n_vocab * g.logits->ne[1]);
     ggml_backend_tensor_get(g.logits, res.logits.data(), 0, sizeof(float) * res.logits.size());
     if (g.hidden) {
-        res.hidden.resize((size_t)hp.n_embd * n_tok);
+        res.hidden.resize((size_t)hp.hidden_width() * n_tok);
         ggml_backend_tensor_get(g.hidden, res.hidden.data(), 0, sizeof(float) * res.hidden.size());
     }
     if (routing) {

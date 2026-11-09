@@ -85,7 +85,7 @@ decoding helps most.
   picks; dense models are split by whole layers, each RAM layer kept wholly on the CPU so a token changes device once.
 - **Hot experts**: tierlm learns which experts each model actually uses as you chat and can keep exactly those in
   VRAM; optionally they **follow the conversation**, a few swapped in per word.
-- **Speculative decoding**: the model's own draft layer (MTP, in Qwen3.5 / 3.6 / 3.8 and Qwen3-Next) guesses ahead
+- **Speculative decoding**: the model's own draft layer (MTP, in Qwen3.5 / 3.6 / 3.8, Qwen3-Next and Qwen3.8 Flash-Next) guesses ahead
   and the model checks several guesses in one pass; **prompt lookup** guesses text the reply repeats (code, edits)
   for every model. Same answers, more tokens per read of the weights.
 - **CUDA graphs** on NVIDIA (each token's GPU work replayed with one launch: about 50% faster on a laptop RTX 3070),

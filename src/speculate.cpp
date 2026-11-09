@@ -9,7 +9,7 @@ Speculator::Speculator(Model& m, int n_draft, float p_min) : m_(m), n_draft_(std
 
 std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_threads, std::vector<int32_t>* routing) {
     if (routing) routing->clear();
-    const int E = m_.hparams().n_embd, end = (int)toks.size();
+    const int E = m_.hparams().hidden_width(), end = (int)toks.size();
     if (end == 0) return {};
     const int n0 = m_.n_past();                       // tokens [0, n0) are in the cache and unchanged
     if (m_.has_mtp() && n0 > 0 && h_pos_ != n0 - 1 && ck_.h_pos == n0 - 1 && !ck_.h_last.empty()) {
@@ -80,7 +80,7 @@ std::vector<int32_t> Speculator::lookup_guesses(const std::vector<int32_t>& ctx,
 
 std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop,
                                       std::vector<int32_t>* routing) {
-    const int P = m_.n_past(), E = m_.hparams().n_embd, V = m_.hparams().n_vocab;
+    const int P = m_.n_past(), E = m_.hparams().hidden_width(), V = m_.hparams().n_vocab;
     const int room = m_.max_ctx() - P - 1;            // positions left after x
     const int n_max = std::max(0, std::min(n_draft_, room));
     const auto t0 = std::chrono::steady_clock::now();

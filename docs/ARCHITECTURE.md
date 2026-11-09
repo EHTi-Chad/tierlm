@@ -256,6 +256,10 @@ When a model doesn't fit in VRAM, generating a token is limited by how fast its 
 out of each read. Qwen3.5 / 3.6 / 3.8 and Qwen3-Next ship a small **MTP draft layer** (multi-token prediction):
 one full-attention block that takes the token just chosen and the model's last hidden state, and predicts the
 next token. Unsloth publishes it as a separate `mtp-<model>.gguf`; tierlm loads it from either place.
+Qwen3.8 Flash-Next's draft block works on its hyper-connection copies: it reads the model's copies before the last
+stream mixer (`hidden_width()` = copies x width), puts each one beside the token's embedding through `eh_proj`, runs
+one full-attention MoE block with its stream mixers, and mixes the copies back with its own last mixer
+(`nextn.hc_head_*`). Unsloth's "shared" file leaves out the token table and uses the model's.
 
 Each step (`src/speculate.cpp`):
 
@@ -267,7 +271,9 @@ Each step (`src/speculate.cpp`):
    settings; while it equals the guess, the next position is checked too. At the first difference the model's
    token is kept and the rest are undone (`Model::accept`): attention layers just forget the extra keys and
    values; DeltaNet layers, whose running memory can't be rewound, restore it from a per-token snapshot that
-   ggml's `gated_delta_net` op keeps for exactly this, along with the convolution's last inputs.
+   ggml's `gated_delta_net` op keeps for exactly this, along with the convolution's last inputs. Flash-Next's
+   per-layer embedding keeps a short convolution of its own, rewound the same way (0.8.5: before that, a guess that
+   wasn't kept left its input in that convolution, so output with prompt lookup drifted from the model's own).
 4. **Catch up.** The draft layer re-reads the kept tokens with the model's real hidden states, so its own cache
    matches what the model saw.
 
@@ -560,6 +566,6 @@ There is no llama.cpp to compare against, so every piece is checked against an i
    while the CPU finishes the last one's RAM experts.
 3. **Cheaper expert moves** for the experts that follow the conversation: copies on their own GPU stream, overlapped
    with the next step.
-4. **MTP drafting for Flash-Next** (Unsloth's separate MTP file) and faster CPU expert multiplies.
+4. **Faster CPU expert multiplies.**
 5. **Usage-based precision** (rarely used experts stored at lower precision) and **expert-aware speculation**.
 6. **More families**: Gemma 4, Phi, DeepSeek V4 and more real-model tests.
