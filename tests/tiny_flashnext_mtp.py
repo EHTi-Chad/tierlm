@@ -194,4 +194,38 @@ for ci, (name, over) in enumerate(CASES.items()):
     ok &= same
     print(f"{name:12s} {'file':7s}: separate mtp- draft file {'found, same results' if same else 'NOT the same'}  ->  {'ok' if same else 'FAIL'}")
     os.remove(path)
+
+# Speculative sampling (temperature > 0): guesses drawn from the draft block's probabilities and kept by the ratio of
+# the model's to the draft block's must leave the replies' odds exactly as the model's own. On a 16-token vocabulary
+# (so the guesses are often kept: about 40%), many 3-token replies are drawn with and without guessing and compared
+# with a chi-square test, token by token, in pairs and whole (z within 4: a real error shows up far beyond that).
+from collections import Counter
+cfg, m, mtp = build(dict(vocab_size=16), 60)
+path = write(cfg, m, mtp)
+env = {**os.environ, "TIERLM_DEVICE": "cpu", "TIERLM_SAMPLE_RUNS": "8000", "TIERLM_SAMPLE_TOPK": "16", "TIERLM_SAMPLE_TEMP": "1"}
+runs = {}
+for mode in ("--gen", "--gen-spec"):
+    r = subprocess.run([exe, path, mode, "3", "5", "9", "13"], capture_output=True, text=True, env=env)
+    if r.returncode != 0: sys.exit(f"sampling: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
+    runs[mode] = [tuple(l.split(",")) for l in r.stdout.split()]
+def z_of(a, b):
+    ca, cb = Counter(a), Counter(b)
+    na, nb = len(a), len(b)
+    chi, df, rest = 0.0, -1, [0, 0]
+    for k in set(ca) | set(cb):
+        x, y = ca[k], cb[k]
+        if x + y < 10: rest[0] += x; rest[1] += y; continue
+        ex, ey = (x + y) * na / (na + nb), (x + y) * nb / (na + nb)
+        chi += (x - ex) ** 2 / ex + (y - ey) ** 2 / ey; df += 1
+    if sum(rest):
+        x, y = rest; ex, ey = (x + y) * na / (na + nb), (x + y) * nb / (na + nb)
+        chi += (x - ex) ** 2 / ex + (y - ey) ** 2 / ey; df += 1
+    return (chi - df) / (2 * df) ** 0.5 if df > 0 else 0.0
+P, Q = runs["--gen"], runs["--gen-spec"]
+zs = [z_of([t[i] for t in P], [t[i] for t in Q]) for i in range(3)]
+zs += [z_of([t[:2] for t in P], [t[:2] for t in Q]), z_of([t[1:] for t in P], [t[1:] for t in Q]), z_of(P, Q)]
+passed = all(abs(z) < 4 for z in zs)
+ok &= passed
+print(f"{'sampling':12s} {'exact':7s}: replies' odds with speculative sampling, z = {', '.join(f'{z:.1f}' for z in zs)} (limit 4)  ->  {'ok' if passed else 'FAIL'}")
+os.remove(path)
 sys.exit(0 if ok else 1)

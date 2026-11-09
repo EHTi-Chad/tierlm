@@ -2314,9 +2314,9 @@ int main(int argc, char** argv) {
             };
             // Sampling: speculative sampling (guesses drawn from the draft block's own probabilities, kept by the
             // ratio of the model's to the draft block's); the reply follows the model's distribution exactly either
-            // way, but far more guesses are kept. Off until its test passes: TIERLM_SPEC_SAMPLING=1 turns it on
-            // (otherwise: guess the best, keep it if the model's draw agrees).
-            static const bool spec_sampling = std::getenv("TIERLM_SPEC_SAMPLING") && !std::strcmp(std::getenv("TIERLM_SPEC_SAMPLING"), "1");
+            // way, but more guesses are kept (Flash-Next IQ3_XXS, 5090, a story at 0.7: 63 tok/s against 46-52).
+            // TIERLM_SPEC_SAMPLING=0: guess the best, keep it if the model's draw agrees.
+            static const bool spec_sampling = !(std::getenv("TIERLM_SPEC_SAMPLING") && !std::strcmp(std::getenv("TIERLM_SPEC_SAMPLING"), "0"));
             struct ClearSampling { Speculator* s; ~ClearSampling() { s->clear_sampling(); } } clear_sampling{spx};
             if (sp.temperature > 0.0f && spec_sampling)
                 spx->set_sampling([&](const float* row, const std::vector<int32_t>& ctx) {
