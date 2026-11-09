@@ -279,8 +279,19 @@ Each step (`src/speculate.cpp`):
 
 Every token that comes out is the model's own choice at that position, so with temperature 0 the reply is the
 same as without speculation (the tests check this, also with scripted, partly wrong guesses that exercise every
-undo depth), and with sampling it follows the same distribution. The draft layer's math is checked against a
-NumPy version of Hugging Face's MTP block.
+undo depth). The draft layer's math is checked against a NumPy version of Hugging Face's MTP block (Flash-Next's,
+against one built from Hugging Face's own layers).
+
+**Sampling** (temperature > 0, since 0.8.5). Checking the model's own draw against the draft layer's single best
+guess keeps few guesses when the model is really choosing between words: a story at temperature 0.7 kept under half.
+So with sampling, tierlm uses **speculative sampling**: each guess is drawn from the draft layer's own probabilities
+q (after the same penalties, temperature and top-k/top-p/min-p as the reply), and kept with probability
+min(1, p/q), where p is the model's. At the first one not kept, the token is drawn from what p has left over q
+(p - q where positive, renormalised); when every guess is kept, one more token from p. The reply's odds are exactly
+the model's own: `tests/tiny_flashnext_mtp.py` draws 8,000 three-token replies with and without it on a
+16-token vocabulary (40% of guesses kept) and compares them with a chi-square test, token by token, in pairs and
+whole. Flash-Next IQ3_XXS on an RTX 5090, 4 guesses: a story at 0.7 went from 46-52 to 63 tok/s (55 without
+guessing); prompts at 0.7 from 67-73 to 77-90.
 
 **Measured.** RTX 3070 laptop, Qwen3.6-27B MTP Q4_K_M with 23 of 64 layers in VRAM, 16K context, 8-bit KV:
 3.0 tok/s without speculation; 3.9, **5.3** and 4.1 tok/s with 2, 3 and 4 guesses per check. At 3 guesses a check
@@ -313,6 +324,13 @@ The timing decides only whether to guess, never what the reply says.
 **Measured** (Qwen3-0.6B Q8_0 on 8 CPU threads, temperature 0, same reply with and without): rewriting 2.6 KB of
 code with one word renamed, 10.5 → **27.7 tok/s** (6.6 tokens per check, 203 of 212 guesses kept); writing new
 code, 12.1 → 12.1 tok/s (lookup found few matches and the adaptive length kept misses cheap).
+
+**Flash-Next on the RTX 5090** (UD-IQ3_XXS, 25.7 GB of experts in RAM, busiest experts in VRAM, Ryzen 9 9950X3D,
+64 GB DDR5-6000, 12 threads, Unsloth's `mtp-...-shared-Q8_0.gguf`, 4 guesses, four 500-token answers at
+temperature 0): 61.6 tok/s without guessing, **84.3** with it, 3.1-3.6 tokens per check. A check of 4 guessed words
+costs about 35 ms against 18 ms for one word: each distinct expert the words pick is read once, and most of them are
+already in VRAM. With the experts in RAM instead, checks cost too much and guessing lost (47 against 48 tok/s), which
+is why Find the fastest settings measures the VRAM-expert splits with guesses too.
 
 **KV cache precision.** The cache can be stored at 8 bits (`q8_0`, about 1% from exact) or 4 bits (`q4_0`), which
 leaves VRAM for more of the model's layers. Quantized caches are read by flash attention, which turns on with them.
@@ -518,7 +536,10 @@ runs exactly what a chat runs: the chat's own reply code, in the model's chat fo
 settings (temperature, top-k, top-p, min-p, repeat penalty), recording the experts used, answering two different
 questions for about 3 seconds each. A fixed seed makes every setting answer the same way, so they are compared
 fairly. Only the replies are timed. Threads and speculation only win by a clear margin (2-3%), so noise doesn't
-pick them, and hot experts are kept on only if they measured fastest. The **Benchmark** in the side menu measures
+pick them, and hot experts are kept on only if they measured fastest. With a draft layer, the VRAM-expert splits
+(busiest, or following the conversation) within 15% of the winner without guessing are measured with guesses too:
+guessing makes checks cheap only when most experts are in VRAM, so a split that lost without guessing can win with
+it (0.8.5). The **Benchmark** in the side menu measures
 the same way. (Before 0.5.1 it generated a fixed text greedily, which overstated chat speed by a quarter to a third;
 part of that gap was the chat reading each layer's experts back from the GPU separately, now one read per token.)
 
