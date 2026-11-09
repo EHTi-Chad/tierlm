@@ -41,7 +41,7 @@ keeps those it agrees with, so every reply is its own.
 | A 500-token story at temperature 0.7, no guessing | about 55 |
 | The same story, 4 guesses with speculative sampling | **63** |
 | Two of the answers at temperature 0.7, 4 guesses | **87 and 90** |
-| **Find the fastest settings**, as the app runs it (it picks the VRAM experts following the conversation and 3 guesses) | **75.4** (0.8.4 picked 42.2) |
+| **Find the fastest settings**, as the app runs it (it picks the VRAM experts following the conversation and 3 guesses) | **75.4** (best without guessing in the same run: 42.2) |
 
 **Every setting.** RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11, an NVMe drive for the SSD tier;
 tierlm 0.8.5 with its CUDA 12.9 engine. Qwen3.8-Flash-Next UD-IQ3_XXS from unsloth (4 files) with
