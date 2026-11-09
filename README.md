@@ -81,9 +81,9 @@ It makes a large difference: the 17 GB Qwen3.6-35B-A3B on an 8 GB laptop GPU run
 
 How tierlm keeps it fast, at any size:
 
-- **Size is about memory.** Any model that fits in VRAM plus RAM runs (about 10 GB is needed for Windows, the
-  context and working memory), and the SSD tier goes past that: the parts used least stay on the drive and are read
-  as each word needs them.
+- **Size is about memory.** Any model that fits in VRAM plus RAM runs at full speed (about 10 GB is needed for
+  Windows, the context and working memory). With the **SSD tier** on, bigger models run too: the parts used least
+  stay on an NVMe drive and are read as each word needs them.
 - **Each part goes where it's fastest.** For mixture-of-experts models, attention and the context stay on the GPU and
   only the experts go to RAM, so the CPU reads just the few experts each token picks; dense models are split by whole
   layers. tierlm picks the split itself.
@@ -91,14 +91,19 @@ How tierlm keeps it fast, at any size:
   Speculative decoding gets several tokens out of each read, and the CPU work uses the best instruction set the
   processor has (AVX2, AVX-512).
 
-| Graphics card | System RAM | Largest model, roughly | For example |
-|---|---|---|---|
-| 8 GB | 32 GB | 30 GB | Qwen3.6-35B-A3B at 3 or 4 bits |
-| 8 GB | 64 GB | 60 GB | Qwen3.6-35B-A3B at 8 bits |
-| 16 GB | 64 GB | 70 GB | Qwen3-Coder-Next 80B-A3B at 4 to 5 bits |
-| 24 GB | 64 GB | 75 GB | Llama 3.3 70B at 6 bits |
-| 32 GB | 64 GB | 85 GB | Qwen3-Coder-Next 80B-A3B at 6 bits |
-| 24 GB | 128 GB | 140 GB | Qwen3.5-122B-A10B at 8 bits |
+| Graphics card | System RAM | SSD tier | Largest model, roughly | For example |
+|---|---|---|---|---|
+| 8 GB | 32 GB | off | 30 GB | Qwen3.6-35B-A3B at 3 or 4 bits: 33 tok/s on a laptop RTX 3070 |
+| 8 GB | 64 GB | off | 60 GB | Qwen3.6-35B-A3B at 8 bits |
+| 16 GB | 64 GB | off | 70 GB | Qwen3-Coder-Next 80B-A3B at 4 to 5 bits |
+| 24 GB | 64 GB | off | 75 GB | Llama 3.3 70B at 6 bits |
+| 24 GB | 128 GB | off | 140 GB | Qwen3.5-122B-A10B at 8 bits |
+| 32 GB | 64 GB | off | 85 GB | Qwen3-Coder-Next 80B-A3B at 6 bits |
+| 32 GB | 64 GB | **on (NVMe)** | **120 GB tested** | **Qwen3.8 Flash-Next at 4 bits (120 GB): 37 tok/s on an RTX 5090** |
+
+With the SSD tier, the limit is the drive, and the speed depends on how often the parts on it are needed. It works
+best for parts that are big but rarely read: Flash-Next keeps its 29 GB n-gram table on the SSD and reads a few rows
+per word, and a mixture-of-experts model keeps its least-used experts there.
 
 Mixture-of-experts models (A3B, A10B...) stay fast with most of the model in RAM: Qwen3.6-35B-A3B (17 GB) runs at
 33 tok/s on an 8 GB laptop RTX 3070. Dense models are slower once they spill into RAM, which is where speculative
