@@ -83,6 +83,18 @@ void MappedFile::prefetch(const void* p, size_t n) {
 #endif
 }
 
+void MappedFile::prefetch_many(const std::vector<std::pair<const void*, size_t>>& ranges) {
+    if (ranges.empty()) return;
+#ifdef _WIN32
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> r;
+    r.reserve(ranges.size());
+    for (const auto& [p, n] : ranges) if (p && n) r.push_back({ (PVOID)p, n });
+    if (!r.empty()) PrefetchVirtualMemory(GetCurrentProcess(), r.size(), r.data(), 0);
+#else
+    for (const auto& [p, n] : ranges) prefetch(p, n);
+#endif
+}
+
 std::vector<DriveInfo> list_drives() {
     std::vector<DriveInfo> out;
 #ifdef _WIN32

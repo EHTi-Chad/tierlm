@@ -20,6 +20,8 @@ public:
     const std::string& path() const { return path_; }
     // Asks the OS to start reading [p, p+n) now, without waiting (a hint; does nothing where unsupported).
     static void prefetch(const void* p, size_t n);
+    // Many ranges at once: the reads go to the drive together (deep queue), not one page fault after another.
+    static void prefetch_many(const std::vector<std::pair<const void*, size_t>>& ranges);
 private:
     const char* data_ = nullptr;
     size_t size_ = 0;

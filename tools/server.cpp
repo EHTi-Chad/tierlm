@@ -2875,24 +2875,40 @@ int main(int argc, char** argv) {
                     }
                     if (draft > 0 && best < plain * 1.03) draft = 0;    // not worth it for a sliver
                     if (draft == 0) best = plain;
-                    // The busiest experts in VRAM and the VRAM experts that follow the conversation are close
-                    // relatives: the one that lost without guessing can win with it (guessed words reuse the experts
-                    // already moved in). Within 15%, the other one is measured with the same guesses too.
-                    const bool one = mode.size() > 2 && mode.compare(mode.size() - 2, 2, "@1") == 0;
-                    const std::string m0 = one ? mode.substr(0, mode.size() - 2) : mode;
-                    const std::string alt = (m0 == "hot" ? "live" : m0 == "live" ? "hot" : "") + std::string(one && (m0 == "hot" || m0 == "live") ? "@1" : "");
-                    if (draft > 0 && !alt.empty() && plain_of.count(alt) && plain_of.count(mode) &&
-                        plain_of[alt].first >= plain_of[mode].first * 0.85) {
-                        const std::string alt_label = plain_of[alt].second;
-                        if (!status("Loading with " + alt_label)) throw std::runtime_error("cancelled");
-                        load_mode(alt);
-                        if (!status("Measuring " + alt_label + ", speculative decoding")) throw std::runtime_error("cancelled");
-                        const double t = measure(n_gen, draft);
-                        if (!record(alt_label + (cpu_work ? ", " + threads_text(eng.threads) : "") + ", speculative decoding " +
-                                    std::to_string(draft) + (draft == 1 ? " guess" : " guesses"), {{"split_mode", alt}, {"draft_max", draft}}, t))
-                            throw std::runtime_error("cancelled");
-                        if (t > best) { best = t; mode = alt; mode_text = alt_label; }
-                        else {
+                    // Guessing changes which split wins: a check of several guessed words costs about one read per
+                    // distinct expert, so with most experts already in VRAM (busiest, or following the conversation)
+                    // checks are cheap, and with experts in RAM they aren't. (Flash-Next IQ3_XXS, RTX 5090: experts in
+                    // RAM won without guessing, 50.4 against 49.1 tok/s, but lost with it, 47 against 79-87.) So the
+                    // VRAM-expert splits within 15% of the winner without guessing are measured with guesses too.
+                    if (plain_of.count(mode)) {
+                        const auto base_of = [](const std::string& m) {
+                            return m.size() > 2 && m.compare(m.size() - 2, 2, "@1") == 0 ? m.substr(0, m.size() - 2) : m;
+                        };
+                        std::vector<std::string> alts;
+                        for (const auto& [m, v] : plain_of) {
+                            const std::string b = base_of(m);
+                            if (m != mode && (b == "hot" || b == "live") && v.first >= plain_of[mode].first * 0.85) alts.push_back(m);
+                        }
+                        std::sort(alts.begin(), alts.end(), [&](const std::string& a, const std::string& b) { return plain_of[a].first > plain_of[b].first; });
+                        if (alts.size() > 2) alts.resize(2);
+                        const int d0 = draft;
+                        for (const std::string& alt : alts) {
+                            const std::string alt_label = plain_of[alt].second;
+                            if (!status("Loading with " + alt_label)) throw std::runtime_error("cancelled");
+                            load_mode(alt);
+                            // (guessing didn't pay on the winner: 3 and 4 guesses, the usual best with experts in VRAM)
+                            std::vector<int> tries = d0 > 0 ? std::vector<int>{d0} : std::vector<int>{3, 4};
+                            for (int d : tries) {
+                                if (!status("Measuring " + alt_label + ", speculative decoding " + std::to_string(d) + " guesses"))
+                                    throw std::runtime_error("cancelled");
+                                const double t = measure(n_gen, d);
+                                if (!record(alt_label + (cpu_work ? ", " + threads_text(eng.threads) : "") + ", speculative decoding " +
+                                            std::to_string(d) + (d == 1 ? " guess" : " guesses"), {{"split_mode", alt}, {"draft_max", d}}, t))
+                                    throw std::runtime_error("cancelled");
+                                if (t > (draft > 0 ? best : best * 1.03)) { best = t; mode = alt; mode_text = alt_label; draft = d; }
+                            }
+                        }
+                        if (loaded_mode != mode) {
                             if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
                             load_mode(mode);
                         }

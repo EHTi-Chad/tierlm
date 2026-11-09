@@ -3249,6 +3249,15 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             hp.ngram.rows(h.data(), (int64_t)h.size() - 1, rows.data() + (size_t)t * NH);
         }
         ggml_backend_tensor_set(g.ngram, rows.data(), 0, sizeof(int32_t) * rows.size());
+        // The table on the SSD tier: ask the drive for every row this step reads, all at once, before the graph
+        // gathers them one page fault after another (16 random reads a token; Flash-Next IQ3_XXS on a 5090 ran
+        // 40% slower until the rows it uses were in the file cache).
+        if (place_.ssd_ngram && ple_embd_->buffer && ggml_backend_buffer_is_host(ple_embd_->buffer) && !std::getenv("TIERLM_NO_NGRAM_PREFETCH")) {
+            std::vector<std::pair<const void*, size_t>> r;
+            r.reserve(rows.size());
+            for (int32_t id : rows) r.push_back({(const char*)ple_embd_->data + (size_t)id * ple_embd_->nb[1], ple_embd_->nb[1]});
+            MappedFile::prefetch_many(r);
+        }
     }
     fill_masks(g, n_kv, tok_seq, tok_pos);
     if (g.out_idx) {                                               // each conversation's last token
