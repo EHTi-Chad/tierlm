@@ -2896,8 +2896,11 @@ int main(int argc, char** argv) {
                             const std::string alt_label = plain_of[alt].second;
                             if (!status("Loading with " + alt_label)) throw std::runtime_error("cancelled");
                             load_mode(alt);
-                            // (guessing didn't pay on the winner: 3 and 4 guesses, the usual best with experts in VRAM)
+                            eng.threads = threads;                  // (a load starts from the default threads)
+                            // the winner's best guesses and one more (checks are cheaper with experts in VRAM); when
+                            // guessing didn't pay on the winner, 3 and 4, the usual best with experts in VRAM
                             std::vector<int> tries = d0 > 0 ? std::vector<int>{d0} : std::vector<int>{3, 4};
+                            if (d0 > 0 && d0 < 4) tries.push_back(d0 + 1);
                             for (int d : tries) {
                                 if (!status("Measuring " + alt_label + ", speculative decoding " + std::to_string(d) + " guesses"))
                                     throw std::runtime_error("cancelled");
@@ -2911,6 +2914,7 @@ int main(int argc, char** argv) {
                         if (loaded_mode != mode) {
                             if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
                             load_mode(mode);
+                            eng.threads = threads;
                         }
                     }
                 }
