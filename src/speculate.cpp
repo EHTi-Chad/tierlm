@@ -78,6 +78,21 @@ std::vector<int32_t> Speculator::lookup_guesses(const std::vector<int32_t>& ctx,
     return out;
 }
 
+// A token drawn from (token, weight) pairs (weights needn't add up to 1).
+int32_t Speculator::draw(const std::vector<std::pair<int32_t, float>>& w) {
+    double total = 0.0;
+    for (const auto& e : w) total += e.second;
+    std::uniform_real_distribution<double> u(0.0, total);
+    double r = u(*rng_);
+    for (const auto& e : w) { r -= e.second; if (r <= 0.0) return e.first; }
+    return w.back().first;
+}
+
+float Speculator::prob_of(const std::vector<std::pair<int32_t, float>>& w, int32_t t) {
+    for (const auto& e : w) if (e.first == t) return e.second;
+    return 0.0f;
+}
+
 std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop,
                                       std::vector<int32_t>* routing) {
     const int P = m_.n_past(), E = m_.hparams().hidden_width(), V = m_.hparams().n_vocab;
@@ -87,6 +102,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
 
     // ---- 1. guess ----
     std::vector<int32_t> drafts;
+    std::vector<std::vector<std::pair<int32_t, float>>> qs;   // sampling: the probabilities each guess was drawn from
     if (hist_.size() != (size_t)P) hist_.clear();     // out of step with the cache (it was changed elsewhere): no lookup
     // Prompt lookup's guesses for after x (none if the conversation has no match).
     std::vector<int32_t> look;
@@ -108,11 +124,24 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
         std::vector<float> h = h_last_, hn;
         for (int i = 0; i < n_max; ++i) {
             std::vector<float> lg = m_.mtp_eval(&tok, h.data(), 1, P + i, n_threads, &hn);
-            const int32_t d = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
-            if (p_min_ > 0.0f) {                      // how sure is the draft block? (softmax probability of d)
-                double sum = 0.0;
-                for (float v : lg) sum += std::exp((double)v - lg[d]);
-                if (1.0 / sum < p_min_) break;
+            int32_t d;
+            if (dist_) {                              // sampling: draw the guess from the draft block's probabilities
+                std::vector<int32_t> ctx(1, x);
+                ctx.insert(ctx.end(), drafts.begin(), drafts.end());
+                std::vector<std::pair<int32_t, float>> q = dist_(lg.data(), ctx);
+                if (q.empty()) break;
+                float qmax = 0.0f;
+                for (const auto& e : q) qmax = std::max(qmax, e.second);
+                if (p_min_ > 0.0f && qmax < p_min_) break;
+                d = draw(q);
+                qs.push_back(std::move(q));
+            } else {
+                d = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+                if (p_min_ > 0.0f) {                  // how sure is the draft block? (softmax probability of d)
+                    double sum = 0.0;
+                    for (float v : lg) sum += std::exp((double)v - lg[d]);
+                    if (1.0 / sum < p_min_) break;
+                }
             }
             drafts.push_back(d);
             if (stop(d)) break;
@@ -130,6 +159,8 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
         if (agree) { drafts = look; from_lookup = (int)look.size(); }
     }
     const int k = (int)drafts.size();
+    // (lookup's guesses, and any without a draw: certain, as far as the guesser goes)
+    if (dist_) while ((int)qs.size() < k) qs.push_back({{drafts[qs.size()], 1.0f}});
     using sclk = std::chrono::steady_clock;
     const auto t1 = sclk::now();
 
@@ -141,7 +172,31 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     // ---- 3. keep the guesses the model agrees with, plus the model's own next token ----
     std::vector<int32_t> produced, accepted;
     for (int i = 0; i <= k; ++i) {
-        const int32_t t = sample(out.logits.data() + (size_t)i * V, accepted);
+        const float* row = out.logits.data() + (size_t)i * V;
+        if (dist_) {
+            std::vector<int32_t> ctx(1, x);
+            ctx.insert(ctx.end(), accepted.begin(), accepted.end());
+            const std::vector<std::pair<int32_t, float>> p = dist_(row, ctx);
+            if (i == k) { produced.push_back(draw(p)); break; }
+            const int32_t d = drafts[i];
+            const float pd = prob_of(p, d), qd = prob_of(qs[i], d);
+            std::uniform_real_distribution<float> u(0.0f, 1.0f);
+            if (qd > 0.0f && u(*rng_) * qd < pd) {    // kept with probability min(1, p(d) / q(d))
+                produced.push_back(d);
+                if (stop(d)) break;
+                accepted.push_back(d);
+                continue;
+            }
+            // not kept: draw from what p has over q, max(0, p - q), normalised (p itself if nothing is left)
+            std::vector<std::pair<int32_t, float>> r;
+            for (const auto& [t, pt] : p) {
+                const float v = pt - prob_of(qs[i], t);
+                if (v > 0.0f) r.push_back({t, v});
+            }
+            produced.push_back(draw(r.empty() ? p : r));
+            break;
+        }
+        const int32_t t = sample(row, accepted);
         produced.push_back(t);
         if (i < k && t == drafts[i] && !stop(t)) { accepted.push_back(t); continue; }
         break;

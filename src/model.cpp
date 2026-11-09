@@ -36,6 +36,7 @@ Model::~Model() {
     if (sched_) ggml_backend_sched_free(sched_);
     free_kv();
     for (auto* b : wbufs_) if (b) ggml_backend_buffer_free(b);
+    release_kept_ram(kept_ram_);
     if (wctx_) ggml_free(wctx_);
     for (auto* b : gpus_) if (b && b != cpu_) ggml_backend_free(b);
     if (cpu_) { forget_cpu_backend(cpu_); ggml_backend_free(cpu_); }
@@ -1512,6 +1513,21 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     std::vector<ggml_backend_t> backends(m->gpus_.begin(), m->gpus_.end());
     backends.push_back(m->cpu_);
     const int n_backends = (int)backends.size();
+    // The weights in system RAM stay there (see keep_in_ram): not the SSD tier's or other file-mapped parts.
+    {
+        std::vector<std::pair<const void*, size_t>> ranges;
+        for (ggml_backend_buffer_t b : m->wbufs_) {
+            if (!b) continue;
+            ggml_backend_dev_t d = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b));
+            if (!d || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) continue;
+            const char* base = (const char*)ggml_backend_buffer_get_base(b);
+            const size_t n = ggml_backend_buffer_get_size(b);
+            bool mapped = false;
+            for (const auto& mf : m->maps_) if (base >= mf->data() && base < mf->data() + mf->size()) mapped = true;
+            if (base && n && !mapped) ranges.push_back({base, n});
+        }
+        m->kept_ram_ = keep_in_ram(ranges);
+    }
     // With weights split between VRAM and RAM, let the scheduler copy RAM weights to the GPU for big
     // batches (reading a long prompt), where that beats computing them on the CPU.
     const bool offload = m->main_ != m->cpu_ && (m->place_.cpu_weights > 0 || !m->place_.kv_on_gpu);

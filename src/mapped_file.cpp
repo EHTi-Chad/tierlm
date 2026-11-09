@@ -1,6 +1,8 @@
 #include "mapped_file.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -142,5 +144,65 @@ bool flush_to_disk(const std::string& path) {
     const bool ok = ::fsync(fd) == 0;
     ::close(fd);
     return ok;
+#endif
+}
+
+#ifdef _WIN32
+static size_t g_kept = 0;
+static bool g_have_base = false;
+static SIZE_T g_base_min = 0, g_base_max = 0;
+static void set_kept(size_t kept) {
+    HANDLE proc = GetCurrentProcess();
+    if (kept == 0) { SetProcessWorkingSetSizeEx(proc, g_base_min, g_base_max, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE); return; }
+    const SIZE_T mn = g_base_min + kept + ((SIZE_T)256 << 20);
+    const SIZE_T mx = (std::max)(g_base_max, mn + ((SIZE_T)1 << 30));
+    SetProcessWorkingSetSizeEx(proc, mn, mx, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+}
+#endif
+
+size_t keep_in_ram(const std::vector<std::pair<const void*, size_t>>& ranges) {
+    if (const char* e = std::getenv("TIERLM_KEEP_RAM"); e && !std::strcmp(e, "0")) return 0;
+    size_t total = 0;
+    for (const auto& r : ranges) total += r.second;
+    if (!total) return 0;
+    size_t kept = 0;
+#ifdef _WIN32
+    HANDLE proc = GetCurrentProcess();
+    if (!g_have_base) {
+        DWORD flags = 0;
+        if (!GetProcessWorkingSetSizeEx(proc, &g_base_min, &g_base_max, &flags)) return 0;
+        g_have_base = true;
+    }
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    // only with room to spare: what's kept, plus 4 GB or an eighth of RAM for everything else
+    if (GlobalMemoryStatusEx(&ms) && g_kept + total + (std::max)((unsigned long long)4 << 30, ms.ullTotalPhys / 8) < ms.ullTotalPhys) {
+        const SIZE_T mn = g_base_min + g_kept + total + ((SIZE_T)256 << 20);
+        const SIZE_T mx = (std::max)(g_base_max, mn + ((SIZE_T)1 << 30));
+        if (SetProcessWorkingSetSizeEx(proc, mn, mx, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+            g_kept += total;
+            kept = total;
+        } else {
+            std::fprintf(stderr, "note: couldn't reserve RAM for the weights (error %lu); they may be slow the first time they're used\n", GetLastError());
+        }
+    }
+#endif
+    // read every page once (anything already pushed out comes back now, not when a word needs it)
+    volatile unsigned char sink = 0;
+    for (const auto& [p, n] : ranges) {
+        const unsigned char* b = (const unsigned char*)p;
+        for (size_t i = 0; i < n; i += 4096) sink ^= b[i];
+    }
+    (void)sink;
+    return kept;
+}
+
+void release_kept_ram(size_t bytes) {
+#ifdef _WIN32
+    if (!bytes || !g_have_base) return;
+    g_kept -= (std::min)(g_kept, bytes);
+    set_kept(g_kept);
+#else
+    (void)bytes;
 #endif
 }

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <random>
 #include <vector>
 
 namespace tierlm {
@@ -51,6 +52,17 @@ public:
     std::vector<int32_t> step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop,
                               std::vector<int32_t>* routing = nullptr);
 
+    // Sampling (temperature > 0): dist(row, context) gives the sampler's probabilities for a row of logits (the
+    // tokens it could pick, after penalties, temperature and top-k/top-p/min-p), where context is the tokens chosen
+    // since x (x first). With it, the draft block's guesses are drawn from its own probabilities q and a guess d is
+    // kept with probability min(1, p(d)/q(d)); after one isn't, the token is drawn from what p has left over q
+    // (speculative sampling): the reply follows exactly the model's own distribution, and far more guesses are kept
+    // than by checking the model's own draw against the draft block's single best guess. Unset: guesses are the
+    // draft block's best, kept when the model's own pick (sample) agrees.
+    using Dist = std::function<std::vector<std::pair<int32_t, float>>(const float* logits, const std::vector<int32_t>& context)>;
+    void set_sampling(Dist dist, std::mt19937* rng) { dist_ = std::move(dist); rng_ = rng; }
+    void clear_sampling() { dist_ = nullptr; rng_ = nullptr; }
+
     // Testing: guesses come from this function instead of the draft block (pos = position of x).
     using DraftSource = std::function<std::vector<int32_t>(int pos, int32_t x, int n)>;
     void set_draft_source(DraftSource f) { draft_src_ = std::move(f); }
@@ -77,6 +89,10 @@ private:
     Model& m_;
     int n_draft_;
     float p_min_;
+    int32_t draw(const std::vector<std::pair<int32_t, float>>& w);
+    static float prob_of(const std::vector<std::pair<int32_t, float>>& w, int32_t t);
+    Dist dist_;
+    std::mt19937* rng_ = nullptr;
     std::vector<float> h_last_;   // the model's final hidden state at position h_pos_
     int h_pos_ = -1;
     int mtp_valid_ = 0;           // the draft block's cache is right for positions [0, mtp_valid_)

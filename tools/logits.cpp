@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
+#include <random>
 #include <thread>
 #include "ggml-backend.h"
 #include "backends.h"
@@ -73,6 +75,58 @@ int main(int argc, char** argv) {
         const int nt = std::getenv("TIERLM_THREADS") ? std::atoi(std::getenv("TIERLM_THREADS")) : std::max(1, (int)std::thread::hardware_concurrency() / 2);
 
         std::vector<float> lg;
+        // TIERLM_SAMPLE_RUNS=R (with --gen or --gen-spec): R separate replies of n tokens, drawn with temperature
+        // TIERLM_SAMPLE_TEMP over the TIERLM_SAMPLE_TOPK best tokens, one per line (comma-separated): the tests
+        // compare how often each reply comes out with and without speculative sampling.
+        if ((gen || gen_spec) && std::getenv("TIERLM_SAMPLE_RUNS")) {
+            const int R = std::atoi(std::getenv("TIERLM_SAMPLE_RUNS")), V = m->hparams().n_vocab;
+            const float T = std::getenv("TIERLM_SAMPLE_TEMP") ? (float)std::atof(std::getenv("TIERLM_SAMPLE_TEMP")) : 1.0f;
+            const int K = std::getenv("TIERLM_SAMPLE_TOPK") ? std::atoi(std::getenv("TIERLM_SAMPLE_TOPK")) : 4;
+            std::mt19937 rng(gen_spec ? 12345u : 777u);
+            auto dist = [&](const float* row, const std::vector<int32_t>&) {
+                std::vector<int32_t> idx(V);
+                for (int i = 0; i < V; ++i) idx[i] = i;
+                std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int a, int b) { return row[a] > row[b]; });
+                std::vector<std::pair<int32_t, float>> out;
+                double sum = 0;
+                for (int i = 0; i < K; ++i) sum += std::exp((row[idx[i]] - row[idx[0]]) / T);
+                for (int i = 0; i < K; ++i) out.push_back({idx[i], (float)(std::exp((row[idx[i]] - row[idx[0]]) / T) / sum)});
+                return out;
+            };
+            auto draw = [&](const std::vector<std::pair<int32_t, float>>& w) {
+                std::uniform_real_distribution<double> u(0.0, 1.0);
+                double r = u(rng);
+                for (const auto& e : w) { r -= e.second; if (r <= 0) return e.first; }
+                return w.back().first;
+            };
+            int steps = 0, drafted = 0, accepted = 0;
+            for (int run = 0; run < R; ++run) {
+                m->reset();
+                std::vector<int32_t> out;
+                if (gen) {
+                    lg = m->eval(ids, nt);
+                    while ((int)out.size() < n_gen) { out.push_back(draw(dist(lg.data(), {}))); lg = m->eval({out.back()}, nt); }
+                } else {
+                    Speculator sp(*m, std::getenv("TIERLM_DRAFT_N") ? std::atoi(std::getenv("TIERLM_DRAFT_N")) : 3);
+                    sp.set_sampling(dist, &rng);
+                    lg = sp.prompt(ids, nt);
+                    int32_t x = draw(dist(lg.data(), {}));
+                    out.push_back(x);
+                    while ((int)out.size() < n_gen) {
+                        auto prod = sp.step(x, nt, [&](const float* row, const std::vector<int32_t>&) { return draw(dist(row, {})); },
+                                            [](int32_t) { return false; });
+                        for (int32_t t : prod) out.push_back(t);
+                        x = prod.back();
+                    }
+                    out.resize(n_gen);
+                    steps += sp.stats().steps; drafted += sp.stats().drafted; accepted += sp.stats().accepted;
+                }
+                for (size_t i = 0; i < out.size(); ++i) std::printf(i ? ",%d" : "%d", out[i]);
+                std::printf("\n");
+            }
+            if (gen_spec) std::fprintf(stderr, "steps %d, drafted %d, accepted %d\n", steps, drafted, accepted);
+            return 0;
+        }
         if (gen || gen_spec) {
             auto argmax = [](const float* v, int n) { return (int32_t)(std::max_element(v, v + n) - v); };
             const int V = m->hparams().n_vocab;

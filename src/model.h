@@ -449,6 +449,7 @@ private:
     std::vector<ggml_backend_buffer*> wbufs_;    // weight memory: one buffer in VRAM, one in system RAM
     std::vector<SsdPrefetch> ssd_pf_;            // per layer (sized at load, so Layer::ssd pointers stay valid)
     std::vector<std::unique_ptr<MappedFile>> maps_;   // the SSD tier's files (outlive wbufs_, freed in ~Model)
+    size_t kept_ram_ = 0;                         // RAM weights held in RAM for this model (keep_in_ram)
     Placement place_;
     EvalStats stats_;
     std::vector<ggml_backend_buffer*> kvbufs_;   // KV cache memory: VRAM part and RAM part

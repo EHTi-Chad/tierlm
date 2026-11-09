@@ -4,6 +4,7 @@
 // recently read parts in spare RAM, so busy experts are read once. Nothing is copied into tierlm's own memory.
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 class MappedFile {
@@ -41,3 +42,13 @@ bool flush_to_disk(const std::string& path);
 
 // Free space and total size of the drive holding `path` (a folder or file), in bytes; false if unknown.
 bool drive_space(const std::string& path, unsigned long long& free_bytes, unsigned long long& total_bytes);
+
+// Keeps tierlm's own copies of weights in RAM (the parts of a model that live in system RAM): after a load reads a
+// big model file, Windows can push some of that memory out to its page file to make room for the file's cache, and
+// each piece then comes back only when a word first needs it, which made the first replies after loading about 15%
+// slower on a 64 GB PC (more with the busiest experts in VRAM, where the RAM experts are each needed rarely). This
+// raises the process's guaranteed minimum of RAM by their size (Windows; only when the PC has room to spare) and
+// reads every page once, so all of it is in RAM now. Returns the bytes now kept (0: only read through). TIERLM_KEEP_RAM=0: off.
+size_t keep_in_ram(const std::vector<std::pair<const void*, size_t>>& ranges);
+// Gives back what keep_in_ram kept (a model being freed).
+void release_kept_ram(size_t bytes);

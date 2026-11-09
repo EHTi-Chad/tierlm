@@ -285,7 +285,10 @@ struct Sampling {
 // temperature <= 0 means always take the most likely token (after the penalty).
 // Only the top-k candidates matter, so one pass over the vocabulary keeps the best ones in a small heap, without
 // copying the logits or computing every probability (gpt-oss has 201,088 tokens: that pass is most of the cost).
-int32_t sample(const float* lg, size_t nv, const Sampling& s, const std::vector<int32_t>& recent, std::mt19937& rng) {
+// The tokens sampling could pick, best first, with their weights (not normalised; greedy: the one best token), and
+// how many of them top-p keeps (n). sample() draws from them; distribution() gives them as probabilities.
+static std::vector<std::pair<float, int32_t>> candidates(const float* lg, size_t nv, const Sampling& s, const std::vector<int32_t>& recent,
+                                                         size_t& n, double& cum) {
     // Tokens used in the last repeat_last_n positions, with their penalised logits (each token once).
     std::vector<std::pair<int32_t, float>> pen;
     const bool rep = s.repeat_penalty > 0.0f && s.repeat_penalty != 1.0f;
@@ -324,7 +327,7 @@ int32_t sample(const float* lg, size_t nv, const Sampling& s, const std::vector<
         if (it != h.end()) it->first = v; else h.push_back({v, t});
     }
     std::sort(h.begin(), h.end(), better);            // best first; equal logits: the lower token id, like max_element
-    if (greedy) return h[0].second;
+    if (greedy) { n = 1; cum = 1.0; return {{1.0f, h[0].second}}; }
     if (h.size() > keep) h.resize(keep);
     const float mx = h[0].first;
     std::vector<std::pair<float, int32_t>> p(h.size());
@@ -333,14 +336,32 @@ int32_t sample(const float* lg, size_t nv, const Sampling& s, const std::vector<
     if (s.min_p > 0.0f) while (p.size() > 1 && p.back().first < s.min_p * p[0].first) p.pop_back();
     double total = 0;
     for (auto& x : p) total += x.first;
-    double cum = 0;
-    size_t n = 0;
+    cum = 0;
+    n = 0;
     while (n < p.size() && cum < s.top_p * total) cum += p[n++].first;
     if (n == 0) n = 1, cum = p[0].first;
+    return p;
+}
+
+int32_t sample(const float* lg, size_t nv, const Sampling& s, const std::vector<int32_t>& recent, std::mt19937& rng) {
+    size_t n = 0;
+    double cum = 0;
+    const std::vector<std::pair<float, int32_t>> p = candidates(lg, nv, s, recent, n, cum);
+    if (s.temperature <= 0.0f) return p[0].second;
     std::uniform_real_distribution<double> u(0.0, cum);
     double r = u(rng);
     for (size_t i = 0; i < n; ++i) { r -= p[i].first; if (r <= 0) return p[i].second; }
     return p[n - 1].second;
+}
+
+// The probabilities sample() picks with: (token, probability) for each token it could pick.
+std::vector<std::pair<int32_t, float>> distribution(const float* lg, size_t nv, const Sampling& s, const std::vector<int32_t>& recent) {
+    size_t n = 0;
+    double cum = 0;
+    const std::vector<std::pair<float, int32_t>> p = candidates(lg, nv, s, recent, n, cum);
+    std::vector<std::pair<int32_t, float>> out(n);
+    for (size_t i = 0; i < n; ++i) out[i] = {p[i].second, (float)(p[i].first / cum)};
+    return out;
 }
 
 // Length of the longest prefix of s that does not end inside a multi-byte UTF-8 character.
@@ -2291,6 +2312,16 @@ int main(int argc, char** argv) {
                 extra.insert(extra.end(), acc.begin(), acc.end());
                 return sample(row, (size_t)hp.n_vocab, sp, recent_with(extra), rng);
             };
+            // Sampling: speculative sampling (guesses drawn from the draft block's own probabilities, kept by the
+            // ratio of the model's to the draft block's); the reply follows the model's distribution exactly either
+            // way, but far more guesses are kept. Off until its test passes: TIERLM_SPEC_SAMPLING=1 turns it on
+            // (otherwise: guess the best, keep it if the model's draw agrees).
+            static const bool spec_sampling = std::getenv("TIERLM_SPEC_SAMPLING") && !std::strcmp(std::getenv("TIERLM_SPEC_SAMPLING"), "1");
+            struct ClearSampling { Speculator* s; ~ClearSampling() { s->clear_sampling(); } } clear_sampling{spx};
+            if (sp.temperature > 0.0f && spec_sampling)
+                spx->set_sampling([&](const float* row, const std::vector<int32_t>& ctx) {
+                    return distribution(row, (size_t)hp.n_vocab, sp, recent_with(ctx));
+                }, &rng);
             int32_t x = pick(lg.data(), {});
             for (;;) {
                 if ((int)out.size() >= max_tokens) { r.stop = "length"; break; }
