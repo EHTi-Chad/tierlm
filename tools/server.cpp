@@ -2798,31 +2798,49 @@ int main(int argc, char** argv) {
                                             "GPU + RAM, experts in RAM, VRAM experts following the conversation"};
                 std::string mode_text;                        // the split chosen so far, for the later rows
                 if (!status("Loading the model")) throw std::runtime_error("cancelled");
-                load_mode("layers");
+                // (the first load is the first split measured: experts in RAM for a mixture-of-experts model, whole
+                // layers otherwise)
+                load_mode(info.value("experts", 0) > 0 ? "experts" : "layers");
                 const Placement& pl = eng.model->placement();
                 const bool split = eng.model->on_gpu() && pl.split();
                 const bool cpu_work = split || !eng.model->on_gpu();
-                {
-                    double t = measure(8, 0);                // a first, short run to size the others
-                    size_runs(t);
-                }
+                const bool try_guess = has_mtp && eng.model->has_mtp();
                 double best = 0;
-                std::map<std::string, std::pair<double, std::string>> plain_of;   // split mode -> speed without guessing, label
+                int draft = 0;
                 if (split) {
                     // (hot experts: MoE models, and not yet for experts with biases, gpt-oss)
                     const auto& hp_ = eng.model->hparams();
-                    const bool can_hot = hp_.is_moe() && !hp_.expert_bias;
+                    const bool moe = hp_.is_moe();
+                    const bool can_hot = moe && !hp_.expert_bias;
                     const size_t n_gpus = eng.model->placement().gpus.size();
                     std::string gpu0 = n_gpus ? eng.model->placement().gpus[0].name : std::string();   // "CUDA0"...
                     if (ggml_backend_dev_t d = n_gpus ? ggml_backend_dev_by_name(gpu0.c_str()) : nullptr)
                         gpu0 = ggml_backend_dev_description(d);                                        // ...as people know it
+                    // Each split is loaded once (a big model takes a minute or more to load) and measured without
+                    // guessing and with it, since guessing changes which split wins: a check of several guessed words
+                    // costs about one read per distinct expert, cheap with most experts in VRAM and not with them in
+                    // RAM (Flash-Next IQ3_XXS, RTX 5090: experts in RAM 41 tok/s without guessing and 60 with it;
+                    // VRAM experts 41 and 74). Whole layers isn't tried for a mixture-of-experts model: it has lost
+                    // every time (17 against 41 tok/s there), and costs a load. The VRAM experts that follow the
+                    // conversation go last, so the likeliest winner is the one left loaded.
                     struct M { std::string mode; int label; };
-                    std::vector<M> modes = {{"layers", 0}, {"experts", 1}};
+                    std::vector<M> modes;
+                    if (!moe) modes.push_back({"layers", 0});
+                    modes.push_back({"experts", 1});
                     if (can_hot && n_gpus <= 1) { modes.push_back({"hot", 2}); modes.push_back({"live", 3}); }   // (hot experts: one GPU)
                     if (n_gpus > 1) {                                // the same on the first GPU alone
                         modes.push_back({"experts@1", 1});
                         if (can_hot) { modes.push_back({"hot@1", 2}); modes.push_back({"live@1", 3}); }
                     }
+                    {
+                        const double t = measure(24, 0);     // a first, short run to size the others
+                        size_runs(t);
+                        // (the VRAM experts move in during a reply's first words: at least 160 tokens a question, and
+                        // every split measured at the same length so they compare like for like)
+                        if (can_hot) n_gen = std::max(n_gen, 160);
+                    }
+                    struct Cand { std::string mode, label; int draft; double tps; };
+                    std::vector<Cand> cands;
                     bool no_hot = false;                             // hot experts had no VRAM left: skip live
                     for (const M& md : modes) {
                         const std::string& m = md.mode;
@@ -2830,7 +2848,7 @@ int main(int argc, char** argv) {
                         const std::string base_m = one ? m.substr(0, m.size() - 2) : m;
                         const std::string label = std::string(mode_label[md.label]) + (one ? ", only the " + gpu0 : "");
                         if (base_m == "experts" && one) no_hot = false;
-                        if (base_m == "live" && no_hot) continue;
+                        if ((base_m == "hot" || base_m == "live") && no_hot) continue;
                         if (base_m == "hot" && learned() <= 0) {
                             if (!status("Learning which experts this model uses")) throw std::runtime_error("cancelled");
                             calibrate();
@@ -2845,32 +2863,59 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         if (!status("Measuring " + label)) throw std::runtime_error("cancelled");
-                        // (the busiest experts and the ones that follow the conversation: at least 160 tokens per
-                        // question even when whole layers set a short run, since moving experts in pays off over a reply)
-                        const double t = measure(base_m == "hot" || base_m == "live" ? std::max(n_gen, 160) : n_gen, 0);
+                        const double t = measure(n_gen, 0);
                         if (!record(label + ", " + threads_text(eng.threads) + ", no speculative decoding", {{"split_mode", m}}, t))
                             throw std::runtime_error("cancelled");
-                        plain_of[m] = {t, label};
-                        if (t > best) { best = t; mode = m; mode_text = label; }
+                        cands.push_back({m, label, 0, t});
+                        if (try_guess && eng.model->has_mtp()) {
+                            // 2 and 3 guesses, and 4 when 3 beat 2
+                            double t2 = 0, t3 = 0;
+                            for (int d = 2; d <= 4; ++d) {
+                                if (d == 4 && t3 <= t2) break;
+                                if (!status("Measuring " + label + ", speculative decoding " + std::to_string(d) + " guesses"))
+                                    throw std::runtime_error("cancelled");
+                                const double tg = measure(n_gen, d);
+                                if (!record(label + ", " + threads_text(eng.threads) + ", speculative decoding " + std::to_string(d) + " guesses",
+                                            {{"split_mode", m}, {"draft_max", d}}, tg))
+                                    throw std::runtime_error("cancelled");
+                                cands.push_back({m, label, d, tg});
+                                if (d == 2) t2 = tg; else if (d == 3) t3 = tg;
+                            }
+                        }
                     }
+                    if (cands.empty()) throw std::runtime_error("nothing could be measured");
+                    // The winner. Guessing has to earn at least 3% over the best without it. And between the two
+                    // VRAM-expert splits, the one that follows the conversation wins a near tie (within 5%): the
+                    // test's questions are close to what the fixed set was learned from, and a chat that turns to
+                    // another subject isn't (Flash-Next on code: the fixed set did 57-69% of the expert work and ran
+                    // at 54-65 tok/s, the following set 73-76).
+                    const Cand* win = &cands[0];
+                    const Cand* plain_win = nullptr;
+                    for (const Cand& c : cands) {
+                        if (c.tps > win->tps) win = &c;
+                        if (c.draft == 0 && (!plain_win || c.tps > plain_win->tps)) plain_win = &c;
+                    }
+                    if (win->draft > 0 && plain_win && win->tps < plain_win->tps * 1.03) win = plain_win;
+                    {
+                        const auto base_of = [](const std::string& m) {
+                            return m.size() > 2 && m.compare(m.size() - 2, 2, "@1") == 0 ? m.substr(0, m.size() - 2) : m;
+                        };
+                        if (base_of(win->mode) == "hot") {
+                            const std::string live_m = "live" + win->mode.substr(3);
+                            const Cand* lv = nullptr;
+                            for (const Cand& c : cands)
+                                if (c.mode == live_m && (win->draft > 0) == (c.draft > 0) && (!lv || c.tps > lv->tps)) lv = &c;
+                            if (lv && lv->tps >= win->tps * 0.95) win = lv;
+                        }
+                    }
+                    mode = win->mode; mode_text = win->label; draft = win->draft; best = win->tps;
                     if (loaded_mode != mode) {
                         if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
                         load_mode(mode);
                     }
-                    // Threads and guesses are measured with replies sized from the winner's speed; the winner is
-                    // measured again at that length first, so the comparisons after it are like for like (a short
-                    // reply and a long one don't run at the same speed).
-                    const int n_before = (mode == "hot" || mode == "live") ? std::max(n_gen, 160) : n_gen;
-                    size_runs(best);
-                    if (n_gen != n_before) {
-                        if (!status("Measuring " + mode_text + " again with longer replies")) throw std::runtime_error("cancelled");
-                        best = measure(n_gen, 0);
-                        if (!record(mode_text + ", " + threads_text(eng.threads) + ", no speculative decoding (again, " +
-                                    std::to_string(n_gen) + "-token replies)", {{"split_mode", mode}}, best))
-                            throw std::runtime_error("cancelled");
-                    }
                 } else {
                     if (!status("Measuring")) throw std::runtime_error("cancelled");
+                    size_runs(measure(24, 0));               // a first, short run to size the others
                     best = measure(n_gen, 0);
                     mode_text = eng.model->on_gpu() ? "All on the GPU" : "CPU only";
                     record(mode_text + (cpu_work ? ", " + threads_text(t0) : "") + ", no speculative decoding", json::object(), best);
@@ -2889,16 +2934,16 @@ int main(int argc, char** argv) {
                         if (c == t0) continue;               // measured above
                         eng.threads = c;
                         if (!status("Measuring " + threads_text(c))) throw std::runtime_error("cancelled");
-                        const double t = measure(n_gen, 0);
-                        if (!record(mode_text + ", " + threads_text(c) + ", no speculative decoding", {{"threads", c}}, t)) throw std::runtime_error("cancelled");
+                        const double t = measure(n_gen, draft);
+                        if (!record(mode_text + ", " + threads_text(c) + (draft > 0 ? ", speculative decoding " + std::to_string(draft) + " guesses" : ", no speculative decoding"),
+                                    {{"threads", c}}, t)) throw std::runtime_error("cancelled");
                         if (t > best * 1.02) { best = t; threads = c; }   // a clear win only: the default is a safe choice
                     }
                     eng.threads = threads;
                 }
 
-                // ---- 3. speculative decoding (when the model has a draft layer) ----
-                int draft = 0;
-                if (has_mtp && eng.model->has_mtp()) {
+                // ---- 3. speculative decoding (a model that isn't split; a split one was measured per split above) ----
+                if (!split && try_guess) {
                     const double plain = best;
                     for (int d = 1; d <= 4; ++d) {
                         if (!status("Measuring speculative decoding, " + std::to_string(d) + (d == 1 ? " guess" : " guesses") + " per check"))
@@ -2911,48 +2956,6 @@ int main(int argc, char** argv) {
                     }
                     if (draft > 0 && best < plain * 1.03) draft = 0;    // not worth it for a sliver
                     if (draft == 0) best = plain;
-                    // Guessing changes which split wins: a check of several guessed words costs about one read per
-                    // distinct expert, so with most experts already in VRAM (busiest, or following the conversation)
-                    // checks are cheap, and with experts in RAM they aren't. (Flash-Next IQ3_XXS, RTX 5090: experts in
-                    // RAM won without guessing, 50.4 against 49.1 tok/s, but lost with it, 47 against 79-87.) So the
-                    // VRAM-expert splits within 15% of the winner without guessing are measured with guesses too.
-                    if (plain_of.count(mode)) {
-                        const auto base_of = [](const std::string& m) {
-                            return m.size() > 2 && m.compare(m.size() - 2, 2, "@1") == 0 ? m.substr(0, m.size() - 2) : m;
-                        };
-                        std::vector<std::string> alts;
-                        for (const auto& [m, v] : plain_of) {
-                            const std::string b = base_of(m);
-                            if (m != mode && (b == "hot" || b == "live") && v.first >= plain_of[mode].first * 0.85) alts.push_back(m);
-                        }
-                        std::sort(alts.begin(), alts.end(), [&](const std::string& a, const std::string& b) { return plain_of[a].first > plain_of[b].first; });
-                        if (alts.size() > 2) alts.resize(2);
-                        const int d0 = draft;
-                        for (const std::string& alt : alts) {
-                            const std::string alt_label = plain_of[alt].second;
-                            if (!status("Loading with " + alt_label)) throw std::runtime_error("cancelled");
-                            load_mode(alt);
-                            eng.threads = threads;                  // (a load starts from the default threads)
-                            // the winner's best guesses and one more (checks are cheaper with experts in VRAM); when
-                            // guessing didn't pay on the winner, 3 and 4, the usual best with experts in VRAM
-                            std::vector<int> tries = d0 > 0 ? std::vector<int>{d0} : std::vector<int>{3, 4};
-                            if (d0 > 0 && d0 < 4) tries.push_back(d0 + 1);
-                            for (int d : tries) {
-                                if (!status("Measuring " + alt_label + ", speculative decoding " + std::to_string(d) + " guesses"))
-                                    throw std::runtime_error("cancelled");
-                                const double t = measure(n_gen, d);
-                                if (!record(alt_label + (cpu_work ? ", " + threads_text(eng.threads) : "") + ", speculative decoding " +
-                                            std::to_string(d) + (d == 1 ? " guess" : " guesses"), {{"split_mode", alt}, {"draft_max", d}}, t))
-                                    throw std::runtime_error("cancelled");
-                                if (t > (draft > 0 ? best : best * 1.03)) { best = t; mode = alt; mode_text = alt_label; draft = d; }
-                            }
-                        }
-                        if (loaded_mode != mode) {
-                            if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
-                            load_mode(mode);
-                            eng.threads = threads;
-                        }
-                    }
                 }
 
                 // ---- 4. connections (asked for more than one): how fast each reply is with 1, 2, 4... at once ----
