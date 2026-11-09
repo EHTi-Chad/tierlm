@@ -218,6 +218,7 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_LIVE_MB=32` / `TIERLM_LIVE_PER_LAYER=2` | Live hot experts: most MB moved per step (both ways), most swaps per layer per step |
 | `TIERLM_LIVE_MARGIN=1.3` | Live hot experts: how much more an expert in RAM must be wanted than one in VRAM to replace it (times its score, + 0.5) |
 | `TIERLM_LIVE_SYNC=1` | Live hot experts: wait for each copy instead of queuing them all on the GPU (for comparison) |
+| `TIERLM_NO_TIMES=1` | `tierlm-server`: no time (HH:MM:SS) in front of each line in its window (the page's console still shows it) |
 | `TIERLM_SPEC_SAMPLING=0` | `tierlm-server`: at temperature > 0, guess the draft block's best word and keep it only when the model's own draw matches, instead of speculative sampling (for comparison; the replies' odds are the model's either way) |
 | `TIERLM_MTP_VRAM=1` | Put the draft block's experts in VRAM before the model's own, so guessing runs wholly on the GPU |
 | `TIERLM_NO_NGRAM_PREFETCH=1` | Flash-Next with its n-gram table on the SSD tier: read the rows one by one as the graph needs them, not all at once before each step (for comparison) |

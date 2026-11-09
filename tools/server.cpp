@@ -1176,14 +1176,28 @@ std::string lan_address() {
 
 // Everything tierlm and ggml print (the black window's text) is also kept for the page's console: stderr is
 // redirected into a pipe, and a thread copies each line to the real stderr and into a ring of recent lines.
+// Every line gets the local time it was printed (HH:MM:SS), in the black window and on the page.
+std::string clock_now() {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char b[16];
+    std::strftime(b, sizeof b, "%H:%M:%S", &tm);
+    return b;
+}
 struct LogRing {
+    struct Line { long long n; std::string time, text; };
     std::mutex mu;
-    std::deque<std::pair<long long, std::string>> lines;   // (line number, text)
+    std::deque<Line> lines;
     long long next = 0;
-    void add(std::string t) {
+    void add(std::string time, std::string t) {
         while (!t.empty() && (t.back() == '\r' || t.back() == '\n')) t.pop_back();
         std::lock_guard<std::mutex> lk(mu);
-        lines.emplace_back(next++, std::move(t));
+        lines.push_back({next++, std::move(time), std::move(t)});
         while (lines.size() > 3000) lines.pop_front();
     }
 };
@@ -1208,16 +1222,38 @@ void capture_stderr() {
     auto wr = [](int fd, const char* b, unsigned n) { return (int)write(fd, b, n); };
 #endif
     std::setvbuf(stderr, nullptr, _IONBF, 0);
-    std::thread([fd = fds[0], orig, rd, wr] {
-        std::string part;
+    // (TIERLM_NO_TIMES=1: the black window without the times, as before 0.8.5)
+    const bool times = !std::getenv("TIERLM_NO_TIMES");
+    std::thread([fd = fds[0], orig, rd, wr, times] {
+        std::string part, part_time;
+        bool line_start = true;                          // the next byte begins a line in the black window
         char buf[4096];
         for (;;) {
             const int n = rd(fd, buf, sizeof buf);
             if (n <= 0) break;
-            wr(orig, buf, (unsigned)n);
+            const std::string now = clock_now();
+            if (times) {
+                // the time in front of each line, written as the line starts (text without a newline yet, such
+                // as a progress line, still shows at once)
+                std::string out;
+                out.reserve((size_t)n + 32);
+                for (int i = 0; i < n; ++i) {
+                    if (line_start && buf[i] != '\r' && buf[i] != '\n') { out += now; out += "  "; line_start = false; }
+                    out += buf[i];
+                    if (buf[i] == '\n') line_start = true;
+                }
+                wr(orig, out.data(), (unsigned)out.size());
+            } else {
+                wr(orig, buf, (unsigned)n);
+            }
+            if (part.empty()) part_time = now;
             part.append(buf, (size_t)n);
             size_t p;
-            while ((p = part.find('\n')) != std::string::npos) { g_log.add(part.substr(0, p)); part.erase(0, p + 1); }
+            while ((p = part.find('\n')) != std::string::npos) {
+                g_log.add(part_time, part.substr(0, p));
+                part.erase(0, p + 1);
+                part_time = now;
+            }
         }
     }).detach();
 }
@@ -3135,8 +3171,8 @@ int main(int argc, char** argv) {
         {
             std::lock_guard<std::mutex> lk(g_log.mu);
             next = g_log.next;
-            for (const auto& [n, t] : g_log.lines)
-                if (n > after) lines.push_back({{"n", n}, {"text", t}, {"v", verbose_line(t)}});
+            for (const auto& l : g_log.lines)
+                if (l.n > after) lines.push_back({{"n", l.n}, {"time", l.time}, {"text", l.text}, {"v", verbose_line(l.text)}});
         }
         res.set_content(dump({{"lines", lines}, {"next", next}}), "application/json; charset=utf-8");
     });

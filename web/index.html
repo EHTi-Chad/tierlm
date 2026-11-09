@@ -105,6 +105,7 @@
   #chat.consolewide #messages, #chat.consolewide #composer { display: none; }
   #console .e { color: #ff9a7a; }
   #console .s { color: #6ff0dc; }
+  #console .lt, #bigconsole pre .lt { color: #6b7385; margin-right: 1.2ch; user-select: text; }
   #chatlist { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
   .chatitem { display: flex; align-items: center; gap: 6px; border-radius: 8px; }
   .chatitem.cur { background: var(--accent-soft); }
@@ -3274,7 +3275,7 @@ let consoleWide = false;
 function renderLog() {
   const html = logLines.filter(l => logVerbose || !l.v).map(l => {
     const cls = l.v ? "v" : /error|failed|could not|not enough/i.test(l.text) ? "e" : /^(loaded|reply:|benchmark:|autotune:.*tok\/s)/.test(l.text) ? "s" : "";
-    return `<div${cls ? ` class="${cls}"` : ""}>${esc(l.text) || "&nbsp;"}</div>`;
+    return `<div${cls ? ` class="${cls}"` : ""}>${l.time ? `<span class="lt">${l.time}</span>` : ""}${esc(l.text) || "&nbsp;"}</div>`;
   }).join("");
   for (const el of [$("console"), $("console2")]) {
     const atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
@@ -3304,7 +3305,7 @@ function setVerbose(v) {
   for (const id of ["c-verbose", "w-verbose"]) $(id).classList.toggle("on", v);
   renderLog();
 }
-const copyLog = () => navigator.clipboard?.writeText(logLines.filter(l => logVerbose || !l.v).map(l => l.text).join("\n"));
+const copyLog = () => navigator.clipboard?.writeText(logLines.filter(l => logVerbose || !l.v).map(l => (l.time ? l.time + "  " : "") + l.text).join("\n"));
 $("c-info").onclick = $("w-info").onclick = () => setVerbose(false);
 $("c-verbose").onclick = $("w-verbose").onclick = () => setVerbose(true);
 $("c-copy").onclick = $("w-copy").onclick = copyLog;
