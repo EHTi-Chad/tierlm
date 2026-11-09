@@ -18,6 +18,7 @@ serves your other apps.
 
 | | |
 |---|---|
+| **Guesses ahead** | Qwen3.8 Flash-Next (IQ3_XXS) at **84 tok/s** on one RTX 5090 with its own draft file, against 60 without it, and the same answers ([details below](#spotlight-qwen38-flash-next-on-one-rtx-5090)) |
 | **Bigger than your RAM** | Qwen3.8 Flash-Next (120 GB) at **37 tok/s** on one RTX 5090 (32 GB) with 64 GB of RAM: the SSD tier reads the rarely used parts from an NVMe drive as each word needs them |
 | **Bigger than your GPU** | gpt-oss-120b (59 GB) at **38.5 tok/s** on one RTX 5090 (32 GB); Qwen3-Coder-Next 80B at **63.8 tok/s** on the same card; Qwen3.6-35B-A3B (17 GB) at **33 tok/s** on an 8 GB laptop RTX 3070 |
 | **Reads images** | screenshots, photos, scanned and handwritten pages, with Qwen3.5 / 3.6: a 4K screenshot read in **0.65 s** on an RTX 5090, a full-screen one in **2.7 s** on the laptop |
@@ -25,6 +26,33 @@ serves your other apps.
 | **Never hits a wall** | chats are saved as readable files; when a conversation fills the context, the oldest messages are archived and looked back at when they matter |
 | **Serves your apps** | OpenAI-compatible API with tool calling and images, an embedding model alongside, a queue, and several replies at once: **4 at once, 364 tok/s in all** on one RTX 5090 |
 | **Tunes itself** | Find the fastest settings measures your PC (split, threads, guessing, connections) and keeps the fastest |
+
+### Spotlight: Qwen3.8 Flash-Next on one RTX 5090
+
+Qwen3.8 Flash-Next is a 512-expert model (120 GB at 4 bits; this is unsloth's smaller 3-bit build). tierlm runs it on one 32 GB card:
+attention, the context, the draft block and the 11,115 busiest experts in VRAM, the other experts in RAM, and its
+29 GB n-gram table on an NVMe drive. Unsloth's draft file guesses ahead; the model checks the guesses in one pass and
+keeps those it agrees with, so every reply is its own.
+
+| tierlm 0.8.5, Qwen3.8-Flash-Next UD-IQ3_XXS | tok/s |
+|---|---|
+| No guessing, four 500-token answers at temperature 0 | 59-66 |
+| **4 guesses per check**, the same answers (3.1-3.7 words per check) | **73-91**, most 81-89 |
+| A 500-token story at temperature 0.7, no guessing | about 55 |
+| The same story, 4 guesses with speculative sampling | **63** |
+| Two of the answers at temperature 0.7, 4 guesses | **87 and 90** |
+| **Find the fastest settings**, as the app runs it (it picks the VRAM experts following the conversation and 3 guesses) | **75.4** (0.8.4 picked 42.2) |
+
+**Every setting.** RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11, an NVMe drive for the SSD tier;
+tierlm 0.8.5 with its CUDA 12.9 engine. Qwen3.8-Flash-Next UD-IQ3_XXS from unsloth (4 files) with
+`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` in the same folder. Experts in RAM with the busiest in VRAM, 12 CPU threads,
+64K context with 16-bit context memory, flash attention, prompt batch 256, thinking off; for the answers at
+temperature 0 the draft block's experts were also in VRAM (`TIERLM_MTP_VRAM=1`). Sampling at 0.7: top-k 40, top-p
+0.9, min-p 0.05. Find the fastest settings measured with the chat's settings (temperature 0.7, repeat penalty 1.1).
+The questions: C++ templates, black holes, Ontario contract law, sourdough bread; the story: a lighthouse keeper.
+
+**To get the same:** put the model and its `mtp-` file in one folder, pick it in tierlm, turn on Speculative
+decoding and press Find the fastest settings.
 
 **[Inside the engine (PDF)](docs/tierlm-0.6.0-inside-the-engine.pdf)** walks through what tierlm's C++ does, step by
 step, with diagrams, code and an honest comparison with llama.cpp. New user? Start with
