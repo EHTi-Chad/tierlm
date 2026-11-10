@@ -1567,6 +1567,9 @@ int main(int argc, char** argv) {
     // Requests waiting in line each hold a thread, so the pool is bigger than httplib's default (the CPU count):
     // with 8 apps waiting, the page and status requests must still get through.
     svr.new_task_queue = [] { return new httplib::ThreadPool(32, 256); };
+    // The largest request body taken (a long conversation with images is a few tens of MB): without a limit, one
+    // request from the network could fill the computer's memory.
+    svr.set_payload_max_length((size_t)256 << 20);
 
     svr.Get("/", [&](const httplib::Request&, httplib::Response& res) {
         std::string page = read_file(a.web + "/index.html");
@@ -1587,15 +1590,18 @@ int main(int argc, char** argv) {
     });
 
     json last_info = {{"loaded", false}, {"version", TIERLM_VERSION}};
+    std::mutex info_mu;                  // guards last_info: read while a reply runs, by requests that didn't get the model's lock
+    auto info_copy = [&] { std::lock_guard<std::mutex> g(info_mu); return last_info; };
+    auto info_set = [&](const json& j) { std::lock_guard<std::mutex> g(info_mu); last_info = j; };
     svr.Get("/api/info", [&](const httplib::Request&, httplib::Response& res) {
         // While a reply is streaming or a model is loading, answer from the last snapshot instead of waiting.
         std::unique_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
         if (!lk.owns_lock()) {
-            json j = last_info; j["busy"] = true; j["waiting"] = line.waiting();
+            json j = info_copy(); j["busy"] = true; j["waiting"] = line.waiting();
             if (!eng.slots.empty()) j["active"] = (int)eng.slots.size() - eng.free_slots.load();   // replies running now
             res.set_content(dump(j), "application/json; charset=utf-8"); return;
         }
-        if (!eng.model) { last_info = {{"loaded", false}, {"version", TIERLM_VERSION}}; res.set_content(dump(last_info), "application/json; charset=utf-8"); return; }
+        if (!eng.model) { const json none = {{"loaded", false}, {"version", TIERLM_VERSION}}; info_set(none); res.set_content(dump(none), "application/json; charset=utf-8"); return; }
         const auto& hp = eng.model->hparams();
         size_t free = 0, total = 0;
         eng.model->device_memory(free, total);
@@ -1643,7 +1649,7 @@ int main(int argc, char** argv) {
                 return ms[id]["tuned"].value("tps", 0.0);
             }()},
         };
-        last_info = j;
+        info_set(j);
         res.set_content(dump(j), "application/json; charset=utf-8");
     });
 
@@ -2529,7 +2535,7 @@ int main(int argc, char** argv) {
                 json messages = body["messages"];
                 agent::ojson tools = agent::ojson::array();
                 const std::string ws = sget("workspace_folder");
-                if (body.value("workspace", false) && !ws.empty()) {
+                if (local && body.value("workspace", false) && !ws.empty()) {      // (another device isn't told the folder)
                     tools = workspace::tools();
                     const std::string note = workspace::instructions(ws);
                     if (!messages.empty() && messages[0].value("role", std::string()) == "system")
@@ -3270,7 +3276,7 @@ int main(int argc, char** argv) {
         std::string cur;
         {
             std::unique_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
-            cur = lk.owns_lock() ? loaded_id() : last_info.value("path", std::string());
+            cur = lk.owns_lock() ? loaded_id() : info_copy().value("path", std::string());
             if (!lk.owns_lock() && !cur.empty()) cur = fs::u8path(cur).filename().u8string();
         }
         if (!cur.empty()) {
@@ -3319,11 +3325,12 @@ int main(int argc, char** argv) {
                 cur_m = v0_model(cur, eng.vision ? "vlm" : "llm", true, eng.model->arch(), 0,
                                  eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per);
             } else if (!lk.owns_lock()) {                     // (busy writing a reply: what was loaded last)
-                cur = last_info.value("path", std::string());
+                const json li = info_copy();
+                cur = li.value("path", std::string());
                 if (!cur.empty()) {
                     cur = fs::u8path(cur).filename().u8string();
-                    cur_m = v0_model(cur, last_info.value("vision", false) ? "vlm" : "llm", true, last_info.value("arch", std::string()),
-                                     0, last_info.value("ctx", 0));
+                    cur_m = v0_model(cur, li.value("vision", false) ? "vlm" : "llm", true, li.value("arch", std::string()),
+                                     0, li.value("ctx", 0));
                 }
             }
         }
@@ -3703,8 +3710,9 @@ int main(int argc, char** argv) {
     auto ws_info = [&](const httplib::Request& req) {
         const std::string folder = sget("workspace_folder");
         std::error_code ec;
-        return json{{"available", ws_check(req, false).empty()}, {"folder", folder},
-                    {"exists", !folder.empty() && fs::is_directory(fs::u8path(folder), ec)},
+        const bool here = ws_check(req, false).empty();         // (another device isn't told which folder, or whether it exists)
+        return json{{"available", here}, {"folder", here ? folder : std::string()},
+                    {"exists", here && !folder.empty() && fs::is_directory(fs::u8path(folder), ec)},
                     {"picker", (bool)
 #ifdef _WIN32
                                 true

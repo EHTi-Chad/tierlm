@@ -186,6 +186,19 @@ models folder, the embedding model and its download, the workspace and saved cha
 model-file lists. The page there shows the chat, speed, context and the address to connect with. `/api/info` adds
 `"remote": true` there, and gives the model's file name instead of its full path.
 
+**What another device can and can't reach** (checked again for 0.8.7):
+
+- It can chat with the loaded model, and see the model's name, context size, speed, whether an embedding model is
+  loaded, and tierlm's own network address.
+- It can't read or write any file on the computer: not the workspace (it isn't even told which folder is chosen;
+  until 0.8.7 `/api/workspace`, and a chat request asking for the workspace tools, gave the folder's path away),
+  not saved chats, not the models folder, not the console, not the settings file with the API key.
+- It can't change anything: models, settings, network access and the key stay with the computer running tierlm.
+- A request body over 256 MB is refused (413), so one request can't fill the computer's memory (since 0.8.7).
+- The connection is plain HTTP: on a network you don't trust, anyone who can watch the traffic sees the chats and
+  the API key. Use it on your own network, or put a tunnel or reverse proxy with HTTPS in front.
+- Without an API key, anyone who can reach the address can use the model. Set one whenever other devices are allowed.
+
 ## tierlm's own API (`/api`)
 
 ### GET /api/info
