@@ -293,6 +293,45 @@ the model's own: `tests/tiny_flashnext_mtp.py` draws 8,000 three-token replies w
 whole. Flash-Next IQ3_XXS on an RTX 5090, 4 guesses: a story at 0.7 went from 46-52 to 63 tok/s (55 without
 guessing); prompts at 0.7 from 67-73 to 77-90.
 
+**Kept plans** (since 0.8.7). A round of guessing runs three kinds of graph in turn: the draft block for one
+token (once per guess), the model's check, and the draft block catching up. ggml's scheduler holds one placed graph
+at a time, so each of them was built and placed again every round, and the reply's one-token graph that tierlm
+keeps to run again (about 3 ms a token saved) never survived a round. Measured on Flash-Next with `TIERLM_PROFILE`:
+1.0 ms to build and 2.7 ms to place the check's graph, of a 45 ms check, and the same kind of work again for each
+of the draft block's steps. Now the check and the draft block's one-token step each have a scheduler of their own,
+with its own working memory, where their graph stays placed and is run again with new inputs (positions, cache
+cells and masks are inputs already), until the cache span or the number of guesses changes. Undoing guesses reads
+the snapshots straight from the check's own memory, which nothing else writes over.
+
+The cost is VRAM: a check keeps a copy of every DeltaNet layer's memory per guess, so its working memory is large
+(571 MB for Flash-Next with 4 guesses, where the largest prompt batch needs 548 MB). It is counted with the VRAM
+kept free at load, so that many fewer experts fit: 10,729 instead of 11,005 of Flash-Next's 24,576 on an RTX 5090,
+still 90% of the expert work. The plans are made only for models with a draft block, and only when the check's
+memory is under 1/32 of the card (`TIERLM_PLANS=1`: always, `=0`: never).
+
+The draft block's experts also go into VRAM before the model's own (since 0.8.7; `TIERLM_MTP_VRAM=0` for the old
+placement by use): the draft block runs once per guess, so its experts in RAM cost a GPU-to-CPU round trip each time.
+
+RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11, Flash-Next UD-IQ3_XXS with its MTP file, 64K
+context, 12 threads, VRAM experts following the conversation, 4 guesses, 500-token replies, one session:
+
+| | Four answers, temperature 0 | A story at 0.7 | Guessing, per check | Checking, per check |
+|---|---|---|---|---|
+| 0.8.6 placement of the draft block's experts | 65.0 tok/s average | | 7.4 ms | |
+| Draft block's experts in VRAM first | 71.7 | | 3.9 ms | |
+| (later session) without kept plans | 77.3 (69.3-87.4, 16 replies) | 57.5 (54.5-61.3) | 3.5-4.5 ms | 33.5-41.6 ms |
+| With kept plans | **86.5** (76.1-96.6, 24 replies) | **66.5** (62.9-69.9) | 2.7-2.9 ms | 29.3-39.1 ms |
+
+The two pairs of rows are from different sessions (a session's speeds depend on how much of the n-gram table Windows
+has cached), so compare within a pair. Replies are identical with and without kept plans (`tests/tiny_flashnext_mtp.py`,
+`tests/tiny_qwen35.py`).
+
+Also measured and not kept: choosing the number of guesses per check from how sure the draft block is (stop when
+the chance that a guess is kept, calibrated per place as the reply goes, falls under what one more checked position
+costs). With at most 4 guesses it matched a fixed 4 on answers (76.9 against 77.3 tok/s) and was slower on a story
+(54.5 against 57.2); allowed up to 8 it was slower everywhere (65.3 on answers), because the model's check gets
+slower per position past 4. A fixed count stays.
+
 **Measured.** RTX 3070 laptop, Qwen3.6-27B MTP Q4_K_M with 23 of 64 layers in VRAM, 16K context, 8-bit KV:
 3.0 tok/s without speculation; 3.9, **5.3** and 4.1 tok/s with 2, 3 and 4 guesses per check. At 3 guesses a check
 produced 2.6 tokens on average and 53% of guesses were kept. More guesses stop paying once the later ones are rarely

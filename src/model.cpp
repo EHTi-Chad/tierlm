@@ -32,7 +32,9 @@ static constexpr int kGraphSize = 16384;
 
 Model::~Model() {
     release_pending();
-    drop_reuse();
+    drop_plans();
+    if (check_.sched) ggml_backend_sched_free(check_.sched);
+    if (mtp1_.sched) ggml_backend_sched_free(mtp1_.sched);
     if (sched_) ggml_backend_sched_free(sched_);
     free_kv();
     for (auto* b : wbufs_) if (b) ggml_backend_buffer_free(b);
@@ -1579,6 +1581,41 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     ggml_free(worst.ctx);
     if (!ok) throw std::runtime_error("failed to reserve compute memory");
     if (!m->gpus_.empty()) m->place_.compute_gpu = ggml_backend_sched_get_buffer_size(m->sched_, m->gpus_[0]);
+    if (std::getenv("TIERLM_PROFILE") && !m->gpus_.empty())
+        std::fprintf(stderr, "profile: working memory for the largest batch: %.0f MB of VRAM\n", m->place_.compute_gpu / 1048576.0);
+    // A draft block: schedulers of their own for the check and for the block's one-token step (see Plan), with
+    // working memory for a check of up to 8 guesses. Counted with the compute memory, so the VRAM kept free covers it.
+    if (m->mtp_ && m->flash_attn_ && !(std::getenv("TIERLM_PLANS") && !std::strcmp(std::getenv("TIERLM_PLANS"), "0")) &&
+        !std::getenv("TIERLM_DUMP_SCHED")) {
+        auto make = [&](Plan& p, bool mtp) {
+            p.sched = ggml_backend_sched_new(backends.data(), sched_bufts.data(), n_backends, m->graph_size_, false, offload);
+            if (!p.sched) return;
+            ggml_backend_sched_set_overlap(p.sched, m->overlap_ && !(std::getenv("TIERLM_OVERLAP") && !std::strcmp(std::getenv("TIERLM_OVERLAP"), "2")));
+            p.mem.resize(m->graph_mem_size_);
+            // (4 guesses and the token before them: the default, and the most Find the fastest settings tries; a
+            // wider check makes its scheduler grow, as the one scheduler did before. TIERLM_PLAN_WIDTH: another width.)
+            const char* we = std::getenv("TIERLM_PLAN_WIDTH");
+            const int w = std::min(we ? std::max(2, std::atoi(we)) : 5, m->max_ctx_);
+            Graph g = mtp ? m->build_mtp(1, m->max_ctx_ - 1, &p.mem) : m->build(w, m->max_ctx_, true, w, true, w, nullptr, &p.mem);
+            if (!mtp) m->pin_cpu_layers(g, p.sched);
+            const bool fits = ggml_backend_sched_reserve(p.sched, g.gf);
+            ggml_free(g.ctx);
+            // Not when it would take more than 1/32 of the card (a check keeps a copy of every DeltaNet layer's memory
+            // per guess: 571 MB for Flash-Next, 1.8% of an RTX 5090, for 11% more speed there; on a small card the
+            // same memory holds weights that matter more). TIERLM_PLANS=1: always.
+            size_t vfree = 0, vtotal = 0;
+            m->device_memory(vfree, vtotal);
+            const bool big = fits && !m->gpus_.empty() && vtotal > 0 && !std::getenv("TIERLM_PLANS") &&
+                             ggml_backend_sched_get_buffer_size(p.sched, m->gpus_[0]) > vtotal / 32;
+            if (!fits || big) { ggml_backend_sched_free(p.sched); p.sched = nullptr; p.mem = {}; return; }   // (as before)
+            if (!m->gpus_.empty()) m->place_.compute_gpu += ggml_backend_sched_get_buffer_size(p.sched, m->gpus_[0]);
+            if (std::getenv("TIERLM_PROFILE") && !m->gpus_.empty())
+                std::fprintf(stderr, "profile: the %s's own working memory: %.0f MB of VRAM\n", mtp ? "draft block step" : "check",
+                             ggml_backend_sched_get_buffer_size(p.sched, m->gpus_[0]) / 1048576.0);
+        };
+        make(m->check_, false);
+        make(m->mtp1_, true);
+    }
     return m;
 }
 
@@ -1586,7 +1623,8 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
 // GPU if it can run it, even in the middle of a layer whose weights are in RAM. Each such op costs two
 // GPU<->CPU hand-offs, which on Windows cost more than the GPU saves. So in a layer split, every op of a RAM
 // layer is pinned to the CPU, and the work changes device once per token.
-void Model::pin_cpu_layers(const Graph& g) {
+void Model::pin_cpu_layers(const Graph& g, ggml_backend_sched* sc) {
+    if (!sc) sc = sched_;
     // Debugging: TIERLM_CPU_OPS=SSM_CONV,GATED_DELTA_NET,... runs those op types on the CPU, to find which
     // GPU kernel disagrees with the reference.
     if (const char* ops = std::getenv("TIERLM_CPU_OPS"); ops && main_ != cpu_) {
@@ -1594,16 +1632,16 @@ void Model::pin_cpu_layers(const Graph& g) {
         for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) {
             ggml_tensor* t = ggml_graph_node(g.gf, i);
             if (list.find(std::string(",") + ggml_op_name(t->op) + ",") != std::string::npos)
-                ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
+                ggml_backend_sched_set_tensor_backend(sc, t, cpu_);
         }
     }
-    for (ggml_tensor* t : g.cpu_ops) ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
+    for (ggml_tensor* t : g.cpu_ops) ggml_backend_sched_set_tensor_backend(sc, t, cpu_);
     if (!pin_layers_) return;
     for (const auto& [t, layer] : g.owner) {
         if (layer < 0 || layer >= (int)layer_dev_.size()) continue;
         const int d = layer_dev_[layer];
-        if (d < 0) ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
-        else if (gpus_.size() > 1) ggml_backend_sched_set_tensor_backend(sched_, t, gpus_[d]);
+        if (d < 0) ggml_backend_sched_set_tensor_backend(sc, t, cpu_);
+        else if (gpus_.size() > 1) ggml_backend_sched_set_tensor_backend(sc, t, gpus_[d]);
     }
 }
 
@@ -2436,7 +2474,7 @@ void Model::profile_step(int n_tok, double prep_ms, double compute_ms, double ou
 }
 
 Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logits, bool want_hidden, int snapshots,
-                          const std::vector<SeqGroup>* groups) {
+                          const std::vector<SeqGroup>* groups, std::vector<uint8_t>* mem) {
     const Hparams& hp = hp_;
     const int n_kv = kv_span(n_kv_end), n_past = n_kv_end - n_tok;   // (attn_block takes the span as n_past + n_tok)
     const SeqGroup one{0, n_tok};
@@ -2444,9 +2482,9 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     const std::vector<SeqGroup>& grp = groups ? *groups : single;
     const int hd = hp.head_dim;
 
-    drop_reuse();                                                  // (its memory is about to be built over)
+    if (!mem) drop_reuse();                                        // (its memory is about to be built over)
     Graph g;
-    std::vector<uint8_t>& gm = graph_mem(n_tok == 1 ? 0 : 1, n_tok);
+    std::vector<uint8_t>& gm = mem ? *mem : graph_mem(n_tok == 1 ? 0 : 1, n_tok);
     ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
     ggml_context* c = g.ctx = ggml_init(ip);
     g.gf = ggml_new_graph_custom(c, graph_size_, false);
@@ -2739,12 +2777,12 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
 //   x = eh_proj([rms(embed(token)) * enorm ; rms(h) * hnorm]), then one full-attention layer with its own KV
 //   cache, then the shared final norm and output head.
 // Its own final hidden state can stand in for the model's, to draft several tokens ahead.
-Model::Graph Model::build_mtp(int n_tok, int n_past) {
+Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem) {
     const Hparams& hp = hp_;
     const Layer& L = *mtp_;
     const int n_kv = kv_span(n_past + n_tok);
     Graph g;
-    std::vector<uint8_t>& gm = graph_mem(2, n_tok);
+    std::vector<uint8_t>& gm = mem ? *mem : graph_mem(2, n_tok);
     ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
     ggml_context* c = g.ctx = ggml_init(ip);
     g.gf = ggml_new_graph_custom(c, kGraphSize, false);
@@ -2824,10 +2862,26 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     if (pos0 + n_tok > max_ctx_) throw std::runtime_error("MTP: past the end of the context");
     release_pending();
     const Hparams& hp = hp_;
-    Graph g = build_mtp(n_tok, pos0);
-    drop_reuse();
-    ggml_backend_sched_reset(sched_);
-    if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) { ggml_free(g.ctx); throw std::runtime_error("failed to allocate compute memory"); }
+    // One token (each guess, and catching up after a check that kept none): the kept plan, run again (see Plan).
+    const bool plan = n_tok == 1 && mtp1_.sched;
+    const ReuseKey key{kv_span(pos0 + n_tok)};
+    ggml_backend_sched* sc = plan ? mtp1_.sched : sched_;
+    if (plan && !(mtp1_.g.ctx && mtp1_.key == key)) {
+        drop_plan(mtp1_);
+        mtp1_.g = build_mtp(1, pos0, &mtp1_.mem);
+        mtp1_.g.kept = true;
+        mtp1_.key = key;
+        ggml_backend_sched_reset(sc);
+        if (!ggml_backend_sched_alloc_graph(sc, mtp1_.g.gf)) { drop_plan(mtp1_); throw std::runtime_error("failed to allocate compute memory"); }
+    }
+    Graph built;
+    if (!plan) {
+        built = build_mtp(n_tok, pos0);
+        drop_reuse();
+        ggml_backend_sched_reset(sched_);
+        if (!ggml_backend_sched_alloc_graph(sched_, built.gf)) { ggml_free(built.ctx); throw std::runtime_error("failed to allocate compute memory"); }
+    }
+    Graph& g = plan ? mtp1_.g : built;
     std::vector<int32_t> positions(n_tok);
     for (int i = 0; i < n_tok; ++i) positions[i] = pos0 + i;
     ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
@@ -2842,14 +2896,17 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
         ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
     }
     set_n_threads(cpu_, n_threads);
-    if (ggml_backend_sched_graph_compute(sched_, g.gf) != GGML_STATUS_SUCCESS) { ggml_free(g.ctx); throw std::runtime_error("graph compute failed"); }
+    if (ggml_backend_sched_graph_compute(sc, g.gf) != GGML_STATUS_SUCCESS) {
+        if (plan) drop_plan(mtp1_); else ggml_free(g.ctx);
+        throw std::runtime_error("graph compute failed");
+    }
     std::vector<float> out(hp.n_vocab);
     ggml_backend_tensor_get(g.logits, out.data(), 0, sizeof(float) * hp.n_vocab);
     if (h_out) {
         h_out->resize((size_t)hp.hidden_width() * n_tok);
         ggml_backend_tensor_get(g.hidden, h_out->data(), 0, sizeof(float) * h_out->size());
     }
-    ggml_free(g.ctx);
+    if (!plan) ggml_free(g.ctx);
     return out;
 }
 
@@ -2957,7 +3014,7 @@ void Model::resize_ctx(int new_ctx) {
         throw std::runtime_error("the conversations in the cache use " + std::to_string(hi_) + " tokens, more than " +
                                  std::to_string(new_ctx) + ": start a new chat first, or choose a longer context");
     release_pending();
-    drop_reuse();                                               // (the kept graph points at the cache that is about to be freed)
+    drop_plans();                                               // (the kept graphs point at the cache that is about to be freed)
     const Hparams& hp = hp_;
     const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), n_seq = n_seq_max();
     // 1. what to keep, in RAM
@@ -3022,7 +3079,7 @@ void Model::resize_ctx(int new_ctx) {
 }
 
 void Model::release_pending() {
-    if (pending_) { ggml_free(((Graph*)pending_)->ctx); delete (Graph*)pending_; pending_ = nullptr; }
+    if (pending_) { if (!((Graph*)pending_)->kept) ggml_free(((Graph*)pending_)->ctx); delete (Graph*)pending_; pending_ = nullptr; }
 }
 
 void Model::accept(int n_keep) {
@@ -3100,6 +3157,15 @@ void Model::drop_reuse() {
     if (reuse_.ctx) ggml_free(reuse_.ctx);
     reuse_ = Graph();
 }
+
+void Model::drop_plan(Plan& p) {
+    if (!p.g.ctx) return;
+    if (pending_ && ((Graph*)pending_)->ctx == p.g.ctx) { delete (Graph*)pending_; pending_ = nullptr; }   // (it was this graph)
+    ggml_free(p.g.ctx);
+    p.g = Graph();
+}
+
+void Model::drop_plans() { drop_reuse(); drop_plan(check_); drop_plan(mtp1_); }
 
 Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
                            std::vector<int32_t>* routing, const std::vector<SeqGroup>* groups) {
@@ -3182,19 +3248,29 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     static const bool reuse_on = !(std::getenv("TIERLM_REUSE") && !std::strcmp(std::getenv("TIERLM_REUSE"), "0")) &&
                                  !std::getenv("TIERLM_DUMP_SCHED");
     const bool cacheable = reuse_on && n_tok == 1 && !groups && !any_image && snapshots <= 1;
-    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden};
-    const bool reuse = cacheable && reuse_.ctx && key == reuse_key_;
+    // A check of guesses (an undoable step) has a scheduler of its own, where its graph stays placed (see Plan).
+    const bool plan = reuse_on && check_.sched && snapshots > 1 && !groups && !any_image;
+    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots};
+    const bool reuse = plan ? check_.g.ctx && key == check_.key : cacheable && reuse_.ctx && key == reuse_key_;
+    ggml_backend_sched* const sc = plan ? check_.sched : sched_;
     Graph built;
-    if (!reuse) built = build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups);
-    Graph& g = reuse ? reuse_ : built;
+    if (!reuse) {
+        if (plan) drop_plan(check_);
+        built = build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups, plan ? &check_.mem : nullptr);
+        if (plan) { built.kept = true; check_.g = built; check_.key = key; }
+    }
+    Graph& g = plan ? check_.g : reuse ? reuse_ : built;
     build_images_ = build_mrope_ = false;
     g.n_tok = n_tok;
     auto t1 = clk::now();
 
     if (!reuse) {
-        ggml_backend_sched_reset(sched_);
-        pin_cpu_layers(g);
-        if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) { ggml_free(g.ctx); throw std::runtime_error("failed to allocate compute memory"); }
+        ggml_backend_sched_reset(sc);
+        pin_cpu_layers(g, sc);
+        if (!ggml_backend_sched_alloc_graph(sc, g.gf)) {
+            if (plan) drop_plan(check_); else ggml_free(g.ctx);
+            throw std::runtime_error("failed to allocate compute memory");
+        }
     }
     auto t2 = clk::now();
     if (std::getenv("TIERLM_DUMP_SCHED") && n_tok == 1) {           // debugging: where the work switches device
@@ -3203,7 +3279,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         for (int i = 0; i < ggml_graph_n_nodes(g.gf) && shown < 60; ++i) {
             ggml_tensor* t = ggml_graph_node(g.gf, i);
             if (t->op == GGML_OP_FLASH_ATTN_EXT || (t->op == GGML_OP_SOFT_MAX && !flash_attn_)) ++layer;
-            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched_, t);
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sc, t);
             if (b == prev) continue;
             prev = b;
             ++shown;
@@ -3216,7 +3292,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             std::fprintf(stderr, "switch at node %4d (layer ~%d): %-14s -> %-8s inputs:%s\n", i, layer, ggml_op_desc(t),
                          b ? ggml_backend_name(b) : "?", srcs.c_str());
         }
-        std::fprintf(stderr, "splits %d\n", ggml_backend_sched_get_n_splits(sched_));
+        std::fprintf(stderr, "splits %d\n", ggml_backend_sched_get_n_splits(sc));
         // TIERLM_DUMP_SCHED=2: also every step of layers 1-4 (op, where it runs, shape), and the step count per device
         if (std::atoi(std::getenv("TIERLM_DUMP_SCHED")) >= 2) {
             std::map<std::string, int> per_dev;
@@ -3224,7 +3300,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) {
                 ggml_tensor* t = ggml_graph_node(g.gf, i);
                 if (t->op == GGML_OP_FLASH_ATTN_EXT || (t->op == GGML_OP_SOFT_MAX && !flash_attn_)) ++layer;
-                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched_, t);
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sc, t);
                 const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
                 const std::string dev = b ? ggml_backend_name(b) : "?";
                 if (!view) per_dev[dev]++;
@@ -3297,7 +3373,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     // TIERLM_TRACE=1: each named result's size, sum, RMS and the last token's first numbers, as it's computed
     static const bool trace = std::getenv("TIERLM_TRACE") != nullptr;
     if (trace) {
-        ggml_backend_sched_set_eval_callback(sched_, [](ggml_tensor* t, bool ask, void*) -> bool {
+        ggml_backend_sched_set_eval_callback(sc, [](ggml_tensor* t, bool ask, void*) -> bool {
             const char* n = ggml_get_name(t);
             const bool mine = std::strncmp(n, "tr:", 3) == 0 && !std::strchr(n, ' ');   // (not the views made from it)
             if (ask) return mine;
@@ -3318,17 +3394,17 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     // TIERLM_OPPROF=1 (developers): time per kind of step (op and device), each one waited for, so the totals are
     // slower than a real run but show what grows with the number of tokens in a step. Printed every 32 steps of a size.
     static const bool opprof = std::getenv("TIERLM_OPPROF") != nullptr;
-    struct OpProf { Model* m; clk::time_point last; std::map<std::string, double>* acc; };
+    struct OpProf { Model* m; ggml_backend_sched* sc; clk::time_point last; std::map<std::string, double>* acc; };
     static std::map<int, std::pair<int, std::map<std::string, double>>> opstats;
-    OpProf op_state{this, clk::now(), &opstats[n_tok].second};
+    OpProf op_state{this, sc, clk::now(), &opstats[n_tok].second};
     if (opprof && !trace) {
-        ggml_backend_sched_set_eval_callback(sched_, [](ggml_tensor* t, bool ask, void* ud) -> bool {
+        ggml_backend_sched_set_eval_callback(sc, [](ggml_tensor* t, bool ask, void* ud) -> bool {
             const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
                               t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
             if (ask) return !view;
             auto* st = (OpProf*)ud;
             const auto now = clk::now();
-            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(st->m->sched_, t);
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(st->sc, t);
             std::string key = std::string(b ? ggml_backend_name(b) : "?") + " " + ggml_op_desc(t);
             if (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT) key += std::string(" ") + ggml_type_name(t->src[0]->type);
             (*st->acc)[key] += std::chrono::duration<double, std::milli>(now - st->last).count();
@@ -3336,12 +3412,12 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             return true;
         }, &op_state);
     }
-    if (ggml_backend_sched_graph_compute(sched_, g.gf) != GGML_STATUS_SUCCESS) {
-        if (reuse) drop_reuse(); else ggml_free(g.ctx);
+    if (ggml_backend_sched_graph_compute(sc, g.gf) != GGML_STATUS_SUCCESS) {
+        if (plan) drop_plan(check_); else if (reuse) drop_reuse(); else ggml_free(g.ctx);
         throw std::runtime_error("graph compute failed");
     }
     if (opprof && !trace) {
-        ggml_backend_sched_set_eval_callback(sched_, nullptr, nullptr);
+        ggml_backend_sched_set_eval_callback(sc, nullptr, nullptr);
         auto& [cnt, acc] = opstats[n_tok];
         if (++cnt == 32) {
             std::vector<std::pair<double, std::string>> v;
@@ -3391,13 +3467,14 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         }
     }
     if (snapshots > 1) { pending_ = new Graph(g); }              // kept for accept()
+    else if (plan) {}                                             // (a check that can't be undone: the plan stays)
     else if (cacheable) { if (!reuse) { reuse_ = g; reuse_key_ = key; } }   // kept to run again
     else ggml_free(g.ctx);
     auto t5 = clk::now();
     stats_.calls++; stats_.tokens += n_tok;
     stats_.build_ms += ms(t0, t1); stats_.alloc_ms += ms(t1, t2); stats_.input_ms += ms(t2, t3);
     stats_.compute_ms += ms(t3, t4); stats_.output_ms += ms(t4, t5);
-    stats_.splits = ggml_backend_sched_get_n_splits(sched_); stats_.copies = ggml_backend_sched_get_n_copies(sched_);
+    stats_.splits = ggml_backend_sched_get_n_splits(sc); stats_.copies = ggml_backend_sched_get_n_copies(sc);
     undo_guard.on = false;
     if (hp.any_ple())                                             // Flash-Next: the tokens, for later n-grams
         for (int t = 0; t < n_tok; ++t) {

@@ -334,6 +334,7 @@ private:
         ggml_context* ctx = nullptr;
         struct ggml_cgraph* gf = nullptr;
         ggml_tensor *inp = nullptr, *pos = nullptr, *mask = nullptr, *logits = nullptr;
+        bool kept = false;                       // belongs to a kept plan (see Plan): not freed after its step
         ggml_tensor *img = nullptr, *keep = nullptr;   // images: image words [n_embd, n_tok], 1 for text tokens [1, n_tok]
         bool mrope = false;                      // pos holds 4 x n_tok 3-part positions
         ggml_tensor *hidden = nullptr;           // final-norm hidden states of every position (for the MTP head)
@@ -359,18 +360,18 @@ private:
     struct SeqGroup { int seq, n; };
     // n_kv_end: the cache positions attention covers (all used ones), at least n_tok.
     Graph build(int n_tok, int n_kv_end, bool want_routing, int n_logits = 1, bool want_hidden = false, int snapshots = 1,
-                const std::vector<SeqGroup>* groups = nullptr);
+                const std::vector<SeqGroup>* groups = nullptr, std::vector<uint8_t>* mem = nullptr);
     struct Layer;
     ggml_tensor* attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
     ggml_tensor* attn_mla(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
     ggml_tensor* ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing);
-    void pin_cpu_layers(const Graph& g);        // keep every op of a RAM layer on the CPU
+    void pin_cpu_layers(const Graph& g, ggml_backend_sched* sc = nullptr);        // keep every op of a RAM layer on the CPU
     std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
     void release_pending();
     // One graph: n_tok tokens of conversation 0 (groups null), or of the conversations in groups.
     EvalOut step(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
                  std::vector<int32_t>* routing, const std::vector<SeqGroup>* groups);
-    Graph build_mtp(int n_tok, int n_past);
+    Graph build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem = nullptr);
     void* pending_ = nullptr;                    // Graph of the last undoable batch, until accept()
     // Live hot experts: per split layer, which expert each VRAM slot holds and how much each is wanted.
     struct LivePart { ggml_tensor *hot, *cold; };   // an expert tensor's VRAM part and its RAM part (the rest)
@@ -499,13 +500,26 @@ private:
     // a reply's one-token graph, kept to run again (see step)
     struct ReuseKey {
         int n_kv = 0; bool routing = false; int n_logits = 0; bool qsa_long = false; bool hidden = false;
+        int n_tok = 1, snapshots = 1;
         bool operator==(const ReuseKey& o) const {
-            return n_kv == o.n_kv && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden;
+            return n_kv == o.n_kv && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden &&
+                   n_tok == o.n_tok && snapshots == o.snapshots;
         }
     };
     Graph reuse_;
     ReuseKey reuse_key_;
     void drop_reuse();
+    // Guessing ahead runs three kinds of graph in turn: the draft block for one token (once per guess), the model's
+    // check of the guesses, and the draft block catching up. One scheduler holds one placed graph, so each of them
+    // used to be built and placed again every time: about 4 ms of a 45 ms check on an RTX 5090, and the same again
+    // over the draft block's steps. The check and the draft block's one-token step each get a scheduler of their
+    // own (with its own working memory), so their graphs stay placed and are run again, like a reply's one-token
+    // graph above. Only for models with a draft block, and when the check's memory is a small part of the card.
+    // TIERLM_PLANS=0: as before.
+    struct Plan { Graph g; ReuseKey key; ggml_backend_sched* sched = nullptr; std::vector<uint8_t> mem; };
+    Plan check_, mtp1_;
+    void drop_plan(Plan& p);
+    void drop_plans();                                             // reuse_ and both plans (the cache changes size)
     bool overlap_ = true;                                          // CPU and GPU at once on split expert layers
     Snapshot ckpt_;                                                // (see checkpoint)
     bool ckpt_ok_ = false;

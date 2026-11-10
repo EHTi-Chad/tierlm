@@ -220,7 +220,9 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_LIVE_SYNC=1` | Live hot experts: wait for each copy instead of queuing them all on the GPU (for comparison) |
 | `TIERLM_NO_TIMES=1` | `tierlm-server`: no time (HH:MM:SS) in front of each line in its window (the page's console still shows it) |
 | `TIERLM_SPEC_SAMPLING=0` | `tierlm-server`: at temperature > 0, guess the draft block's best word and keep it only when the model's own draw matches, instead of speculative sampling (for comparison; the replies' odds are the model's either way) |
-| `TIERLM_MTP_VRAM=1` | Put the draft block's experts in VRAM before the model's own, so guessing runs wholly on the GPU |
+| `TIERLM_MTP_VRAM=0` | Don't put the draft block's experts in VRAM before the model's own (the default since 0.8.7, so guessing runs wholly on the GPU): they compete with the model's experts by use, as before |
+| `TIERLM_PLANS=0` | Models with a draft block: build and place the check's graph and the draft block's graph every time, on the one scheduler, as before 0.8.7 (see "Kept plans" in ARCHITECTURE.md). `1`: keep them even when the check's working memory is more than 1/32 of the card |
+| `TIERLM_PLAN_WIDTH=n` | The widest check (guesses + 1) the kept check plan reserves working memory for at load (default 5, for 4 guesses; a wider check makes it grow) |
 | `TIERLM_NO_NGRAM_PREFETCH=1` | Flash-Next with its n-gram table on the SSD tier: read the rows one by one as the graph needs them, not all at once before each step (for comparison) |
 | `TIERLM_KEEP_RAM=0` | Don't hold the weights in system RAM resident after loading (Windows: a raised working-set minimum) |
 | `TIERLM_SAMPLE_RUNS=8000` | `tierlm-logits --gen` / `--gen-spec`: draw that many separate replies (with `TIERLM_SAMPLE_TEMP`, `TIERLM_SAMPLE_TOPK`), one per line, for the speculative-sampling test |
