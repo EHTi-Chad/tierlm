@@ -150,6 +150,47 @@ Not yet: `logprobs`; `n` > 1; embeddings.
 
 Errors use OpenAI's format: `{"error": {"message": "...", "type": "...", "code": ...}}`.
 
+### POST /v1/messages (Anthropic's Messages API)
+
+Since 0.8.7. The same chat as `/v1/chat/completions`, asked for and answered in Anthropic's format, for Claude Code
+and apps built on Anthropic's SDK. The model named in the request is ignored (these apps send names such as
+`claude-sonnet-4-5`): the loaded model answers. The API key, if one is set, goes in `x-api-key` or
+`Authorization: Bearer`.
+
+- **Read from the request**: `system` (text or text blocks), `messages` with `text`, `image` (base64), `tool_use`,
+  `tool_result` and `thinking` blocks, `tools` (`name`, `description`, `input_schema`), `tool_choice` `{"type":
+  "none"}`, `max_tokens`, `stop_sequences`, `temperature`, `top_p`, `top_k`, `thinking` (`enabled` / `disabled`),
+  `stream`.
+- **The reply**: a `message` with `thinking`, `text` and `tool_use` blocks, `stop_reason` `end_turn`, `max_tokens`
+  or `tool_use`, and `usage` (`input_tokens`, `output_tokens`). Streamed: `message_start`, then for each block
+  `content_block_start`, `content_block_delta` (`thinking_delta`, `text_delta`, or `input_json_delta` with a tool
+  call's arguments whole) and `content_block_stop`, then `message_delta` (with the stop reason and the token
+  counts) and `message_stop`.
+- `POST /v1/messages/count_tokens` gives `{"input_tokens": n}` for a request (an estimate while a reply is running).
+
+Claude Code: set `ANTHROPIC_BASE_URL=http://127.0.0.1:8040` (and `ANTHROPIC_AUTH_TOKEN` to tierlm's API key, or
+any text when none is set) before starting it.
+
+### POST /v1/responses (OpenAI's Responses API)
+
+Since 0.8.7. The same chat again, in the format of OpenAI's newer API, for Codex and apps that call
+`client.responses.create`.
+
+- **Read from the request**: `instructions`, `input` (text, or items: messages with `input_text` / `input_image` /
+  `output_text` parts, `function_call`, `function_call_output`, `reasoning`), `tools` of type `function`,
+  `tool_choice` `"none"`, `max_output_tokens`, `reasoning.effort`, `temperature`, `top_p`, `stream`.
+  `previous_response_id` is refused: tierlm doesn't keep responses, so send the conversation in `input`.
+- **The reply**: a `response` whose `output` holds a `reasoning` item, a `message` with `output_text`, and
+  `function_call` items; `status` `completed` or `incomplete` (`max_output_tokens`); `usage`. Streamed:
+  `response.created`, `response.in_progress`, then per item `response.output_item.added`, the part and its
+  `response.output_text.delta` (or `response.reasoning_text.delta`, `response.function_call_arguments.delta`)
+  events with their `.done`, `response.output_item.done`, and `response.completed` or `response.incomplete`.
+
+Codex: a model provider with `base_url = "http://127.0.0.1:8040/v1"` and `wire_api = "responses"`.
+
+Both were checked with Anthropic's and OpenAI's own Python SDKs reading tierlm's replies (plain text, a tool call,
+a tool result, streamed and not, on Flash-Next); thinking blocks and the two agents themselves haven't been tried yet.
+
 ### LM Studio's REST API (`/api/v0`)
 
 For apps written for LM Studio, which list models at LM Studio's own address:

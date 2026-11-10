@@ -491,6 +491,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [ ] Search and download GGUF models from Hugging Face inside tierlm
 - [x] OpenAI-compatible API, with an Allow other devices switch and optional API key
 - [x] Tool (function) calling in the API, for coding agents (opencode, Cline, Continue agent, Cursor agent mode)
+- [x] Anthropic's Messages API and OpenAI's Responses API, for Claude Code and Codex-style agents (0.8.7; checked with both SDKs, not yet with the agents)
 - [x] NVIDIA (CUDA) testing on an RTX 5090
 - [ ] AMD GPU testing via Vulkan/ROCm
 - [x] Several GPUs as VRAM tiers; auto-tuning of the speed settings; new chat layout with console, chats and benchmark

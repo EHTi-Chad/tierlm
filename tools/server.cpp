@@ -29,6 +29,8 @@
 // (base URL http://<this computer>:<port>/v1; see docs/API.md):
 //   GET  /v1/models            the loaded model and every supported model in the models folder
 //   POST /v1/chat/completions  chat, streamed or not, with tool calling; naming another model loads it first
+//   POST /v1/messages          Anthropic's Messages API (Claude Code): the same chat, in its format (api_compat.h)
+//   POST /v1/responses         OpenAI's Responses API (Codex): the same chat, in its format
 //   POST /v1/embeddings        embeddings from the embedding model loaded next to the chat model (/api/embed)
 #include "model.h"
 #include "speculate.h"
@@ -47,6 +49,7 @@
 #include "workspace.h"
 #include "chats.h"
 #include "prompt_cache.h"
+#include "api_compat.h"
 #include "download.h"
 
 #include <climits>
@@ -3711,6 +3714,226 @@ int main(int argc, char** argv) {
             sink.done();
             return true;
         });
+    });
+
+    // ---------------- Anthropic's Messages API and OpenAI's Responses API ----------------
+    // The same chat as /v1/chat/completions, asked for and answered in two other formats (see api_compat.h), so
+    // Claude Code and Codex-style agents can use the loaded model. The model named in the request is ignored (these
+    // apps send names such as "claude-sonnet-4-5"): the loaded model answers.
+    auto compat_chat = [&](const httplib::Request& req, httplib::Response& res, bool anthropic) {
+        auto fail = [&, anthropic](int status, const std::string& msg, const char* type) {
+            if (!anthropic) return oai_error(res, status, msg, type);
+            res.status = status;
+            res.set_content(dump({{"type", "error"}, {"error", {{"type", type}, {"message", msg}}}}), "application/json; charset=utf-8");
+        };
+        compat::Request rq = anthropic ? compat::from_anthropic(req.body) : compat::from_responses(req.body);
+        if (!rq.error.empty()) return fail(400, rq.error, "invalid_request_error");
+        auto lock = std::make_shared<Hold>();
+        if (!line.enter_reply(mu, *lock, std::function<std::atomic<int>*()>(reply_slots), req.is_connection_closed))
+            return fail(503, "busy: waited too long for earlier replies to finish", anthropic ? "overloaded_error" : "server_error");
+        if (!eng.model) return fail(400, "no model is loaded: load one in tierlm first", "invalid_request_error");
+        const json body = json::parse(req.body, nullptr, false);
+        Sampling sp;
+        sp.temperature = body.value("temperature", sp.temperature);
+        sp.top_p = body.value("top_p", sp.top_p);
+        sp.top_k = body.value("top_k", sp.top_k);
+        sp.repeat_penalty = 1.0f;                                     // (off, as for /v1/chat/completions)
+        json messages = normalize_messages(rq.messages);
+        const agent::ojson tools = rq.tools;
+        const std::string model_id = loaded_id();
+        const long long created = (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        static std::atomic<unsigned> counter{0};
+        const std::string uid = std::to_string(created) + std::to_string(++counter);
+        if (sflag("api_trim_oldest")) {                               // (as for /v1/chat/completions)
+            const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
+            const int reserve = rq.max_tokens > 0 ? std::min(rq.max_tokens, ctx / 2) : std::max(256, ctx / 8);
+            if (prompt_tokens(messages, tools) > ctx - reserve) drop_oldest(messages, tools, std::min(ctx * 6 / 10, ctx - reserve));
+        }
+        // The finished reply in the parts both formats are made of.
+        struct Parts { std::string thinking, text; json calls = json::array(); bool cut = false; size_t n_in = 0, n_out = 0; };
+        auto parts_of = [&, tools](const Gen& g) {
+            Parts p;
+            const agent::Parsed pc = tools.empty() ? agent::Parsed{g.text, json::array()} : parse_calls(g.full, tools);
+            const auto [reasoning, answer] = agent::split_thinking(pc.calls.empty() ? g.text : pc.content);
+            p.thinking = reasoning; p.text = answer; p.calls = pc.calls;
+            p.cut = g.stop == "length" || g.stop == "context";
+            p.n_in = g.n_prompt; p.n_out = g.n_gen;
+            return p;
+        };
+        auto call_args = [](const json& c) { return c.value("arguments_json", dump(c["arguments"])); };
+
+        // ---- Anthropic: a message made of content blocks ----
+        auto a_message = [=](const Parts& p) {
+            json content = json::array();
+            if (!p.thinking.empty()) content.push_back({{"type", "thinking"}, {"thinking", p.thinking}, {"signature", ""}});
+            if (!p.text.empty() || p.calls.empty()) content.push_back({{"type", "text"}, {"text", p.text}});
+            for (size_t i = 0; i < p.calls.size(); ++i)
+                content.push_back({{"type", "tool_use"}, {"id", "toolu_" + uid + "_" + std::to_string(i)}, {"name", p.calls[i]["name"]}, {"input", p.calls[i]["arguments"]}});
+            return json{{"id", "msg_" + uid}, {"type", "message"}, {"role", "assistant"}, {"model", model_id}, {"content", content},
+                        {"stop_reason", !p.calls.empty() ? "tool_use" : p.cut ? "max_tokens" : "end_turn"}, {"stop_sequence", nullptr},
+                        {"usage", {{"input_tokens", p.n_in}, {"output_tokens", p.n_out}}}};
+        };
+        // ---- Responses: a response made of output items ----
+        auto r_items = [=](const Parts& p) {
+            json out = json::array();
+            if (!p.thinking.empty())
+                out.push_back({{"id", "rs_" + uid}, {"type", "reasoning"}, {"summary", json::array()},
+                               {"content", json::array({{{"type", "reasoning_text"}, {"text", p.thinking}}})}});
+            if (!p.text.empty() || p.calls.empty())
+                out.push_back({{"id", "msg_" + uid}, {"type", "message"}, {"status", "completed"}, {"role", "assistant"},
+                               {"content", json::array({{{"type", "output_text"}, {"text", p.text}, {"annotations", json::array()}}})}});
+            for (size_t i = 0; i < p.calls.size(); ++i)
+                out.push_back({{"id", "fc_" + uid + "_" + std::to_string(i)}, {"type", "function_call"}, {"status", "completed"},
+                               {"call_id", "call_" + uid + "_" + std::to_string(i)}, {"name", p.calls[i]["name"]}, {"arguments", p.calls[i].value("arguments_json", dump(p.calls[i]["arguments"]))}});
+            return out;
+        };
+        auto r_response = [=](const char* status, const json& output, const Parts* p) {
+            json r = {{"id", "resp_" + uid}, {"object", "response"}, {"created_at", created}, {"status", status}, {"model", model_id},
+                      {"output", output}, {"error", nullptr}, {"incomplete_details", nullptr}, {"parallel_tool_calls", true}, {"store", false},
+                      {"instructions", body.contains("instructions") ? body["instructions"] : json(nullptr)},
+                      {"tools", body.contains("tools") ? body["tools"] : json::array()},
+                      {"tool_choice", body.contains("tool_choice") ? body["tool_choice"] : json("auto")},
+                      {"temperature", sp.temperature}, {"top_p", sp.top_p}, {"usage", nullptr}};
+            if (p) {
+                r["usage"] = {{"input_tokens", p->n_in}, {"output_tokens", p->n_out}, {"total_tokens", p->n_in + p->n_out}};
+                r["output_text"] = p->text;
+                if (p->cut) r["incomplete_details"] = {{"reason", "max_output_tokens"}};
+            }
+            return r;
+        };
+
+        if (!rq.stream) {
+            try {
+                tl_image_tokens = 0;
+                take_think(rq.think);
+                const Parts p = parts_of(generate(messages, sp, rq.max_tokens, rq.stops, nullptr, nullptr, tools));
+                res.set_content(dump(anthropic ? a_message(p) : r_response(p.cut ? "incomplete" : "completed", r_items(p), &p)), "application/json; charset=utf-8");
+            } catch (const std::exception& e) { fail(500, e.what(), anthropic ? "api_error" : "server_error"); }
+            return;
+        }
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream", [&, anthropic, rq, messages, tools, sp, uid, model_id, parts_of, call_args, a_message, r_items, r_response, lock]
+                                                              (size_t, httplib::DataSink& sink) {
+            int seq = 0;
+            auto send = [&](const char* event, json j) {                 // "event: name" then the data, as both APIs stream
+                if (anthropic) j["type"] = event; else { j["type"] = event; j["sequence_number"] = seq++; }
+                const std::string s = std::string("event: ") + event + "\ndata: " + dump(j) + "\n\n";
+                return sink.write(s.data(), s.size());
+            };
+            // The block (Anthropic) or item (Responses) being streamed: "" none, "thinking" or "text".
+            std::string open, open_text;
+            int index = -1;
+            auto close = [&] {
+                if (open.empty()) return true;
+                bool ok;
+                if (anthropic) ok = send("content_block_stop", {{"index", index}});
+                else if (open == "thinking") {
+                    const std::string id = "rs_" + uid;
+                    ok = send("response.reasoning_text.done", {{"item_id", id}, {"output_index", index}, {"content_index", 0}, {"text", open_text}}) &&
+                         send("response.content_part.done", {{"item_id", id}, {"output_index", index}, {"content_index", 0}, {"part", {{"type", "reasoning_text"}, {"text", open_text}}}}) &&
+                         send("response.output_item.done", {{"output_index", index}, {"item", {{"id", id}, {"type", "reasoning"}, {"summary", json::array()},
+                                                            {"content", json::array({{{"type", "reasoning_text"}, {"text", open_text}}})}}}});
+                } else {
+                    const std::string id = "msg_" + uid;
+                    const json part = {{"type", "output_text"}, {"text", open_text}, {"annotations", json::array()}};
+                    ok = send("response.output_text.done", {{"item_id", id}, {"output_index", index}, {"content_index", 0}, {"text", open_text}}) &&
+                         send("response.content_part.done", {{"item_id", id}, {"output_index", index}, {"content_index", 0}, {"part", part}}) &&
+                         send("response.output_item.done", {{"output_index", index}, {"item", {{"id", id}, {"type", "message"}, {"status", "completed"},
+                                                            {"role", "assistant"}, {"content", json::array({part})}}}});
+                }
+                open.clear(); open_text.clear();
+                return ok;
+            };
+            auto piece = [&](const std::string& kind, const std::string& delta, bool even_empty = false) {
+                if (delta.empty() && !even_empty) return true;
+                if (open != kind) {
+                    if (!close()) return false;
+                    open = kind; ++index;
+                    bool ok;
+                    if (anthropic)
+                        ok = send("content_block_start", {{"index", index}, {"content_block", kind == "thinking" ? json{{"type", "thinking"}, {"thinking", ""}}
+                                                                                                                  : json{{"type", "text"}, {"text", ""}}}});
+                    else if (kind == "thinking")
+                        ok = send("response.output_item.added", {{"output_index", index}, {"item", {{"id", "rs_" + uid}, {"type", "reasoning"}, {"summary", json::array()}, {"content", json::array()}}}}) &&
+                             send("response.content_part.added", {{"item_id", "rs_" + uid}, {"output_index", index}, {"content_index", 0}, {"part", {{"type", "reasoning_text"}, {"text", ""}}}});
+                    else
+                        ok = send("response.output_item.added", {{"output_index", index}, {"item", {{"id", "msg_" + uid}, {"type", "message"}, {"status", "in_progress"},
+                                                                 {"role", "assistant"}, {"content", json::array()}}}}) &&
+                             send("response.content_part.added", {{"item_id", "msg_" + uid}, {"output_index", index}, {"content_index", 0},
+                                                                  {"part", {{"type", "output_text"}, {"text", ""}, {"annotations", json::array()}}}});
+                    if (!ok) return false;
+                }
+                if (delta.empty()) return true;
+                open_text += delta;
+                if (anthropic)
+                    return send("content_block_delta", {{"index", index}, {"delta", kind == "thinking" ? json{{"type", "thinking_delta"}, {"thinking", delta}}
+                                                                                                        : json{{"type", "text_delta"}, {"text", delta}}}});
+                return send(kind == "thinking" ? "response.reasoning_text.delta" : "response.output_text.delta",
+                            {{"item_id", (kind == "thinking" ? "rs_" : "msg_") + uid}, {"output_index", index}, {"content_index", 0}, {"delta", delta}});
+            };
+            try {
+                if (anthropic)
+                    send("message_start", {{"message", {{"id", "msg_" + uid}, {"type", "message"}, {"role", "assistant"}, {"model", model_id}, {"content", json::array()},
+                                                         {"stop_reason", nullptr}, {"stop_sequence", nullptr}, {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}}}});
+                else {
+                    send("response.created", {{"response", r_response("in_progress", json::array(), nullptr)}});
+                    send("response.in_progress", {{"response", r_response("in_progress", json::array(), nullptr)}});
+                }
+                agent::ThinkSplit split;
+                auto feed = [&](const std::pair<std::string, std::string>& p) { return piece("thinking", p.first) && piece("text", p.second); };
+                tl_image_tokens = 0;
+                take_think(rq.think);
+                const Gen g = generate(messages, sp, rq.max_tokens, rq.stops, nullptr,
+                                       [&](const std::string& delta, double, const std::vector<int32_t>&) { return delta.empty() ? true : feed(split.feed(delta)); }, tools);
+                if (g.stop != "abort") {
+                    feed(split.feed("", true));
+                    const Parts p = parts_of(g);
+                    if (index < 0 && p.calls.empty()) piece("text", "", true);   // (nothing was written: an empty text, as in the whole reply)
+                    close();
+                    for (size_t i = 0; i < p.calls.size(); ++i) {       // the tool calls, whole, after the text
+                        ++index;
+                        const std::string args = call_args(p.calls[i]);
+                        if (anthropic) {
+                            send("content_block_start", {{"index", index}, {"content_block", {{"type", "tool_use"}, {"id", "toolu_" + uid + "_" + std::to_string(i)},
+                                                                                             {"name", p.calls[i]["name"]}, {"input", json::object()}}}});
+                            send("content_block_delta", {{"index", index}, {"delta", {{"type", "input_json_delta"}, {"partial_json", args}}}});
+                            send("content_block_stop", {{"index", index}});
+                        } else {
+                            const std::string id = "fc_" + uid + "_" + std::to_string(i);
+                            json item = {{"id", id}, {"type", "function_call"}, {"status", "in_progress"}, {"call_id", "call_" + uid + "_" + std::to_string(i)},
+                                         {"name", p.calls[i]["name"]}, {"arguments", ""}};
+                            send("response.output_item.added", {{"output_index", index}, {"item", item}});
+                            send("response.function_call_arguments.delta", {{"item_id", id}, {"output_index", index}, {"delta", args}});
+                            send("response.function_call_arguments.done", {{"item_id", id}, {"output_index", index}, {"arguments", args}});
+                            item["status"] = "completed"; item["arguments"] = args;
+                            send("response.output_item.done", {{"output_index", index}, {"item", item}});
+                        }
+                    }
+                    if (anthropic) {
+                        send("message_delta", {{"delta", {{"stop_reason", !p.calls.empty() ? "tool_use" : p.cut ? "max_tokens" : "end_turn"}, {"stop_sequence", nullptr}}},
+                                               {"usage", {{"input_tokens", p.n_in}, {"output_tokens", p.n_out}}}});
+                        send("message_stop", json::object());
+                    } else send(p.cut ? "response.incomplete" : "response.completed", {{"response", r_response(p.cut ? "incomplete" : "completed", r_items(p), &p)}});
+                }
+            } catch (const std::exception& e) {
+                if (anthropic) send("error", {{"error", {{"type", "api_error"}, {"message", e.what()}}}});
+                else send("error", {{"code", nullptr}, {"message", e.what()}, {"param", nullptr}});
+            }
+            sink.done();
+            return true;
+        });
+    };
+    svr.Post("/v1/messages", [&](const httplib::Request& req, httplib::Response& res) { compat_chat(req, res, true); });
+    svr.Post("/v1/responses", [&](const httplib::Request& req, httplib::Response& res) { compat_chat(req, res, false); });
+    // Anthropic's token count for a request ({"input_tokens": n}): what the prompt would be, with its tools.
+    svr.Post("/v1/messages/count_tokens", [&](const httplib::Request& req, httplib::Response& res) {
+        const compat::Request rq = compat::from_anthropic(req.body);
+        if (!rq.error.empty()) { res.status = 400; return res.set_content(dump({{"type", "error"}, {"error", {{"type", "invalid_request_error"}, {"message", rq.error}}}}), "application/json; charset=utf-8"); }
+        std::shared_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
+        int n = 0;
+        if (lk.owns_lock() && eng.model) n = prompt_tokens(normalize_messages(rq.messages), rq.tools);
+        else n = (int)(req.body.size() / 4);                             // (busy with a reply: an estimate, 4 bytes a token)
+        res.set_content(dump({{"input_tokens", n}}), "application/json; charset=utf-8");
     });
 
     // ---------------- network access and API key ----------------
