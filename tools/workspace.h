@@ -84,6 +84,17 @@ inline fs::path inside(const fs::path& root, const std::string& rel) {
     if (ec || !fs::is_directory(base, ec)) throw Error("the workspace folder doesn't exist any more: choose it again in tierlm's settings");
     std::string r = agent::trim(rel);
     while (!r.empty() && (r == "." || r == "./" || r == ".\\")) r.clear();
+    // A path with a drive, a root or a network share (\\server\share) is refused by its spelling, before the file
+    // system is asked anything (looking a share up would contact that server), unless it spells out a place inside
+    // the workspace.
+    {
+        const fs::path rp = fs::u8path(r);
+        if (rp.has_root_name() || rp.has_root_directory()) {
+            const fs::path in = rp.lexically_normal().lexically_relative(base);
+            if (in.empty() || *in.begin() == "..")
+                throw Error(rel + " is outside the workspace; only files inside it can be used (give paths relative to the workspace)");
+        }
+    }
     const fs::path full = fs::weakly_canonical(r.empty() ? base : base / fs::u8path(r), ec);
     if (ec) throw Error("can't use the path " + rel);
     const fs::path inner = full.lexically_relative(base);
@@ -265,7 +276,13 @@ inline std::string search_files(const fs::path& root, const json& a) {
         fs::recursive_directory_iterator it(where, fs::directory_options::skip_permission_denied, ec), end;
         for (; !ec && it != end && hits < 100; it.increment(ec)) {
             std::error_code e2;
-            if (it->is_directory(e2)) { if (skip_dir(it->path().filename().u8string())) it.disable_recursion_pending(); continue; }
+            // (links and junctions aren't followed: one pointing outside the workspace would be read through)
+            if (it->is_symlink(e2)) { it.disable_recursion_pending(); continue; }
+            if (it->is_directory(e2)) {
+                if (skip_dir(it->path().filename().u8string())) { it.disable_recursion_pending(); continue; }
+                try { inside(root, shown(root, it->path())); } catch (...) { it.disable_recursion_pending(); }
+                continue;
+            }
             if (it->is_regular_file(e2)) look(it->path());
         }
     }

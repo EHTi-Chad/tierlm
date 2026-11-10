@@ -1425,7 +1425,7 @@ setInterval(async () => {
 async function streamReply(useWs) {
   const bubble = addMsg("assistant", "");
   bubble.classList.add("streaming");
-  let reply = "", meta = "", drawPending = false, doneEv = null, recall = null;
+  let reply = "", meta = "", drawPending = false, doneEv = null, recall = null, failed = false;
   try {
     const res = await api("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
@@ -1471,19 +1471,21 @@ async function streamReply(useWs) {
     }
   } catch (e) {
     if (e.name === "AbortError") meta = "stopped";
-    else addMsg("error", "⚠ " + e.message);
+    else { failed = true; addMsg("error", "⚠ " + e.message); }
   }
+  // The stream ended without tierlm saying the reply was done (the server stopped, or the connection dropped).
+  if (!doneEv && !failed && meta !== "stopped" && lastFull !== "full" && reply.trim()) meta = "cut off: the connection to tierlm ended";
   bubble.classList.remove("streaming");
   setReply(bubble, reply);
   const calls = doneEv?.tool_calls || [];
   if (doneEv?.stop === "context") lastFull = "cut";
-  if (!reply.trim() && !calls.length && lastFull === "full") bubble.remove();
+  if (!reply.trim() && !calls.length && (lastFull === "full" || failed)) bubble.remove();
   else if (!reply.trim() && calls.length) bubble.remove();         // only a tool call: its card says it all
   else {
     if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m); }
     if (recall?.length) bubble.appendChild(recallLine(recall));
   }
-  return { reply, meta, done: doneEv, recall };
+  return { reply, meta, done: doneEv, recall, failed };
 }
 async function send(text) {
   text = (text ?? $("input").value).trim();
@@ -1525,7 +1527,16 @@ async function runTurn() {
       if (calls.length) m.tool_calls = calls;
       if (r.recall?.length) m.recall = r.recall;
       history.push(m);
-    } else if (history.at(-1)?.role === "user" && r.meta !== "stopped" && lastFull !== "full") history.pop();
+    } else if (history.at(-1)?.role === "user" && r.meta !== "stopped" && lastFull !== "full") {
+      // No reply: the message isn't part of the conversation. After an error it leaves the screen too and goes
+      // back into the box to send again (it used to stay on screen while the model no longer saw it).
+      const m = history.pop();
+      if (r.failed) {
+        [...$("messages").querySelectorAll(".msg.user")].pop()?.remove();
+        const t = m.shown ?? (typeof m.content === "string" ? m.content : "");
+        if (t && !$("input").value) $("input").value = t;
+      }
+    }
     saveChat();
     if (!calls.length || r.meta === "stopped" || !controller) break;
     let stopped = false;
@@ -2017,9 +2028,10 @@ function applySaved() {
                                : "Only for mixture-of-experts models.";
   $("seed").value = s.seed ?? -1;
   $("topk").value = s.top_k ?? 40; $("topp").value = s.top_p ?? 0.9; $("minp").value = s.min_p ?? 0.05;
-  if (s.repeat_penalty) $("rpen").value = s.repeat_penalty;
+  $("rpen").value = s.repeat_penalty || 1.1;
   $("ppen").value = s.presence_penalty ?? 0;
-  for (const id of ["topk", "topp", "minp", "rpen", "ppen"]) $(id).oninput();
+  if (s.temperature != null) $("temp").value = s.temperature;
+  for (const id of ["topk", "topp", "minp", "rpen", "ppen", "temp"]) $(id).oninput();
   $("forcecpu").checked = !!s.force_cpu;
   $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb / 1024).toFixed(1) : 0;
   // Settings saved before "Automatic" existed (no settings_v) had whole layers as the default: treat as Automatic.
@@ -2345,13 +2357,21 @@ $("ctxapply").onclick = async () => {
 
 // Eject: unload the model (and the embedding model) and give their memory back, e.g. before a game or another app
 // needs the GPU. Replies still being written finish first. The setup screen then shows the memory free again.
+// A fresh conversation: nothing on screen, and no saved chat to write into (leaving curChat set made the next
+// message overwrite the previous saved chat).
+// In front of every previewed page: scripts are already off (sandbox), and this keeps the page from loading
+// anything from the network, so a page the model wrote can't send data out through an image or stylesheet address.
+const PV_CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:; media-src data: blob:">`;
+function resetConversation() {
+  history = []; curChat = null; renderChats(); $("messages").innerHTML = ""; speedPts = []; totalPicks = 0; tokCount = 0;
+}
 async function ejectModel(b) {
   if (busy || !info) return;
   b.disabled = true; b.textContent = "Ejecting…";
   try { await api("/api/unload", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embedding: true }) }); }
   catch (e) {}
   b.disabled = false; b.textContent = "Eject";
-  history = []; $("messages").innerHTML = "";
+  resetConversation();
   await loadInfo();                                   // (no model: the setup screen, with the memory free again)
 }
 $("ejectbtn").onclick = () => ejectModel($("ejectbtn"));
@@ -2367,7 +2387,7 @@ $("loadbtn").onclick = async () => {
     const r = await api("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || r.statusText);
-    history = []; curChat = null; renderChats(); $("messages").innerHTML = ""; speedPts = []; totalPicks = 0; tokCount = 0;
+    resetConversation();
     msg.textContent = "";
     await loadInfo();
     updateHits();
@@ -2442,7 +2462,7 @@ $("tunebtn").onclick = async () => {
     done.hidden = false;
     done.innerHTML = `<span>Fastest: <b>${fin.tps.toFixed(1)} tok/s</b> with ${esc(parts.join(", "))}. Saved for this model.</span>`;
     const go = document.createElement("button"); go.className = "primary"; go.textContent = "Start chatting";
-    go.onclick = async () => { history = []; $("messages").innerHTML = ""; speedPts = []; totalPicks = 0; tokCount = 0; await loadInfo(); updateHits(); };
+    go.onclick = async () => { resetConversation(); await loadInfo(); updateHits(); };
     done.appendChild(go);
     md.saved = md.saved || {}; md.saved[selModel.id] = st;
     applySaved(); renderSetup();
@@ -3106,7 +3126,7 @@ function previewText(key, name, text, kind) {
     else if (html && !src) {
       const f = document.createElement("iframe"); f.className = "pvframe";
       f.setAttribute("sandbox", "");               // no scripts, no access to tierlm: the page is only drawn
-      f.srcdoc = text; box.replaceWith(f);
+      f.srcdoc = PV_CSP + text; box.replaceWith(f);
     } else box.innerHTML = codeView(text, name);
   } });
 }
@@ -3198,7 +3218,7 @@ function previewChange(key, path, before, after, created, decide) {
       const t = document.createElement("button"); t.className = "tiny ghost"; t.textContent = page ? "Code" : "Page";
       t.onclick = () => { page = !page; pvRender(); }; bar.querySelector(".grow").after(t);
     }
-    if (web && page) { const f = document.createElement("iframe"); f.className = "pvframe"; f.setAttribute("sandbox", ""); f.srcdoc = after; el.appendChild(f); }
+    if (web && page) { const f = document.createElement("iframe"); f.className = "pvframe"; f.setAttribute("sandbox", ""); f.srcdoc = PV_CSP + after; el.appendChild(f); }
     else el.appendChild(created ? Object.assign(document.createElement("div"), { innerHTML: codeView(after, path) }) : sbsView(before, after, path));
   } };
   previewOpen(tab);

@@ -386,6 +386,8 @@ json read_settings(const std::string& path) {
     return j.is_object() ? j : json::object();
 }
 void write_settings(const std::string& path, const json& j) {
+    static std::mutex one;                               // one save at a time (they share the temporary file)
+    std::lock_guard<std::mutex> lk(one);
     const std::string tmp = path + ".tmp";
     { std::ofstream f(fs::u8path(tmp), std::ios::binary); if (!f) return; f << j.dump(2); }
     std::error_code ec;
@@ -1370,6 +1372,13 @@ int main(int argc, char** argv) {
     const fs::path own_models = fs::absolute(fs::u8path(a.models_given ? a.models : std::string("models")), own_ec).lexically_normal();
     // The models folder: --models if given, else the one saved last time, else "models".
     json settings = read_settings(a.settings);
+    // The settings are read and changed from several request threads (a load, the tuner, the network and workspace
+    // choices): every change and every read after startup takes this lock (two at once corrupted the map, and two
+    // saves at once could leave a file that didn't parse, losing the API key and the tuned settings).
+    std::recursive_mutex settings_mu;
+    auto sget = [&](const char* k) { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value(k, std::string()); };
+    auto sflag = [&](const char* k) { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value(k, false); };
+    auto smodels = [&] { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value("models", json::object()); };
     bool recursive = settings.value("recursive", true);
     if (!a.models_given && settings.contains("models_folder") && settings["models_folder"].is_string()) {
         std::error_code ec;
@@ -1403,6 +1412,7 @@ int main(int argc, char** argv) {
         eng.spec.reset();
         eng.look.reset();
         eng.vision.reset(); eng.vision_file.clear();
+        eng.path.clear();                // (until this load succeeds, no model is loaded: a failed load used to leave the old name)
         eng.model.reset();               // free the old model (and its GPU memory) first
         eng.cached.clear();
         eng.saved.clear();
@@ -1473,7 +1483,7 @@ int main(int argc, char** argv) {
                 eng.think_switch = ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos;
                 eng.think_starts = eng.think_switch || ct.find("<think>\\n") != std::string::npos;
             }
-            const json ms = settings.value("models", json::object());
+            const json ms = smodels();
             std::error_code ec;
             const std::string rel = model_key(path);
             const json saved = ms.contains(rel) && ms[rel].is_object() ? ms[rel] : json::object();
@@ -1535,7 +1545,7 @@ int main(int argc, char** argv) {
         o.live_hot = body.value("live_experts", false);  // VRAM experts follow the conversation (see LoadOptions::live_hot)
         // The SSD tier: the folder chosen in the setup screen (for every model), and whether to use it ("ssd": false
         // keeps everything in RAM, as before 0.8.2).
-        o.ssd_dir = settings.value("ssd_dir", std::string());
+        o.ssd_dir = sget("ssd_dir");
         if (body.contains("ssd")) o.ssd = body.value("ssd", true) ? -1 : 0;
         // Connections: replies written at once. The context length is per connection, so the cache holds that many.
         o.parallel = std::max(1, std::min(64, body.value("connections", 1)));
@@ -1549,6 +1559,8 @@ int main(int argc, char** argv) {
     }
 
     httplib::Server svr;
+    // (files are never taken for scripts or styles by a browser, and another site's page can't embed tierlm's replies)
+    svr.set_default_headers({{"X-Content-Type-Options", "nosniff"}, {"Cross-Origin-Resource-Policy", "same-origin"}});
     // Requests waiting in line each hold a thread, so the pool is bigger than httplib's default (the CPU count):
     // with 8 apps waiting, the page and status requests must still get through.
     svr.new_task_queue = [] { return new httplib::ThreadPool(32, 256); };
@@ -1621,7 +1633,7 @@ int main(int argc, char** argv) {
             {"tuned_tps", [&] {
                 std::error_code ec;
                 const std::string id = model_key(eng.path);
-                const json& ms = settings.contains("models") ? settings["models"] : json::object();
+                const json ms = smodels();
                 if (!ms.contains(id) || !ms[id].contains("tuned")) return 0.0;
                 return ms[id]["tuned"].value("tps", 0.0);
             }()},
@@ -1742,10 +1754,10 @@ int main(int argc, char** argv) {
             std::error_code e2;
             if (!fs::equivalent(fs::u8path(f), base, e2)) suggest.push_back({{"name", "LM Studio models"}, {"folder", f}});
         }
-        json per_model = settings.value("models", json::object());
+        json per_model = smodels();
         json j = {{"folder", fs::absolute(base, ec).make_preferred().u8string()}, {"exists", exists}, {"recursive", recursive},
                   {"models", list}, {"default_ctx", a.ctx}, {"current", eng.path}, {"suggestions", suggest},
-                  {"saved", per_model}, {"last_model", settings.value("last_model", std::string())}, {"bundled", scan_bundled()},
+                  {"saved", per_model}, {"last_model", sget("last_model")}, {"bundled", scan_bundled()},
 #ifdef _WIN32
                   {"can_pick", true},
 #else
@@ -1772,8 +1784,10 @@ int main(int argc, char** argv) {
                 return;
             }
             a.models = fs::absolute(fs::u8path(f), ec).make_preferred().u8string();
+            std::lock_guard<std::recursive_mutex> sl(settings_mu);
             settings["models_folder"] = a.models;
         }
+        std::lock_guard<std::recursive_mutex> sl(settings_mu);
         settings["recursive"] = recursive;
         write_settings(a.settings, settings);
         res.set_content(dump({{"ok", true}, {"folder", a.models}, {"recursive", recursive}}), "application/json; charset=utf-8");
@@ -1857,6 +1871,7 @@ int main(int argc, char** argv) {
             const std::string id = body.value("model", std::string());
             json saved = body;
             saved.erase("model");
+            std::lock_guard<std::recursive_mutex> sl(settings_mu);
             settings["models"][id] = saved;
             settings["last_model"] = id;
             write_settings(a.settings, settings);
@@ -1882,6 +1897,7 @@ int main(int argc, char** argv) {
         if (!eng.model) return oai_error(res, 400, "no model is loaded");
         std::error_code ec;
         const std::string id = model_key(eng.path);
+        std::lock_guard<std::recursive_mutex> sl(settings_mu);
         if (body.contains("thinking") && body["thinking"].is_boolean()) {
             eng.thinking = body["thinking"].get<bool>();
             if (settings.contains("models") && settings["models"].contains(id)) settings["models"][id]["thinking"] = eng.thinking;
@@ -1945,7 +1961,7 @@ int main(int argc, char** argv) {
         json list = json::array();
         for (const DriveInfo& d : list_drives())
             list.push_back({{"path", d.path}, {"label", d.label}, {"free", d.free_bytes}, {"total", d.total_bytes}});
-        std::string dir = settings.value("ssd_dir", std::string());
+        std::string dir = sget("ssd_dir");
         unsigned long long fr = 0, tot = 0;
         const bool known = !dir.empty() && drive_space(fs::u8path(dir).root_path().u8string(), fr, tot);
         res.set_content(dump(json{{"drives", list}, {"ssd_dir", dir}, {"ssd_free", known ? fr : 0ull}}), "application/json; charset=utf-8");
@@ -1962,6 +1978,7 @@ int main(int argc, char** argv) {
             if (!fs::is_directory(p, ec)) return oai_error(res, 400, "can't use " + p.u8string() + ": " + (ec ? ec.message() : "not a folder"));
             dir = p.u8string();
         }
+        std::lock_guard<std::recursive_mutex> sl(settings_mu);
         settings["ssd_dir"] = dir;
         write_settings(a.settings, settings);
         std::fprintf(stderr, "SSD tier: %s (from the next load)\n", dir.empty() ? "each model's own drive" : dir.c_str());
@@ -1984,6 +2001,7 @@ int main(int argc, char** argv) {
         // (kept for next time with the other load settings of this model)
         std::error_code ec;
         const std::string id = model_key(eng.path);                  // (as loaded_id below)
+        std::lock_guard<std::recursive_mutex> sl(settings_mu);
         if (settings.contains("models") && settings["models"].contains(id) && settings["models"][id].is_object()) {
             settings["models"][id]["ctx"] = want;
             write_settings(a.settings, settings);
@@ -2505,7 +2523,7 @@ int main(int argc, char** argv) {
                 // tools only describe; running them is /api/workspace/tool, which only this computer's page can use.
                 json messages = body["messages"];
                 agent::ojson tools = agent::ojson::array();
-                const std::string ws = settings.value("workspace_folder", std::string());
+                const std::string ws = sget("workspace_folder");
                 if (body.value("workspace", false) && !ws.empty()) {
                     tools = workspace::tools();
                     const std::string note = workspace::instructions(ws);
@@ -3074,12 +3092,16 @@ int main(int argc, char** argv) {
                 std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", std::localtime(&now));
                 saved["tuned"] = {{"tps", std::round(best * 10) / 10}, {"results", results}, {"when", when},
                                   {"version", TIERLM_VERSION}, {"pc", pc}};
+                std::lock_guard<std::recursive_mutex> sl(settings_mu);
                 settings["models"][id] = saved;
                 settings["last_model"] = id;
                 write_settings(a.settings, settings);
                 send({{"type", "done"}, {"tps", std::round(best * 10) / 10}, {"settings", saved}, {"results", results},
                       {"all_on_gpu", eng.model && eng.model->placement().all_on_gpu()}});
             } catch (const std::exception& e) {
+                // Cancelled or failed part-way: whatever split is loaded stays loaded (it works), with the threads
+                // asked for rather than the last ones tried.
+                eng.threads = std::max(1, body.value("threads", a.threads));
                 send({{"type", "error"}, {"message", e.what()}});
             }
             sink.done();
@@ -3364,9 +3386,10 @@ int main(int argc, char** argv) {
             const bool in_folder = !file.empty() && file.extension() == ".gguf";
             if (in_folder) {
                 try {
-                    json saved = settings.value("models", json::object()).value(model_key(file.u8string()), json::object());
+                    json saved = smodels().value(model_key(file.u8string()), json::object());
                     eng.draft_max = std::min(8, std::max(0, saved.value("draft_max", 0)));
                     load(file.u8string(), load_options(saved), saved.value("threads", a.threads), saved.value("seed", -1), saved.value("hot_experts", false));
+                    std::lock_guard<std::recursive_mutex> sl(settings_mu);
                     settings["last_model"] = model_key(file.u8string());
                     write_settings(a.settings, settings);
                 } catch (const std::exception& e) {
@@ -3428,7 +3451,7 @@ int main(int argc, char** argv) {
         // Too long for the context: with "Drop the oldest messages" on (API panel, "api_trim_oldest"), the oldest
         // messages are left out (down to about 60% of the context); otherwise the app gets an error and can compact
         // the conversation itself, as coding agents do.
-        if (settings.value("api_trim_oldest", false) && eng.model) {
+        if (sflag("api_trim_oldest") && eng.model) {
             const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
             const int reserve = max_tokens > 0 ? std::min(max_tokens, ctx / 2) : std::max(256, ctx / 8);
             if (prompt_tokens(messages, tools) > ctx - reserve) {
@@ -3474,7 +3497,7 @@ int main(int argc, char** argv) {
             return;
         }
         res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider("text/event-stream", [&, messages, tools, openai_calls, sp, max_tokens, stops, usage_in_stream, model_id, created, id, lock]
+        res.set_chunked_content_provider("text/event-stream", [&, body, messages, tools, openai_calls, sp, max_tokens, stops, usage_in_stream, model_id, created, id, lock]
                                                               (size_t, httplib::DataSink& sink) {
             auto send = [&](const json& j) { std::string s = "data: " + dump(j) + "\n\n"; return sink.write(s.data(), s.size()); };
             auto chunk = [&](const json& delta, const json& fin) {
@@ -3530,8 +3553,8 @@ int main(int argc, char** argv) {
     // network too, for phones, other PCs, or Open WebUI in Docker. An API key, if set, is then required by
     // everything that isn't plainly this computer, and by every /v1 request, so a tunnel (needed by Cursor)
     // can't open tierlm to the internet. --host and --api-key on the command line override the saved values.
-    std::atomic<bool> allow_network{settings.value("allow_network", false)};
-    std::string api_key = a.api_key_given ? a.api_key : settings.value("api_key", std::string());
+    std::atomic<bool> allow_network{sflag("allow_network")};
+    std::string api_key = a.api_key_given ? a.api_key : sget("api_key");
     std::mutex net_mu;                   // guards api_key
     std::atomic<bool> relisten{false};
     auto bind_host = [&]() { return a.host_given ? a.host : (allow_network ? std::string("0.0.0.0") : std::string("127.0.0.1")); };
@@ -3563,6 +3586,38 @@ int main(int argc, char** argv) {
             oai_error(res, 403, "settings can only be changed on the computer running tierlm", "permission_error");
             return httplib::Server::HandlerResponse::Handled;
         }
+        // A web page open in a browser on this computer can send requests here too, and the browser counts as this
+        // computer. So for everything under /api and /v1:
+        //  - a request a browser marks as coming from another site is refused (Sec-Fetch-Site, sent by current
+        //    browsers on every request, and Origin, sent on every cross-site POST): tierlm's own page is the only
+        //    web page that may call it. Programs (curl, Python, apps) send neither header. Browser extensions that
+        //    talk to local models (their Origin isn't http) may use the model's API (/v1, /api/v0), not the rest.
+        //  - tierlm's own API (/api, the settings) answers this computer only under this computer's names, so a
+        //    site that points its own name at 127.0.0.1 (DNS rebinding) isn't taken for tierlm's page.
+        {
+            const bool v1 = req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 8, "/api/v0/") == 0;
+            const bool own = req.path.compare(0, 5, "/api/") == 0 && !v1;
+            if (v1 || own) {
+                const std::string host = req.get_header_value("Host"), port = std::to_string(a.port);
+                auto loop_name = [&](const std::string& h) {
+                    for (const char* n : {"127.0.0.1", "localhost", "[::1]"})
+                        if (h == std::string(n) + ":" + port || (a.port == 80 && h == n)) return true;
+                    return false;
+                };
+                std::string why;
+                if (req.get_header_value("Sec-Fetch-Site") == "cross-site") why = "another website";
+                if (why.empty() && req.has_header("Origin")) {
+                    const std::string o = req.get_header_value("Origin");
+                    const bool web = o.compare(0, 7, "http://") == 0 || o.compare(0, 8, "https://") == 0 || o == "null";
+                    if (web ? o != "http://" + host : own) why = "another page (" + o + ")";
+                }
+                if (why.empty() && own && local && !loop_name(host)) why = "a name that isn't this computer's (" + host + ")";
+                if (!why.empty()) {
+                    oai_error(res, 403, "refused: this request came from " + why + ", not from tierlm's own page", "permission_error");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+        }
         std::string key;
         { std::lock_guard<std::mutex> lk(net_mu); key = api_key; }
         const bool is_api = req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 5, "/api/") == 0;
@@ -3589,7 +3644,7 @@ int main(int argc, char** argv) {
         if (!lan.empty()) urls.push_back({{"label", "Other devices on your network"}, {"url", "http://" + lan + ":" + std::to_string(a.port) + "/v1"}});
         json j = {{"allow_network", (bool)allow_network}, {"listening_on", bind_host()}, {"port", a.port}, {"lan_address", lan},
                   {"api_key_set", !key.empty()}, {"urls", urls}, {"fixed_by_command_line", a.host_given || a.api_key_given},
-                  {"api_trim_oldest", settings.value("api_trim_oldest", false)}};
+                  {"api_trim_oldest", sflag("api_trim_oldest")}};
         if (show_key) j["api_key"] = key;
         return j;
     };
@@ -3603,6 +3658,7 @@ int main(int argc, char** argv) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded()) { oai_error(res, 400, "bad request"); return; }
         const std::string before = bind_host();
+        std::lock_guard<std::recursive_mutex> sl(settings_mu);
         if (body.contains("allow_network")) { allow_network = body.value("allow_network", false); settings["allow_network"] = (bool)allow_network; }
         if (body.contains("api_trim_oldest")) settings["api_trim_oldest"] = body.value("api_trim_oldest", false);
         if (body.contains("api_key") && !a.api_key_given) {
@@ -3640,7 +3696,7 @@ int main(int argc, char** argv) {
         return "";
     };
     auto ws_info = [&](const httplib::Request& req) {
-        const std::string folder = settings.value("workspace_folder", std::string());
+        const std::string folder = sget("workspace_folder");
         std::error_code ec;
         return json{{"available", ws_check(req, false).empty()}, {"folder", folder},
                     {"exists", !folder.empty() && fs::is_directory(fs::u8path(folder), ec)},
@@ -3666,6 +3722,7 @@ int main(int argc, char** argv) {
             if (ec || !fs::is_directory(p, ec)) return oai_error(res, 400, "not a folder: " + folder);
             folder = p.u8string();
         }
+        std::lock_guard<std::recursive_mutex> sl(settings_mu);
         settings["workspace_folder"] = folder;
         write_settings(a.settings, settings);
         std::fprintf(stderr, "workspace: %s\n", folder.empty() ? "none" : folder.c_str());
@@ -3675,7 +3732,7 @@ int main(int argc, char** argv) {
         if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
 #ifdef _WIN32
         bool cancelled = true;
-        const std::string f = pick_folder_windows(settings.value("workspace_folder", std::string()), cancelled);
+        const std::string f = pick_folder_windows(sget("workspace_folder"), cancelled);
         res.set_content(dump({{"cancelled", cancelled}, {"folder", f}}), "application/json; charset=utf-8");
 #else
         oai_error(res, 501, "type the folder path instead (the picker is Windows only)");
@@ -3688,7 +3745,7 @@ int main(int argc, char** argv) {
         if (const std::string why = ws_check(req, true); !why.empty()) return oai_error(res, 403, why, "permission_error");
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded()) return oai_error(res, 400, "bad request");
-        const std::string folder = settings.value("workspace_folder", std::string());
+        const std::string folder = sget("workspace_folder");
         try {
             if (folder.empty()) throw workspace::Error("no workspace folder is chosen");
             json args = body.contains("arguments") ? body["arguments"] : json::object();
@@ -3708,15 +3765,14 @@ int main(int argc, char** argv) {
     // GET /api/embed: the loaded embedding model. POST /api/embed/load {"model": id}, POST /api/embed/unload.
     // The choice is saved, and the model loads again when tierlm starts.
     auto save_embed_choice = [&](const std::string& id) {
-        std::unique_lock<std::shared_timed_mutex> lk(mu, std::defer_lock);
-        if (!lk.try_lock_for(std::chrono::seconds(10))) return;               // settings are written under mu
+        std::lock_guard<std::recursive_mutex> sl(settings_mu);
         if (id.empty()) settings.erase("embed_model"); else settings["embed_model"] = id;
         write_settings(a.settings, settings);
     };
     // A workspace file as it is, for the page's preview: text, or an image. ?path=src/main.cpp
     svr.Get("/api/workspace/file", [&](const httplib::Request& req, httplib::Response& res) {
         if (const std::string why = ws_check(req, false); !why.empty()) return oai_error(res, 403, why, "permission_error");
-        const std::string folder = settings.value("workspace_folder", std::string()), rel = req.get_param_value("path");
+        const std::string folder = sget("workspace_folder"), rel = req.get_param_value("path");
         try {
             if (folder.empty()) throw workspace::Error("no workspace folder is chosen");
             const fs::path p = workspace::inside(fs::u8path(folder), rel);
@@ -3753,7 +3809,7 @@ int main(int argc, char** argv) {
         try {
             // (links to workspace files: the chat's own folder, else the one chosen now)
             const std::string wsf = c.is_object() && c.contains("workspace") && c["workspace"].is_string() ? c["workspace"].get<std::string>()
-                                                                                                            : settings.value("workspace_folder", std::string());
+                                                                                                            : sget("workspace_folder");
             const fs::path f = chats::save(chats_dir, req.matches[1], c, wsf);
             res.set_content(dump({{"ok", true}, {"folder", f.filename().u8string()}}), "application/json; charset=utf-8");
         } catch (const std::exception& e) { oai_error(res, 500, e.what()); }

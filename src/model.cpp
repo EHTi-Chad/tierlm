@@ -1614,6 +1614,7 @@ std::vector<int> Model::alloc_cells(int s, int n) {
     got.reserve(n);
     auto& mine = seq_cells_[s];
     for (int c = free_lo_; (int)got.size() < n; ++c) {
+        if (c >= (int)cell_seq_.size()) throw std::runtime_error("context cells out of step (no free cell found)");
         if (cell_seq_[c] >= 0) continue;
         cell_seq_[c] = s;
         cell_pos_[c] = (int)mine.size();
@@ -1741,6 +1742,7 @@ void Model::seq_truncate(int s, int n) {
     if (s == 0) { truncate(n); return; }
     if (n >= seq_past(s)) return;
     if (hp_.hybrid) { seq_reset(s); return; }                  // the running memory can't be rewound
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // (another conversation's step uses the cell tables)
     free_cells_from(s, n);
 }
 
@@ -1790,6 +1792,7 @@ void Model::truncate(int n) {
         if (mtp_ && mtp_->conv_state) { put(mtp_->conv_state); put(mtp_->ssm_state_t); }
         return;
     }
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // (another conversation's step uses the cell tables)
     n_past_ = n < 0 ? 0 : n;
     free_cells_from(0, n_past_);
 }
@@ -2953,6 +2956,7 @@ void Model::resize_ctx(int new_ctx) {
         throw std::runtime_error("the conversations in the cache use " + std::to_string(hi_) + " tokens, more than " +
                                  std::to_string(new_ctx) + ": start a new chat first, or choose a longer context");
     release_pending();
+    drop_reuse();                                               // (the kept graph points at the cache that is about to be freed)
     const Hparams& hp = hp_;
     const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), n_seq = n_seq_max();
     // 1. what to keep, in RAM
@@ -3024,7 +3028,11 @@ void Model::accept(int n_keep) {
     if (!pending_) return;
     Graph& g = *(Graph*)pending_;
     const int d = g.n_tok - n_keep;                               // tokens to drop
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
     if (d > 0) {
+        // (checked before anything is rewound, so a refusal leaves the state whole)
+        for (auto& [li, rb] : g.rollback) if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
+        for (auto& [li, rb] : g.ple_rollback) if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
         n_past_ -= d;                                             // attention layers: just forget their keys/values
         free_cells_from(0, n_past_);
         for (auto& [li, rb] : g.rollback) {                       // DeltaNet layers: restore the memory d tokens back
@@ -3102,6 +3110,10 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     std::vector<int> tok_seq, tok_pos, cells;
     tok_seq.reserve(n_tok); tok_pos.reserve(n_tok); cells.reserve(n_tok);
     std::vector<std::pair<int, int>> undo;                        // (conversation, tokens before) if this step fails
+    struct Undo {                                                 // on an exception: give the cells back
+        Model& m; std::vector<std::pair<int, int>>& u; bool on = true;
+        ~Undo() { if (on) for (auto [s, n] : u) m.free_cells_from(s, n); }
+    } undo_guard{*this, undo};
     {
         const SeqGroup one{0, n_tok};
         const std::vector<SeqGroup> single(1, one);
@@ -3148,10 +3160,6 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             it->second = start + std::max(im->rows, im->cols);
         }
     }
-    struct Undo {                                                 // on an exception: give the cells back
-        Model& m; std::vector<std::pair<int, int>>& u; bool on = true;
-        ~Undo() { if (on) for (auto [s, n] : u) m.free_cells_from(s, n); }
-    } undo_guard{*this, undo};
     const int n_kv_end = cells_end(), n_kv = kv_span(n_kv_end);
     std::vector<int32_t> live_routing;                            // live hot experts need the picks even if the caller doesn't
     if (!routing && !live_.empty()) routing = &live_routing;
