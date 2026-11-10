@@ -34,14 +34,14 @@ attention, the context, the draft block and the 11,115 busiest experts in VRAM, 
 29 GB n-gram table on an NVMe drive. Unsloth's draft file guesses ahead; the model checks the guesses in one pass and
 keeps those it agrees with, so every reply is its own.
 
-| tierlm 0.8.5, Qwen3.8-Flash-Next UD-IQ3_XXS | tok/s |
+| tierlm 0.8.5 / 0.8.6, Qwen3.8-Flash-Next UD-IQ3_XXS | tok/s |
 |---|---|
 | No guessing, four 500-token answers at temperature 0 | 59-66 |
 | **4 guesses per check**, the same answers (3.1-3.7 words per check) | **73-91**, most 81-89 |
 | A 500-token story at temperature 0.7, no guessing | about 55 |
 | The same story, 4 guesses with speculative sampling | **63** |
 | Two of the answers at temperature 0.7, 4 guesses | **87 and 90** |
-| **Find the fastest settings**, as the app runs it (it picks the VRAM experts following the conversation and 3 guesses) | **75.4** (best without guessing in the same run: 42.2) |
+| **Find the fastest settings**, as the app runs it in 0.8.6 (6 minutes; it picks the VRAM experts following the conversation and 4 guesses) | **78.8** (best without guessing in the same run: 40.7) |
 
 **Every setting.** RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11, an NVMe drive for the SSD tier;
 tierlm 0.8.5 with its CUDA 12.9 engine. Qwen3.8-Flash-Next UD-IQ3_XXS from unsloth (4 files) with
