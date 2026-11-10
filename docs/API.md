@@ -218,6 +218,8 @@ While a reply is streaming or a model is loading, `/api/info` returns the last k
 `"busy": true` and `waiting` (requests in line) instead of waiting. It also gives `ram_free` (system RAM free, bytes) and `tuned_tps`
 (what **Find the fastest settings** measured for this model on this PC, 0 if never run): the page uses them to say
 when a reply was much slower than that, and why it probably was.
+Since 0.8.7 also `ram_short` (true when the model was loaded with less RAM free than it keeps there, so the system
+will page and replies will be slow), with `ram_need_at_load` and `ram_free_at_load` in bytes.
 
 ### GET /api/devices
 
@@ -289,7 +291,7 @@ requests from the same computer. Elsewhere it returns HTTP 501.
 | `ctx` | Context length in tokens |
 | `threads` | CPU threads |
 | `flash_attn` | Flash attention on/off |
-| `kv_type` | KV cache precision: `f16` (default), `q8_0` (8-bit, half the memory), `q4_0` (4-bit, a quarter, lower quality) or `f32` (exact). 8-bit and 4-bit turn on flash attention |
+| `kv_type` | KV cache precision: `f16` (default), `q8_0` (8-bit, half the memory), `q5_0` (5-bit, a third; since 0.8.7), `q4_0` (4-bit, a quarter, lower quality) or `f32` (exact). 8-bit and below turn on flash attention |
 | `batch` | Tokens per step when reading a prompt (default 256) |
 | `experts_used` | Active experts per token for MoE models; 0 keeps the model's own value |
 | `seed` | -1 for random sampling; any other number makes replies repeatable |

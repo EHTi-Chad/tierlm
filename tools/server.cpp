@@ -13,7 +13,7 @@
 //   POST /api/folder   {"folder": "D:\\models", "recursive": true}  sets the models folder (saved)
 //   POST /api/pick-folder  opens a folder picker on this computer (Windows; local requests only)
 //   POST /api/load     {"model": "sub/file.gguf", "device": "auto|cpu|<device>", "ctx": 4096, "threads": 4,
-//                       "flash_attn": true, "kv_type": "f16|q8_0|q4_0|f32", "batch": 256, "experts_used": 0, "seed": -1,
+//                       "flash_attn": true, "kv_type": "f16|q8_0|q5_0|q4_0|f32", "batch": 256, "experts_used": 0, "seed": -1,
 //                       "vram_limit_mb": 0, "split_mode": "auto|layers|experts"}
 //   POST /api/unload   frees the model
 //   POST /api/chat    {"messages":[{"role":"user","content":"..."}], "temperature":0.7, "top_p":0.9, "top_k":40,
@@ -1507,6 +1507,9 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "loaded %s (%s, %s chat format) on %s%s in %.1fs\n", path.c_str(), eng.model->arch().c_str(),
                      chat_fmt_name(eng.chat), eng.model->device_name().c_str(), where.c_str(), eng.load_s);
+        if (pl.ram_short())
+            std::fprintf(stderr, "RAM: this model keeps %.1f GB in RAM but only %.1f GB was free, so the system will move memory to disk and "
+                         "replies will be slow. Close other programs (or restart the PC) and load it again.\n", pl.ram_need / 1e9, pl.ram_free / 1e9);
         if (pl.hot_experts > 0) {
             int split = 0; for (size_t l = 0; l < pl.hot.size(); ++l) split += !pl.hot[l].empty() && !pl.ffn_vram[l];
             // How much of the past expert work the VRAM experts would have done: what the CPU is spared.
@@ -1535,7 +1538,7 @@ int main(int argc, char** argv) {
         o.device = body.value("device", std::string("auto"));
         o.max_ctx = body.value("ctx", a.ctx);
         if (body.contains("flash_attn")) o.flash_attn = body.value("flash_attn", true) ? 1 : 0;
-        if (body.contains("kv_type")) o.kv_type = body.value("kv_type", std::string("f16"));   // f16, f32, q8_0, q4_0
+        if (body.contains("kv_type")) o.kv_type = body.value("kv_type", std::string("f16"));   // f16, f32, q8_0, q5_0, q4_0
         o.batch = body.value("batch", 0);
         o.experts_used = body.value("experts_used", 0);
         o.vram_budget_mb = body.value("vram_limit_mb", 0);
@@ -1629,6 +1632,8 @@ int main(int argc, char** argv) {
             {"learned_tokens", [&] { double t = 0; for (float v : eng.usage) t += v; return hp.n_layer * hp.n_expert_used > 0 ? (long long)(t / (hp.n_layer * hp.n_expert_used)) : 0LL; }()},
             {"version", TIERLM_VERSION},
             // For "slower than expected" hints: system RAM now, and what Find the fastest settings measured here.
+            {"ram_need_at_load", eng.model->placement().ram_need}, {"ram_free_at_load", eng.model->placement().ram_free},
+            {"ram_short", eng.model->placement().ram_short()},
             {"ram_free", [&] { size_t f = 0, t = 0; if (auto d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(d, &f, &t); return f; }()},
             {"tuned_tps", [&] {
                 std::error_code ec;

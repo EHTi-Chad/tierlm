@@ -82,7 +82,7 @@ The setup screen shows:
    - **Find GGUF models on Hugging Face**: opens Hugging Face in your browser.
 3. **Settings**: **context length** (how much of the conversation the model remembers; longer uses more
    memory), **context memory precision** (16-bit normally; **8-bit** halves the context's memory with practically
-   the same quality, which can let more of the model fit in VRAM; 4-bit quarters it at some cost in quality) and
+   the same quality, which can let more of the model fit in VRAM; 5-bit takes a third and 4-bit a quarter, at some cost in quality) and
    **CPU threads**, and **Speculative decoding** for models that include a draft layer (most Qwen3.5 / 3.6 / 3.8
    files, or with a matching `mtp-*.gguf` file in the same folder; the model card says "Speculative decoding"): the
    draft layer guesses a few words ahead and the model checks them all at once, for faster replies with the same

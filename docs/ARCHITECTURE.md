@@ -447,6 +447,33 @@ used to hold whole expert layers. Now it holds the **most-used experts of any la
 The tests run every MoE model with made-up usage counts at many VRAM sizes, so layers end up whole, split or absent,
 and compare with the reference (exact on the stand-in GPU).
 
+### Reading a prompt with experts in RAM
+
+ggml hands a batch of 32 tokens or more to the GPU even where the weights are in RAM (op offload): the weights are
+copied to VRAM for that batch. With experts split between VRAM and RAM that meant copying every RAM expert of every
+layer, for every batch, whatever its size: 28 GB for Flash-Next on the RTX 5090. Up to 0.8.6 a 39-token message
+waited 1.4 s for it, and a long prompt was read at 154-168 tok/s.
+
+Since 0.8.7 the CPU computes just the picks that are in RAM, as it does during a reply, unless the batch is big
+enough for the copy to pay. Flash-Next IQ3_XXS on the RTX 5090 + Ryzen 9 9950X3D (12 threads, 64K context, the VRAM
+experts serving 45-80% of the picks), prompt tokens per second:
+
+| Prompt | GPU does the RAM experts (as before) | CPU does them |
+|---|---|---|
+| 39 tokens | 22-28 | **126-156** (55-61 for the first one after loading) |
+| 121 tokens | 70 | **120-141** |
+| 285 tokens | 182 | **367** |
+| 505 tokens | 307 | **347-498** |
+| 772 tokens, batches of 256 | 171 | **309-425** |
+| 1,031 tokens, batches of 256 | 154-168 | **323-490** (slowest right after a change of subject) |
+| 772 tokens, one batch of 1,024 | **386** | 305 |
+| 1,031 tokens, one batch of 1,024 | 490 | 484 |
+
+So the GPU takes the RAM experts' work only in batches of 512 tokens or more on a card with 24 GB or more, which
+the default batch size of 256 never reaches; on smaller cards, not measured yet, from 128 tokens
+(`TIERLM_COLD_OFFLOAD_MIN`). A bigger batch size (512, 1,024) with the GPU doing them is a little faster on long
+prompts (a 1,035-token prompt at 545 tok/s) for 60 to 300 MB more VRAM to work in. Reply speed is the same either way, and so are the replies (the same text at temperature 0).
+
 ### Live hot experts (following the conversation)
 
 The learned set describes the model's average use, but a conversation has its own: a coding session leans on
@@ -483,6 +510,17 @@ while the model runs:
   38.0-38.4. On the RTX 5090 with Qwen3.8 Flash-Next (four subjects, 500 tokens each, two runs each): 8% of the
   time 38.8 and 38.8 tok/s with 0.9-1.1 s of moving per reply, 0.8.3's 32 MB per word 35.6 and 39.2 with 1.3-1.8 s,
   the fixed set 31.5 and 33.8.
+- **A prompt on a new subject** (since 0.8.7). After a prompt batch the VRAM experts served poorly, as many
+  experts move as pay, at once: nothing when they served 62% of the batch's picks or more, up to a quarter of a
+  second when 45% or less (`TIERLM_LIVE_PROMPT_HIT`, `TIERLM_LIVE_PROMPT_MS`; 0 turns it off). The reply then starts
+  with the prompt's experts in VRAM instead of catching up 8% of a step at a time. Flash-Next IQ3_XXS on the RTX
+  5090 (4 guesses, 500-token replies, two runs each way): batches on the subject the experts suited were served
+  65-82%, a new subject's 42-54%, and a burst moved about 750 experts in 250 ms. A 772-token contract after C#
+  code: the reply at 83-90 tok/s instead of 77-82; a story after technical questions 52-53 instead of 46-49; the
+  C# prompt the experts already suited, unchanged (76). The price: the next prompt back on the old subject found
+  fewer of its experts (103-105 tok/s instead of 109-111). Over the seven prompts and replies of the test, 67.6-68.4 s
+  instead of 69.4-70.0. A first version that moved experts after every prompt batch, whatever it was served, read
+  prompts 1.2 s slower and won nothing on prompts the experts suited, so it was dropped.
 - **Same answers.** Each pick is still computed in whichever part holds it, so the result equals the unsplit
   model, whichever experts are in VRAM at the time. The tests run every MoE model (and Qwen3.5/Qwen3-Next with
   speculation and saved conversations) with `TIERLM_LIVE_EAGER=1`, which swaps at every chance, and compare with the

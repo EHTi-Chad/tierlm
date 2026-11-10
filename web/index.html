@@ -557,8 +557,8 @@
         </div>
         <div>
           <label for="kvsel">Context memory precision</label>
-          <select id="kvsel"><option value="f16">16-bit (normal)</option><option value="q8_0">8-bit: half the memory, practically the same quality</option><option value="q4_0">4-bit: a quarter of the memory, lower quality</option><option value="f32">32-bit: exact, twice the memory</option></select>
-          <div class="help">How the context (KV cache) is stored. Smaller leaves room for a longer context, or for more of the model in VRAM: watch the purple part of the bars. 8-bit and 4-bit use flash attention.</div>
+          <select id="kvsel"><option value="f16">16-bit (normal)</option><option value="q8_0">8-bit: half the memory, practically the same quality</option><option value="q5_0">5-bit: a third of the memory, between 8-bit and 4-bit in quality</option><option value="q4_0">4-bit: a quarter of the memory, lower quality</option><option value="f32">32-bit: exact, twice the memory</option></select>
+          <div class="help">How the context (KV cache) is stored. Smaller leaves room for a longer context, or for more of the model in VRAM: watch the purple part of the bars. 8-bit and below use flash attention.</div>
         </div>
         <div>
           <label class="chk"><input type="checkbox" id="specon"> Speculative decoding</label>
@@ -581,8 +581,8 @@
           </div>
           <div>
             <label for="batchsel">Prompt batch size</label>
-            <select id="batchsel"><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option></select>
-            <div class="help">Tokens read at once when processing a prompt. Bigger is faster for long prompts but needs more memory.</div>
+            <select id="batchsel"><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option><option>2048</option></select>
+            <div class="help">Tokens read at once when processing a prompt. Bigger can be faster for long prompts but needs more VRAM to work in.</div>
           </div>
           <div>
             <label for="experts">Active experts per token: <span id="expv"></span></label>
@@ -662,6 +662,7 @@
       <div id="loadrow">
         <button class="primary" id="loadbtn">Load and start chatting</button>
         <button id="tunebtn" title="Loads the model and measures the settings that affect speed, then keeps the fastest">Find the fastest settings</button>
+        <button class="ghost" id="tunecancel" hidden title="Stops Find the fastest settings; nothing is saved">Cancel</button>
         <button class="ghost" id="backbtn" hidden>Back to chat</button>
         <span id="loadmsg"></span>
         <div id="loadprog" hidden><div></div></div>
@@ -1674,6 +1675,13 @@ function onDone(ev) {
   updateHits();
   checkSpeed(ev);
 }
+// Loaded with less RAM free than the model keeps there: say so before the first slow reply.
+function noteRamShort() {
+  if (!info?.ram_short) return;
+  const gb = b => (b / 1e9).toFixed(1);
+  addMsg("note", `This model keeps ${gb(info.ram_need_at_load)} GB in RAM, but only ${gb(info.ram_free_at_load)} GB was free when it loaded, ` +
+    "so the system will move memory to disk and replies will be slow. Close other programs (or restart the PC), then load it again.");
+}
 // A reply much slower than Find the fastest settings measured on this PC: say so once per load, with the likely
 // cause (usually Windows running out of memory, or another program using the GPU).
 let slowNoted = "";
@@ -1840,8 +1848,8 @@ function showSetup() {
 function showApp() { $("apihome").appendChild($("netbody")); $("setup").hidden = true; $("app").hidden = false; $("setupbtn").hidden = false; $("ejectbtn").hidden = !info; resizeCanvases(); }
 let cpuFeatures = "";
 const WORK = 768 * 1048576;
-// KV cache size relative to 16-bit: q8_0 stores 32 values in 34 bytes, q4_0 in 18.
-const KV_FACTOR = { f16: 1, f32: 2, q8_0: 34 / 64, q4_0: 18 / 64 };
+// KV cache size relative to 16-bit: q8_0 stores 32 values in 34 bytes, q5_0 in 22, q4_0 in 18.
+const KV_FACTOR = { f16: 1, f32: 2, q8_0: 34 / 64, q5_0: 22 / 64, q4_0: 18 / 64 };
 // The split mode tierlm will use: Automatic means experts in RAM for mixture-of-experts models (the CPU then only
 // reads the few experts each token picks), whole layers for the rest.
 function splitMode() { const v = $("splitsel").value; return v !== "auto" ? v : (selModel && selModel.experts ? "experts" : "layers"); }
@@ -2391,6 +2399,7 @@ $("loadbtn").onclick = async () => {
     msg.textContent = "";
     await loadInfo();
     updateHits();
+    noteRamShort();
   } catch (e) {
     msg.className = "err"; msg.textContent = "Could not load: " + e.message;
   }
@@ -2425,8 +2434,13 @@ $("tunebtn").onclick = async () => {
   $("tunestat").textContent = "Loading " + selModel.file + "… about a minute, longer for big models.";
   const rows = [];
   watchProgress(true);
+  // Cancel: the request is dropped; tierlm notices before its next step (a load under way finishes first).
+  const stop = new AbortController(), cancel = $("tunecancel");
+  let cancelled = false;
+  cancel.hidden = false;
+  cancel.onclick = () => { cancelled = true; stop.abort(); };
   try {
-    const r = await api("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(loadBody(p)) });
+    const r = await api("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(loadBody(p)), signal: stop.signal });
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || r.statusText); }
     const rd = r.body.getReader(), dec = new TextDecoder();
     let buf = "", fin = null;
@@ -2462,14 +2476,27 @@ $("tunebtn").onclick = async () => {
     done.hidden = false;
     done.innerHTML = `<span>Fastest: <b>${fin.tps.toFixed(1)} tok/s</b> with ${esc(parts.join(", "))}. Saved for this model.</span>`;
     const go = document.createElement("button"); go.className = "primary"; go.textContent = "Start chatting";
-    go.onclick = async () => { resetConversation(); await loadInfo(); updateHits(); };
+    go.onclick = async () => { resetConversation(); await loadInfo(); updateHits(); noteRamShort(); };
     done.appendChild(go);
+    try {                                         // measured with RAM short: the speeds above are lower than this PC can do
+      const inf = await (await api("/api/info")).json();
+      if (inf.ram_short) {
+        const w = document.createElement("div"); w.className = "err"; w.style.marginTop = "6px";
+        w.textContent = `Only ${(inf.ram_free_at_load / 1e9).toFixed(1)} GB of RAM was free and this model keeps ${(inf.ram_need_at_load / 1e9).toFixed(1)} GB there, ` +
+          "so these speeds are lower than this PC can do. Close other programs (or restart the PC) and run this again.";
+        done.appendChild(w);
+      }
+    } catch (e) {}
     md.saved = md.saved || {}; md.saved[selModel.id] = st;
     applySaved(); renderSetup();
   } catch (e) {
     $("tunestat").textContent = ""; watchProgress(false);
-    msg.className = "err"; msg.textContent = "Could not finish: " + e.message;
+    if (cancelled) {
+      $("tunebox").hidden = true;
+      msg.className = ""; msg.textContent = "Cancelled: nothing was saved. The step that was running finishes first, so the next load may wait a moment.";
+    } else { msg.className = "err"; msg.textContent = "Could not finish: " + e.message; }
   }
+  cancel.hidden = true;
   tuning = false;
   btns.forEach(b => b.disabled = false);
 };

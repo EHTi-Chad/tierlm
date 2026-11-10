@@ -190,6 +190,20 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         m->device_name_ = "CPU";
         m->dev_ = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
+    // Experts split between VRAM and RAM: the batch size from which the GPU does the RAM experts' work too (they are
+    // copied over for the batch, every batch). ggml's own rule is 32 tokens. Measured on the RTX 5090 + Ryzen 9
+    // 9950X3D with Flash-Next (28 GB of experts in RAM, the VRAM experts serving 45-80% of the picks), prompt
+    // tokens/s with the CPU doing them against the GPU, batches of up to 1,024: 39 tokens 133-156 against 22-28,
+    // 121 tokens 120-141 against 70, 285 tokens 367 against 182, 505 tokens 347-498 against 307, 772 tokens 305
+    // against 386, 1,031 tokens 484 against 490. With the usual batches of 256, a 1,031-token prompt: 323-490 against
+    // 154-168. So from 512 tokens on a 24 GB card or more (reached only with a bigger batch size set); elsewhere
+    // (not measured yet) from 128, below which a copy of every RAM expert can't pay. TIERLM_COLD_OFFLOAD_MIN: another size.
+    if (const char* e = std::getenv("TIERLM_COLD_OFFLOAD_MIN")) m->cold_offload_min_ = std::max(1, std::atoi(e));
+    else if (m->main_ != m->cpu_) {
+        size_t vfree = 0, vtotal = 0;
+        m->device_memory(vfree, vtotal);
+        m->cold_offload_min_ = vtotal >= ((size_t)23 << 30) && !m->integrated_gpu() ? 512 : 128;
+    }
 
     // ---- read the headers: tensor shapes/types only, no data yet ----
     // A model may be split over several files; part 1 has the settings, every part has some tensors.
@@ -540,7 +554,8 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // computes with it (the scheduler moves activations between the two).
     m->max_ctx_ = max_ctx > 0 ? max_ctx : hp.n_ctx;
     // KV cache precision: f16 by default; f32 is exact (the tests use it to check the attention math, via
-    // TIERLM_KV_F32=1); q8_0 halves the memory again with practically no quality loss, q4_0 quarters it.
+    // TIERLM_KV_F32=1); q8_0 halves the memory again with practically no quality loss, q5_0 takes a third,
+    // q4_0 a little over a quarter.
     // Quantized caches are read by flash attention, so they turn it on, and need a head size that is a whole
     // number of 32-value blocks.
     {
@@ -549,7 +564,8 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             if (const char* e = std::getenv("TIERLM_KV_TYPE")) want = e;
             else want = (opt.kv_f32 >= 0 ? opt.kv_f32 == 1 : std::getenv("TIERLM_KV_F32") != nullptr) ? "f32" : "f16";
         }
-        m->kv_t_ = want == "f32" ? GGML_TYPE_F32 : want == "q8_0" ? GGML_TYPE_Q8_0 : want == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;
+        m->kv_t_ = want == "f32" ? GGML_TYPE_F32 : want == "q8_0" ? GGML_TYPE_Q8_0 : want == "q5_0" ? GGML_TYPE_Q5_0 :
+                   want == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;
         if (ggml_is_quantized((ggml_type)m->kv_t_) && hp.head_dim % 32 != 0) {
             std::fprintf(stderr, "note: this model's head size (%d) can't use a %s cache; using f16\n", hp.head_dim, want.c_str());
             m->kv_t_ = GGML_TYPE_F16;
@@ -942,6 +958,11 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             if (forced < 0 && ram_need > ram_budget)
                 std::fprintf(stderr, "note: the weights left for RAM (%.1f GB) are still more than it has room for (%.1f GB)\n",
                              ram_need / 1e9, ram_budget / 1e9);
+        }
+        if (!on_cpu.empty()) {
+            m->place_.ram_need = ram_need + ((size_t)1 << 30);
+            m->place_.ram_free = free_ram;
+            if (const char* e = std::getenv("TIERLM_TEST_RAM_FREE_MB")) m->place_.ram_free = (uint64_t)std::atoll(e) << 20;   // tests: the warning
         }
     }
     auto alloc = [&](ggml_backend_buffer_type_t buft, std::vector<ggml_tensor*>& ts, uint64_t& bytes) {
@@ -2394,8 +2415,12 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             ggml_tensor* mask   = ggml_reshape_3d(c, mcont, 1, hp.n_expert_used, n_tok);
             ggml_tensor* w_hot  = ggml_mul(c, w, mask);                     // [1, n_used, n_tok]
             ggml_tensor* w_cold = ggml_sub(c, w, w_hot);
+            // Handing the RAM experts' work to the GPU means copying all of a layer's RAM experts over for the batch,
+            // the same cost whatever its size, so it only pays for big batches (see cold_offload_min_): below that
+            // the CPU computes just the picks that are in RAM, as it does for a reply's steps.
             static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
-            ggml_tensor* ids_c  = remap(L.map_cold, L.down_xc, n_tok >= std::min(offload_batch, 32));
+            const bool cold_gpu = n_tok >= std::max(offload_batch, cold_offload_min_);
+            ggml_tensor* ids_c  = remap(L.map_cold, L.down_xc, cold_gpu);
             ggml_tensor* ids_h  = remap(L.map_hot, L.down_xh, true);
             for (ggml_tensor* t : {mcont->src[0]->view_src, mcont, w_hot, w_cold, ids_c, ids_c->src[0]->src[0]->view_src, ids_h, ids_h->src[0]->src[0]->view_src})
                 if (t) g.cpu_ops.push_back(t);
@@ -2427,6 +2452,15 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             } else {
                 cold = experts(L.gate_up_xc, L.gate_xc, L.up_xc, L.down_xc, ids_c, w_cold);
                 hot  = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_hot);
+            }
+            if (!cold_gpu && n_tok >= offload_batch) {                      // (the scheduler would hand it to the GPU: keep it on the CPU)
+                std::set<ggml_tensor*> seen;
+                std::function<void(ggml_tensor*)> pin = [&](ggml_tensor* t) {
+                    if (!t || t == ids_c || t == w_cold || t == h3 || t == xin || t->op == GGML_OP_NONE || !seen.insert(t).second) return;
+                    g.cpu_ops.push_back(t);
+                    for (ggml_tensor* src : t->src) pin(src);
+                };
+                pin(cold);
             }
             moe = ggml_add(c, cold, hot);                                   // cold first: the graph runs the RAM part, then the VRAM part
         } else {
@@ -3419,7 +3453,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     if (opprof && !trace) {
         ggml_backend_sched_set_eval_callback(sc, nullptr, nullptr);
         auto& [cnt, acc] = opstats[n_tok];
-        if (++cnt == 32) {
+        if (++cnt == (n_tok > 16 ? 3 : 32)) {                      // (prompt batches are few: every 3)
             std::vector<std::pair<double, std::string>> v;
             double tot = 0;
             for (auto& [k, ms] : acc) { v.push_back({ms / cnt, k}); tot += ms / cnt; }
@@ -3539,6 +3573,9 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     if (live_step_ms_ > 0 && live_ms_per_mb_ > 0) allowance = (size_t)(share * live_step_ms_ / live_ms_per_mb_ * 1024 * 1024);
     size_t budget_bytes = std::min(cap_bytes, live_credit_ + allowance);
     if (prompt || eager) budget_bytes = cap_bytes;                              // a prompt: a long step (tests: every chance)
+    static const double prompt_ms = [] { const char* e = std::getenv("TIERLM_LIVE_PROMPT_MS"); return e ? std::atof(e) : 250.0; }();
+    static const double prompt_hit = [] { const char* e = std::getenv("TIERLM_LIVE_PROMPT_HIT"); return e ? std::atof(e) : 0.62; }();
+    const uint64_t picks0 = live_stats_.picks, hits0 = live_stats_.hits;
     static const int per_layer = [] { const char* e = std::getenv("TIERLM_LIVE_PER_LAYER"); return e ? std::max(0, std::atoi(e)) : 2; }();
     static const float margin = [] { const char* e = std::getenv("TIERLM_LIVE_MARGIN"); return e ? (float)std::atof(e) : 1.3f; }();
     if ((int)routing.size() < n_tok * NL * K) return;
@@ -3559,6 +3596,19 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
                 if (ll.slot_of[e] >= 0) live_stats_.hits++;
             }
     }
+    // After a prompt batch whose picks the VRAM experts served poorly (a new subject): as many moves as pay, so the
+    // reply starts with the prompt's experts in VRAM instead of catching up 8% of a step at a time. How long it may
+    // take goes by how poorly: nothing at 62% served or more, up to a quarter of a second at 45% or less (measured on
+    // Flash-Next, RTX 5090: batches on the subject the experts suit were served 65-82%, a new subject's 42-54%; a
+    // burst moves about 750 experts in 250 ms, and the next batch is then served 74-80%, so a long prompt pays once).
+    // Not for a prompt the experts already suit: there the moves bring in the prompt's own experts in place of ones
+    // the reply uses, and replies ran 4-6% slower.
+    // TIERLM_LIVE_PROMPT_MS: the longest (0: never, as before 0.8.7); TIERLM_LIVE_PROMPT_HIT: the share where it starts.
+    const uint64_t picks = live_stats_.picks - picks0, hits = live_stats_.hits - hits0;
+    const double served = picks ? (double)hits / (double)picks : 1.0;
+    const double burst_ms = prompt && !eager ? prompt_ms * std::min(1.0, std::max(0.0, (prompt_hit - served) / 0.17)) : 0.0;
+    const bool burst = burst_ms >= 10.0;
+    if (burst) budget_bytes = live_ms_per_mb_ > 0 ? (size_t)(burst_ms / live_ms_per_mb_ * 1024 * 1024) : (size_t)(burst_ms / 250.0 * 256) << 20;
     const auto t0 = std::chrono::steady_clock::now();
     size_t spent = 0;
     const int n = (int)live_.size();
@@ -3567,10 +3617,14 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     static const bool sync_each = std::getenv("TIERLM_LIVE_SYNC") != nullptr;
     ggml_backend* gpu = sync_each || gpus_.empty() ? nullptr : gpus_[0];
     swap_buf_.clear();
-    if (gpu && swap_buf_.capacity() < budget_bytes + ((size_t)64 << 20)) swap_buf_.reserve(budget_bytes + ((size_t)64 << 20));
+    // (a burst is staged 64 MB at a time: the copies queued so far are waited for when the staging memory is full)
+    const size_t stage = std::min(budget_bytes, (size_t)64 << 20) + ((size_t)64 << 20);
+    if (gpu && swap_buf_.capacity() < stage) swap_buf_.reserve(stage);
     static int start = 0;
     start = n ? (start + 1) % n : 0;
     bool any = false;
+    for (int pass = 0, moved = 1; moved && pass < (burst ? 64 : 1); ++pass) {     // (a burst: round after round while any layer moves one)
+    moved = 0;
     for (int j = 0; j < n && spent < budget_bytes; ++j) {
         LiveLayer& ll = live_[(start + j) % n];
         size_t per_expert = 0;
@@ -3611,13 +3665,14 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
             ll.cold_of[out] = cs; ll.cold_of[in] = -1;
             spent += per_expert;
             live_stats_.swaps++;
-            any = true;
+            any = true; ++moved;
             if (ll.layer < (int)place_.hot.size()) {             // the dashboard's map of VRAM experts
                 auto& v = place_.hot[ll.layer];
                 v = ll.in_slot;
                 std::sort(v.begin(), v.end());
             }
         }
+    }
     }
     if (any && gpu) ggml_backend_synchronize(gpu);                // the outgoing experts are in RAM before the CPU's next step
     const auto t1 = std::chrono::steady_clock::now();
@@ -3627,6 +3682,9 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
         const double mb = spent / (1024.0 * 1024.0);
         if (mb > 0) live_ms_per_mb_ = live_ms_per_mb_ > 0 ? 0.8 * live_ms_per_mb_ + 0.2 * (ms / mb) : ms / mb;
     }
+    if (prompt && std::getenv("TIERLM_LIVE_TRACE"))                // (developers: what each prompt batch found and did)
+        std::fprintf(stderr, "live: prompt batch of %d tokens, VRAM experts served %.0f%% of its picks; moved %zu MB in %.0f ms%s\n", n_tok,
+                     picks ? 100.0 * hits / picks : 0.0, spent >> 20, std::chrono::duration<double, std::milli>(t1 - t0).count(), burst ? " (burst)" : "");
     live_last_ = t1;
     live_credit_ = prompt || eager ? 0 : budget_bytes - std::min(spent, budget_bytes);
 }

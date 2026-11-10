@@ -205,7 +205,7 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_DUMP_SCHED=1` | Debugging: prints each point where the work switches between CPU and GPU |
 | `TIERLM_CPU_OPS=MUL_MAT,...` | Debugging: runs the listed ggml operation types on the CPU, to find which GPU kernel differs |
 | `TIERLM_DEVICE=cpu` | `tierlm-logits` (tests): device to load the model on |
-| `TIERLM_KV_TYPE=q8_0` | KV cache precision for the tools and tests: `f16`, `q8_0`, `q4_0` or `f32` |
+| `TIERLM_KV_TYPE=q8_0` | KV cache precision for the tools and tests: `f16`, `q8_0`, `q5_0`, `q4_0` or `f32` |
 | `TIERLM_NO_REPACK=1` | Keep RAM weights in the file's layout instead of rearranging them for the CPU |
 | `TIERLM_RPC=host:port[,host:port]` | Tests: add `tierlm-rpc-server` instances as stand-in GPUs (needs a build with `-DGGML_RPC=ON`) |
 | `TIERLM_VRAM_MB=N` / `TIERLM_VRAM_BYTES=n[,n...]` | Tests: VRAM budget for `tierlm-logits`, in MiB, or in bytes per GPU |
@@ -216,6 +216,9 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_TRACE_CACHE=1` | `tierlm-server`: for each request, how much of the prompt cache it reuses and where it stops matching |
 | `TIERLM_LIVE_SHARE=0.08` | Live hot experts: the share of each step's time that moving experts may take |
 | `TIERLM_LIVE_MB=32` / `TIERLM_LIVE_PER_LAYER=2` | Live hot experts: most MB moved per step (both ways), most swaps per layer per step |
+| `TIERLM_LIVE_PROMPT_MS=250` / `TIERLM_LIVE_PROMPT_HIT=0.62` | Live hot experts: the longest burst of moves after a prompt batch the VRAM experts served poorly (0: never), and the share of the batch's picks served from VRAM under which it starts (full length 17 points lower) |
+| `TIERLM_LIVE_TRACE=1` | Live hot experts: prints, for each prompt batch, the share of its picks the VRAM experts served and what was moved |
+| `TIERLM_COLD_OFFLOAD_MIN=n` | Experts split between VRAM and RAM: the prompt batch size from which the GPU does the RAM experts' work too, copying them over for the batch (default 512 on a 24 GB card or more, 128 otherwise; ggml's rule, and tierlm's before 0.8.7, is 32) |
 | `TIERLM_LIVE_MARGIN=1.3` | Live hot experts: how much more an expert in RAM must be wanted than one in VRAM to replace it (times its score, + 0.5) |
 | `TIERLM_LIVE_SYNC=1` | Live hot experts: wait for each copy instead of queuing them all on the GPU (for comparison) |
 | `TIERLM_NO_TIMES=1` | `tierlm-server`: no time (HH:MM:SS) in front of each line in its window (the page's console still shows it) |

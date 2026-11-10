@@ -236,6 +236,8 @@ def PASSES(extra):
         # 8-bit KV cache: about 1% from exact. On these tiny random models the top two tokens are often nearly tied,
         # so only the size of the difference is checked.
         passes.append(("kv 8-bit", {"TIERLM_KV_TYPE": "q8_0", "TIERLM_DEVICE": os.environ.get("TIERLM_DEVICE", "cpu")}, 6e-2, False))
+        # 5-bit: coarser (measured on these models: see the printed worst difference); a wrong cache layout would be 100%+
+        passes.append(("kv 5-bit", {"TIERLM_KV_TYPE": "q5_0", "TIERLM_DEVICE": os.environ.get("TIERLM_DEVICE", "cpu")}, 3e-1, False))
     return passes
 long_ids = list(np.random.default_rng(7).integers(0, V, 300))   # > 256: the running memory must carry across batches
 # With TIERLM_RPC set (a tierlm-rpc-server standing in for a GPU), each variant also runs split between that

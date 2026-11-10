@@ -124,7 +124,7 @@ struct LoadOptions {
     std::string device = "auto";     // "auto", "cpu", "gpu", or a ggml device name ("Vulkan0", "CUDA0")
     int flash_attn = -1;             // 1 on, 0 off, -1 default (on, unless TIERLM_NO_FA is set)
     int kv_f32 = -1;                 // 1 f32 cache, 0 f16, -1 default (f16, unless TIERLM_KV_F32 is set)
-    std::string kv_type;             // "f16", "f32", "q8_0" or "q4_0"; overrides kv_f32 when set
+    std::string kv_type;             // "f16", "f32", "q8_0", "q5_0" or "q4_0"; overrides kv_f32 when set
     int batch = 0;                   // tokens per graph when reading a prompt; 0 = 256
     int experts_used = 0;            // override active experts per token (MoE); 0 = the model's value
     int vram_budget_mb = 0;          // most VRAM to use for weights + KV cache; 0 = whatever is free
@@ -200,6 +200,11 @@ struct Placement {
     bool ssd_ngram = false;                      // Flash-Next's n-gram table is there
     std::string ssd_file;                        // the file they're read from
     int cold_mapped_layers = 0;                  // split layers whose RAM experts are read from the model file as used
+    // The weights held in RAM (plus 1 GB to work in) against the RAM that was free when loading. ram_need more than
+    // ram_free: other programs hold RAM this model counts on, Windows will page, and replies run several times slower
+    // (Flash-Next on a 64 GB PC: 18 tok/s that way, 74 after a restart).
+    uint64_t ram_need = 0, ram_free = 0;
+    bool ram_short() const { return ram_free > 0 && ram_need > ram_free; }
     uint64_t compute_gpu = 0;                    // the first GPU's working memory (compute buffers), bytes
     int vram_reserve_mb = 0;                     // VRAM kept free for it and the driver at this load
     // Every layer (attention, feed-forward/experts and its cache) in VRAM: only the token embedding table, which
@@ -292,7 +297,7 @@ public:
     bool integrated_gpu() const;                  // shares system memory (e.g. Intel Arc in a laptop)
     void device_memory(size_t& free, size_t& total) const;   // of the device holding the weights
     bool flash_attn() const { return flash_attn_; }
-    const char* kv_type() const;      // "f16", "f32", "q8_0" or "q4_0"
+    const char* kv_type() const;      // "f16", "f32", "q8_0", "q5_0" or "q4_0"
     int batch() const { return batch_; }
     int experts_default() const { return n_expert_used_file_; }   // active experts the model was trained with
 
@@ -554,6 +559,7 @@ private:
     bool flash_attn_ = true, kv_f32_ = false;
     int kv_t_ = 1;                               // ggml_type of the KV cache (GGML_TYPE_F16)
     int batch_ = 256, n_expert_used_file_ = 0;
+    int cold_offload_min_ = 32;                  // (see load: when the GPU takes over the RAM experts' work in a batch)
 };
 using OlmoeModel = Model;
 

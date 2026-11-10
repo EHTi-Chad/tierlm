@@ -140,6 +140,13 @@ as administrator:
 `Get-WinEvent -LogName "Microsoft-Windows-CodeIntegrity/Operational" -MaxEvents 20 | Format-List TimeCreated, Message`.
 Smart App Control can't make an exception for one program; signed releases are the real fix and are on the way.
 
+**"This model keeps ... GB in RAM, but only ... GB was free when it loaded"**
+Other programs (or a model loaded earlier that Windows hasn't let go of yet) hold RAM that this model counts on. It
+still loads, but Windows then moves memory to disk and replies run several times slower: Flash-Next on a 64 GB PC
+ran at 18 tok/s that way and 74 after a restart. Close other programs, or restart the PC, and load the model again.
+The same note appears under Find the fastest settings' result when it measured that way, since its speeds are then
+lower than the PC can do. (Since 0.8.7.)
+
 **The setup screen says "No models found"**
 Put a supported `.gguf` file in the `models` folder next to `start-tierlm.bat` (the screen shows the exact
 folder), or use the **⋯** menu to choose the folder where your models already are, then click **Rescan**. See [Getting started](GETTING_STARTED.md#step-2-download-the-model).

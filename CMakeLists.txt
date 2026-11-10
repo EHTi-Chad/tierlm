@@ -43,6 +43,8 @@ set(GGML_CUDA   ${TIERLM_CUDA}   CACHE BOOL "" FORCE)
 # CUDA graphs: the GPU replays a whole step's kernels in one launch instead of launching each op (ggml leaves this
 # off outside llama.cpp). tierlm's graphs keep their shapes from token to token, which this needs (see kv_span).
 set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
+# Flash attention kernels for the context memory types tierlm offers (ggml's default set has no 5-bit).
+set(GGML_CUDA_FA_QUANTS "q4_0-q4_0;q5_0-q5_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING "" FORCE)
 set(GGML_VULKAN ${TIERLM_VULKAN} CACHE BOOL "" FORCE)
 # CPU threads: OpenMP (the default), or ggml's own thread pool, which tierlm keeps ready between the many small CPU
 # steps of a split model (see set_n_threads in src/backends.cpp). OFF to try the thread pool.
