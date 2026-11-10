@@ -176,7 +176,7 @@
   .msg.user { align-self: flex-end; background: var(--user); color: var(--user-ink); border-bottom-right-radius: 4px; }
   .msg.assistant { align-self: flex-start; background: var(--panel-2); border-bottom-left-radius: 4px; }
   .msg.assistant.streaming::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
-  .msg .meta { display: block; margin-top: 6px; font-size: 11.5px; color: var(--faint); white-space: normal; }
+  .msg .meta { display: block; margin-top: 6px; font-size: 11.5px; color: var(--faint); white-space: pre-line; }
   .msg.tool { align-self: flex-start; max-width: 92%; background: transparent; border: 1px solid var(--line); border-radius: 10px;
               padding: 7px 10px; font-size: 13px; white-space: normal; }
   .msg.tool .thead { font-weight: 600; color: var(--muted); }
@@ -1427,6 +1427,8 @@ async function streamReply(useWs) {
   const bubble = addMsg("assistant", "");
   bubble.classList.add("streaming");
   let reply = "", meta = "", drawPending = false, doneEv = null, recall = null, failed = false;
+  const sentAt = performance.now();
+  let firstAt = 0;                                // when the first word arrived
   try {
     const res = await api("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
@@ -1455,6 +1457,7 @@ async function streamReply(useWs) {
         }
         else if (ev.type === "prompt") { if (!reply) bubble.textContent = ""; onPrompt(ev); }
         else if (ev.type === "token") {
+          if (!firstAt) firstAt = performance.now();
           reply += ev.text; onToken(ev);
           if (!drawPending) { drawPending = true; requestAnimationFrame(() => { drawPending = false; setReply(bubble, reply); $("messages").scrollTop = $("messages").scrollHeight; }); }
         }
@@ -1464,6 +1467,17 @@ async function streamReply(useWs) {
           if (ev.spec && ev.spec.checks && ev.spec.drafted) meta += " · speculative: " + (ev.n_gen / ev.spec.checks).toFixed(1) + " tokens per check, " +
             Math.round(100 * ev.spec.accepted / Math.max(1, ev.spec.drafted)) + "% of guesses kept" +
             (ev.spec.looked ? " (prompt lookup: " + ev.spec.look_ok + " of " + ev.spec.looked + ")" : "");
+          // A second line with the rest: the prompt (how much came from the cache or the drive, how fast the rest
+          // was read), the wait for the first word, the whole reply's time, and where the experts' work was done.
+          if (ev.n_prompt) {
+            const n = v => Number(v).toLocaleString(), read = ev.n_prompt - ev.reused, sec = v => v < 10 ? v.toFixed(1) : Math.round(v);
+            const d = ["prompt " + n(ev.n_prompt) + " tokens: " + n(ev.reused) + " from the cache" + (ev.from_drive ? " (" + n(ev.from_drive) + " loaded from the drive)" : "") +
+                       ", " + n(read) + " read" + (ev.prompt_s > 0 ? " in " + sec(ev.prompt_s) + " s (" + Math.round(read / Math.max(ev.prompt_s, 1e-9)).toLocaleString() + " tok/s)" : "")];
+            if (firstAt) d.push("first word after " + sec((firstAt - sentAt) / 1000) + " s");
+            d.push("reply in " + sec(ev.gen_s) + " s, " + sec((performance.now() - sentAt) / 1000) + " s in all");
+            if (ev.vram_pct != null) d.push("VRAM experts did " + ev.vram_pct + "% of the expert work" + (ev.moved ? " (" + n(ev.moved) + " moved in)" : ""));
+            meta += "\n" + d.join(" · ");
+          }
           onDone(ev);
         }
         else if (ev.type === "error" && ev.code === "context_full") { lastFull = "full"; }

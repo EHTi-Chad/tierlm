@@ -147,6 +147,13 @@ ran at 18 tok/s that way and 74 after a restart. Close other programs, or restar
 The same note appears under Find the fastest settings' result when it measured that way, since its speeds are then
 lower than the PC can do. (Since 0.8.7.)
 
+**What is the `tierlm-cache` folder?**
+Since 0.8.7, when a conversation starts with a long system message (1,024 tokens or more: a coding agent's
+instructions and tools), tierlm saves what the model holds after reading it, so the next conversation that starts
+the same way loads it in a fraction of a second instead of reading it again. The folder is next to
+`tierlm-settings.json`, holds at most 8 GB (oldest-used files go first), and can be deleted at any time. To change
+the limit or turn it off, set `"prompt_cache_gb"` in `tierlm-settings.json` (0 = off) and restart tierlm.
+
 **The setup screen says "No models found"**
 Put a supported `.gguf` file in the `models` folder next to `start-tierlm.bat` (the screen shows the exact
 folder), or use the **⋯** menu to choose the folder where your models already are, then click **Rescan**. See [Getting started](GETTING_STARTED.md#step-2-download-the-model).

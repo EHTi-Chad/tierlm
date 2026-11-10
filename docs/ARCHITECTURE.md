@@ -177,6 +177,32 @@ request stops matching the cache.
 The idea of keeping several conversations' prompt caches comes from other engines: llama.cpp's server keeps several
 slots, and Magnitude shares cached prompts between concurrent agent sessions.
 
+### Openings saved on the drive
+
+A coding agent starts every session with the same instructions and tool descriptions, often 10 to 20 thousand
+tokens, and a hybrid model (Qwen3.5, Qwen3-Next, Flash-Next) can't go back to the end of them once a conversation
+has moved on: its running memory can't be rewound, so the next session reads them all again.
+
+Since 0.8.7 the first time a system message of 1,024 tokens or more is read, tierlm stops at its end and writes
+what the model holds there to `tierlm-cache/` next to the settings file: the context memory of those tokens, the
+hybrid layers' running memories, the draft block's state (`tools/prompt_cache.h`). The writing happens on another
+thread while the request goes on. A later conversation that starts with the same tokens loads that file instead of
+reading the text, also after tierlm or the model has been started again, and a hybrid model gets its point to go
+back to for free.
+
+- **What must match.** The file is named by a fingerprint of the model's line (file name, size and date, the
+  architecture, context memory precision, experts per token, whether a draft block is loaded) and the tokens, and
+  holds both; they are compared exactly before anything is used. A file that turns out not to fit is deleted and
+  the text is read as before.
+- **Size.** Up to 8 GB in all (`prompt_cache_gb` in `tierlm-settings.json`, 0 turns it off); the oldest-used files
+  go first. Nothing is written when the drive would be left with under 10 GB, or RAM is short for the copy.
+- **Not** with several connections or images in the opening, for now.
+
+Flash-Next IQ3_XXS on the RTX 5090, 64K context, 16-bit context memory, a 2,474-token system message: read at
+324-350 tok/s (7.1-7.6 s) the first time and saved as a 199 MB file; every later conversation with it, in the same
+run or after a restart, loaded it in 0.13-0.22 s. The replies were the same text as without the cache (temperature
+0, 4 guesses). At that rate a 20,000-token opening is about 1.6 GB on the drive.
+
 ## Embedding models (a second model)
 
 Search and document-comparison tools need an embedding model next to the chat model. These are encoders (BERT-style:

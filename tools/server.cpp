@@ -46,6 +46,7 @@
 #include "harmony.h"
 #include "workspace.h"
 #include "chats.h"
+#include "prompt_cache.h"
 #include "download.h"
 
 #include <climits>
@@ -745,6 +746,13 @@ struct Engine {
         Speculator::State spec;
     };
     std::list<SavedConv> saved;
+    // Openings saved on the drive (see prompt_cache.h): the folder, its size limit (0: off), the shortest opening
+    // worth saving, and the line that says which model and settings a saved state belongs to (made at load).
+    std::filesystem::path pc_dir;
+    uint64_t pc_limit = 0;
+    size_t pc_min = 1024;
+    std::string pc_identity;
+    std::shared_ptr<std::atomic<bool>> pc_writing = std::make_shared<std::atomic<bool>>(false);
     size_t saved_bytes() const { size_t n = 0; for (const auto& c : saved) n += c.snap.bytes; return n; }
     // Room for saved conversations: up to 4 GB, and never more than a quarter of the RAM that is free now.
     size_t saved_budget() const {
@@ -1378,6 +1386,17 @@ int main(int argc, char** argv) {
     std::recursive_mutex settings_mu;
     auto sget = [&](const char* k) { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value(k, std::string()); };
     auto sflag = [&](const char* k) { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value(k, false); };
+    // Openings saved on the drive (prompt_cache.h): tierlm-cache next to the settings file, up to prompt_cache_gb
+    // (settings; default 8, 0 turns it off). TIERLM_PROMPT_CACHE_GB / TIERLM_PROMPT_CACHE_MIN (tokens) override.
+    {
+        eng.pc_dir = fs::absolute(fs::u8path(a.settings)).parent_path() / "tierlm-cache";
+        double gb = 8;
+        { std::lock_guard<std::recursive_mutex> sl(settings_mu); if (settings.contains("prompt_cache_gb") && settings["prompt_cache_gb"].is_number()) gb = settings["prompt_cache_gb"].get<double>(); }
+        if (const char* e = std::getenv("TIERLM_PROMPT_CACHE_GB")) gb = std::atof(e);
+        eng.pc_limit = gb > 0 ? (uint64_t)(gb * 1073741824.0) : 0;
+        if (const char* e = std::getenv("TIERLM_PROMPT_CACHE_MIN")) eng.pc_min = (size_t)std::max(16, std::atoi(e));
+        pcache::tidy(eng.pc_dir);                                    // (leftovers of a write that was cut short)
+    }
     auto smodels = [&] { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value("models", json::object()); };
     bool recursive = settings.value("recursive", true);
     if (!a.models_given && settings.contains("models_folder") && settings["models_folder"].is_string()) {
@@ -1492,6 +1511,15 @@ int main(int argc, char** argv) {
         }
         eng.path = path;
         eng.name = gguf_string(path, "general.name");
+        {   // which saved openings fit this load: the file (name, size, date), and what changes the numbers kept
+            std::error_code ec;
+            const fs::path mp = fs::u8path(path);
+            const auto sz = fs::file_size(mp, ec);
+            const auto mt = fs::last_write_time(mp, ec).time_since_epoch().count();
+            eng.pc_identity = "1|" + mp.filename().u8string() + "|" + std::to_string((unsigned long long)sz) + "|" + std::to_string((long long)mt) +
+                              "|" + eng.model->arch() + "|kv " + eng.model->kv_type() + "|used " + std::to_string(eng.model->hparams().n_expert_used) +
+                              "|mtp " + (eng.model->has_mtp() ? "1" : "0");
+        }
         eng.threads = threads > 0 ? threads : a.threads;
         eng.seed = seed;
         if (seed >= 0) eng.rng.seed((uint32_t)seed);
@@ -1640,6 +1668,8 @@ int main(int argc, char** argv) {
             // For "slower than expected" hints: system RAM now, and what Find the fastest settings measured here.
             {"ram_need_at_load", eng.model->placement().ram_need}, {"ram_free_at_load", eng.model->placement().ram_free},
             {"ram_short", eng.model->placement().ram_short()},
+            {"prompt_cache", [&] { const pcache::Usage u = pcache::tidy(eng.pc_dir);
+                                   return json{{"files", u.files}, {"bytes", u.bytes}, {"limit_bytes", eng.pc_limit}, {"min_tokens", eng.pc_min}}; }()},
             {"ram_free", [&] { size_t f = 0, t = 0; if (auto d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(d, &f, &t); return f; }()},
             {"tuned_tps", [&] {
                 std::error_code ec;
@@ -2069,6 +2099,7 @@ int main(int argc, char** argv) {
     //   on_token   for each piece of new text (with the experts each layer picked); return false to stop
     // `stops` are strings that end the reply (OpenAI's "stop"); text that might be the start of one is held back.
     struct Gen { size_t n_prompt = 0, reused = 0, n_gen = 0, drafted = 0, accepted = 0, checks = 0, looked = 0, look_ok = 0; double prompt_s = 0, gen_s = 0, guess_ms = 0, check_ms = 0, catch_ms = 0;
+                 int vram_pct = -1; long long moved = 0; size_t from_drive = 0;   // (the page's details line)
                  std::string stop = "length", text, full; };
     // The tool calls in a reply, in the model's own format.
     auto parse_calls = [&](const std::string& full, const agent::ojson& tools) {
@@ -2214,6 +2245,7 @@ int main(int argc, char** argv) {
         }
         if (std::getenv("TIERLM_TRACE_CACHE"))
             std::fprintf(stderr, "cache trace: reuse %zu, cached %zu, n_past %d, checkpoint %d\n", common, cached.size(), npast(), model->checkpoint_pos());
+        bool kept_now = false;                                    // the cache's conversation was just saved to RAM
         if (!par) {
             // A saved conversation that this request continues further than the cache does: swap it in (saving the
             // cache's own conversation first). Hybrid models can't rewind, so for them it must continue all of it.
@@ -2228,6 +2260,7 @@ int main(int argc, char** argv) {
                 auto c = std::move(*best);
                 eng.saved.erase(best);
                 eng.save_current();
+                kept_now = true;
                 const auto t0 = Clock::now();
                 model->restore(c.snap);
                 if (eng.spec) eng.spec->set_state(c.has_spec ? c.spec : Speculator::State{});
@@ -2238,8 +2271,61 @@ int main(int argc, char** argv) {
             } else if (cached.size() >= common + 256 &&
                        !(hp.hybrid && model->checkpoint_pos() >= 0 && common >= (size_t)model->checkpoint_pos())) {
                 eng.save_current();                                      // about to be overwritten: keep it
+                kept_now = true;
                                                                          // (not when a hybrid model just goes back to its checkpoint)
             }
+        }
+        // The opening (the system message: an agent's instructions and tool descriptions) from the drive, when this
+        // conversation starts with one that was saved there and the cache doesn't already hold it (prompt_cache.h).
+        // `opening`: where it ends in this conversation, 0 if it has none worth saving.
+        size_t opening = 0;
+        bool save_opening = false;
+        if (!par && !has_pics && eng.pc_limit > 0 && !eng.pc_identity.empty()) {
+            static const char* const marks[] = {"<|im_start|>", "<start_of_turn>", "<|start_header_id|>", "<|start|>"};
+            int32_t mark = -1;
+            for (const char* m : marks) if ((mark = tok.find(m)) >= 0) break;
+            size_t first = toks.size(), second = toks.size();
+            if (mark >= 0)
+                for (size_t i = 0; i < toks.size(); ++i)
+                    if (toks[i] == mark) { if (first == toks.size()) first = i; else { second = i; break; } }
+            if (second < toks.size() && second >= eng.pc_min) {
+                std::string role;                                       // the first turn must be the system's
+                try { role = tok.decode(std::vector<int32_t>(toks.begin() + first, toks.begin() + std::min(first + 6, second)), false); } catch (...) {}
+                if (role.find("system") != std::string::npos || role.find("developer") != std::string::npos) opening = second;
+            }
+        }
+        // (how much of the cache this conversation can really keep: a hybrid model can't rewind, so unless the
+        // conversation continues all of the cache or goes back to the model's one checkpoint, it starts over)
+        size_t reach = common;
+        if (hp.hybrid && common < cached.size() && !(model->checkpoint_pos() >= 0 && common >= (size_t)model->checkpoint_pos())) reach = 0;
+        if (opening > reach) {
+            const fs::path file = eng.pc_dir / pcache::file_name(eng.pc_identity, toks.data(), opening);
+            std::error_code fec;
+            if (fs::is_regular_file(file, fec)) {
+                const auto t0 = Clock::now();
+                pcache::Entry e;
+                bool ok = pcache::read(file, eng.pc_identity, toks.data(), opening, e);
+                if (ok) {
+                    if (!kept_now && cached.size() >= common + 256) eng.save_current();   // (what the cache holds now: kept in RAM)
+                    try {
+                        model->restore(e.snap);
+                        if (eng.spec) eng.spec->set_state(e.has_spec ? e.spec : Speculator::State{});
+                        cached = e.tokens;
+                        common = prefix(cached);
+                        pcache::touch(file);
+                        r.from_drive = opening;
+                        std::fprintf(stderr, "cache: loaded a saved %zu-token opening from the drive in %.2f s (%.0f MB)\n", opening, since(t0),
+                                     e.snap.bytes / 1048576.0);
+                    } catch (const std::exception& ex) {                 // (it doesn't fit this load after all: read it as text)
+                        ok = false;
+                        model->reset();
+                        if (eng.spec) eng.spec->set_state(Speculator::State{});
+                        cached.clear(); common = 0;
+                        std::fprintf(stderr, "cache: a saved opening couldn't be used (%s); reading it again\n", ex.what());
+                    }
+                }
+                if (!ok) { fs::remove(file, fec); save_opening = true; }
+            } else save_opening = true;
         }
         if (common == toks.size()) common = toks.size() - 1;      // must evaluate at least one token
         if (par) model->seq_truncate(seq, (int)common); else model->truncate((int)common);
@@ -2251,6 +2337,47 @@ int main(int argc, char** argv) {
         std::vector<float> lg;
         // (speculation: one conversation only, and not with images: the draft block reads text only)
         Speculator* const spx = par || has_pics ? nullptr : eng.active_spec();
+        // An opening not on the drive yet: read up to its end, and save what the model holds there (written by another
+        // thread; this request goes on reading). `opened`: tokens read here that count as read, not reused, below.
+        size_t opened = 0;
+        if (save_opening && opening > common && !eng.pc_writing->load()) {
+            const std::vector<int32_t> head(toks.begin(), toks.begin() + opening);
+            if (spx) spx->prompt(head, eng.threads, &routing);
+            else evalm(std::vector<int32_t>(head.begin() + common, head.end()), &routing);
+            opened = opening - common;
+            common = opening;
+            cached = head;
+            suffix.assign(toks.begin() + common, toks.end());
+            size_t free_ram = 0, total_ram = 0;
+            if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(cpu, &free_ram, &total_ram);
+            const size_t need = (size_t)(model->kv_bytes_per_token() * opening) + ((size_t)256 << 20);   // about what the copy takes
+            unsigned long long dfree = 0, dtot = 0;
+            std::error_code dec;
+            fs::create_directories(eng.pc_dir, dec);
+            const bool room = !drive_space(eng.pc_dir.u8string(), dfree, dtot) || dfree > need + ((unsigned long long)10 << 30);
+            if (need > eng.pc_limit) std::fprintf(stderr, "cache: this %zu-token opening is larger than the limit for saved openings; not saved\n", opening);
+            else if (!room) std::fprintf(stderr, "cache: not saving the opening: the drive has less than 10 GB to spare\n");
+            else if (free_ram && free_ram < 2 * need + ((size_t)4 << 30)) std::fprintf(stderr, "cache: not saving the opening: too little RAM free for the copy\n");
+            else {
+                auto e = std::make_shared<pcache::Entry>();
+                e->tokens = head;
+                e->snap = model->save();
+                if (eng.spec) { e->has_spec = true; e->spec = eng.spec->state(); }
+                eng.pc_writing->store(true);
+                std::thread([e, dir = eng.pc_dir, id = eng.pc_identity, limit = eng.pc_limit, flag = eng.pc_writing] {
+                    const auto t0 = Clock::now();
+                    pcache::tidy(dir, limit, pcache::bytes_of(*e));
+                    const bool ok = pcache::write(dir / pcache::file_name(id, e->tokens.data(), e->tokens.size()), id, *e);
+                    std::fprintf(stderr, ok ? "cache: saved a %zu-token opening to the drive (%.0f MB, %.1f s); the next conversation that starts with it loads it instead of reading it\n"
+                                            : "cache: couldn't write a %zu-token opening to the drive (%.0f MB, %.1f s)\n",
+                                 e->tokens.size(), e->snap.bytes / 1048576.0, since(t0));
+                    flag->store(false);
+                }).detach();
+            }
+        }
+        // (a hybrid model's point to go back to: the opening's end, as when the whole prompt is read in one go below;
+        // a later turn in this prompt moves it there)
+        if (!par && hp.hybrid && opening && common == opening) { model->checkpoint(); if (spx) spx->mark(); }
         // Hybrid models can't rewind, so they keep one point to go back to: the start of this reply's own turn. The
         // next message repeats everything before it word for word (the turn itself is written differently in the
         // history: no empty thinking block), so it carries on from there instead of reading the conversation again.
@@ -2277,6 +2404,7 @@ int main(int argc, char** argv) {
             if (!par && hp.hybrid && common == 0) { model->checkpoint(); if (spx) spx->mark(); }
         }
         r.prompt_s = since(p0);
+        common -= opened;                                         // (the opening read above was read, not reused)
         std::fprintf(stderr, "chat: %zu prompt tokens, %zu reused from the cache, %zu read at %.0f tok/s\n", toks.size(), (size_t)common,
                      toks.size() - common, (toks.size() - common) / std::max(r.prompt_s, 1e-9));
         r.n_prompt = toks.size();
@@ -2287,8 +2415,8 @@ int main(int argc, char** argv) {
         if (K > 0) for (size_t i = 0; i < routing.size(); ++i) if (routing[i] >= 0) counts[((i / K) % L) * E + routing[i]]++;   // (-1: a layer without experts)
         eng.add_usage(routing, K);
         if (on_prompt)
-            on_prompt({{"n_prompt", toks.size()}, {"n_new", suffix.size()}, {"reused", common}, {"prompt_s", r.prompt_s},
-                       {"prompt_tps", suffix.size() / std::max(r.prompt_s, 1e-9)}, {"counts", counts}, {"n_past", npast()}});
+            on_prompt({{"n_prompt", toks.size()}, {"n_new", toks.size() - common}, {"reused", common}, {"prompt_s", r.prompt_s},
+                       {"prompt_tps", (toks.size() - common) / std::max(r.prompt_s, 1e-9)}, {"counts", counts}, {"n_past", npast()}});
 
         std::vector<int32_t> out;
         size_t shown = 0;
@@ -2423,7 +2551,10 @@ int main(int argc, char** argv) {
         std::string vram_note;                                   // how much of this reply's expert work VRAM did
         {
             std::lock_guard<std::mutex> lk(eng.usage_mu);
-            if (eng.picks > 0) vram_note = "; VRAM experts did " + std::to_string((int)std::lround(100.0 * eng.picks_vram / eng.picks)) + "% of this reply's expert work";
+            if (eng.picks > 0) {
+                r.vram_pct = (int)std::lround(100.0 * eng.picks_vram / eng.picks);
+                vram_note = "; VRAM experts did " + std::to_string(r.vram_pct) + "% of this reply's expert work";
+            }
             eng.picks = eng.picks_vram = 0;
         }
         if (model->live_hot()) {                                 // the VRAM set moves: count where each pick really was
@@ -2433,6 +2564,7 @@ int main(int argc, char** argv) {
                 std::snprintf(b, sizeof b, "; VRAM experts did %d%% of this reply's expert work (%lld moved into VRAM, %.0f ms)",
                               (int)std::lround(100.0 * ls.hits / ls.picks), ls.swaps, ls.swap_ms);
                 vram_note = b;
+                r.vram_pct = (int)std::lround(100.0 * ls.hits / ls.picks); r.moved = ls.swaps;
             }
             model->reset_live_stats();
         }
@@ -2605,7 +2737,10 @@ int main(int argc, char** argv) {
                         return send({{"type", "token"}, {"text", delta}, {"tps", tps}, {"n_past", tl_past}, {"routing", picks}});
                     }, tools);
                 json done = {{"type", "done"}, {"n_gen", g.n_gen}, {"gen_s", g.gen_s},
-                             {"gen_tps", g.n_gen / std::max(g.gen_s, 1e-9)}, {"stop", g.stop}, {"n_past", tl_past}};
+                             {"gen_tps", g.n_gen / std::max(g.gen_s, 1e-9)}, {"stop", g.stop}, {"n_past", tl_past},
+                             // (for the details under the reply)
+                             {"n_prompt", g.n_prompt}, {"reused", g.reused}, {"prompt_s", g.prompt_s}, {"from_drive", g.from_drive}};
+                if (g.vram_pct >= 0) { done["vram_pct"] = g.vram_pct; done["moved"] = g.moved; }
                 if (!tools.empty()) {                          // the reply as written (the next request sends it back) and its calls
                     const agent::Parsed pc = parse_calls(g.full, tools);
                     done["raw"] = g.full;

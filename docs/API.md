@@ -231,7 +231,8 @@ While a reply is streaming or a model is loading, `/api/info` returns the last k
 `"busy": true` and `waiting` (requests in line) instead of waiting. It also gives `ram_free` (system RAM free, bytes) and `tuned_tps`
 (what **Find the fastest settings** measured for this model on this PC, 0 if never run): the page uses them to say
 when a reply was much slower than that, and why it probably was.
-Since 0.8.7 also `ram_short` (true when the model was loaded with less RAM free than it keeps there, so the system
+Since 0.8.7 also `prompt_cache` (`files`, `bytes`, `limit_bytes`, `min_tokens`: the openings saved on the drive, see
+ARCHITECTURE.md) and `ram_short` (true when the model was loaded with less RAM free than it keeps there, so the system
 will page and replies will be slow), with `ram_need_at_load` and `ram_free_at_load` in bytes.
 
 ### GET /api/devices

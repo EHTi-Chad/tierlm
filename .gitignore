@@ -11,3 +11,4 @@ scripts/go5.bat
 scripts/t5-runs*.bat
 scripts/watch5.bat
 scripts/watchL.bat
+tierlm-cache/
