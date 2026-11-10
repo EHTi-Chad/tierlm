@@ -925,7 +925,13 @@ json describe_model(const std::string& path, bool header_only = false) {
         gguf_free(g);
         return j;
     }
-    if (arch_supported(arch) && (tk == "gpt2" || tk == "llama")) j["supported"] = true;
+    // PrismML's Bonsai 2 (ternary weights): an architecture and weight types tierlm knows, but the weights are stored
+    // rotated (a Hadamard transform, declared under prism.hadamard.*), and running them without the matching
+    // transform gives gibberish. Refused until tierlm applies it.
+    bool rotated = false;
+    for (int64_t i = 0; i < gguf_get_n_kv(g) && !rotated; ++i) rotated = std::strncmp(gguf_get_key(g, i), "prism.hadamard", 14) == 0;
+    if (rotated) j["reason"] = "Bonsai 2 (ternary weights stored in a rotated form) is not supported yet";
+    else if (arch_supported(arch) && (tk == "gpt2" || tk == "llama")) j["supported"] = true;
     else if (arch_supported(arch)) j["reason"] = "the " + (tk.empty() ? std::string("unknown") : tk) + " tokenizer is not supported yet";
     else if (arch == "clip") {
         // A vision projector (mmproj file): the "eyes" of a vision model, not a model that runs on its own.

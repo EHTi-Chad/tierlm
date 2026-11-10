@@ -256,6 +256,13 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
 
     const std::string arch = str("general.architecture");
     if (!arch_supported(arch)) { gguf_free(g); throw std::runtime_error("the " + arch + " architecture is not supported yet"); }
+    // PrismML's Bonsai 2: weights stored rotated (a Hadamard transform, declared under prism.hadamard.*). Without the
+    // matching transform on the way in, the model loads and writes gibberish, so it is refused until tierlm has it.
+    for (int64_t i = 0; i < gguf_get_n_kv(g); ++i)
+        if (std::strncmp(gguf_get_key(g, i), "prism.hadamard", 14) == 0) {
+            gguf_free(g);
+            throw std::runtime_error("Bonsai 2 (ternary weights stored in a rotated form) is not supported yet");
+        }
     Hparams& hp = m->hp_;
     hp.arch          = arch;
     hp.n_layer       = u32(arch + ".block_count", true);

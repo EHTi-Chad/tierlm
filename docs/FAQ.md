@@ -147,6 +147,12 @@ ran at 18 tok/s that way and 74 after a restart. Close other programs, or restar
 The same note appears under Find the fastest settings' result when it measured that way, since its speeds are then
 lower than the PC can do. (Since 0.8.7.)
 
+**"Bonsai 2 (ternary weights stored in a rotated form) is not supported yet"**
+PrismML's Bonsai 2 models keep every weight as -1, 0 or +1, stored in a rotated form that needs a matching
+transform when the model runs. tierlm knows the architecture and the weight type but doesn't apply that transform
+yet, and without it the model would load and write gibberish, so since 0.8.7 it refuses these files instead.
+Support is planned.
+
 **What is the `tierlm-cache` folder?**
 Since 0.8.7, when a conversation starts with a long system message (1,024 tokens or more: a coding agent's
 instructions and tools), tierlm saves what the model holds after reading it, so the next conversation that starts
