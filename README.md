@@ -81,7 +81,7 @@ It makes a large difference: the 17 GB Qwen3.6-35B-A3B on an 8 GB laptop GPU run
 
 How tierlm keeps it fast, at any size:
 
-- **Size is about memory.** Any model that fits in VRAM plus RAM runs at full speed (about 10 GB is needed for
+- **Size is about memory.** Any model that fits in VRAM plus RAM runs without touching the drive (about 10 GB is needed for
   Windows, the context and working memory). With the **SSD tier** on, bigger models run too: the parts used least
   stay on an NVMe drive and are read as each word needs them.
 - **Each part goes where it's fastest.** For mixture-of-experts models, attention and the context stay on the GPU and

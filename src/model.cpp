@@ -10,6 +10,7 @@
 #include <set>
 #include <functional>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1812,39 +1813,56 @@ void Model::reset() {
     n_past_ = 0;
     free_cells_from(0, 0);
     if (hp_.hybrid) clear_state(0);                             // clear the running memory
-    ckpt_ok_ = false;
+    ckpts_.clear();
 }
 
 void Model::checkpoint() {
     if (!hp_.hybrid) return;
     release_pending();
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
-    ckpt_ = Snapshot();
-    ckpt_.n_past = n_past_;
+    while (!ckpts_.empty() && ckpts_.back().n_past >= n_past_) ckpts_.pop_back();   // (one here already, or past the end: replaced)
+    Snapshot ck;
+    ck.n_past = n_past_;
     auto grab = [&](ggml_tensor* t) {
-        ckpt_.parts.emplace_back(ggml_nbytes(t));
-        ggml_backend_tensor_get(t, ckpt_.parts.back().data(), 0, ggml_nbytes(t));
-        ckpt_.bytes += ggml_nbytes(t);
+        ck.parts.emplace_back(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, ck.parts.back().data(), 0, ggml_nbytes(t));
+        ck.bytes += ggml_nbytes(t);
     };
     for (const auto& L : layers_) {
         if (L.conv_state) { grab(L.conv_state); grab(L.ssm_state_t); }
         if (!L.ple_states.empty()) grab(L.ple_states[0]);
     }
     if (mtp_ && mtp_->conv_state) { grab(mtp_->conv_state); grab(mtp_->ssm_state_t); }
-    ckpt_ok_ = true;
+    ckpts_.push_back(std::move(ck));
+    // Too many, or too much RAM: the one whose neighbours are closest together goes (never the first or the last),
+    // so the ones kept stay spread over the conversation.
+    static const size_t max_n = [] { const char* e = std::getenv("TIERLM_ANCHORS"); return (size_t)std::max(1, e ? std::atoi(e) : 12); }();
+    static const size_t max_bytes = [] { const char* e = std::getenv("TIERLM_ANCHORS_MB"); return (size_t)(e ? std::atoll(e) : 1536) << 20; }();
+    auto total = [&] { size_t n = 0; for (const Snapshot& c : ckpts_) n += c.bytes; return n; };
+    while (ckpts_.size() > 1 && (ckpts_.size() > max_n || total() > max_bytes)) {
+        size_t drop = 0;
+        int gap = INT_MAX;
+        for (size_t i = 1; i + 1 < ckpts_.size(); ++i) {
+            const int g = ckpts_[i + 1].n_past - ckpts_[i - 1].n_past;
+            if (g < gap) { gap = g; drop = i; }
+        }
+        ckpts_.erase(ckpts_.begin() + (std::ptrdiff_t)drop);       // (two left: the earlier one)
+    }
 }
 
 void Model::truncate(int n) {
     release_pending();
     if (n >= n_past_) return;
     if (hp_.hybrid) {                                           // the running memory can't be rewound...
-        if (!ckpt_ok_ || n < ckpt_.n_past || ckpt_.n_past > n_past_) { reset(); return; }
+        while (!ckpts_.empty() && (ckpts_.back().n_past > n || ckpts_.back().n_past > n_past_)) ckpts_.pop_back();
+        if (ckpts_.empty()) { reset(); return; }
+        const Snapshot& ck = ckpts_.back();                     // ...but it can go back to the last checkpoint before n
         std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
-        n_past_ = ckpt_.n_past;                                 // ...but it can go back to the checkpoint
+        n_past_ = ck.n_past;
         free_cells_from(0, n_past_);
         rope_truncate(0, n_past_);
         size_t i = 0;
-        auto put = [&](ggml_tensor* t) { const auto& p = ckpt_.parts.at(i++); ggml_backend_tensor_set(t, p.data(), 0, p.size()); };
+        auto put = [&](ggml_tensor* t) { const auto& p = ck.parts.at(i++); ggml_backend_tensor_set(t, p.data(), 0, p.size()); };
         for (const auto& L : layers_) {
             if (L.conv_state) { put(L.conv_state); put(L.ssm_state_t); }
             if (!L.ple_states.empty()) put(L.ple_states[0]);
@@ -1902,7 +1920,7 @@ Model::Snapshot Model::save() const {
 
 void Model::restore(const Snapshot& s) {
     release_pending();
-    ckpt_ok_ = false;
+    ckpts_.clear();
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
     n_past_ = 0;
     free_cells_from(0, 0);

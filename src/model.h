@@ -255,11 +255,21 @@ public:
     // short of the whole conversation means starting over (n_past() tells the caller where it stands).
     void truncate(int n);
     // Hybrid models (DeltaNet): their running memory can't be rewound, so truncate starts the conversation over...
-    // unless it goes back no further than the last checkpoint: a copy of the running memories at the end of a prompt.
-    // So the next message reuses the conversation up to there instead of reading it all again (the reply as stored
-    // in the history often differs a little from what was generated, e.g. without its empty thinking block).
+    // unless there is a checkpoint (an anchor) to go back to: a copy of the running memories as they were at some
+    // position. truncate(n) goes back to the last one at or before n, so a message that repeats the conversation up
+    // to there carries on from it instead of reading everything again (the reply as stored in the history often
+    // differs a little from what was generated, e.g. without its empty thinking block; a coding agent rewrites
+    // earlier turns). Several are kept (the cache's keys and values up to each are still there, so an anchor is
+    // only the running memories: about 110 MB each for Flash-Next), at most 12 and 1.5 GB (TIERLM_ANCHORS,
+    // TIERLM_ANCHORS_MB); when there are too many, the one closest to its neighbours goes.
     void checkpoint();
-    int checkpoint_pos() const { return ckpt_ok_ ? ckpt_.n_past : -1; }   // where truncate can go back to (-1: none)
+    int checkpoint_pos() const { return ckpts_.empty() ? -1 : ckpts_.back().n_past; }   // the last one (-1: none)
+    int checkpoint_before(int n) const {                          // where truncate(n) would go back to (-1: the start)
+        int best = -1;
+        for (const Snapshot& c : ckpts_) if (c.n_past <= n && c.n_past <= n_past_) best = c.n_past;
+        return best;
+    }
+    int checkpoints() const { return (int)ckpts_.size(); }
 
     // A conversation's memory, copied out to system RAM so another conversation can use the cache meanwhile and
     // this one can come back without being read again: the keys and values of its n_past positions in every
@@ -526,8 +536,7 @@ private:
     void drop_plan(Plan& p);
     void drop_plans();                                             // reuse_ and both plans (the cache changes size)
     bool overlap_ = true;                                          // CPU and GPU at once on split expert layers
-    Snapshot ckpt_;                                                // (see checkpoint)
-    bool ckpt_ok_ = false;
+    std::vector<Snapshot> ckpts_;                                  // (see checkpoint) in order of position
     int n_threads_last_ = 0;                                       // (for the profile)
     void profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms, double build_ms = 0, double alloc_ms = 0);
     bool pin_layers_ = false;                    // layer split: RAM layers must run entirely on the CPU

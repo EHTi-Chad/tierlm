@@ -174,6 +174,22 @@ Qwen3.8 Flash-Next). Three changes fix it:
 Now a follow-up reads only the new message: 4,391 of 4,415 tokens reused on the RTX 5090, and on the laptop with
 Qwen3.6-35B-A3B 176 of 208 tokens (the reply and everything before it). `TIERLM_TRACE_CACHE=1` prints where a
 request stops matching the cache.
+
+**Anchors: several points to go back to** (since 0.8.7). A coding agent doesn't only add to a conversation: it
+rewrites earlier turns, most often replacing old tool results with a short note to save context. With one point to
+go back to (the last turn's start), any such change sent a hybrid model back to the beginning. Now the model keeps
+up to 12 checkpoints (`TIERLM_ANCHORS`; at most 1.5 GB of RAM, `TIERLM_ANCHORS_MB`): while a prompt is read, one is
+taken at each turn's start that is at least 1,024 tokens after the one before (`TIERLM_ANCHOR_EVERY`), besides the
+end of the system message and the last turn's start. A checkpoint is only the running memories (the keys and
+values before it are still in the cache), and `Model::truncate` goes back to the last one before the change. When
+there are too many, the one whose neighbours are closest goes, so those kept stay spread over the conversation.
+The draft block's state is kept per checkpoint too.
+
+Flash-Next IQ3_XXS on the RTX 5090: a 5,237-token agent conversation (a 2,474-token system message, a file, two
+tool results) sent again with the tool results replaced by one line, 3,529 tokens. Before: all 3,529 read again
+(10.5 s). With the system message loaded from the drive but no anchors: 1,055 read (about 3 s). With an anchor at
+the turn before the change (anchors every 512 tokens in this test): 75 read, 0.5 s. The reply was the same text
+as after reading the changed conversation from the start (temperature 0, fixed VRAM experts).
 The idea of keeping several conversations' prompt caches comes from other engines: llama.cpp's server keeps several
 slots, and Magnitude shares cached prompts between concurrent agent sessions.
 

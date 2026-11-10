@@ -80,7 +80,11 @@ public:
     void set_state(const State& s) { h_last_ = s.h_last; h_pos_ = s.h_pos; mtp_valid_ = s.mtp_valid; }
     // Remember the hidden state at the model's checkpoint (Model::checkpoint), so a prompt that goes back there
     // can carry on the draft block without recomputing from the start.
-    void mark() { ck_ = state(); }
+    void mark() {
+        while (!marks_.empty() && marks_.back().h_pos >= h_pos_) marks_.pop_back();
+        marks_.push_back(state());
+        if (marks_.size() > 64) marks_.erase(marks_.begin() + 1);   // (far more than the model keeps checkpoints)
+    }
 
     const SpecStats& stats() const { return st_; }
     void reset_stats() { st_ = SpecStats(); }
@@ -96,7 +100,7 @@ private:
     std::vector<float> h_last_;   // the model's final hidden state at position h_pos_
     int h_pos_ = -1;
     int mtp_valid_ = 0;           // the draft block's cache is right for positions [0, mtp_valid_)
-    State ck_;                    // the state at the model's checkpoint (mark)
+    std::vector<State> marks_;    // the states at the model's checkpoints (mark), in order of position
     SpecStats st_;
     DraftSource draft_src_;
     int lookup_max_ = 0, lookup_min_ = 3;

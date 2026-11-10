@@ -2269,7 +2269,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "cache: brought back a saved %zu-token conversation in %.2f s\n", cached.size(), since(t0));
                 eng.saved.push_front(std::move(c));                    // (kept: the conversation may branch here again)
             } else if (cached.size() >= common + 256 &&
-                       !(hp.hybrid && model->checkpoint_pos() >= 0 && common >= (size_t)model->checkpoint_pos())) {
+                       !(hp.hybrid && model->checkpoint_before((int)common) >= 0)) {
                 eng.save_current();                                      // about to be overwritten: keep it
                 kept_now = true;
                                                                          // (not when a hybrid model just goes back to its checkpoint)
@@ -2297,7 +2297,7 @@ int main(int argc, char** argv) {
         // (how much of the cache this conversation can really keep: a hybrid model can't rewind, so unless the
         // conversation continues all of the cache or goes back to the model's one checkpoint, it starts over)
         size_t reach = common;
-        if (hp.hybrid && common < cached.size() && !(model->checkpoint_pos() >= 0 && common >= (size_t)model->checkpoint_pos())) reach = 0;
+        if (hp.hybrid && common < cached.size()) reach = (size_t)std::max(0, model->checkpoint_before((int)common));
         if (opening > reach) {
             const fs::path file = eng.pc_dir / pcache::file_name(eng.pc_identity, toks.data(), opening);
             std::error_code fec;
@@ -2381,26 +2381,44 @@ int main(int argc, char** argv) {
         // Hybrid models can't rewind, so they keep one point to go back to: the start of this reply's own turn. The
         // next message repeats everything before it word for word (the turn itself is written differently in the
         // history: no empty thinking block), so it carries on from there instead of reading the conversation again.
+        // More such points (anchors) on the way there, at turns' starts at least 1,024 tokens apart (TIERLM_ANCHOR_EVERY):
+        // a coding agent rewrites earlier turns (it trims old tool results), and the conversation then carries on
+        // from the last anchor before the change instead of from the start.
         size_t split = 0;
+        std::vector<size_t> stops_at;                             // where to stop and keep a checkpoint, in order
         if (!par && hp.hybrid) {
             static const char* const marks[] = {"<|im_start|>", "<start_of_turn>", "<|start_header_id|>", "<|start|>"};
+            static const size_t every = [] { const char* e = std::getenv("TIERLM_ANCHOR_EVERY"); return (size_t)std::max(64, e ? std::atoi(e) : 1024); }();
             int32_t mark = -1;
             for (const char* m : marks) if ((mark = tok.find(m)) >= 0) break;
             if (mark >= 0) for (size_t i = toks.size(); i-- > common + 1;) if (toks[i] == mark) { split = i; break; }
+            if (split > common) {
+                size_t last = std::max(common, (size_t)std::max(0, model->checkpoint_pos()));
+                for (size_t i = common + 1; i < split; ++i)
+                    if (toks[i] == mark && i >= last + every && split >= i + every) { stops_at.push_back(i); last = i; }
+                stops_at.push_back(split);
+            }
         }
         if (split > common) {
-            const std::vector<int32_t> head(toks.begin(), toks.begin() + split);
-            std::vector<int32_t> rest_routing;
-            if (spx) spx->prompt(head, eng.threads, &routing);
-            else evalm(std::vector<int32_t>(head.begin() + common, head.end()), &routing);
-            model->checkpoint();
-            if (spx) spx->mark();
-            if (spx) { lg = spx->prompt(toks, eng.threads, &rest_routing); spx->reset_stats(); }
-            else lg = evalm(std::vector<int32_t>(toks.begin() + split, toks.end()), &rest_routing);
-            routing.insert(routing.end(), rest_routing.begin(), rest_routing.end());
+            std::vector<int32_t> part;
+            size_t at = common;
+            for (size_t stop : stops_at) {
+                const std::vector<int32_t> head(toks.begin(), toks.begin() + stop);
+                if (spx) spx->prompt(head, eng.threads, &part);
+                else evalm(std::vector<int32_t>(head.begin() + at, head.end()), &part);
+                routing.insert(routing.end(), part.begin(), part.end());
+                model->checkpoint();
+                if (spx) spx->mark();
+                at = stop;
+            }
+            if (spx) { lg = spx->prompt(toks, eng.threads, &part); spx->reset_stats(); }
+            else lg = evalm(std::vector<int32_t>(toks.begin() + split, toks.end()), &part);
+            routing.insert(routing.end(), part.begin(), part.end());
         } else {
-            if (spx) { lg = spx->prompt(toks, eng.threads, &routing); spx->reset_stats(); }   // also feeds the draft block
-            else lg = evalm(suffix, &routing);
+            std::vector<int32_t> part;
+            if (spx) { lg = spx->prompt(toks, eng.threads, &part); spx->reset_stats(); }   // also feeds the draft block
+            else lg = evalm(suffix, &part);
+            routing.insert(routing.end(), part.begin(), part.end());
             if (!par && hp.hybrid && common == 0) { model->checkpoint(); if (spx) spx->mark(); }
         }
         r.prompt_s = since(p0);
