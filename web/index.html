@@ -1869,12 +1869,13 @@ const KV_FACTOR = { f16: 1, f32: 2, q8_0: 34 / 64, q5_0: 22 / 64, q4_0: 18 / 64 
 function splitMode() { const v = $("splitsel").value; return v !== "auto" ? v : (selModel && selModel.experts ? "experts" : "layers"); }
 function kvFactor() { return KV_FACTOR[$("kvsel").value] || 1; }   // working memory the engine keeps free on the GPU (as the tier loader does)
 // Memory the loaded model holds now. Loading another one frees it first, so it counts as free when planning.
-function heldNow(gpu) {
-  if (!info || !info.loaded) return { vram: 0, ram: 0 };
-  const onThisGpu = gpu && info.on_gpu && String(info.device || "").startsWith(gpu.id);
-  const kvG = info.layers ? (info.kv_bytes || 0) * (info.kv_gpu_layers || 0) / info.layers : 0;
-  return { vram: onThisGpu ? (info.vram_weights || 0) + kvG : 0,
-           ram: (info.ram_weights || 0) + (info.kv_bytes || 0) - (onThisGpu ? kvG : 0) };
+function heldNow(gpu, other) {                      // (other: an /api/info answer to use in place of the page's)
+  const i = other || info;
+  if (!i || !i.loaded) return { vram: 0, ram: 0 };
+  const onThisGpu = gpu && i.on_gpu && String(i.device || "").startsWith(gpu.id);
+  const kvG = i.layers ? (i.kv_bytes || 0) * (i.kv_gpu_layers || 0) / i.layers : 0;
+  return { vram: onThisGpu ? (i.vram_weights || 0) + kvG : 0,
+           ram: (i.ram_weights || 0) + (i.kv_bytes || 0) - (onThisGpu ? kvG : 0) };
 }
 // Same order as the engine's "auto": the dedicated GPU with the most memory, then an integrated GPU.
 function bestGpu() {
@@ -2859,10 +2860,13 @@ function cardDiff(card, diff) {
 const hfq = $("hfq");
 let hfTimer = null, hfPoll = null, hfCur = null, hfSeq = 0;
 const esc2 = t => String(t ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+let hfInfo = null;                                  // /api/info when Get models was opened
 async function hfOpen() {
   $("hfwin").hidden = false;
   document.body.style.overflow = "hidden";
-  if (!devices.length) { try { devices = (await (await api("/api/devices")).json()).devices || []; } catch (e) {} }
+  // (the memory as it is now, and what the loaded model holds of it, for the "On this PC" column)
+  try { devices = (await (await api("/api/devices")).json()).devices || devices; } catch (e) {}
+  try { hfInfo = await (await api("/api/info")).json(); } catch (e) { hfInfo = null; }
   if (!$("hflist").querySelector(".hfitem")) hfSearch();
   hfq.focus();
   hfWatch();
@@ -2905,10 +2909,12 @@ async function hfSearch() {
   }
 }
 // How a file of this size would sit on this PC (the weights only; the context comes on top).
+// The memory the model loaded now holds counts as free: it is ejected when another is loaded. (Until 0.8.7 it
+// didn't, so with a model loaded everything looked as if it had to go to RAM and the drive.)
 function hfFit(size) {
-  const g = bestGpu(), c = cpuDev();
-  const vram = g ? Math.max(0, g.free - 1.5 * 1073741824) : 0;
-  const ram = c ? Math.max(0, c.free - Math.max(1.5 * 1073741824, 0.12 * (c.total || 0)) - 1073741824) : 0;
+  const g = bestGpu(), c = cpuDev(), held = heldNow(g, hfInfo || info);
+  const vram = g ? Math.max(0, g.free + held.vram - 1.5 * 1073741824) : 0;
+  const ram = c ? Math.max(0, c.free + held.ram - Math.max(1.5 * 1073741824, 0.12 * (c.total || 0)) - 1073741824) : 0;
   if (g && size <= vram) return { cls: "good", t: "Fits in VRAM" };
   if (size <= vram + ram) return { cls: "warn", t: g ? fmtGiB(size - vram) + " in RAM" : "In RAM (no GPU)" };
   return { cls: "bad", t: "SSD tier: " + fmtGiB(size - vram - ram) + " on the drive" };
