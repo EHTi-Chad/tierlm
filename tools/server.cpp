@@ -2080,6 +2080,7 @@ int main(int argc, char** argv) {
         eng.vision.reset(); eng.vision_file.clear();
         eng.model.reset();
         eng.cached.clear();
+        eng.saved.clear();                                             // (the conversations kept in RAM were this model's)
         eng.path.clear();
         bool emb_freed = false;
         if (with_embed) { std::lock_guard<std::mutex> le(emb.mu); emb_freed = emb.enc != nullptr; emb.enc.reset(); emb.id.clear(); emb.path.clear(); emb.name.clear(); }
@@ -2139,11 +2140,23 @@ int main(int argc, char** argv) {
             if (e == "none" || e == "minimal") tl_think = 0; else if (tl_think < 0 && !e.empty()) tl_think = 1;
         }
     };
-    auto generate = [&](const json& messages, const Sampling& sp, int max_tokens, const std::vector<std::string>& stops_in,
+    auto generate = [&](const json& messages, const Sampling& sp_in, int max_tokens, const std::vector<std::string>& stops_in,
                         const std::function<void(const json&)>& on_prompt,
                         const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token,
                         const agent::ojson& tools = agent::ojson()) {
         Gen r;
+        // Sampling values as an app sent them, kept within what makes sense (a huge repeat_last_n walked the whole
+        // cache for every token; a negative top_k or temperature isn't a setting).
+        Sampling sp = sp_in;
+        auto within = [](float v, float lo, float hi) { return std::isfinite(v) ? std::min(hi, std::max(lo, v)) : lo; };
+        sp.temperature = within(sp.temperature, 0.0f, 5.0f);
+        sp.top_p = std::isfinite(sp.top_p) ? std::min(1.0f, std::max(0.01f, sp.top_p)) : 1.0f;
+        sp.min_p = within(sp.min_p, 0.0f, 1.0f);
+        sp.top_k = std::max(0, sp.top_k);
+        sp.repeat_last_n = std::min(4096, std::max(0, sp.repeat_last_n));
+        sp.repeat_penalty = within(sp.repeat_penalty, 0.1f, 10.0f);
+        sp.presence_penalty = within(sp.presence_penalty, -2.0f, 2.0f);
+        sp.frequency_penalty = within(sp.frequency_penalty, -2.0f, 2.0f);
         // harmony (gpt-oss): a reply is several messages (reasoning, then the answer or a tool call) separated by
         // special tokens; it ends only at <|return|> or <|call|>, and is shown as <think>reasoning</think>answer.
         const bool harm = eng.chat == ChatFmt::Harmony;
@@ -4530,7 +4543,10 @@ int main(int argc, char** argv) {
         if (!body.is_object() || !body.contains("files") || !body["files"].is_array()) return oai_error(res, 400, "expected {\"id\": \"owner/name\", \"files\": [paths]}");
         const std::string id = body.value("id", std::string());
         if (!valid_repo(id)) return oai_error(res, 400, "not a Hugging Face model name (owner/name)");
-        if (hf.running) return oai_error(res, 409, "a download is already running; wait for it or cancel it");
+        // (claimed here, before Hugging Face is asked for the file list: two requests at once could both pass a
+        // plain check and start two downloads into the same files)
+        if (hf.running.exchange(true)) return oai_error(res, 409, "a download is already running; wait for it or cancel it");
+        struct Claim { std::atomic<bool>& r; bool keep = false; ~Claim() { if (!keep) r = false; } } claim{hf.running};
         // the files, as Hugging Face lists them (sizes and checksums from there, not from the request)
         int rc = 0;
         const json j = json::parse(hf_get(hf_base + "/api/models/" + id + "?blobs=true", &rc), nullptr, false);
@@ -4561,6 +4577,7 @@ int main(int argc, char** argv) {
         }
         {
             std::lock_guard<std::mutex> lk(hf_mu);
+            claim.keep = true;                                         // (the download's thread gives it back)
             hf.running = true; hf.cancel = false; hf.state = "downloading"; hf.error.clear(); hf.id = id; hf.folder = folder.u8string(); hf.files = want; hf.cur = 0;
         }
         std::fprintf(stderr, "get models: %s, %zu files, %.1f GB, into %s\n", id.c_str(), want.size(), need / 1e9, folder.u8string().c_str());
