@@ -2508,7 +2508,8 @@ $("tunebtn").onclick = async () => {
     $("tunestat").textContent = ""; watchProgress(false);
     if (cancelled) {
       $("tunebox").hidden = true;
-      msg.className = ""; msg.textContent = "Cancelled: nothing was saved. The step that was running finishes first, so the next load may wait a moment.";
+      msg.className = ""; msg.textContent = "Cancelled: nothing was saved, and no model is loaded now. Load and start chatting loads it with your settings.";
+      setTimeout(() => { loadInfo().catch(() => {}); }, 2500);   // (tierlm lets go of the model a moment after the request is dropped)
     } else { msg.className = "err"; msg.textContent = "Could not finish: " + e.message; }
   }
   cancel.hidden = true;

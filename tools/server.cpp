@@ -1381,6 +1381,8 @@ int main(int argc, char** argv) {
     } line;
     auto reply_slots = [&]() -> std::atomic<int>* { return eng.slots.empty() ? nullptr : &eng.free_slots; };
     std::atomic<bool> loading{false};    // a model is being loaded (for the page's progress bar)
+    std::function<bool()> load_abort;    // set while Find the fastest settings runs: true once it was cancelled, which
+                                         // stops a load part-way (the load throws "cancelled")
     std::atomic<float> load_progress{0.0f};
 
     // tierlm's own models folder: "models" next to it (or --models). Downloads always go there, and its models are
@@ -1462,7 +1464,7 @@ int main(int argc, char** argv) {
         }
         // the VRAM this model needs beyond its weights, measured at the first load (see LoadOptions::vram_reserve_mb)
         if (o.vram_note.empty()) o.vram_note = usage_file(a.settings, path) + ".vram";
-        o.progress = [&](float f) { load_progress = f; };
+        o.progress = [&](float f) { load_progress = f; if (load_abort && load_abort()) throw std::runtime_error("cancelled"); };
         load_progress = 0.0f;
         loading = true;
         struct Done { std::atomic<bool>& b; ~Done() { b = false; } } done{loading};
@@ -2920,6 +2922,9 @@ int main(int argc, char** argv) {
                 return alive;
             };
             auto status = [&](const std::string& t) { std::fprintf(stderr, "autotune: %s\n", t.c_str()); return send({{"type", "status"}, {"text", t}}); };
+            // Cancelled (the page's Cancel button drops the request): a load under way stops too.
+            load_abort = [&] { return !alive || !sink.is_writable(); };
+            struct NoAbort { std::function<bool()>& f; ~NoAbort() { f = nullptr; } } no_abort{load_abort};
             try {
                 const json info = describe_model(file.u8string());
                 if (!info.value("supported", false)) throw std::runtime_error(info.value("reason", std::string("unsupported model")));
@@ -3285,9 +3290,20 @@ int main(int argc, char** argv) {
                 send({{"type", "done"}, {"tps", std::round(best * 10) / 10}, {"settings", saved}, {"results", results},
                       {"all_on_gpu", eng.model && eng.model->placement().all_on_gpu()}});
             } catch (const std::exception& e) {
-                // Cancelled or failed part-way: whatever split is loaded stays loaded (it works), with the threads
-                // asked for rather than the last ones tried.
+                // Failed part-way: whatever split is loaded stays loaded (it works), with the threads asked for rather
+                // than the last ones tried. Cancelled: nothing stays loaded (a split that was only being tried isn't
+                // what the user chose; Load and start chatting loads the model with the saved settings).
                 eng.threads = std::max(1, body.value("threads", a.threads));
+                if (std::string(e.what()) == "cancelled" || !sink.is_writable()) {
+                    eng.save_usage(true);
+                    eng.batch.finish();
+                    eng.slots.clear(); eng.free_slots = 0;
+                    eng.spec.reset(); eng.look.reset();
+                    eng.vision.reset(); eng.vision_file.clear();
+                    eng.model.reset();
+                    eng.cached.clear(); eng.saved.clear(); eng.path.clear();
+                    std::fprintf(stderr, "autotune: cancelled; nothing was saved and no model is loaded now\n");
+                }
                 send({{"type", "error"}, {"message", e.what()}});
             }
             sink.done();
