@@ -632,9 +632,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             const std::string rest = name.substr(name.find('.', 4) + 1);
             if (by_layer) prio = 2;                                      // the whole layer moves together
             else if (rest.find("_exps") != std::string::npos)
-                // (the draft block's experts: TIERLM_MTP_VRAM=1 places them before the model's, so guessing runs
-                // wholly on the GPU)
-                prio = layer == hp.n_layer && std::getenv("TIERLM_MTP_VRAM") ? 3 : 4;
+                // The draft block's experts go into VRAM before the model's: every guess and every catch-up runs
+                // them, and left in RAM (where they landed whenever the model's experts filled VRAM) each of those
+                // calls went GPU - CPU - GPU. TIERLM_MTP_VRAM=0: after the model's, as before 0.8.7.
+                prio = layer == hp.n_layer && !(std::getenv("TIERLM_MTP_VRAM") && !std::strcmp(std::getenv("TIERLM_MTP_VRAM"), "0")) ? 3 : 4;
             else if (rest.compare(0, 9, "ffn_gate.") == 0 || rest.compare(0, 7, "ffn_up.") == 0 || rest.compare(0, 9, "ffn_down.") == 0) prio = 3;
             else own = true;
         } else { prio = 0; own = true; }
