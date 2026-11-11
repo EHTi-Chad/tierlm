@@ -69,6 +69,14 @@ keeps those it agrees with, so every reply is its own.
 follow the conversation; the same PC and files as below, 64K context, 12 CPU threads, measured on a 0.8.7
 development build (the same code).
 
+![Find the fastest settings on the 120 GB Qwen3.8 Flash-Next Q4_K_M: 88.8 tok/s](docs/images/flash-next-0.8.7-q4-fastest.png)
+
+![The 120 GB model writing a 6,155-token C++ program at 80.3 tok/s](docs/images/flash-next-0.8.7-q4-speed.png)
+
+![The details under that reply: guesses kept, VRAM experts' share, first word](docs/images/flash-next-0.8.7-q4-lines.png)
+
+![The UD-IQ3_XXS build writing a 9,199-token C# program at 94.8 tok/s](docs/images/flash-next-0.8.7-iq3-lines.png)
+
 **Every setting** (the 0.8.5 / 0.8.6 table). RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11, an NVMe drive for the SSD tier;
 tierlm 0.8.5 with its CUDA 12.9 engine. Qwen3.8-Flash-Next UD-IQ3_XXS from unsloth (4 files) with
 `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` in the same folder. Experts in RAM with the busiest in VRAM, 12 CPU threads,
@@ -242,15 +250,18 @@ The best results so far, each measured in a normal chat unless noted (details be
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.6-35B-A3B Q4_K_M, 4 replies at once (Connections 4) | all in VRAM | **364 tok/s in all**, about 90 tok/s each (Find the fastest settings) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.6-35B-A3B Q8_0 (37 GB) | GPU + RAM, experts in RAM | **93.7 tok/s** |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3-Coder-Next 80B-A3B Q4_K_M (45 GB) | GPU + RAM, busiest experts in VRAM | **63.8 tok/s** (Find the fastest settings) |
-| RTX 5090 (32 GB), 64 GB RAM | gpt-oss-120b (59 GB) | GPU + RAM, 34 GB of experts in RAM | **38.5 tok/s** |
+| RTX 5090 (32 GB), 64 GB RAM | Qwen3.8 Flash-Next UD-IQ3_XXS (77.9 GiB) with its MTP draft file | GPU + RAM + SSD, VRAM experts following the conversation, 4 guesses | **94.8 tok/s** (0.8.7) |
+| RTX 5090 (32 GB), 64 GB RAM | Qwen3.8 Flash-Next Q4_K_M (120 GB) with its MTP draft file | GPU + RAM + SSD, VRAM experts following the conversation, 2 guesses | **80.3 tok/s**; 88.8 in Find the fastest settings (0.8.7) |
+| RTX 5090 (32 GB), 64 GB RAM | gpt-oss-120b (59 GB) | GPU + RAM, experts in RAM | **44.1 tok/s** at 32K context; 47.5 in Find the fastest settings (0.8.7) |
 | RTX 5080 (16 GB), 32 GB RAM | Qwen3.6-35B-A3B Q6_K (27 GB) | GPU + RAM, experts in RAM | **65.2 tok/s** (Find the fastest settings) |
 | RTX 3070 Laptop (8 GB), 32 GB RAM | Qwen3.5-9B | GPU (a sliver in RAM) | **59 tok/s**; a full-screen screenshot read in **2.7 s** |
-| RTX 3070 Laptop (8 GB), 32 GB RAM | Qwen3.6-35B-A3B UD-Q3_K_XL (17 GB) | GPU + RAM, experts in RAM, speculative decoding | **35.3 tok/s** (Find the fastest settings) |
+| RTX 3070 Laptop (8 GB), 32 GB RAM | Qwen3.6-35B-A3B UD-Q3_K_XL (17 GB) | GPU + RAM, VRAM experts following the conversation, speculative decoding | **44.0 tok/s** across code, contract law, science and a story (0.8.7) |
 
 **gpt-oss-120b on one RTX 5090: a 59 GB model on a 32 GB card.** RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB
 DDR5-6000, Windows 11, tierlm 0.7.0. gpt-oss-120b MXFP4 (2 files, 59.0 GiB), 64K context, CUDA:
 attention, routers and the context in VRAM (25.0 GiB of the model), the experts that don't fit in RAM (34.0 GiB),
-computed by the CPU. No second GPU.
+computed by the CPU. No second GPU. On 0.8.7 at 32K context the same file wrote a 5,218-token C program at
+**44.1 tok/s** (47.5 in Find the fastest settings); the table and pictures below are 0.7.0.
 
 | | Speed |
 |---|---|
