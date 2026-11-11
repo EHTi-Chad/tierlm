@@ -64,6 +64,8 @@ PATTERNS = {
     # DeepSeek V3 / R1: three splits in a row
     "deepseek-v3": [r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+",
                     r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"],
+    # Mistral's Tekken (Nemotron 3.5 too): o200k's words without the contractions, every digit on its own
+    "pixtral":   r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
     # Kimi K2: OpenAI's o200k words with Chinese characters on their own
     "kimi-k2":   r"\p{Han}+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 }
@@ -76,6 +78,10 @@ for pre, pat in PATTERNS.items():
     tr = trainers.BpeTrainer(vocab_size=1500, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False,
                              special_tokens=[AddedToken("<|im_start|>", special=True), AddedToken("<|im_end|>", special=True)])
     tk.train_from_iterator(corpus, tr)
+    if pre == "pixtral":                         # Tekken: a piece that is a token is that token, merges or not
+        import json
+        st = json.loads(tk.to_str()); st["model"]["ignore_merges"] = True
+        tk = Tokenizer.from_str(json.dumps(st))
     vocab = tk.get_vocab()
     tokens = [None] * len(vocab)
     for t, i in vocab.items(): tokens[i] = t

@@ -133,8 +133,14 @@ places, each checked against a NumPy reference written from Hugging Face's `mode
   as OpenAI's chat template does (tools as a TypeScript namespace; `tests/harmony_test.py` compares them byte for
   byte), stops only at `<|return|>` or `<|call|>`, and shows the reasoning as the usual collapsible "Thinking".
 
-Not yet for gpt-oss: hot experts (the split doesn't divide the expert biases yet; whole expert layers go to VRAM
-or RAM instead) and a shorter KV cache for the sliding-window layers.
+- **Experts in VRAM**: gpt-oss's experts have biases as well as weights. When a layer's experts are split between
+  VRAM and RAM (the busiest in VRAM, or following the conversation), the weights are split and the biases are not:
+  they are small (about 4 MB a layer for gpt-oss-120b), so the RAM part uses the file's and the VRAM part a whole
+  copy, both looked up by the router's own picks. A pick that lives in the other part gets its bias on top of the
+  zero expert's zeros and then a weight of 0, so the sum is the same as unsplit (the tests compare both with the
+  reference at several splits).
+
+Not yet for gpt-oss: a shorter KV cache for the sliding-window layers.
 
 ## Several conversations in the cache
 
@@ -290,6 +296,42 @@ block, no experts); and only the sliding-window layers **rotate positions**: the
 Checked against a NumPy version of Hugging Face's `modeling_flint.py` (a dense layer, a sliding MoE layer and a full
 MoE layer; 2e-6), also split between a stand-in GPU and RAM. Its tokenizer's word splitting and its chat format
 (GLM-style, `<|user|>`) still need the real model files to check against.
+
+## Nemotron 3.5 (Mamba-2 and LatentMoE)
+
+NVIDIA's Nemotron 3.5 (`nemotron_h_moe`; Bolt 74B-A9B has 88 blocks) is built differently from the other families:
+a block is **one** thing behind one norm, added back to the stream, not attention followed by a feed-forward part.
+
+- **Mamba-2** (40 of Bolt's 88 blocks) is the model's running memory, in place of most of the attention. One
+  projection gives, per token, an output gate z, a step size dt per head, and x with B and C, which first pass a
+  short causal convolution. Each head keeps a state of [head width x 128] numbers:
+  `state = state * exp(dt * A) + dt * (x outer B)`, `y = state . C + D * x`, with `dt = softplus(dt + bias)` and
+  A negative, per head. Then `y * silu(z)`, normed group by group, and back to the model's width. The state is a
+  fixed size per conversation whatever its length (about 4 MB a block for Bolt), so like Qwen3.5's DeltaNet layers
+  it can't be rewound: tierlm keeps the same snapshots, anchors and undo points for it (the scan keeps the state as
+  it was 1, 2, ... tokens back when a check of guesses may be partly undone).
+- **Attention** (8 blocks) is plain causal attention with **no position encoding**: the Mamba blocks carry the order.
+- **LatentMoE** (40 blocks): the router reads the full width and scores each expert with its own sigmoid; the
+  experts are chosen with a per-expert bias added and weighted without it, the weights renormalised and scaled
+  (x5). The experts themselves work in a narrower **latent** width (1024 of 4096) between a down and an up
+  projection, with no gate: up, relu squared, down. One shared expert at full width is added. Blocks have
+  **different numbers of experts** (240 to 496 in Bolt), of different widths, and their own count per token.
+- NVIDIA's 4-bit files store the Mamba projections as NVFP4 with one more number each, a scale on the result.
+
+Checked against a NumPy version of the model math (`tests/tiny_nemotron.py`: all three kinds of block, uneven
+expert counts and widths; 3e-6 for a whole prompt, one token at a time, saved and restored, three conversations at
+once, and guesses partly undone), also split between a stand-in GPU and RAM, and the NumPy version itself against
+llama.cpp. The tokenizer's word splitting (Mistral's Tekken) is checked against Hugging Face's `tokenizers`.
+
+Not yet: experts in VRAM by use (the blocks' uneven expert counts need the split to work per block; whole expert
+layers go to VRAM or RAM instead), images, and a check against the real files.
+
+**The Mamba state on the GPU.** ggml's Mamba scan is a CPU kernel (there is none for CUDA), so used as is, every
+Mamba block of every token would stop the GPU, copy to the CPU and come back: 40 times a token for Bolt. For a
+reply's steps and checks of a few guesses (up to 8 tokens) with the state in VRAM, tierlm writes the recurrence
+out with operations every backend has (softplus, exp, multiply, add, sum), token by token, so the block never
+leaves the GPU; the states between the tokens are the undo points. Prompts take the scan: one trip per block for
+the whole batch. Both give the same numbers (the test runs both). `TIERLM_MAMBA_UNROLL=0` always uses the scan.
 
 ## Speculative decoding
 

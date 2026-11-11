@@ -235,6 +235,20 @@ int main(int argc, char** argv) {
             m->eval(std::vector<int32_t>(ids.rbegin(), ids.rend()), nt);
             m->restore(snap);
             lg = m->eval(std::vector<int32_t>(ids.begin() + h, ids.end()), nt);
+        } else if (!step && std::getenv("TIERLM_SHOW_ROUTING")) {
+            // Tests: the experts each token picked in each layer, one line per token to stderr ("routing: ..."),
+            // layers separated by "|", -1 where a layer has no experts or picks fewer.
+            std::vector<int32_t> routing;
+            lg = m->eval(ids, nt, &routing);
+            const int NL = m->hparams().n_layer, K = m->hparams().n_expert_used;
+            for (size_t t = 0; K > 0 && t < routing.size() / ((size_t)NL * K); ++t) {
+                std::string line = "routing:";
+                for (int l = 0; l < NL; ++l) {
+                    for (int k = 0; k < K; ++k) line += " " + std::to_string(routing[(t * NL + l) * K + k]);
+                    if (l + 1 < NL) line += " |";
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
         } else if (!step) lg = m->eval(ids, nt);
         else for (int32_t id : ids) lg = m->eval({id}, nt);
         if (m->live_hot() && std::getenv("TIERLM_SHOW_PLACEMENT")) {

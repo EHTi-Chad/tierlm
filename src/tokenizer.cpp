@@ -173,7 +173,12 @@ std::vector<std::pair<size_t, size_t>> pretokenize_llama3(const std::string& s, 
 // (lower case, plus the same caseless letters and marks).
 // kimi: Kimi K2's variant (tiktoken): runs of Chinese characters (the Han script) are pieces of their own and are
 // not letters for the word rules, and a punctuation run takes newlines after it but not slashes.
-std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s, bool kimi = false) {
+// tekken: Mistral's Tekken (also NVIDIA's Nemotron 3.5; "tekken" or "pixtral" in GGUF files): the same words
+// without the contractions, and every digit on its own:
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+
+//  |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*
+//  |\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s, bool kimi = false, bool tekken = false) {
     const auto cps = utf8_decode(s);
     const size_t n = cps.size();
     std::vector<std::pair<size_t, size_t>> out;
@@ -230,11 +235,11 @@ std::vector<std::pair<size_t, size_t>> pretokenize_o200k(const std::string& s, b
                 if (pre && !(prefix_ok(C(i)) && i + 1 < n)) continue;
                 e = br == 0 ? first_branch(i + pre) : second_branch(i + pre);
             }
-        if (e) { e += contraction(e); emit(i, e); i = e; continue; }
-        // 3. digits, up to three
+        if (e) { if (!tekken) e += contraction(e); emit(i, e); i = e; continue; }
+        // 3. digits, up to three (Tekken: one)
         if (is_number(C(i))) {
             size_t k = i + 1;
-            while (k < n && k - i < 3 && is_number(C(k))) ++k;
+            while (!tekken && k < n && k - i < 3 && is_number(C(k))) ++k;
             emit(i, k); i = k; continue;
         }
         // 4. optional space, a run of punctuation/symbols, then any newlines or slashes
@@ -361,6 +366,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         else if (pre == "qwen35") t.pre_ = Pre::Qwen35;
         else if (pre == "gpt-4o" || pre == "o200k") t.pre_ = Pre::O200k;
         else if (pre == "kimi-k2") t.pre_ = Pre::Kimi;
+        else if (pre == "tekken" || pre == "pixtral") t.pre_ = Pre::Tekken;
         else if (pre == "deepseek-v3") t.pre_ = Pre::DeepseekV3;
         else if (pre.empty() || pre == "default" || pre == "gpt-2" || pre == "olmo" || pre == "gpt2") t.pre_ = Pre::Gpt2;
         else {
@@ -449,6 +455,12 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
 void Tokenizer::bpe(const std::string& chunk, std::vector<int32_t>& out) const {
     std::vector<std::string> sym;
     for (unsigned char c : chunk) sym.push_back(byte_to_uni_[c]);
+    if (pre_ == Pre::Tekken && sym.size() > 1) {         // Tekken: a piece that is a token is that token, merges or not
+        std::string whole;
+        for (const auto& x : sym) whole += x;
+        auto it = token_to_id_.find(whole);
+        if (it != token_to_id_.end()) { out.push_back(it->second); return; }
+    }
 
     while (sym.size() > 1) {
         int best = INT_MAX; size_t at = 0;
@@ -479,6 +491,7 @@ void Tokenizer::encode_plain(const std::string& text, std::vector<int32_t>& out,
     const auto parts = pre_ == Pre::Gpt2 ? pretokenize_gpt2(text)
                      : pre_ == Pre::O200k ? pretokenize_o200k(text)
                      : pre_ == Pre::Kimi ? pretokenize_o200k(text, true)
+                     : pre_ == Pre::Tekken ? pretokenize_o200k(text, false, true)
                      : pre_ == Pre::DeepseekV3 ? pretokenize_deepseek_v3(text)
                      : pretokenize_llama3(text, pre_ == Pre::Llama3 ? 3 : 1, pre_ == Pre::Qwen35);
     for (const auto& [off, len] : parts) bpe(text.substr(off, len), out);

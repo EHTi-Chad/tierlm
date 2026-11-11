@@ -873,8 +873,17 @@ json describe_model(const std::string& path, bool header_only = false) {
         int64_t id = gguf_find_key(g, k.c_str());
         return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING ? gguf_get_val_str(g, id) : "";
     };
-    auto u32 = [&](const std::string& k) -> int64_t {
+    // (a key that holds a number per layer, as Nemotron's do: the largest; nonzero: how many layers have one)
+    auto u32 = [&](const std::string& k, int64_t* nonzero = nullptr) -> int64_t {
         int64_t id = gguf_find_key(g, k.c_str());
+        if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY &&
+            (gguf_get_arr_type(g, id) == GGUF_TYPE_INT32 || gguf_get_arr_type(g, id) == GGUF_TYPE_UINT32)) {
+            int64_t mx = 0, nz = 0;
+            const int32_t* d = (const int32_t*)gguf_get_arr_data(g, id);
+            for (size_t i = 0; i < gguf_get_arr_n(g, id); ++i) { mx = std::max<int64_t>(mx, d[i]); nz += d[i] != 0; }
+            if (nonzero) *nonzero = nz;
+            return mx;
+        }
         return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32 ? (int64_t)gguf_get_val_u32(g, id) : 0;
     };
     const std::string arch = str("general.architecture");
@@ -910,6 +919,12 @@ json describe_model(const std::string& path, bool header_only = false) {
     if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp") {
         const int64_t interval = u32(arch + ".full_attention_interval") ? u32(arch + ".full_attention_interval") : 4;
         kv_layers = layers / interval;
+        j["hybrid"] = true;
+    }
+    if (arch == "nemotron_h_moe") {                       // only its few attention blocks keep keys and values
+        int64_t nz = 0;
+        u32(arch + ".attention.head_count_kv", &nz);
+        kv_layers = nz;
         j["hybrid"] = true;
     }
     if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * kv_layers * (kv_heads ? kv_heads : heads) * head_dim * 2;
@@ -3017,10 +3032,10 @@ int main(int argc, char** argv) {
                 double best = 0;
                 int draft = 0;
                 if (split) {
-                    // (hot experts: MoE models, and not yet for experts with biases, gpt-oss)
+                    // (hot experts: MoE models)
                     const auto& hp_ = eng.model->hparams();
                     const bool moe = hp_.is_moe();
-                    const bool can_hot = moe && !hp_.expert_bias;
+                    const bool can_hot = moe && !hp_.mamba;                 // (not yet for Nemotron: uneven expert counts)
                     const size_t n_gpus = eng.model->placement().gpus.size();
                     std::string gpu0 = n_gpus ? eng.model->placement().gpus[0].name : std::string();   // "CUDA0"...
                     if (ggml_backend_dev_t d = n_gpus ? ggml_backend_dev_by_name(gpu0.c_str()) : nullptr)

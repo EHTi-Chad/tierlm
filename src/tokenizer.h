@@ -46,7 +46,7 @@ private:
     int32_t bos_ = -1, eos_ = -1, eot_ = -1, unk_ = -1, cls_ = -1, sep_ = -1;
     enum class Kind { Bpe, Spm, Wpm } kind_ = Kind::Bpe;
     bool lowercase_ = true;                                     // WordPiece: uncased vocabulary (lower case, no accents)
-    enum class Pre { Gpt2, Llama3, Qwen2, Qwen35, O200k, Kimi, DeepseekV3 } pre_ = Pre::Gpt2;   // how BPE text is split before merging
+    enum class Pre { Gpt2, Llama3, Qwen2, Qwen35, O200k, Kimi, DeepseekV3, Tekken } pre_ = Pre::Gpt2;   // how BPE text is split before merging
     bool add_space_prefix_ = true, add_bos_ = false;                              // SentencePiece: " " before the text
     std::vector<float> score_;                                  // SentencePiece merge scores
     std::string chat_template_;

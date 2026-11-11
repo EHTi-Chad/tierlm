@@ -170,6 +170,7 @@ python3 -m venv ~/tierlm-oracle
 # The hybrid Qwen3.5 / 3.8 architecture (Gated DeltaNet), against a NumPy version of Hugging Face's model
 ~/tierlm-oracle/bin/python tests/tiny_qwen35.py build/tierlm-logits
 ~/tierlm-oracle/bin/python tests/tiny_deepseek.py build/tierlm-logits     # DeepSeek / Kimi, against transformers' own code
+~/tierlm-oracle/bin/python tests/tiny_nemotron.py build/tierlm-logits     # Nemotron 3.5: Mamba-2, LatentMoE, attention
 
 # Tokenizers, without any model: trains small BPE and SentencePiece tokenizers and compares
 ~/tierlm-oracle/bin/pip install sentencepiece

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "model_map.h"
 #include "gguf_split.h"
 #include "ggml.h"
@@ -36,6 +37,13 @@ static Role classify(const std::string& n) {
 
 static int get_u32(gguf_context* g, const std::string& key) {
     int64_t id = gguf_find_key(g, key.c_str());
+    if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY &&            // a number per layer (Nemotron): the largest
+        (gguf_get_arr_type(g, id) == GGUF_TYPE_INT32 || gguf_get_arr_type(g, id) == GGUF_TYPE_UINT32)) {
+        int mx = 0;
+        const int32_t* d = (const int32_t*)gguf_get_arr_data(g, id);
+        for (size_t i = 0; i < gguf_get_arr_n(g, id); ++i) mx = std::max(mx, (int)d[i]);
+        return mx;
+    }
     if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_UINT32) return 0;
     return (int) gguf_get_val_u32(g, id);
 }

@@ -57,7 +57,7 @@ struct Hparams {
     int n_dense_lead = 0;             // Flint: the first layers have a dense feed-forward block instead of experts
     std::vector<bool> rope_layer;     // per layer: rotates positions (empty: all do). Flint: only sliding-window layers
     bool swiglu_oai = false;
-    bool expert_bias = false;         // experts have biases (gpt-oss): no hot-expert split yet          // gpt-oss experts: clamped SwiGLU, out = (clamp(up) + 1) * g * sigmoid(1.702 g), g = min(gate, 7)
+    bool expert_bias = false;         // experts have biases (gpt-oss)          // gpt-oss experts: clamped SwiGLU, out = (clamp(up) + 1) * g * sigmoid(1.702 g), g = min(gate, 7)
     int n_swa = 0;                    // sliding-window attention: these layers see only the last n_swa tokens
     std::vector<bool> swa;            // per layer: uses the window
     bool is_swa(int il) const { return n_swa > 0 && il < (int)swa.size() && swa[il]; }
@@ -111,7 +111,25 @@ struct Hparams {
     bool dn_sigmoid_gate = false;   // Flash-Next: DeltaNet's output gate is sigmoid(z), not Qwen3.5's silu(z)
     int n_nextn = 0;                  // multi-token-prediction draft blocks in the file (after the n_layer layers)           // value heads grouped by key head (Qwen3-Next) instead of tiled (Qwen3.5)
     bool is_recurrent(int il) const { return hybrid && il < (int)recurrent.size() && recurrent[il]; }
-    int ssm_conv_dim() const { return 2 * ssm_k_heads * ssm_state + ssm_v_heads * ssm_state; }
+    bool gated_attn = false;          // Qwen3.5: attention layers project [q | output gate] per head
+    // Nemotron 3.5 (nemotron_h_moe): every block is one thing behind one norm: a Mamba-2 mixer (the running memory),
+    // plain attention with no position encoding, or LatentMoE experts. block[il] says which.
+    enum Block { kBoth = 0, kMamba, kAttn, kFfn };
+    bool mamba = false;
+    std::vector<int> block;           // per layer (empty: every layer is attention or DeltaNet, then feed-forward)
+    int block_kind(int il) const { return il >= 0 && il < (int)block.size() ? block[il] : kBoth; }
+    // Mamba-2: inner width, heads (m_inner / m_heads wide each), state size per inner channel, B/C groups
+    int m_inner = 0, m_heads = 0, m_state = 0, m_groups = 0;
+    // LatentMoE: the experts work at this width (0: the model's), between a down and an up projection; blocks have
+    // their own number of experts, expert width and experts per token (n_expert / n_expert_used: the largest)
+    int latent = 0;
+    std::vector<int> n_expert_l, n_expert_used_l;
+    bool expert_relu2 = false;        // experts are up, relu squared, down (no gate)
+    int n_expert_at(int il) const { return il >= 0 && il < (int)n_expert_l.size() && n_expert_l[il] ? n_expert_l[il] : n_expert; }
+    int n_used_at(int il) const { return il >= 0 && il < (int)n_expert_used_l.size() && n_expert_used_l[il] ? n_expert_used_l[il] : n_expert_used; }
+    // The running memory of a recurrent layer, per conversation: the convolution's last inputs and the state
+    int ssm_conv_dim() const { return mamba ? m_inner + 2 * m_groups * m_state : 2 * ssm_k_heads * ssm_state + ssm_v_heads * ssm_state; }
+    int64_t ssm_mem_elems() const { return mamba ? (int64_t)m_state * m_inner : (int64_t)ssm_state * ssm_state * ssm_v_heads; }
 };
 using OlmoeHparams = Hparams;
 
@@ -357,6 +375,7 @@ private:
         ggml_tensor *rope_ff = nullptr;          // YaRN frequency factors (Hparams::rope_ff), as input
         ggml_tensor *h_in = nullptr;             // MTP head: the target model's hidden states, as input
         ggml_tensor *cells = nullptr;            // where each token's key and value go in the cache
+        ggml_tensor *zero_id = nullptr;          // Mamba's scan: which state to start from (always the one given: 0)
         ggml_tensor *out_idx = nullptr;          // several conversations: the tokens whose logits are wanted
         ggml_tensor *ngram = nullptr;            // Flash-Next: each token's n-gram rows in the PLE table [heads * n_tok]
         std::vector<std::pair<int, ggml_tensor*>> qsa_k;   // QSA: per indexed layer, this batch's indexer keys
@@ -439,6 +458,7 @@ private:
         // in the other part goes to the zero expert with weight 0.
         ggml_tensor *gate_xh = nullptr, *up_xh = nullptr, *down_xh = nullptr, *gate_up_xh = nullptr;
         ggml_tensor *gate_xc = nullptr, *up_xc = nullptr, *down_xc = nullptr, *gate_up_xc = nullptr;
+        ggml_tensor *gate_xbh = nullptr, *up_xbh = nullptr, *down_xbh = nullptr;   // the biases' VRAM copies (gpt-oss; whole)
         ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *hot_mask = nullptr;   // [1, n_expert]
         bool cold_mapped = false;                // the RAM part is the file's whole expert tensor (see load: RAM short)
         ggml_tensor *up_s = nullptr, *gate_s = nullptr, *down_s = nullptr, *gate_inp_s = nullptr;   // shared expert
@@ -449,6 +469,11 @@ private:
         ggml_tensor *ssm_beta = nullptr, *ssm_alpha = nullptr, *ssm_norm = nullptr, *ssm_out = nullptr;
         ggml_tensor *ssm_ba = nullptr, *ssm_in = nullptr;    // Qwen3-Next: fused beta/alpha, and older fused q/k/v/z
         ggml_tensor *conv_state = nullptr;       // [ssm_conv - 1, conv_dim]: the last few inputs
+        // Nemotron: what the block is (Hparams::Block); Mamba-2's convolution bias, D and the scales NVFP4 files
+        // keep beside in/out; LatentMoE's projections into and out of the experts' width
+        int kind = 0;
+        ggml_tensor *ssm_conv_b = nullptr, *ssm_d = nullptr, *ssm_in_s = nullptr, *ssm_out_s = nullptr;
+        ggml_tensor *lat_down = nullptr, *lat_up = nullptr;
         // MTP draft block only
         ggml_tensor *eh_proj = nullptr, *enorm = nullptr, *hnorm = nullptr, *mtp_embd = nullptr, *head_norm = nullptr, *head = nullptr;
         ggml_tensor *hc_head_norm = nullptr, *hc_head_down = nullptr, *hc_head_up = nullptr;   // (Flash-Next's draft block: its own last mixer)
