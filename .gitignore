@@ -13,3 +13,9 @@ scripts/watch5.bat
 scripts/watchL.bat
 tierlm-cache/
 __pycache__/
+
+# Local environment and credential files
+.env
+.env.*
+*.pem
+*.key
