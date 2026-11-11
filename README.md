@@ -43,7 +43,17 @@ keeps those it agrees with, so every reply is its own.
 | Two of the answers at temperature 0.7, 4 guesses | **87 and 90** |
 | **Find the fastest settings**, as the app runs it in 0.8.6 (6 minutes; it picks the VRAM experts following the conversation and 4 guesses) | **78.8** (best without guessing in the same run: 40.7) |
 
-**Every setting.** RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11, an NVMe drive for the SSD tier;
+| tierlm 0.8.7, in the app's chat (temperature 0.7, repeat penalty 1.1) | tok/s |
+|---|---|
+| UD-IQ3_XXS, 4 guesses: a 9,199-token C# program (4.1 words per check, 77% of guesses kept, VRAM experts doing 92% of the expert work) | **94.8** |
+| The 4-bit build, Q4_K_M (77.9 GiB, 4.59 GiB of it read from the SSD): **Find the fastest settings** (VRAM experts following the conversation, 2 guesses; 48.1 without guessing) | **88.8** |
+| Q4_K_M, 2 guesses: a 6,155-token C++ program (92% of guesses kept, VRAM experts doing 87% of the expert work) | **80.3** |
+
+0.8.7 keeps the guessing work plans ready, puts the draft block's experts in VRAM first and lets the VRAM experts
+follow the conversation; the same PC and files as below, 64K context, 12 CPU threads, measured on a 0.8.7
+development build (the same code).
+
+**Every setting** (the 0.8.5 / 0.8.6 table). RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11, an NVMe drive for the SSD tier;
 tierlm 0.8.5 with its CUDA 12.9 engine. Qwen3.8-Flash-Next UD-IQ3_XXS from unsloth (4 files) with
 `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` in the same folder. Experts in RAM with the busiest in VRAM, 12 CPU threads,
 64K context with 16-bit context memory, flash attention, prompt batch 256, thinking off; for the answers at
@@ -93,12 +103,12 @@ How tierlm keeps it fast, at any size:
 
 | Graphics card | System RAM | SSD tier | Model size | For example | Measured |
 |---|---|---|---|---|---|
-| 8 GB | 32 GB | off | 30 GB | Qwen3.6-35B-A3B at 3 or 4 bits | **33 tok/s** (laptop RTX 3070) |
+| 8 GB | 32 GB | off | 30 GB | Qwen3.6-35B-A3B at 3 or 4 bits | **31-49 tok/s** (laptop RTX 3070, Q3_K_XL, by subject) |
 | 8 GB | 64 GB | off | 60 GB | Qwen3.6-35B-A3B at 8 bits | estimate |
 | 16 GB | 64 GB | off | 70 GB | Qwen3-Coder-Next 80B-A3B at 4 to 5 bits | estimate |
 | 24 GB | 64 GB | off | 75 GB | Llama 3.3 70B at 6 bits | estimate |
-| 32 GB | 64 GB | off | 85 GB | gpt-oss-120b | **38.5 tok/s** (RTX 5090) |
-| 32 GB | 64 GB | on (NVMe) | 120 GB | Qwen3.8 Flash-Next at 4 bits | **37 tok/s** (RTX 5090) |
+| 32 GB | 64 GB | off | 85 GB | gpt-oss-120b (MXFP4, 59 GiB) | **44-47 tok/s** (RTX 5090, 32K context) |
+| 32 GB | 64 GB | on (NVMe) | 120 GB | Qwen3.8 Flash-Next at 4 bits (Q4_K_M with its draft file) | **80-89 tok/s** (RTX 5090) |
 | 32 GB | 128 GB | on (NVMe) | 220 GB | Qwen3.5-397B-A17B at 4 bits (about 70 GB of it on the SSD) | not yet |
 | 32 GB | 128 GB | on (2 TB NVMe) | 400 GB | DeepSeek V3 / R1 at 4 bits (early support) | not yet |
 | 32 GB | 256 GB | on (2 TB NVMe) | 600 GB | Kimi K2 at 4 bits (early support) | not yet |

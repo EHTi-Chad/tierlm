@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
 endif()
-project(tierlm VERSION 0.8.6 LANGUAGES C CXX)
+project(tierlm VERSION 0.8.7 LANGUAGES C CXX)
 set(TIERLM_VERSION "${PROJECT_VERSION}" CACHE STRING "Version shown in the app")
 # A developer build (scripts\dev-update.bat passes "dev") shows which version it is a development copy of.
 if(TIERLM_VERSION STREQUAL "dev")
