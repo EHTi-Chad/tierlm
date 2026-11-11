@@ -46,7 +46,7 @@ keeps those it agrees with, so every reply is its own.
 | tierlm 0.8.7, in the app's chat (temperature 0.7, repeat penalty 1.1) | tok/s |
 |---|---|
 | UD-IQ3_XXS, 4 guesses: a 9,199-token C# program (4.1 words per check, 77% of guesses kept, VRAM experts doing 92% of the expert work) | **94.8** |
-| The 4-bit build, Q4_K_M (77.9 GiB, 4.59 GiB of it read from the SSD): **Find the fastest settings** (VRAM experts following the conversation, 2 guesses; 48.1 without guessing) | **88.8** |
+| The 4-bit build, Q4_K_M (120 GB; its n-gram table and 4.59 GiB of experts read from the SSD): **Find the fastest settings** (VRAM experts following the conversation, 2 guesses; 48.1 without guessing) | **88.8** |
 | Q4_K_M, 2 guesses: a 6,155-token C++ program (92% of guesses kept, VRAM experts doing 87% of the expert work) | **80.3** |
 
 0.8.7 keeps the guessing work plans ready, puts the draft block's experts in VRAM first and lets the VRAM experts
@@ -108,7 +108,7 @@ How tierlm keeps it fast, at any size:
 | 16 GB | 64 GB | off | 70 GB | Qwen3-Coder-Next 80B-A3B at 4 to 5 bits | estimate |
 | 24 GB | 64 GB | off | 75 GB | Llama 3.3 70B at 6 bits | estimate |
 | 32 GB | 64 GB | off | 85 GB | gpt-oss-120b (MXFP4, 59 GiB) | **44-47 tok/s** (RTX 5090, 32K context) |
-| 32 GB | 64 GB | on (NVMe) | 120 GB | Qwen3.8 Flash-Next at 4 bits | **80-89 tok/s** (RTX 5090; the 77.9 GiB Q4_K_M build with its draft file, 4.59 GiB of it on the SSD) |
+| 32 GB | 64 GB | on (NVMe) | 120 GB | Qwen3.8 Flash-Next at 4 bits | **80-89 tok/s** (RTX 5090; Q4_K_M with its draft file, its n-gram table and 4.59 GiB of experts on the SSD) |
 | 32 GB | 128 GB | on (NVMe) | 220 GB | Qwen3.5-397B-A17B at 4 bits (about 70 GB of it on the SSD) | not yet |
 | 32 GB | 128 GB | on (2 TB NVMe) | 400 GB | DeepSeek V3 / R1 at 4 bits (early support) | not yet |
 | 32 GB | 256 GB | on (2 TB NVMe) | 600 GB | Kimi K2 at 4 bits (early support) | not yet |
