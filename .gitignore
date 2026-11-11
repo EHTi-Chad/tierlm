@@ -12,3 +12,4 @@ scripts/t5-runs*.bat
 scripts/watch5.bat
 scripts/watchL.bat
 tierlm-cache/
+__pycache__/
