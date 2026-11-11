@@ -14,13 +14,29 @@ gpt-oss and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or 
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps.
 
+### New in 0.8.7: the same PC, the same models, much faster
+
+| Measured in the app's chat | before | **0.8.7** |
+|---|---|---|
+| Qwen3.8 Flash-Next Q4_K_M, the 120 GB model, on one RTX 5090 (32 GB): a 6,155-token C++ program | 40.2 tok/s (0.8.3) | **80.3 tok/s** (88.8 in Find the fastest settings) |
+| Qwen3.8 Flash-Next UD-IQ3_XXS on the same card: a 9,199-token C# program | 54-76 tok/s (0.8.5) | **94.8 tok/s** |
+| gpt-oss-120b MXFP4 (59 GiB) on the same card: a 5,218-token C program | 38.5 tok/s (0.7.0, 64K context) | **44.1 tok/s** (32K context; 47.5 in Find the fastest settings) |
+| Qwen3.6-35B-A3B (17 GB) on an 8 GB laptop RTX 3070: code, contract law, science and a story | 35.6 tok/s (0.8.3) | **44.0 tok/s** |
+| The wait for the first word of a short message, experts in RAM (RTX 5090) | 1.4 s (0.8.6) | **0.3 s** |
+| A coding agent's 2,474-token instructions at the start of every session (RTX 5090) | 7.5 s (0.8.6) | **0.2 s**, loaded from the SSD, also after a restart |
+
+0.8.7 keeps its guessing work ready, lets the experts in VRAM follow the conversation, stops copying experts to
+the GPU to read a short prompt, and saves a conversation's opening on the SSD. RTX 5090 (32 GB), Ryzen 9 9950X3D,
+64 GB DDR5-6000, NVMe; the laptop is an RTX 3070 Laptop (8 GB), Ryzen 9 5900HX, 32 GB. Every setting is in the
+[spotlight below](#spotlight-qwen38-flash-next-on-one-rtx-5090) and on [tierlm.com/performance](https://tierlm.com/performance/#v087).
+
 ### At a glance
 
 | | |
 |---|---|
-| **Guesses ahead** | Qwen3.8 Flash-Next (IQ3_XXS) at **84 tok/s** on one RTX 5090 with its own draft file, against 60 without it, and the same answers ([details below](#spotlight-qwen38-flash-next-on-one-rtx-5090)) |
-| **Bigger than your RAM** | Qwen3.8 Flash-Next (120 GB) at **37 tok/s** on one RTX 5090 (32 GB) with 64 GB of RAM: the SSD tier reads the rarely used parts from an NVMe drive as each word needs them |
-| **Bigger than your GPU** | gpt-oss-120b (59 GB) at **38.5 tok/s** on one RTX 5090 (32 GB); Qwen3-Coder-Next 80B at **63.8 tok/s** on the same card; Qwen3.6-35B-A3B (17 GB) at **33 tok/s** on an 8 GB laptop RTX 3070 |
+| **Guesses ahead** | Qwen3.8 Flash-Next (IQ3_XXS) at **94.8 tok/s** on one RTX 5090 with its own draft file, writing a 9,199-token program ([details below](#spotlight-qwen38-flash-next-on-one-rtx-5090)) |
+| **Bigger than your RAM** | Qwen3.8 Flash-Next (120 GB) at **80.3 tok/s** on one RTX 5090 (32 GB) with 64 GB of RAM: the SSD tier reads the rarely used parts from an NVMe drive as each word needs them |
+| **Bigger than your GPU** | gpt-oss-120b (59 GB) at **44.1 tok/s** on one RTX 5090 (32 GB); Qwen3-Coder-Next 80B at **63.8 tok/s** on the same card; Qwen3.6-35B-A3B (17 GB) at **44 tok/s** on an 8 GB laptop RTX 3070 |
 | **Reads images** | screenshots, photos, scanned and handwritten pages, with Qwen3.5 / 3.6: a 4K screenshot read in **0.65 s** on an RTX 5090, a full-screen one in **2.7 s** on the laptop |
 | **Works on your projects** | the model lists, reads and searches a folder and proposes changes you see side by side and approve, one by one; each chat keeps its own folder |
 | **Never hits a wall** | chats are saved as readable files; when a conversation fills the context, the oldest messages are archived and looked back at when they matter |
