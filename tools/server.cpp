@@ -2356,7 +2356,9 @@ int main(int argc, char** argv) {
         auto evalm = [&](const std::vector<int32_t>& ids, std::vector<int32_t>* rt) {
             return par ? eng.batch.eval(seq, ids, rt) : model->eval(ids, eng.threads, rt);
         };
-        if ((int)toks.size() + 1 >= ctx_lim) throw std::runtime_error("conversation is longer than the context window; start a new chat");
+        if ((int)toks.size() + 1 >= ctx_lim) throw std::runtime_error("the prompt is " + std::to_string(toks.size()) + " tokens and the context length is " + std::to_string(ctx_lim) +
+                                     ": load the model with a longer context, or send less (the app's system prompt and the tools it "
+                                     "offers the model count too, also in a new chat)");
 
         // Reuse whatever part of the KV cache still matches this conversation.
         auto prefix = [&](const std::vector<int32_t>& a) {
