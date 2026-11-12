@@ -636,4 +636,7 @@ Clears the KV cache. Returns `{"ok": true}`.
 context, return an error instead of making it fit. On by default since 0.8.8: tierlm first shortens the long parts of
 earlier messages (a file written into a tool call, a long tool result, an earlier reply), keeping their start and end
 with a note of how much was left out, and only then leaves out the oldest messages; the system message and the last
-message stay whole. Off: the app gets an error, for coding agents that compact their conversations themselves. Only accepted from this computer. Returns the same as `GET /api/network`.
+message stay whole. Off: the app gets an error, for coding agents that compact their conversations themselves. And/or
+`{"api_tools_notice": false}`: don't add a note to replies when an app's instructions and tool descriptions take more
+than a quarter of the context (on by default since 0.8.8; once an hour per device, only on replies without tool
+calls, /v1/chat/completions only; the window says it either way). Only accepted from this computer. Returns the same as `GET /api/network`.

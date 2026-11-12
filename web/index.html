@@ -702,6 +702,10 @@
       <div class="help hostonly">On (the default): when an app sends more than the context holds, tierlm shortens the long parts of earlier
         messages (a file a tool wrote, a tool's long result), keeping their start and end, and if that isn't enough leaves out the
         oldest messages. Off: the app gets an error and can shorten the conversation itself, as some coding agents do.</div>
+      <label class="chk hostonly" style="margin-top:12px"><input type="checkbox" id="apinotice"> Tell people when an app's tools crowd out the context</label>
+      <div class="help hostonly">On (the default): when an app's instructions and tool descriptions take more than a quarter of the context before the
+        conversation starts (Open WebUI's built-in tools are about 16,500 tokens), a reply says so at its end, with how to turn tools off; once an
+        hour per device. Making conversations fit can't shorten those, so on a short context there may be little room left for the work.</div>
       <div id="appsetup" hidden>
         <h3 class="setuph">Set up an app</h3>
         <div class="help">Ready-made settings for the loaded model: its name, context length, tool calling and this address.
@@ -3619,11 +3623,14 @@ async function loadNetwork() {
   $("apikey").value = local ? (n.api_key || "") : (n.api_key_set ? "set (shown only on the computer running tierlm)" : "");
   for (const id of ["allownet", "keygen", "keyclear"]) $(id).disabled = !local || n.fixed_by_command_line;
   $("apitrim").checked = !!n.api_trim_oldest; $("apitrim").disabled = !local;
+  $("apinotice").checked = n.api_tools_notice !== false; $("apinotice").disabled = !local;
   $("keycopy").disabled = !local || !n.api_key;
   $("netmsg").innerHTML = !local ? "Settings, and which model is loaded, can be changed on the computer running tierlm."
     : n.fixed_by_command_line ? "Set by --host / --api-key on the command line."
     : n.allow_network && !n.api_key_set ? '<span class="warnline">Other devices can use tierlm without a key. Consider setting one.</span>' : "";
 }
+$("apinotice").onchange = () => api("/api/network", { method: "POST", headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ api_tools_notice: $("apinotice").checked }) }).catch(() => {});
 $("apitrim").onchange = () => api("/api/network", { method: "POST", headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ api_trim_oldest: $("apitrim").checked }) }).catch(() => {});
 async function setNetwork(body, msg) {

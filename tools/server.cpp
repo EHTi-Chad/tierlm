@@ -2861,26 +2861,58 @@ int main(int argc, char** argv) {
         return what;
     };
 
-    // How much of the context an app's instructions and tool descriptions take before the conversation starts. When
-    // it's a quarter or more, the window says so once per size: Open WebUI's built-in tools alone are about 16,500
-    // tokens, half of a 32K context, and every reply that writes a file through them adds the file again.
-    auto note_overhead = [&](const json& messages, const agent::ojson& tools) {
-        if (tools.empty() || !eng.model) return;
-        static std::mutex m;
-        static std::set<int> said;
+    // How much of the context an app's instructions and tool descriptions take before the conversation starts.
+    // Open WebUI's built-in tools alone are about 16,500 tokens: with a 24K context that leaves 8K for the work, and
+    // making the conversation fit can't shorten those. When they take more than a quarter of the context, the window
+    // says so (once per size), and the person using the app is told in a reply (once an hour per device and size;
+    // "api_tools_notice": false turns that off). Returns the note for the reply, or "".
+    struct Told { std::mutex m; std::map<std::string, std::chrono::steady_clock::time_point> at; };
+    auto told = std::make_shared<Told>();
+    // (key: set to what to pass to told_note once the note has gone out in a reply)
+    auto overhead_note = [&, told](const json& messages, const agent::ojson& tools, const std::string& client, std::string& key) -> std::string {
+        key.clear();
+        if (tools.empty() || !eng.model) return "";
         json head = json::array();
         if (!messages.empty() && messages[0].value("role", std::string()) == "system") head.push_back(messages[0]);
         head.push_back({{"role", "user"}, {"content", ""}});
         const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
         const int n = prompt_tokens(head, tools);
-        if (n * 4 < ctx) return;
+        if (n * 4 <= ctx) return "";
+        static std::mutex m;
+        static std::set<int> logged;
+        const auto now = std::chrono::steady_clock::now();
+        bool tell;
+        const std::string k = client + "/" + std::to_string(n / 500);
         {
             std::lock_guard<std::mutex> lk(m);
-            if (!said.insert(n / 500).second) return;
+            if (logged.insert(n / 500).second)
+                std::fprintf(stderr, "api: the app's instructions and its %zu tools take %d of the %d-token context (%d%%) before the "
+                                     "conversation starts. In Open WebUI, Function Calling: Legacy (the chat's controls, or the model's "
+                                     "Advanced Params) or the model's Builtin Tools switch leaves its built-in tools out\n",
+                             tools.size(), n, ctx, n * 100 / ctx);
         }
-        std::fprintf(stderr, "api: the app's instructions and its %zu tools take %d of the %d-token context before the conversation "
-                             "starts. In Open WebUI, Function Calling: Legacy (the chat's controls, or the model's Advanced Params) or "
-                             "the model's Builtin Tools switch leaves its built-in tools out\n", tools.size(), n, ctx);
+        {
+            std::lock_guard<std::mutex> lk(told->m);
+            auto it = told->at.find(k);
+            tell = it == told->at.end() || now - it->second > std::chrono::hours(1);
+        }
+        {
+            std::lock_guard<std::recursive_mutex> sl(settings_mu);
+            if (!settings.value("api_tools_notice", true)) return "";
+        }
+        if (!tell) return "";
+        key = k;
+        auto num = [](int v) { std::string t = std::to_string(v); for (int i = (int)t.size() - 3; i > 0; i -= 3) t.insert((size_t)i, ","); return t; };
+        return "\n\n---\n**tierlm:** this app's instructions and its " + std::to_string(tools.size()) + " tools take " + num(n) + " of the model's " +
+               num(ctx) + "-token context (" + std::to_string(n * 100 / ctx) + "%) before your conversation starts, leaving about " +
+               num(std::max(0, ctx - n)) + " for your work. Turn off the tools you don't need to give it more room. In Open WebUI: "
+               "the sliders icon next to the model name \u2192 Advanced Params \u2192 Function Calling \u2192 Legacy (this chat), or the "
+               "model's Builtin Tools switch (every chat).";
+    };
+    auto told_note = [told](const std::string& key) {
+        if (key.empty()) return;
+        std::lock_guard<std::mutex> lk(told->m);
+        told->at[key] = std::chrono::steady_clock::now();
     };
 
     svr.Post("/api/chat", [&](const httplib::Request& req, httplib::Response& res) {
@@ -3872,7 +3904,8 @@ int main(int argc, char** argv) {
         // Too long for the context: made to fit (fit_messages) unless the app asked for the error ("Make long
         // conversations fit" off in the API panel, "api_trim_oldest": false), as some coding agents prefer, to compact
         // the conversation themselves.
-        note_overhead(messages, tools);
+        std::string note_key;
+        const std::string note = overhead_note(messages, tools, req.remote_addr, note_key);
         if (api_fit() && eng.model) {
             const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
             const int reserve = max_tokens > 0 ? std::min(max_tokens, ctx / 2) : std::max(256, ctx / 8);
@@ -3908,6 +3941,10 @@ int main(int argc, char** argv) {
                         fin = "tool_calls";
                     }
                 }
+                if (!note.empty() && fin != "tool_calls" && msg["content"].is_string()) {   // (a reply the person reads)
+                    msg["content"] = msg["content"].get<std::string>() + note;
+                    told_note(note_key);
+                }
                 res.set_content(dump({{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", model_id},
                     {"choices", json::array({{{"index", 0}, {"message", msg},
                                               {"logprobs", nullptr}, {"finish_reason", fin}}})},
@@ -3919,7 +3956,7 @@ int main(int argc, char** argv) {
             return;
         }
         res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider("text/event-stream", [&, body, messages, tools, openai_calls, sp, max_tokens, stops, usage_in_stream, model_id, created, id, lock]
+        res.set_chunked_content_provider("text/event-stream", [&, body, messages, tools, openai_calls, sp, max_tokens, stops, usage_in_stream, model_id, created, id, lock, note, note_key]
                                                               (size_t, httplib::DataSink& sink) {
             auto send = [&](const json& j) { std::string s = "data: " + dump(j) + "\n\n"; return sink.write(s.data(), s.size()); };
             auto chunk = [&](const json& delta, const json& fin) {
@@ -3954,6 +3991,7 @@ int main(int argc, char** argv) {
                             fin = "tool_calls";
                         }
                     }
+                    if (!note.empty() && fin != "tool_calls" && chunk({{"content", note}}, nullptr)) told_note(note_key);
                     chunk(json::object(), fin);
                     if (usage_in_stream)
                         send({{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model_id},
@@ -3998,7 +4036,10 @@ int main(int argc, char** argv) {
         const long long created = (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         static std::atomic<unsigned> counter{0};
         const std::string uid = std::to_string(created) + std::to_string(++counter);
-        note_overhead(messages, tools);
+        {
+            std::string unused;                                           // (the window's note; these apps aren't told in replies)
+            overhead_note(messages, tools, req.remote_addr, unused);
+        }
         if (api_fit() && eng.model) {                                 // (as for /v1/chat/completions)
             const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
             const int reserve = rq.max_tokens > 0 ? std::min(rq.max_tokens, ctx / 2) : std::max(256, ctx / 8);
@@ -4325,7 +4366,8 @@ int main(int argc, char** argv) {
         if (!lan.empty()) urls.push_back({{"label", "Other devices on your network"}, {"url", "http://" + lan + ":" + std::to_string(a.port) + "/v1"}});
         json j = {{"allow_network", (bool)allow_network}, {"listening_on", bind_host()}, {"port", a.port}, {"lan_address", lan},
                   {"api_key_set", !key.empty()}, {"urls", urls}, {"fixed_by_command_line", a.host_given || a.api_key_given},
-                  {"api_trim_oldest", api_fit()}};
+                  {"api_trim_oldest", api_fit()},
+                  {"api_tools_notice", [&] { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value("api_tools_notice", true); }()}};
         if (show_key) j["api_key"] = key;
         return j;
     };
@@ -4342,6 +4384,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::recursive_mutex> sl(settings_mu);
         if (body.contains("allow_network")) { allow_network = body.value("allow_network", false); settings["allow_network"] = (bool)allow_network; }
         if (body.contains("api_trim_oldest")) settings["api_trim_oldest"] = body.value("api_trim_oldest", true);
+            if (body.contains("api_tools_notice")) settings["api_tools_notice"] = body.value("api_tools_notice", true);
         if (body.contains("api_key") && !a.api_key_given) {
             std::string k = body["api_key"].is_string() ? body["api_key"].get<std::string>() : std::string();
             if (k == "generate") k = random_key();

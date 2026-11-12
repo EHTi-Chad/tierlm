@@ -131,7 +131,10 @@ The app sends more than your message. Open WebUI's built-in tools (notes, tasks,
 with every request: about **16,500 tokens** of tool descriptions, half of a 32K context, before you type a word. And
 when the model uses one of them to write a file, the whole file goes back and forth in the conversation, sometimes
 several times in one reply. tierlm's window shows it: a `chat:` line with thousands of prompt tokens for a one-line
-message, and since 0.8.8 a line saying how much of the context the app's instructions and tools take.
+message. Since 0.8.8 tierlm also says it: in its window, and, when the app's instructions and tools take more than a
+quarter of the context, at the end of a reply in the app itself (once an hour per device; the **Connect other apps**
+card can turn that off). On a short context that matters most: making the conversation fit can shorten earlier
+messages, not the app's tools, so with 16,500 tokens of tools in a 24K context only 8K is left for the work.
 
 What to do, best first, for PCs that can't hold a long context:
 
