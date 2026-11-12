@@ -227,6 +227,12 @@ tierlm remembers your choice and loads it again next time. Apps reach it at `/v1
 
 Close the black tierlm window, or press **Ctrl+C** in it.
 
+## Without the browser
+
+To use tierlm from another app (Open WebUI, SillyTavern, a coding agent) with no page or browser open, start it from
+`start-tierlm-console.bat` instead: edit the model and its settings at the top of the file, then double-click it.
+Every option, a step by step with Qwen3.8 Flash-Next, and how to connect common apps: **[CONSOLE.md](CONSOLE.md)**.
+
 ## Connect other apps
 
 tierlm speaks the same API as OpenAI, so apps made for OpenAI (or for LM Studio and Ollama) can use the model

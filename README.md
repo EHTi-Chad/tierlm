@@ -501,6 +501,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - **[docs/tierlm-0.6.0-inside-the-engine.pdf](docs/tierlm-0.6.0-inside-the-engine.pdf)**: what the engine does, part by part, with diagrams, code and a comparison with llama.cpp
 - [docs/tierlm-0.5.0-guide.pdf](docs/tierlm-0.5.0-guide.pdf): the setup guide with every setting and test results
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): download, run, and use tierlm (no programming needed)
+- [docs/CONSOLE.md](docs/CONSOLE.md): running tierlm from the console, with no browser, for your own front end
 - [docs/FAQ.md](docs/FAQ.md): questions and troubleshooting
 - [docs/BUILD.md](docs/BUILD.md): building on Windows and Linux, GPU backends, making a release
 - [docs/TOOLS.md](docs/TOOLS.md): every tool and option, environment variables, tests

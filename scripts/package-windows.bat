@@ -87,8 +87,9 @@ if /i "%FLAVOR%"=="full" (
   if exist "%CUDA_PATH%\EULA.txt" copy /y "%CUDA_PATH%\EULA.txt" "%OUT%\licenses\NVIDIA-CUDA-EULA.txt" >nul
 )
 copy /y scripts\start-tierlm.bat "%OUT%\" >nul
+copy /y scripts\start-tierlm-console.bat "%OUT%\" >nul
 mkdir "%OUT%\docs" && copy /y docs\*.md "%OUT%\docs\" >nul
-(echo tierlm %VER%& echo.& echo Start here: docs\GETTING_STARTED.md& echo Problems: docs\FAQ.md& echo Project page: https://github.com/EHTi-Chad/tierlm& echo.& echo 1. Put a supported .gguf model in the models folder.& echo 2. Double-click start-tierlm.bat.) > "%OUT%\README-FIRST.txt"
+(echo tierlm %VER%& echo.& echo Start here: docs\GETTING_STARTED.md& echo Problems: docs\FAQ.md& echo Project page: https://github.com/EHTi-Chad/tierlm& echo.& echo 1. Put a supported .gguf model in the models folder.& echo 2. Double-click start-tierlm.bat.& echo.& echo No browser: edit start-tierlm-console.bat, then double-click it. See docs\CONSOLE.md.) > "%OUT%\README-FIRST.txt"
 copy /y LICENSE "%OUT%\licenses\tierlm-LICENSE.txt" >nul
 copy /y THIRD_PARTY_NOTICES.md "%OUT%\licenses\" >nul
 copy /y third_party\ggml\LICENSE "%OUT%\licenses\ggml-LICENSE.txt" >nul
