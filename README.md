@@ -213,8 +213,8 @@ Choose a folder for a chat (**+** → **Work in a folder…**, or Settings) and 
   OpenAI SDK can use tierlm. **Allow other devices** and an optional API key control who can connect; ready-made
   settings for common apps are one click away.
 - **Two models at once**: an **embedding model** stays loaded beside the chat model for search and document
-  comparison; **nomic-embed-text downloads in one click**, checked against Hugging Face's checksum (LM Studio's
-  built-in copy is found too).
+  comparison; **nomic-embed-text downloads in one click**, checked against Hugging Face's checksum, into
+  tierlm's own models folder (since 0.8.8 tierlm doesn't use LM Studio's copy).
 - **Several people or apps at once**: requests wait in line, first come first served, and the chat shows your place.
   With **Connections** above one, that many replies are written at once in the same model steps (the weights read
   once for all of them); Find the fastest settings recommends the most your PC keeps above a speed floor. On an RTX

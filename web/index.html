@@ -1062,7 +1062,7 @@ async function loadEmbed() {
     : opts.length ? "A second, small model that turns text into numbers for search and document comparison. Choose one to load it next to the chat model; apps use it through /v1/embeddings."
     : "No embedding model yet: the button above downloads nomic-embed-text from Nomic's own Hugging Face page and checks it, or put any GGUF embedding model in the models folder.";
   // One click for nomic-embed-text, when no copy of it is here yet (this computer only).
-  const haveNomic = opts.some(m => !m.builtin && /nomic-embed-text/i.test(m.id));   // (LM Studio's copy aside: tierlm keeps its own)
+  const haveNomic = opts.some(m => m.own && /nomic-embed-text/i.test(m.id));   // (tierlm's own copy: another app's doesn't count)
   $("embdlrow").hidden = haveNomic || !embLocal;
   if (!haveNomic && embLocal && !embDlTimer) pollEmbDl(false);
 }
