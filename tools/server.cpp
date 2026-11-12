@@ -42,6 +42,7 @@
 #include "ggml-backend.h"
 #include <list>
 #include <map>
+#include <set>
 #include "httplib.h"
 #include "json.hpp"
 #include "agent.h"
@@ -2860,6 +2861,28 @@ int main(int argc, char** argv) {
         return what;
     };
 
+    // How much of the context an app's instructions and tool descriptions take before the conversation starts. When
+    // it's a quarter or more, the window says so once per size: Open WebUI's built-in tools alone are about 16,500
+    // tokens, half of a 32K context, and every reply that writes a file through them adds the file again.
+    auto note_overhead = [&](const json& messages, const agent::ojson& tools) {
+        if (tools.empty() || !eng.model) return;
+        static std::mutex m;
+        static std::set<int> said;
+        json head = json::array();
+        if (!messages.empty() && messages[0].value("role", std::string()) == "system") head.push_back(messages[0]);
+        head.push_back({{"role", "user"}, {"content", ""}});
+        const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
+        const int n = prompt_tokens(head, tools);
+        if (n * 4 < ctx) return;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (!said.insert(n / 500).second) return;
+        }
+        std::fprintf(stderr, "api: the app's instructions and its %zu tools take %d of the %d-token context before the conversation "
+                             "starts. In Open WebUI, Function Calling: Legacy (the chat's controls, or the model's Advanced Params) or "
+                             "the model's Builtin Tools switch leaves its built-in tools out\n", tools.size(), n, ctx);
+    };
+
     svr.Post("/api/chat", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array()) {
@@ -3849,6 +3872,7 @@ int main(int argc, char** argv) {
         // Too long for the context: made to fit (fit_messages) unless the app asked for the error ("Make long
         // conversations fit" off in the API panel, "api_trim_oldest": false), as some coding agents prefer, to compact
         // the conversation themselves.
+        note_overhead(messages, tools);
         if (api_fit() && eng.model) {
             const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
             const int reserve = max_tokens > 0 ? std::min(max_tokens, ctx / 2) : std::max(256, ctx / 8);
@@ -3974,6 +3998,7 @@ int main(int argc, char** argv) {
         const long long created = (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         static std::atomic<unsigned> counter{0};
         const std::string uid = std::to_string(created) + std::to_string(++counter);
+        note_overhead(messages, tools);
         if (api_fit() && eng.model) {                                 // (as for /v1/chat/completions)
             const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
             const int reserve = rq.max_tokens > 0 ? std::min(rq.max_tokens, ctx / 2) : std::max(256, ctx / 8);

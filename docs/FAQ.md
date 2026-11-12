@@ -126,6 +126,31 @@ prompts.
 
 ## Problems
 
+**Open WebUI (or another app) says the conversation is longer than the context window, even in a new chat**
+The app sends more than your message. Open WebUI's built-in tools (notes, tasks, memory, web search and more) go
+with every request: about **16,500 tokens** of tool descriptions, half of a 32K context, before you type a word. And
+when the model uses one of them to write a file, the whole file goes back and forth in the conversation, sometimes
+several times in one reply. tierlm's window shows it: a `chat:` line with thousands of prompt tokens for a one-line
+message, and since 0.8.8 a line saying how much of the context the app's instructions and tools take.
+
+What to do, best first, for PCs that can't hold a long context:
+
+1. **Leave Open WebUI's built-in tools out.** In a chat: the sliders icon next to the model name → **Advanced
+   Params** → **Function Calling** → **Legacy**. For every chat: the model's own settings (your avatar → Settings
+   or Admin Panel → **Models** → the model's edit button) → **Capabilities** → untick **Builtin Tools**, or set
+   Function Calling to Legacy under its **Advanced Params**. A new chat then starts at a few hundred tokens, and
+   replies write the file into the chat instead.
+2. **Let tierlm make it fit.** Since 0.8.8 this is on by default (the **Connect other apps** card: **Make apps'
+   conversations fit the context**): the long parts of earlier messages are shortened, keeping their start and end,
+   then the oldest messages are left out. In 0.8.7 and earlier tick **When an app's conversation is too long, drop
+   its oldest messages**.
+3. **A longer context**, if your PC has room. Hybrid models such as Qwen3.5, Qwen3.6 and Flash-Next keep keys and
+   values for only a quarter of their layers, so going from 32K to 64K costs them little VRAM; for other models it
+   costs much more.
+
+Also: add tierlm in Open WebUI as an **OpenAI API** connection (`http://<the PC's address>:<port>/v1`), not an
+Ollama one: tierlm doesn't speak Ollama's API, and Open WebUI then says "failed to get models".
+
 **"Windows protected your PC" when starting it**
 tierlm isn't code-signed, so SmartScreen doesn't recognise it. Click **More info**, then **Run anyway**. You
 can verify the zip against the `.sha256` file on the Releases page first. Code signing is on the way.
