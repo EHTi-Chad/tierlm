@@ -1324,6 +1324,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // after a copy to the drive: the copy was the first half of the progress bar, reading the rest the second
     const float pbase = copy_total ? 0.5f : 0.0f, pscale = copy_total ? 0.5f : 1.0f;
     auto report = [&](float f) { if (opt.progress) opt.progress(pbase + pscale * f); };
+    double read_s = 0, split_s = 0, set_s = 0;                         // (TIERLM_LOAD_TRACE: where loading's time goes)
+    using lclock = std::chrono::steady_clock;
+    auto since = [](lclock::time_point t) { return std::chrono::duration<double>(lclock::now() - t).count(); };
     for (const Source& s : sources) {
         if (ssd_set.count(s.t)) continue;                              // read from the drive when used
         if (auto it = split_of.find(s.t); it != split_of.end()) {      // an expert tensor split into VRAM and RAM parts
@@ -1333,29 +1336,30 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             done_bytes += n;
             chunk.resize(n);
             auto& f = files[s.part];
+            const auto t_read = lclock::now();
             f.seekg((std::streamoff)s.offset);
             if (!f.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + paths[s.part]); }
-            // Each expert goes straight from the read buffer to its place in the VRAM part or the RAM part (no copies
-            // of the whole tensor in between: for gpt-oss-120b those took longer than reading the file). What's left
-            // after the experts (the zero expert at the end of each part) is set to zeros.
-            static std::vector<char> zeros;
-            if (zeros.size() < per) zeros.assign(per, 0);
-            auto zero_rest = [&](ggml_tensor* t, size_t from) {
-                for (size_t off = from, n_t = ggml_nbytes(t); off < n_t; off += per)
-                    ggml_backend_tensor_set(t, zeros.data(), off, std::min(per, n_t - off));
-            };
+            read_s += since(t_read);
+            // The VRAM part and the RAM part, each put together in a buffer kept from tensor to tensor (not made and
+            // zeroed again for each: for gpt-oss-120b that took longer than reading the file), then set in one go.
+            // The last expert of each part is the zero expert.
+            static std::vector<char> hb, cb;
+            const size_t hn = ggml_nbytes(sp.hot), cn = ggml_nbytes(sp.cold);
+            const auto t_split = lclock::now();
+            if (hb.size() < hn) hb.resize(hn);
+            if (!hl.cold_mapped && cb.size() < cn) cb.resize(cn);
             std::vector<char> is_hot(E, 0);
-            for (int k = 0; k < (int)hl.ids.size(); ++k) {
-                ggml_backend_tensor_set(sp.hot, chunk.data() + (size_t)hl.ids[k] * per, (size_t)k * per, per);
-                is_hot[hl.ids[k]] = 1;
-            }
-            zero_rest(sp.hot, hl.ids.size() * per);
+            for (int k = 0; k < (int)hl.ids.size(); ++k) { std::memcpy(hb.data() + (size_t)k * per, chunk.data() + (size_t)hl.ids[k] * per, per); is_hot[hl.ids[k]] = 1; }
+            if (hn > hl.ids.size() * per) std::memset(hb.data() + hl.ids.size() * per, 0, hn - hl.ids.size() * per);
+            ggml_backend_tensor_set(sp.hot, hb.data(), 0, hn);
             if (!hl.cold_mapped) {                                             // (mapped: the file is it)
                 size_t ci = 0;
                 for (int e = 0; e < E; ++e)
-                    if (!is_hot[e]) ggml_backend_tensor_set(sp.cold, chunk.data() + (size_t)e * per, ci++ * per, per);
-                zero_rest(sp.cold, ci * per);
+                    if (!is_hot[e]) std::memcpy(cb.data() + ci++ * per, chunk.data() + (size_t)e * per, per);
+                if (cn > ci * per) std::memset(cb.data() + ci * per, 0, cn - ci * per);
+                ggml_backend_tensor_set(sp.cold, cb.data(), 0, cn);
             }
+            split_s += since(t_split);
             report(total_bytes ? (float)((double)done_bytes / total_bytes) : 1.0f);
             continue;
         }
@@ -1368,11 +1372,18 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         }
         chunk.resize(n);
         auto& f = files[s.part];
+        const auto t_read = lclock::now();
         f.seekg((std::streamoff)s.offset);
         if (!f.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + paths[s.part]); }
+        read_s += since(t_read);
+        const auto t_set = lclock::now();
         ggml_backend_tensor_set(s.t, chunk.data(), 0, n);
         if (auto bc = bias_copy.find(s.t); bc != bias_copy.end()) ggml_backend_tensor_set(bc->second, chunk.data(), 0, n);
+        set_s += since(t_set);
     }
+    if (std::getenv("TIERLM_LOAD_TRACE"))
+        std::fprintf(stderr, "load: reading the file %.1f s, splitting experts between VRAM and RAM %.1f s, copying the rest %.1f s\n",
+                     read_s, split_s, set_s);
     // MLA: the per-head key/value expansion rearranged into the layout attention uses (see mla_derive above): read
     // from the file, turned into numbers (whatever the file's type), reordered, and stored.
     if (!mla_derive.empty()) {

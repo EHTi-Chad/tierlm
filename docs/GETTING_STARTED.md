@@ -322,12 +322,13 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Qwen3.5 / 3.6 / 3.8 dense (hybrid) | `qwen35` | Qwen3.8-27B, Qwen3.5-9B | Tested: Qwen3.6-27B on an RTX 3070 laptop, with speculative decoding |
 | Qwen3.5 / 3.6 MoE (hybrid) | `qwen35moe` | Qwen3.6-35B-A3B, Qwen3.5-122B-A10B | Tested: Qwen3.6-35B-A3B Q8_0 on an RTX 5090 |
 | Qwen3-Next (hybrid MoE) | `qwen3next` | Qwen3-Coder-Next-80B-A3B, Qwen3-Next-80B-A3B | Model math verified, real-model test pending |
-| gpt-oss | `gpt-oss` | gpt-oss-20b, gpt-oss-120b, HyperNova-60B | Model math and chat format verified, real-model test pending |
+| gpt-oss | `gpt-oss` | gpt-oss-20b, gpt-oss-120b, HyperNova-60B | Tested: gpt-oss-20b and gpt-oss-120b on an RTX 5090 |
 | Embedding models: BERT-style | `bert` | bge-small/base/large, all-MiniLM-L6-v2, e5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
 | Embedding models: Nomic | `nomic-bert` | nomic-embed-text v1, v1.5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
 | DeepSeek V3 / R1 / V3.1, Kimi K2 / K2.5 / K2.6, Moonlight, DeepSeek V2 / V2-Lite | `deepseek2` | DeepSeek-V3-0324, DeepSeek-R1, Kimi-K2-Instruct, Moonlight-16B-A3B, DeepSeek-V2-Lite | Early. Model math checked against Hugging Face's own code (latent attention, grouped routing, YaRN); tokenizers (DeepSeek V3, Kimi K2) checked against Hugging Face's tokenizers; real-model test pending. The big ones need the SSD tier |
 | Qwen3.8 Flash-Next | `qwen4exp` | Qwen3.8-Flash-Next (512 experts, 10 active) | Model math checked against Hugging Face's own code, including its hyper-connections, the n-gram embedding on layer 1 and its sparse attention past 2,048 tokens, and against llama.cpp; tested on the real model (Q4_K_M, 120 GB): 37 tok/s on an RTX 5090 with 64 GB RAM and the SSD tier. Its draft file (Unsloth's `mtp-...-shared-Q8_0.gguf`, in the same folder) is used for speculative decoding since 0.8.5: UD-IQ3_XXS on the same PC at 84 tok/s with 4 guesses (62 without). Text only for now (its vision file isn't used yet). Its 35 GB n-gram table is the first thing the SSD tier moves to the SSD; the rows each step needs are asked for all at once |
-| Gemma, Phi, GLM, Nemotron, DeepSeek V4, ... | various | | Not yet |
+| NVIDIA Nemotron 3.5 (Mamba-2, LatentMoE) | `nemotron_h_moe` | Nemotron-3.5-Bolt-74B-A9B | Tested: Bolt 74B-A9B on an RTX 5090, all in VRAM and with its experts in RAM; images not yet |
+| Gemma, Phi, GLM, DeepSeek V4, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision file**: tierlm loads it with the model so it can read
 images (Qwen3.5 / 3.6; see [Reading images](#reading-images)). Checked against Hugging Face's code; tested with Qwen3.5-9B on an RTX 3070 laptop.

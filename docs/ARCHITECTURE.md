@@ -140,8 +140,8 @@ places, each checked against a NumPy reference written from Hugging Face's `mode
   zero expert's zeros and then a weight of 0, so the sum is the same as unsplit (the tests compare both with the
   reference at several splits). On an RTX 5090 with 64 GB of RAM at 32K context, gpt-oss-120b (MXFP4)
   writes 83-86 tok/s with the busiest experts in VRAM (2,043 of 4,608, doing 86-87% of the expert work) and 82
-  following the conversation, against 45 with its experts in RAM. Loading it this way takes about 3 minutes
-  instead of 74 s (to look at).
+  following the conversation, against 45 with its experts in RAM. Loading it this way takes 79 s (74 s with its
+  experts in RAM; up to 0.8.7 it took 3 minutes, its split layers put together in buffers made and zeroed afresh).
 
 Not yet for gpt-oss: a shorter KV cache for the sliding-window layers.
 
