@@ -53,9 +53,12 @@ It answers without the API key and says nothing about the model or the computer.
 
 ### GET /v1/models
 
-The loaded model first (`"loaded": true`), then the loaded embedding model if there is one (`"type": "embeddings"`),
-then every supported model in the models folder. `id` is the
-model's path inside the folder, e.g. `lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q8_0.gguf`.
+The models loaded now, which are the ones an app can use: the chat model, then the embedding model if there is one
+(`"type": "embeddings"`). `id` is the model's path inside the models folder, e.g.
+`lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q8_0.gguf`. (Up to 0.8.7 this also listed every model in
+the folder that wasn't loaded, which front ends such as Open WebUI then offered in their model menus. Apps on the same
+computer can still load another model by naming it; the folder's list, with which ones are loaded, is at
+`/api/v0/models`, and only for apps on the same computer.)
 
 ### POST /v1/embeddings
 

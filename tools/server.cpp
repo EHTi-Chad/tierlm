@@ -3609,6 +3609,8 @@ int main(int argc, char** argv) {
         return model_key(eng.path);
     };
 
+    // The models loaded now: what an app can use. (Apps on this computer can still load another one by naming it;
+    // the models folder's list is at /api/v0/models, LM Studio's API, which says which are loaded.)
     svr.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         json data = json::array();
         std::string cur;
@@ -3626,11 +3628,6 @@ int main(int argc, char** argv) {
         {
             std::lock_guard<std::mutex> lk(emb.mu);
             if (emb.enc) data.push_back({{"id", emb.id}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}, {"type", "embeddings"}});
-        }
-        bool exists = false;
-        for (const auto& m : scan_models(exists)) {
-            if (!m.value("supported", false) || m.value("id", std::string()) == cur) continue;
-            data.push_back({{"id", m["id"]}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", false}});
         }
         res.set_content(dump({{"object", "list"}, {"data", data}}), "application/json; charset=utf-8");
     });
@@ -3652,7 +3649,7 @@ int main(int argc, char** argv) {
         if (type == "vlm") m["capabilities"] = json::array({"vision"});
         return m;
     };
-    auto v0_models = [&]() {
+    auto v0_models = [&](bool local) {                    // (local: also the models that aren't loaded, see /v1/models)
         json data = json::array();
         std::string cur;
         json cur_m;
@@ -3683,7 +3680,7 @@ int main(int argc, char** argv) {
             const std::string id = m.value("id", std::string());
             for (auto& d : data)                              // the loaded ones: the context the model was trained for
                 if (d["id"] == id) d["max_context_length"] = m.value("ctx_train", 0);
-            if (id == cur || id == emb_id) continue;
+            if (id == cur || id == emb_id || !local) continue;
             const bool embedding = m.value("kind", std::string()) == "embedding" && m.value("embedding", false);
             if (!embedding && !m.value("supported", false)) continue;
             std::string type = embedding ? "embeddings" : "llm";
@@ -3700,12 +3697,12 @@ int main(int argc, char** argv) {
         }
         return data;
     };
-    svr.Get("/api/v0/models", [&](const httplib::Request&, httplib::Response& res) {
-        res.set_content(dump({{"object", "list"}, {"data", v0_models()}}), "application/json; charset=utf-8");
+    svr.Get("/api/v0/models", [&](const httplib::Request& req, httplib::Response& res) {
+        res.set_content(dump({{"object", "list"}, {"data", v0_models(is_local(req))}}), "application/json; charset=utf-8");
     });
     svr.Get(R"(/api/v0/models/(.+))", [&](const httplib::Request& req, httplib::Response& res) {
         const std::string want = req.matches[1].str();
-        for (const auto& m : v0_models())
+        for (const auto& m : v0_models(is_local(req)))
             if (m["id"] == want) return res.set_content(dump(m), "application/json; charset=utf-8");
         oai_error(res, 404, "no model \"" + want + "\" in the models folder", "invalid_request_error", "model_not_found");
     });
