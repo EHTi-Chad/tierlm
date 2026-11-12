@@ -44,6 +44,13 @@ for chunk in reply:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
+### GET /v1
+
+Says tierlm is running. Opened in a browser (to check an app's base URL, or that another device can reach tierlm),
+it is a short page with the address to give an app and whether it needs the API key; programs get
+`{"object": "status", "running": true, "name": "tierlm", "version": "...", "api_key_required": false, "base_url": "..."}`.
+It answers without the API key and says nothing about the model or the computer.
+
 ### GET /v1/models
 
 The loaded model first (`"loaded": true`), then the loaded embedding model if there is one (`"type": "embeddings"`),

@@ -4166,7 +4166,9 @@ int main(int argc, char** argv) {
         std::string key;
         { std::lock_guard<std::mutex> lk(net_mu); key = api_key; }
         const bool is_api = req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 5, "/api/") == 0;
-        const bool needs_key = !key.empty() && is_api && (!local || req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 8, "/api/v0/") == 0);
+        // (/v1 itself only says that tierlm is running: no key needed, nothing about the model)
+        const bool status = req.path == "/v1" || req.path == "/v1/";
+        const bool needs_key = !key.empty() && is_api && !status && (!local || req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 8, "/api/v0/") == 0);
         if (needs_key) {
             std::string auth = req.get_header_value("Authorization");
             std::string given = auth.compare(0, 7, "Bearer ") == 0 ? auth.substr(7) : req.get_header_value("X-Api-Key");
@@ -4179,6 +4181,39 @@ int main(int argc, char** argv) {
         }
         return httplib::Server::HandlerResponse::Unhandled;
     });
+
+    // The API's own address, opened in a browser (to check a front end's setting, or that another device can reach
+    // tierlm): a page saying tierlm is running and what to put in the app. Programs get the same as JSON. Nothing
+    // about the model or the computer: with an API key set, this is the one thing that answers without it.
+    auto api_status = [&](const httplib::Request& req, httplib::Response& res) {
+        bool key_set;
+        { std::lock_guard<std::mutex> lk(net_mu); key_set = !api_key.empty(); }
+        std::string host = req.get_header_value("Host");
+        if (host.empty() || host.find_first_of("<>\"'& ") != std::string::npos) host = "127.0.0.1:" + std::to_string(a.port);
+        const std::string base = "http://" + host + "/v1";
+        if (req.get_header_value("Accept").find("text/html") == std::string::npos) {
+            res.set_content(dump({{"object", "status"}, {"running", true}, {"name", "tierlm"}, {"version", TIERLM_VERSION},
+                                  {"api_key_required", key_set}, {"base_url", base}}), "application/json; charset=utf-8");
+            return;
+        }
+        const std::string page = std::string(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            "<title>tierlm is running</title><style>"
+            "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;font:16px/1.5 system-ui,sans-serif}"
+            "main{max-width:34rem;padding:2rem 1.25rem}h1{font-size:1.6rem;margin:0 0 .5rem}h1 span{color:#2bb39a}"
+            "code{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:.15rem .4rem;font-size:.95em}"
+            "p{color:#9da7b3}ul{color:#9da7b3;padding-left:1.2rem}</style></head><body><main>"
+            "<h1><span>&#9679;</span> tierlm is running</h1>"
+            "<p>This is its OpenAI-compatible API. In your app (Open WebUI, SillyTavern, a coding agent...) set the base URL to</p>"
+            "<p><code>") + base + "</code></p>" +
+            (key_set ? "<p>An API key is set: the app has to send it too.</p>" : "<p>No API key is needed.</p>") +
+            "<ul><li><code>/v1/chat/completions</code> OpenAI chat</li><li><code>/v1/messages</code> Anthropic Messages</li>"
+            "<li><code>/v1/responses</code> OpenAI Responses</li><li><code>/v1/models</code> the loaded model</li></ul>"
+            "<p>tierlm " TIERLM_VERSION "</p></main></body></html>";
+        res.set_content(page, "text/html; charset=utf-8");
+    };
+    svr.Get("/v1", api_status);
+    svr.Get("/v1/", api_status);
 
     auto network_info = [&](bool show_key) {
         std::string key;
