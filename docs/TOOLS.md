@@ -244,6 +244,7 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_RPC=host:port[,host:port]` | Tests: add `tierlm-rpc-server` instances as stand-in GPUs (needs a build with `-DGGML_RPC=ON`) |
 | `TIERLM_VRAM_MB=N` / `TIERLM_VRAM_BYTES=n[,n...]` | Tests: VRAM budget for `tierlm-logits`, in MiB, or in bytes per GPU |
 | `TIERLM_SPLIT=layers\|experts` | Tests: split mode for `tierlm-logits` |
+| `TIERLM_SHOW_PROMPT=1` | tierlm-server: write each prompt to the window as the model reads it (chat format, tools, thinking), to compare with a model's own template |
 | `TIERLM_MAMBA_UNROLL=N` | Nemotron: write the Mamba recurrence out as ordinary operations for batches of up to N tokens (default: up to 8 when the state is in VRAM; 0: always ggml's scan, a CPU kernel) |
 | `TIERLM_EXPERT_USAGE=seed` | Tests: made-up expert usage counts, so models load with hot experts (some layers whole, some split) |
 | `TIERLM_SHOW_PLACEMENT=1` | `tierlm-logits`: print where the model was placed (per GPU, and the hot-expert count), and with live hot experts the picks served from VRAM and the swaps |

@@ -245,7 +245,25 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
         }
         return s + "<|assistant|>\n";
     }
-    case ChatFmt::ChatML:                                 // Qwen, and many others
+    case ChatFmt::ChatML: {                               // Qwen, and many others
+        // NVIDIA's Nemotron 3.5 writes ChatML with a few differences of its own: there is always a system turn (empty
+        // when there's no system message), earlier replies start with an empty thinking block "<think></think>" (no
+        // newlines), and thinking is on unless switched off, which is "<think></think>" too.
+        const std::string& ct = tok.chat_template();
+        const bool nemo = ct.find("truncate_history_thinking") != std::string::npos && ct.find("{reasoning effort") != std::string::npos;
+        if (nemo) {
+            if (messages.empty() || messages[0].value("role", std::string()) != "system") s += "<|im_start|>system\n<|im_end|>\n";
+            for (const auto& m : messages) {
+                const std::string role = m.value("role", std::string("user"));
+                std::string c = m.value("content", std::string());
+                if (role == "assistant") {
+                    if (c.compare(0, 7, "<think>") != 0) c = "<think></think>" + agent::trim(c);
+                    else c = agent::trim(c);
+                }
+                s += "<|im_start|>" + role + "\n" + c + "<|im_end|>\n";
+            }
+            return s + "<|im_start|>assistant\n" + (think == 0 ? "<think></think>" : "<think>\n");
+        }
         for (const auto& m : messages) {
             const std::string role = m.value("role", std::string("user")), c = m.value("content", std::string());
             // With thinking off, earlier replies were written after an empty thinking block: show them the same way,
@@ -254,6 +272,7 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
             s += "<|im_start|>" + role + "\n" + (empty_think ? "<think>\n\n</think>\n\n" : "") + c + "<|im_end|>\n";
         }
         return s + "<|im_start|>assistant\n" + (think == 0 ? "<think>\n\n</think>\n\n" : think == 1 ? "<think>\n" : "");
+    }
     case ChatFmt::DeepSeek: {                             // DeepSeek V3 / R1 / V3.1: <｜User｜>... <｜Assistant｜>...
         const std::string U = "<\xEF\xBD\x9CUser\xEF\xBD\x9C>", A = "<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>";
         const std::string bos = "<\xEF\xBD\x9C" "begin\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>";
@@ -1598,8 +1617,10 @@ int main(int argc, char** argv) {
         {
             const std::string& ct = eng.tok.chat_template();
             eng.think_switch = eng.chat == ChatFmt::ChatML && ct.find("enable_thinking") != std::string::npos;
-            eng.think_starts = eng.think_switch &&       // (its generation prompt: {{- '<think>\\n' }}, as Qwen3.5 and later)
-                std::regex_search(ct, std::regex(R"('<think>(\\n|\n)'\s*\}\})"));
+            // (its generation prompt ends with '<think>\\n' }}, as Qwen3.5 and later do, and Nemotron 3.5's
+            // '<|im_start|>assistant\\n<think>\\n' }})
+            eng.think_starts = eng.think_switch &&
+                std::regex_search(ct, std::regex(R"(<think>(\\n|\n)'\s*\}\})"));
             if (eng.chat == ChatFmt::DeepSeek) {          // V3.1 has a thinking switch; R1 always starts by thinking
                 eng.think_switch = ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos;
                 eng.think_starts = eng.think_switch || ct.find("<think>\\n") != std::string::npos;
@@ -2302,8 +2323,12 @@ int main(int argc, char** argv) {
         const int think = think_mode();
         // (the template opened the <think> block: the reply is shown, split and saved with it, as the model wrote it)
         const std::string pre = think == 1 ? "<think>\n" : "";
-        std::vector<int32_t> toks = tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
-                                                    : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok, think), true);
+        const std::string prompt_text = harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
+                                             : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok, think);
+        // (TIERLM_SHOW_PROMPT=1: the prompt as the model reads it, in the window, between two lines of ====)
+        static const bool show_prompt = std::getenv("TIERLM_SHOW_PROMPT") != nullptr;
+        if (show_prompt) std::fprintf(stderr, "==== prompt\n%s\n==== end of prompt\n", prompt_text.c_str());
+        std::vector<int32_t> toks = tok.encode(prompt_text, true);
         if (!pics.empty()) {                                      // each image's <|image_pad|> becomes its words
             const int32_t pad = tok.find("<|image_pad|>");
             std::vector<int32_t> with;
