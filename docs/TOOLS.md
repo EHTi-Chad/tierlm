@@ -18,9 +18,41 @@ Common options:
 Web chat and live dashboard, plus the HTTP API described in [API.md](API.md).
 
 ```
-tierlm-server [model.gguf] [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu|<device>] [-t N] [-c 4096]
+tierlm-server [model] [--port 8080] [--host 127.0.0.1] [--api-key KEY] [--no-web]
               [--web web] [--models models] [--settings tierlm-settings.json]
+              [--saved] [-c 4096] [-t N] [-d auto|cpu|gpu|<device>] [--experts auto|layers|ram|busiest|follow]
+              [--guesses N] [--lookup N] [--kv 32|16|8|5|4] [--batch N] [--connections N] [--vram-limit MiB]
+              [--no-ssd] [--no-flash-attn] [--one-gpu] [--experts-used N] [--no-thinking] [--effort low|medium|high]
 ```
+
+### From a console, with your own front end
+
+Give the model and its settings on the command line and tierlm loads it at once and serves the API, with no
+setup screen to click through. Any front end that speaks OpenAI's API (Open WebUI, SillyTavern, a coding agent,
+your own script) connects to `http://<host>:<port>/v1`; `/v1/messages` and `/v1/responses` are there too.
+
+```
+tierlm-server.exe C:\models\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf --ctx 32768 --experts follow --guesses 2 --threads 6 --port 8040 --no-web
+```
+
+- **The model** is a `.gguf` file, or its name in the models folder as the page lists it (`unsloth/model.gguf`,
+  `@tierlm/folder/model.gguf`). For a model in several files, give the first.
+- **`--saved`** starts from the settings saved for that model: what the page last loaded it with, or what Find the
+  fastest settings found. So you can tune once on the page and start it from a console or a script after that:
+  `tierlm-server.exe model.gguf --saved --no-web`. Flags given beside `--saved` win over the saved ones.
+- **`--no-web`** leaves the chat page out: the address answers with one line of text and the API is all there is.
+  Without it the page is there as well, opened on the loaded model.
+- **`--experts`** is where a MoE model's experts go when it doesn't fit in VRAM: `layers` (whole layers in VRAM, the
+  rest in RAM), `ram` (experts in RAM, everything else in VRAM), `busiest` (the busiest experts in VRAM too),
+  `follow` (the VRAM experts follow the conversation), or `auto`.
+- **`--guesses N`** turns speculative decoding on with the model's draft block (N guesses ahead; 0 off);
+  **`--lookup N`** guesses from the conversation's own text (0 off, -1 automatic).
+- **`--kv`** is the context memory precision in bits; **`--connections N`** lets N replies be written at once, each
+  with its own context of `--ctx` tokens.
+- `--host 0.0.0.0` lets other devices on your network connect; give `--api-key` with it.
+- A mistake in the options, or a model that can't be loaded, is said in the window and tierlm stops (exit code 1).
+  `tierlm-server --help` lists everything.
+- Loading this way doesn't change the saved settings.
 
 - **Without a model**, the page opens a **setup screen**: it shows the GPUs and CPU it found with free memory
   and where the model will go (it picks the device itself: the best GPU the model fits on, else the CPU), the
@@ -29,7 +61,7 @@ tierlm-server [model.gguf] [--port 8080] [--host 127.0.0.1] [-d auto|cpu|gpu|<de
 - The models folder chosen on the page, and the settings used for each model, are saved in the `--settings`
   file. `--models` on the command line overrides the saved folder.
 - It warns on the page if `VK_ICD_FILENAMES` or `VK_DRIVER_FILES` is set, since these can hide the GPU.
-- **With a model**, it loads that model straight away (on the device given by `-d`) and opens the chat.
+- **With a model**, it loads that model straight away with the settings given (see above) and opens the chat.
 - `-d <device>` takes a name from `tierlm-devices`, such as `Vulkan0` or `CUDA0`. `auto` picks the dedicated
   GPU with the most memory, then an integrated GPU, then the CPU.
 - Open `http://127.0.0.1:<port>` in a browser. Run it from the tierlm folder, or pass `--web <folder>` to

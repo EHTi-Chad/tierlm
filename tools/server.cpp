@@ -103,7 +103,51 @@ struct Args {
     std::string api_key;
     bool models_given = false, host_given = false, api_key_given = false;
     int port = 8080, threads = std::max(1, (int)std::thread::hardware_concurrency() / 2), ctx = 4096;
+    // Console use: the model's load settings given as flags (the same names /api/load takes), whether to start
+    // from the settings saved for this model, and whether to leave the page out (the API only).
+    nlohmann::json load = nlohmann::json::object();
+    bool saved = false, no_web = false, threads_given = false, ctx_given = false, device_given = false;
 };
+
+const char* kUsage =
+    "usage: %s [model] [options]\n"
+    "\n"
+    "Without a model, open the page and choose one there. With a model (a .gguf file, or its name in the models\n"
+    "folder as the page lists it), tierlm loads it at once with the options below and serves the API, so it can run\n"
+    "from a console or a script with any front end connected to http://<host>:<port>/v1.\n"
+    "\n"
+    "Server\n"
+    "  --port N              port to listen on (8080)\n"
+    "  --host ADDRESS        address to listen on (127.0.0.1; 0.0.0.0: every device on your network)\n"
+    "  --api-key KEY         other devices must send this key\n"
+    "  --no-web              don't serve the chat page: the API only\n"
+    "  --models DIR          the models folder        --settings FILE   the settings file\n"
+    "  --web DIR             the folder with index.html\n"
+    "\n"
+    "Model (with a model given)\n"
+    "  --saved               start from the settings saved for this model (what the page last used, or what Find\n"
+    "                        the fastest settings found); flags given here still win\n"
+    "  -c, --ctx N           context length in tokens, per connection (4096)\n"
+    "  -t, --threads N       CPU threads\n"
+    "  -d, --device NAME     auto, cpu, gpu, or a device from tierlm-devices (CUDA0, Vulkan0)\n"
+    "  --experts MODE        where a MoE model's experts go when it doesn't fit in VRAM:\n"
+    "                          auto      tierlm decides\n"
+    "                          layers    whole layers in VRAM, the rest in RAM\n"
+    "                          ram       experts in RAM, everything else in VRAM\n"
+    "                          busiest   experts in RAM, the busiest ones in VRAM\n"
+    "                          follow    experts in RAM, the VRAM ones following the conversation\n"
+    "  --guesses N           speculative decoding with the model's draft block: N guesses ahead (0: off)\n"
+    "  --lookup N            guess from the conversation's own text: N tokens (0: off, -1: automatic)\n"
+    "  --kv BITS             context memory precision: 32, 16, 8, 5 or 4 (16)\n"
+    "  --batch N             prompt tokens read at once\n"
+    "  --connections N       replies written at once (1); each has its own context\n"
+    "  --vram-limit MIB      use at most this much VRAM\n"
+    "  --no-ssd              keep everything in RAM even when an SSD folder is set\n"
+    "  --no-flash-attn       plain attention\n"
+    "  --one-gpu             don't spread the model over several GPUs\n"
+    "  --experts-used N      experts per token (the model's own number unless given)\n"
+    "  --no-thinking         thinking off for models that can switch it off\n"
+    "  --effort LEVEL        gpt-oss reasoning effort: low, medium or high\n";
 
 std::string read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -1302,28 +1346,60 @@ bool verbose_line(const std::string& t) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    capture_stderr();
-    Args a;
+    Args a;                              // (read before the window's lines are captured, so --help and mistakes show)
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (k == "--port") a.port = std::atoi(next().c_str());
         else if (k == "--host") { a.host = next(); a.host_given = true; }
         else if (k == "--api-key") { a.api_key = next(); a.api_key_given = true; }
-        else if (k == "-d") a.device = next();
-        else if (k == "-t") a.threads = std::atoi(next().c_str());
-        else if (k == "-c") a.ctx = std::atoi(next().c_str());
+        else if (k == "-d" || k == "--device") { a.device = next(); a.device_given = true; }
+        else if (k == "-t" || k == "--threads") { a.threads = std::atoi(next().c_str()); a.threads_given = true; }
+        else if (k == "-c" || k == "--ctx") { a.ctx = std::atoi(next().c_str()); a.ctx_given = true; }
         else if (k == "--web") a.web = next();
         else if (k == "--models") { a.models = next(); a.models_given = true; }
         else if (k == "--settings") a.settings = next();
-        else if (k == "-h" || k == "--help") {
-            std::fprintf(stderr, "usage: %s [model.gguf] [--port 8080] [--host 127.0.0.1] [--api-key KEY] [-d auto|cpu|gpu|<device>] [-t threads] [-c context] [--web dir] [--models dir] [--settings file]\n"
-                                 "Without a model, the web page opens a setup screen to choose the hardware and model.\n", argv[0]);
-            return 0;
+        else if (k == "--no-web") a.no_web = true;
+        else if (k == "--saved") a.saved = true;
+        else if (k == "--experts") {
+            const std::string v = next();
+            if (v != "auto" && v != "layers" && v != "ram" && v != "busiest" && v != "follow") {
+                std::fprintf(stderr, "error: --experts is auto, layers, ram, busiest or follow\n"); return 1;
+            }
+            a.load["split_mode"] = v == "auto" || v == "layers" ? v : "experts";
+            a.load["hot_experts"] = v == "busiest" || v == "follow";
+            a.load["live_experts"] = v == "follow";
         }
+        else if (k == "--guesses") { const int n = std::atoi(next().c_str()); a.load["speculative"] = n > 0; a.load["draft_max"] = n; }
+        else if (k == "--lookup") a.load["lookup"] = std::atoi(next().c_str());
+        else if (k == "--kv") {
+            const std::string v = next();
+            const char* t = v == "32" ? "f32" : v == "16" ? "f16" : v == "8" ? "q8_0" : v == "5" ? "q5_0" : v == "4" ? "q4_0" : nullptr;
+            if (!t) { std::fprintf(stderr, "error: --kv is 32, 16, 8, 5 or 4\n"); return 1; }
+            a.load["kv_type"] = t;
+        }
+        else if (k == "--batch") a.load["batch"] = std::atoi(next().c_str());
+        else if (k == "--connections") a.load["connections"] = std::atoi(next().c_str());
+        else if (k == "--vram-limit") a.load["vram_limit_mb"] = std::atoi(next().c_str());
+        else if (k == "--no-ssd") a.load["ssd"] = false;
+        else if (k == "--no-flash-attn") a.load["flash_attn"] = false;
+        else if (k == "--one-gpu") a.load["multi_gpu"] = false;
+        else if (k == "--experts-used") a.load["experts_used"] = std::atoi(next().c_str());
+        else if (k == "--no-thinking") a.load["thinking"] = false;
+        else if (k == "--effort") {
+            const std::string v = next();
+            if (v != "low" && v != "medium" && v != "high") { std::fprintf(stderr, "error: --effort is low, medium or high\n"); return 1; }
+            a.load["effort"] = v;
+        }
+        else if (k == "-h" || k == "--help") { std::fprintf(stderr, kUsage, argv[0]); return 0; }
+        else if (!k.empty() && k[0] == '-') { std::fprintf(stderr, "error: unknown option %s (--help lists them)\n", k.c_str()); return 1; }
         else if (a.model.empty()) a.model = k;
+        else { std::fprintf(stderr, "error: one model at a time (got %s and %s)\n", a.model.c_str(), k.c_str()); return 1; }
     }
+    if (a.model.empty() && (!a.load.empty() || a.saved))
+        std::fprintf(stderr, "note: the model options are only used with a model on the command line; choose one on the page\n");
 
+    capture_stderr();
     load_backends();                     // in release builds: the best CPU engine for this PC, and the GPU engines
     // Testing hook: TIERLM_RPC=host:port adds a tierlm-rpc-server as a stand-in GPU.
     if (const char* ep = std::getenv("TIERLM_RPC")) add_rpc_server(ep);
@@ -1609,12 +1685,6 @@ int main(int argc, char** argv) {
         if (o.parallel > 1 && o.max_ctx > 0) o.max_ctx *= o.parallel;
         return o;
     };
-    if (!a.model.empty()) {
-        LoadOptions o; o.max_ctx = a.ctx; o.device = a.device;
-        try { load(a.model, o, a.threads, -1); }
-        catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
-    }
-
     httplib::Server svr;
     // (files are never taken for scripts or styles by a browser, and another site's page can't embed tierlm's replies)
     svr.set_default_headers({{"X-Content-Type-Options", "nosniff"}, {"Cross-Origin-Resource-Policy", "same-origin"}});
@@ -1626,6 +1696,10 @@ int main(int argc, char** argv) {
     svr.set_payload_max_length((size_t)256 << 20);
 
     svr.Get("/", [&](const httplib::Request&, httplib::Response& res) {
+        if (a.no_web) {                                                    // --no-web: the API only
+            res.set_content("tierlm is running without its chat page (--no-web). The API is at /v1 on this address.\n", "text/plain; charset=utf-8");
+            return;
+        }
         std::string page = read_file(a.web + "/index.html");
         if (page.empty()) {
             res.status = 404;
@@ -1908,6 +1982,37 @@ int main(int argc, char** argv) {
         if (ec || rel.empty() || rel.begin()->string() == ".." || !std::filesystem::is_regular_file(file, ec)) return {};
         return file;
     };
+
+    // A model on the command line: loaded now, with the flags as its settings (the names /api/load takes). --saved
+    // starts from what is saved for this model, so a setup found on the page can be started from a console.
+    if (!a.model.empty()) {
+        std::error_code ec;
+        fs::path file = fs::u8path(a.model);
+        std::string id;                                                    // its name in the models folder, when it has one
+        if (!fs::is_regular_file(file, ec)) { id = a.model; file = model_file(id); }
+        else id = model_key(file.u8string());
+        // (the window's lines go through a thread: give it a moment to write the message before leaving)
+        auto fail = [](const std::string& why) { std::fprintf(stderr, "error: %s\n", why.c_str()); std::this_thread::sleep_for(std::chrono::milliseconds(300)); return 1; };
+        if (file.empty()) return fail(a.model + " is not a file, and not a model in the models folder (" + a.models + ")");
+        json body = json::object();
+        if (a.saved) {
+            std::lock_guard<std::recursive_mutex> sl(settings_mu);
+            if (settings.contains("models") && settings["models"].contains(id) && settings["models"][id].is_object()) body = settings["models"][id];
+            else std::fprintf(stderr, "note: no settings are saved for %s yet; using the defaults and the flags given\n", id.c_str());
+        }
+        for (auto it = a.load.begin(); it != a.load.end(); ++it) body[it.key()] = it.value();
+        if (a.ctx_given || !body.contains("ctx")) body["ctx"] = a.ctx;
+        if (a.device_given || !body.contains("device")) body["device"] = a.device;
+        const int threads = a.threads_given || !body.contains("threads") ? a.threads : body.value("threads", a.threads);
+        try {
+            const LoadOptions o = load_options(body);
+            eng.draft_max = std::min(8, std::max(0, body.value("draft_max", 0)));
+            eng.lookup = std::max(-1, std::min(16, body.value("lookup", -1)));
+            load(file.u8string(), o, threads, body.value("seed", -1), body.value("hot_experts", false));
+            if (body.contains("thinking") && body["thinking"].is_boolean()) eng.thinking = body["thinking"].get<bool>();
+            if (body.contains("effort") && body["effort"].is_string()) eng.effort = body["effort"].get<std::string>();
+        } catch (const std::exception& e) { return fail(e.what()); }
+    }
 
     svr.Post("/api/load", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
@@ -4744,6 +4849,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (a.no_web)
+        std::fprintf(stderr, "\n  tierlm is ready (no chat page: --no-web)\n  %s\n  OpenAI-compatible API: http://127.0.0.1:%d/v1\n"
+                             "  Also: /v1/messages (Anthropic) and /v1/responses (OpenAI Responses)\n  (Ctrl+C to stop)\n\n",
+                     eng.model ? "" : "No model loaded: give one on the command line (--help), or load one with POST /api/load.", a.port);
+    else
     std::fprintf(stderr, "\n  tierlm is ready: open http://127.0.0.1:%d in your browser\n  %s\n  OpenAI-compatible API: http://127.0.0.1:%d/v1\n  (Ctrl+C to stop)\n\n",
                  a.port, eng.model ? "" : "No model loaded yet: the page will show the setup screen.", a.port);
     for (;;) {

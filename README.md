@@ -546,6 +546,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Reading images (Qwen3.5 / 3.6 vision), so screenshots and scanned documents can be read
 - [ ] Speech to text
 - [ ] The busiest experts in VRAM across two different GPUs (a fast card and a slower one each doing what suits it)
+- [x] Console start: the model and all its load settings as flags (`tierlm-server model.gguf --ctx 32768 --experts follow --guesses 2 --no-web`), `--saved` for the settings found on the page, for use with your own front end
 - [ ] Flint 40B-A2.5B: tokenizer and chat format (the model itself is in and checked)
 - [ ] Nemotron 3.5 (Mamba-2, LatentMoE): the model math is in and checked on a tiny test model; next the real files, experts in VRAM by use, and the Mamba scan on the GPU
 - [x] gpt-oss: the busiest experts in VRAM, and VRAM experts following the conversation (the experts' biases kept whole beside the split weights)
