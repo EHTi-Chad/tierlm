@@ -10,9 +10,23 @@ in [docs/GGML_CHANGES.md](docs/GGML_CHANGES.md); the tokenizers, model graphs, K
 encoder, server and web page are all tierlm's own. It does not use llama.cpp.
 
 It runs **Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8 dense and MoE, Qwen3-Next,
-gpt-oss and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
+gpt-oss, NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
-serves your other apps.
+serves your other apps, also with no page or browser at all: start it from the console.
+
+### New in 0.8.8: run it from the console, gpt-oss-120b twice as fast, Nemotron 3.5
+
+| Measured on one RTX 5090 (32 GB) with 64 GB of RAM | before | **0.8.8** |
+|---|---|---|
+| gpt-oss-120b MXFP4 (59 GiB), 32K context: a 1,200-token C program | 45 tok/s (experts in RAM) | **83-86 tok/s** (its busiest experts in VRAM) |
+| Qwen3.8 Flash-Next UD-IQ3_XXS (77.9 GiB), started from `start-tierlm-console.bat`: a 3,000-token C# program | 94.8 tok/s (0.8.7, a 9,199-token reply in the app's chat) | **113-121 tok/s** |
+| NVIDIA Nemotron 3.5 Bolt 74B-A9B (22 GB file), all in VRAM | not supported | **137-147 tok/s**; 74-84 with 12 GB of VRAM used and its experts in RAM |
+| Open WebUI, a new chat: tokens sent before your first word | 16,525 (its built-in tools) | **14** with them left out; tierlm now says so in the app |
+
+**No browser needed**: put your model and its settings at the top of `start-tierlm-console.bat` and double-click
+it, or give them as flags (`tierlm-server.exe model.gguf --ctx 65536 --experts follow --guesses 4 --no-web`).
+tierlm loads the model and serves the API for Open WebUI, SillyTavern or a coding agent; `--saved` starts from what
+Find the fastest settings found on the page. The guide, with this step by step: **[docs/CONSOLE.md](docs/CONSOLE.md)**.
 
 ### New in 0.8.7: the same PC, the same models, much faster
 
@@ -34,13 +48,13 @@ the GPU to read a short prompt, and saves a conversation's opening on the SSD. R
 
 | | |
 |---|---|
-| **Guesses ahead** | Qwen3.8 Flash-Next UD-IQ3_XXS (77.9 GiB) at **94.8 tok/s** on one RTX 5090 with its own draft file, writing a 9,199-token program ([details below](#spotlight-qwen38-flash-next-on-one-rtx-5090)) |
+| **Guesses ahead** | Qwen3.8 Flash-Next UD-IQ3_XXS (77.9 GiB) at **113-121 tok/s** on one RTX 5090 with its own draft file, started from the console ([step by step](docs/CONSOLE.md#step-by-step-qwen38-flash-next-on-one-rtx-5090)) |
 | **Bigger than your RAM** | Qwen3.8 Flash-Next (120 GB) at **80.3 tok/s** on one RTX 5090 (32 GB) with 64 GB of RAM: the SSD tier reads the rarely used parts from an NVMe drive as each word needs them |
-| **Bigger than your GPU** | gpt-oss-120b (59 GB) at **44.1 tok/s** on one RTX 5090 (32 GB); Qwen3-Coder-Next 80B at **63.8 tok/s** on the same card; Qwen3.6-35B-A3B (17 GB) at **44 tok/s** on an 8 GB laptop RTX 3070 |
+| **Bigger than your GPU** | gpt-oss-120b (59 GB) at **83-86 tok/s** on one RTX 5090 (32 GB); Qwen3-Coder-Next 80B at **63.8 tok/s** on the same card; Qwen3.6-35B-A3B (17 GB) at **44 tok/s** on an 8 GB laptop RTX 3070 |
 | **Reads images** | screenshots, photos, scanned and handwritten pages, with Qwen3.5 / 3.6: a 4K screenshot read in **0.65 s** on an RTX 5090, a full-screen one in **2.7 s** on the laptop |
 | **Works on your projects** | the model lists, reads and searches a folder and proposes changes you see side by side and approve, one by one; each chat keeps its own folder |
 | **Never hits a wall** | chats are saved as readable files; when a conversation fills the context, the oldest messages are archived and looked back at when they matter |
-| **Serves your apps** | OpenAI-compatible API with tool calling and images, an embedding model alongside, a queue, and several replies at once: **4 at once, 364 tok/s in all** on one RTX 5090 |
+| **Serves your apps** | from the page or the console, no browser needed; OpenAI-compatible API with tool calling and images, an embedding model alongside, a queue, and several replies at once: **4 at once, 364 tok/s in all** on one RTX 5090 |
 | **Tunes itself** | Find the fastest settings measures your PC (split, threads, guessing, connections) and keeps the fastest |
 
 ### Spotlight: Qwen3.8 Flash-Next on one RTX 5090
@@ -252,7 +266,8 @@ The best results so far, each measured in a normal chat unless noted (details be
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3-Coder-Next 80B-A3B Q4_K_M (45 GB) | GPU + RAM, busiest experts in VRAM | **63.8 tok/s** (Find the fastest settings) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.8 Flash-Next UD-IQ3_XXS (77.9 GiB) with its MTP draft file | GPU + RAM + SSD, VRAM experts following the conversation, 4 guesses | **94.8 tok/s** (0.8.7) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.8 Flash-Next Q4_K_M (120 GB) with its MTP draft file | GPU + RAM + SSD, VRAM experts following the conversation, 2 guesses | **80.3 tok/s**; 88.8 in Find the fastest settings (0.8.7) |
-| RTX 5090 (32 GB), 64 GB RAM | gpt-oss-120b (59 GB) | GPU + RAM, experts in RAM | **44.1 tok/s** at 32K context; 47.5 in Find the fastest settings (0.8.7) |
+| RTX 5090 (32 GB), 64 GB RAM | gpt-oss-120b (59 GB) | GPU + RAM, the busiest experts in VRAM | **83-86 tok/s** at 32K context (0.8.8; 45 with its experts in RAM) |
+| RTX 5090 (32 GB), 64 GB RAM | NVIDIA Nemotron 3.5 Bolt 74B-A9B (22 GB) | GPU | **137-147 tok/s** (0.8.8) |
 | RTX 5080 (16 GB), 32 GB RAM | Qwen3.6-35B-A3B Q6_K (27 GB) | GPU + RAM, experts in RAM | **65.2 tok/s** (Find the fastest settings) |
 | RTX 3070 Laptop (8 GB), 32 GB RAM | Qwen3.5-9B | GPU (a sliver in RAM) | **59 tok/s**; a full-screen screenshot read in **2.7 s** |
 | RTX 3070 Laptop (8 GB), 32 GB RAM | Qwen3.6-35B-A3B UD-Q3_K_XL (17 GB) | GPU + RAM, VRAM experts following the conversation, speculative decoding | **44.0 tok/s** across code, contract law, science and a story (0.8.7) |
@@ -261,7 +276,7 @@ The best results so far, each measured in a normal chat unless noted (details be
 DDR5-6000, Windows 11, tierlm 0.7.0. gpt-oss-120b MXFP4 (2 files, 59.0 GiB), 64K context, CUDA:
 attention, routers and the context in VRAM (25.0 GiB of the model), the experts that don't fit in RAM (34.0 GiB),
 computed by the CPU. No second GPU. On 0.8.7 at 32K context the same file wrote a 5,218-token C program at
-**44.1 tok/s** (47.5 in Find the fastest settings); the table and pictures below are 0.7.0.
+**44.1 tok/s** (47.5 in Find the fastest settings); on 0.8.8, with its busiest experts in VRAM, **83-86 tok/s**. The table and pictures below are 0.7.0.
 
 | | Speed |
 |---|---|
