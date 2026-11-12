@@ -2845,13 +2845,15 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
                 ggml_tensor* dtb = ggml_add(c, rows(MH, DI + CC), L.ssm_dt);     // [MH, n]: before the softplus
                 ggml_tensor* y = nullptr;
                 std::vector<ggml_tensor*> back;                                   // the state as it was d tokens back (d >= 1)
-                // A reply's steps and checks of a few guesses, with the state in VRAM: the recurrence written out
-                // with ordinary operations, token by token, so the whole block stays on the GPU. (ggml's scan is a
-                // CPU kernel; used here it would mean a trip to the CPU and back in every Mamba block for every
-                // token.) Prompts take the scan: one trip per block for the whole batch.
+                // ggml's scan runs on the CPU and on CUDA (where it also keeps the undo points of a check of guesses:
+                // 139 tok/s on an RTX 5090 against 114 written out). Vulkan's scan doesn't keep undo points, so on a
+                // GPU other than CUDA a check of guesses has the recurrence written out with ordinary operations,
+                // token by token, which keeps the states between the tokens.
                 static const int unroll_env = [] { const char* e = std::getenv("TIERLM_MAMBA_UNROLL"); return e ? std::atoi(e) : -1; }();
-                const bool unroll = unroll_env >= 0 ? n <= unroll_env
-                                  : n <= 8 && li < (int)layer_dev_.size() && layer_dev_[li] >= 0;
+                const int dev = li < (int)layer_dev_.size() ? layer_dev_[li] : -1;
+                const bool cuda_dev = dev >= 0 && dev < (int)gpus_.size() &&
+                                      std::strncmp(ggml_backend_dev_name(ggml_backend_get_device(gpus_[dev])), "CUDA", 4) == 0;
+                const bool unroll = unroll_env >= 0 ? n <= unroll_env : snapshots > 1 && dev >= 0 && !cuda_dev;
                 if (unroll) {
                     const int R = MH / MG;
                     ggml_tensor* dts = ggml_softplus(c, dtb);                                           // [MH, n]

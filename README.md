@@ -444,7 +444,7 @@ Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-Min
 Images: Qwen3.5 / 3.6 with their `mmproj` vision file (`qwen3vl_merger`), checked against Hugging Face's code and
 tested with Qwen3.5-9B (RTX 3070 laptop) and Qwen3.6-35B-A3B (RTX 5090).
 
-Not yet: Gemma, Phi, DeepSeek V4 and others. Nemotron 3.5 (Mamba-2 and LatentMoE) is in the source and checked on a tiny test model, not yet on the real files or in a release. The setup screen says which
+Not yet: Gemma, Phi, DeepSeek V4 and others. Nemotron 3.5 (Mamba-2 and LatentMoE) is in the source, checked on a tiny test model and running on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s); not yet in a release. The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
 
 ## Build from source (Windows)
@@ -548,7 +548,7 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [ ] The busiest experts in VRAM across two different GPUs (a fast card and a slower one each doing what suits it)
 - [x] Console start: the model and all its load settings as flags (`tierlm-server model.gguf --ctx 32768 --experts follow --guesses 2 --no-web`), `--saved` for the settings found on the page, for use with your own front end
 - [ ] Flint 40B-A2.5B: tokenizer and chat format (the model itself is in and checked)
-- [ ] Nemotron 3.5 (Mamba-2, LatentMoE): the model math is in and checked on a tiny test model; next the real files, experts in VRAM by use, and the Mamba scan on the GPU
+- [ ] Nemotron 3.5 (Mamba-2, LatentMoE): runs on the real Bolt file on an RTX 5090; next smaller cards (experts in RAM, and in VRAM by use) and images
 - [x] gpt-oss: the busiest experts in VRAM, and VRAM experts following the conversation (the experts' biases kept whole beside the split weights)
 
 ## Credits and licence

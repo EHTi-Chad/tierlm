@@ -324,14 +324,18 @@ once, and guesses partly undone), also split between a stand-in GPU and RAM, and
 llama.cpp. The tokenizer's word splitting (Mistral's Tekken) is checked against Hugging Face's `tokenizers`.
 
 Not yet: experts in VRAM by use (the blocks' uneven expert counts need the split to work per block; whole expert
-layers go to VRAM or RAM instead), images, and a check against the real files.
+layers go to VRAM or RAM instead), images, and the real files on smaller cards.
 
-**The Mamba state on the GPU.** ggml's Mamba scan is a CPU kernel (there is none for CUDA), so used as is, every
-Mamba block of every token would stop the GPU, copy to the CPU and come back: 40 times a token for Bolt. For a
-reply's steps and checks of a few guesses (up to 8 tokens) with the state in VRAM, tierlm writes the recurrence
-out with operations every backend has (softplus, exp, multiply, add, sum), token by token, so the block never
-leaves the GPU; the states between the tokens are the undo points. Prompts take the scan: one trip per block for
-the whole batch. Both give the same numbers (the test runs both). `TIERLM_MAMBA_UNROLL=0` always uses the scan.
+First run on the real file (Bolt 74B-A9B, 22 GB file, RTX 5090, the whole model in VRAM, 16K context): replies
+at 137-147 tok/s, a 3,286-token prompt read at 2,400-2,900 tok/s; answers right with thinking on and off, and a
+correct tool call.
+
+**The Mamba state on the GPU.** ggml's Mamba scan runs on CUDA, and on CUDA it also keeps the state as it was 1, 2,
+... tokens back, the undo points of a check of guesses. Vulkan's scan doesn't keep them, so on a GPU other than
+CUDA a check of guesses has the recurrence written out with operations every backend has (softplus, exp, multiply,
+add, sum), token by token, keeping the states between the tokens. Both give the same numbers (the test runs both);
+on CUDA the scan is faster (139 against 114 tok/s on an RTX 5090). `TIERLM_MAMBA_UNROLL=N` writes it out for
+batches of up to N tokens anywhere, `TIERLM_MAMBA_UNROLL=0` never.
 
 ## Speculative decoding
 
