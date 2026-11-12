@@ -698,9 +698,10 @@
       <div class="help hostonly">When set, apps must send it as their API key, and the tierlm page asks for it on other devices. Needed if you
         open tierlm to the internet through a tunnel (Cursor works that way).</div>
       <div class="caption" id="netmsg"></div>
-      <label class="chk hostonly" style="margin-top:12px"><input type="checkbox" id="apitrim"> When an app's conversation is too long, drop its oldest messages</label>
-      <div class="help hostonly">Off (the default): the app gets an error and can shorten the conversation itself, as coding agents such as
-        opencode do. On: tierlm leaves out the oldest messages so the rest fits, like LM Studio's "truncate" option.</div>
+      <label class="chk hostonly" style="margin-top:12px"><input type="checkbox" id="apitrim"> Make apps' conversations fit the context</label>
+      <div class="help hostonly">On (the default): when an app sends more than the context holds, tierlm shortens the long parts of earlier
+        messages (a file a tool wrote, a tool's long result), keeping their start and end, and if that isn't enough leaves out the
+        oldest messages. Off: the app gets an error and can shorten the conversation itself, as some coding agents do.</div>
       <div id="appsetup" hidden>
         <h3 class="setuph">Set up an app</h3>
         <div class="help">Ready-made settings for the loaded model: its name, context length, tool calling and this address.

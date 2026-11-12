@@ -632,6 +632,8 @@ Clears the KV cache. Returns `{"ok": true}`.
 ### POST /api/network
 
 `{"allow_network": true}` and/or `{"api_key": "generate"}` (a new random key), `{"api_key": "my-key"}` or
-`{"api_key": ""}` (no key), and/or `{"api_trim_oldest": true}`: when an app's conversation is too long for the
-context, leave out its oldest messages instead of returning an error (off by default: coding agents shorten their
-conversations themselves when told). Only accepted from this computer. Returns the same as `GET /api/network`.
+`{"api_key": ""}` (no key), and/or `{"api_trim_oldest": false}`: when an app's conversation is too long for the
+context, return an error instead of making it fit. On by default since 0.8.8: tierlm first shortens the long parts of
+earlier messages (a file written into a tool call, a long tool result, an earlier reply), keeping their start and end
+with a note of how much was left out, and only then leaves out the oldest messages; the system message and the last
+message stay whole. Off: the app gets an error, for coding agents that compact their conversations themselves. Only accepted from this computer. Returns the same as `GET /api/network`.

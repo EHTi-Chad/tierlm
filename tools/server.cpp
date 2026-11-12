@@ -1507,6 +1507,8 @@ int main(int argc, char** argv) {
     std::recursive_mutex settings_mu;
     auto sget = [&](const char* k) { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value(k, std::string()); };
     auto sflag = [&](const char* k) { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value(k, false); };
+    // Apps' conversations longer than the context are made to fit unless switched off (on by default since 0.8.8)
+    auto api_fit = [&] { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value("api_trim_oldest", true); };
     // Openings saved on the drive (prompt_cache.h): tierlm-cache next to the settings file, up to prompt_cache_gb
     // (settings; default 8, 0 turns it off). TIERLM_PROMPT_CACHE_GB / TIERLM_PROMPT_CACHE_MIN (tokens) override.
     {
@@ -2809,6 +2811,55 @@ int main(int argc, char** argv) {
         return (int)k;
     };
 
+    // Makes an app's conversation fit the context, for apps that send more than fits (Open WebUI's built-in tools
+    // write a whole file into a tool call, then read and show it again, all in one turn). First the long parts of
+    // earlier messages are shortened, keeping their start and end: tool results, the text in the model's tool calls,
+    // earlier replies; the system message and the last message stay whole. Then, if still needed, the oldest
+    // messages are dropped. Returns what was done, for the log ("" when it already fit or nothing helped).
+    auto fit_messages = [&](json& messages, const agent::ojson& tools, int budget) -> std::string {
+        if (prompt_tokens(messages, tools) <= budget) return "";
+        auto cut = [](std::string& t, size_t keep) {                     // keep the start and the end, mark the middle
+            if (t.size() <= keep + 64) return false;
+            size_t a = keep * 2 / 3, b = t.size() - (keep - a);
+            while (a > 0 && (t[a] & 0xC0) == 0x80) --a;                   // (not inside a UTF-8 character)
+            while (b < t.size() && (t[b] & 0xC0) == 0x80) ++b;
+            t = t.substr(0, a) + "\n[... " + std::to_string(b - a) + " characters left out to fit the context ...]\n" + t.substr(b);
+            return true;
+        };
+        int shortened = 0;
+        for (size_t keep : {6000u, 2000u, 600u}) {
+            bool any = false;
+            for (size_t i = 0; i + 1 < messages.size(); ++i) {
+                json& m = messages[i];
+                const std::string role = m.value("role", std::string());
+                if (role == "system") continue;
+                if (m.contains("content") && m["content"].is_string()) {
+                    std::string t = m["content"].get<std::string>();
+                    if (cut(t, keep)) { m["content"] = t; any = true; ++shortened; }
+                }
+                if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array())
+                    for (auto& c : m["tool_calls"]) {
+                        if (!c.contains("function") || !c["function"].contains("arguments") || !c["function"]["arguments"].is_string()) continue;
+                        json args = json::parse(c["function"]["arguments"].get<std::string>(), nullptr, false);
+                        if (!args.is_object()) continue;
+                        bool changed = false;
+                        for (auto it = args.begin(); it != args.end(); ++it)   // (the arguments stay valid JSON)
+                            if (it.value().is_string()) {
+                                std::string t = it.value().get<std::string>();
+                                if (cut(t, keep)) { it.value() = t; changed = true; }
+                            }
+                        if (changed) { c["function"]["arguments"] = args.dump(); any = true; ++shortened; }
+                    }
+            }
+            if (any && prompt_tokens(messages, tools) <= budget)
+                return "shortened " + std::to_string(shortened) + " long parts of earlier messages";
+        }
+        const int n = drop_oldest(messages, tools, budget);
+        std::string what = shortened ? "shortened " + std::to_string(shortened) + " long parts of earlier messages" : "";
+        if (n > 0) what += (what.empty() ? "" : " and ") + std::string("left out the ") + std::to_string(n) + " oldest messages";
+        return what;
+    };
+
     svr.Post("/api/chat", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array()) {
@@ -3795,15 +3846,15 @@ int main(int argc, char** argv) {
             return out;
         };
 
-        // Too long for the context: with "Drop the oldest messages" on (API panel, "api_trim_oldest"), the oldest
-        // messages are left out (down to about 60% of the context); otherwise the app gets an error and can compact
-        // the conversation itself, as coding agents do.
-        if (sflag("api_trim_oldest") && eng.model) {
+        // Too long for the context: made to fit (fit_messages) unless the app asked for the error ("Make long
+        // conversations fit" off in the API panel, "api_trim_oldest": false), as some coding agents prefer, to compact
+        // the conversation themselves.
+        if (api_fit() && eng.model) {
             const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
             const int reserve = max_tokens > 0 ? std::min(max_tokens, ctx / 2) : std::max(256, ctx / 8);
             if (prompt_tokens(messages, tools) > ctx - reserve) {
-                const int n = drop_oldest(messages, tools, std::min(ctx * 6 / 10, ctx - reserve));
-                if (n > 0) std::fprintf(stderr, "api: left out the %d oldest messages to fit the context\n", n);
+                const std::string what = fit_messages(messages, tools, std::min(ctx * 6 / 10, ctx - reserve));
+                if (!what.empty()) std::fprintf(stderr, "api: the conversation was longer than the context: %s\n", what.c_str());
             }
         }
 
@@ -3923,10 +3974,13 @@ int main(int argc, char** argv) {
         const long long created = (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         static std::atomic<unsigned> counter{0};
         const std::string uid = std::to_string(created) + std::to_string(++counter);
-        if (sflag("api_trim_oldest")) {                               // (as for /v1/chat/completions)
+        if (api_fit() && eng.model) {                                 // (as for /v1/chat/completions)
             const int ctx = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
             const int reserve = rq.max_tokens > 0 ? std::min(rq.max_tokens, ctx / 2) : std::max(256, ctx / 8);
-            if (prompt_tokens(messages, tools) > ctx - reserve) drop_oldest(messages, tools, std::min(ctx * 6 / 10, ctx - reserve));
+            if (prompt_tokens(messages, tools) > ctx - reserve) {
+                const std::string what = fit_messages(messages, tools, std::min(ctx * 6 / 10, ctx - reserve));
+                if (!what.empty()) std::fprintf(stderr, "api: the conversation was longer than the context: %s\n", what.c_str());
+            }
         }
         // The finished reply in the parts both formats are made of.
         struct Parts { std::string thinking, text; json calls = json::array(); bool cut = false; size_t n_in = 0, n_out = 0; };
@@ -4246,7 +4300,7 @@ int main(int argc, char** argv) {
         if (!lan.empty()) urls.push_back({{"label", "Other devices on your network"}, {"url", "http://" + lan + ":" + std::to_string(a.port) + "/v1"}});
         json j = {{"allow_network", (bool)allow_network}, {"listening_on", bind_host()}, {"port", a.port}, {"lan_address", lan},
                   {"api_key_set", !key.empty()}, {"urls", urls}, {"fixed_by_command_line", a.host_given || a.api_key_given},
-                  {"api_trim_oldest", sflag("api_trim_oldest")}};
+                  {"api_trim_oldest", api_fit()}};
         if (show_key) j["api_key"] = key;
         return j;
     };
@@ -4262,7 +4316,7 @@ int main(int argc, char** argv) {
         const std::string before = bind_host();
         std::lock_guard<std::recursive_mutex> sl(settings_mu);
         if (body.contains("allow_network")) { allow_network = body.value("allow_network", false); settings["allow_network"] = (bool)allow_network; }
-        if (body.contains("api_trim_oldest")) settings["api_trim_oldest"] = body.value("api_trim_oldest", false);
+        if (body.contains("api_trim_oldest")) settings["api_trim_oldest"] = body.value("api_trim_oldest", true);
         if (body.contains("api_key") && !a.api_key_given) {
             std::string k = body["api_key"].is_string() ? body["api_key"].get<std::string>() : std::string();
             if (k == "generate") k = random_key();
