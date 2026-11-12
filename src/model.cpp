@@ -1335,13 +1335,27 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             auto& f = files[s.part];
             f.seekg((std::streamoff)s.offset);
             if (!f.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + paths[s.part]); }
-            std::vector<char> hb(ggml_nbytes(sp.hot), 0), cb(ggml_nbytes(sp.cold), 0);   // the last expert of each stays zero
+            // Each expert goes straight from the read buffer to its place in the VRAM part or the RAM part (no copies
+            // of the whole tensor in between: for gpt-oss-120b those took longer than reading the file). What's left
+            // after the experts (the zero expert at the end of each part) is set to zeros.
+            static std::vector<char> zeros;
+            if (zeros.size() < per) zeros.assign(per, 0);
+            auto zero_rest = [&](ggml_tensor* t, size_t from) {
+                for (size_t off = from, n_t = ggml_nbytes(t); off < n_t; off += per)
+                    ggml_backend_tensor_set(t, zeros.data(), off, std::min(per, n_t - off));
+            };
             std::vector<char> is_hot(E, 0);
-            for (int k = 0; k < (int)hl.ids.size(); ++k) { std::memcpy(hb.data() + (size_t)k * per, chunk.data() + (size_t)hl.ids[k] * per, per); is_hot[hl.ids[k]] = 1; }
-            for (int e = 0, ci = 0; e < E; ++e)
-                if (!is_hot[e]) std::memcpy(cb.data() + (size_t)ci++ * per, chunk.data() + (size_t)e * per, per);
-            ggml_backend_tensor_set(sp.hot, hb.data(), 0, hb.size());
-            if (!hl.cold_mapped) ggml_backend_tensor_set(sp.cold, cb.data(), 0, cb.size());   // (mapped: the file is it)
+            for (int k = 0; k < (int)hl.ids.size(); ++k) {
+                ggml_backend_tensor_set(sp.hot, chunk.data() + (size_t)hl.ids[k] * per, (size_t)k * per, per);
+                is_hot[hl.ids[k]] = 1;
+            }
+            zero_rest(sp.hot, hl.ids.size() * per);
+            if (!hl.cold_mapped) {                                             // (mapped: the file is it)
+                size_t ci = 0;
+                for (int e = 0; e < E; ++e)
+                    if (!is_hot[e]) ggml_backend_tensor_set(sp.cold, chunk.data() + (size_t)e * per, ci++ * per, per);
+                zero_rest(sp.cold, ci * per);
+            }
             report(total_bytes ? (float)((double)done_bytes / total_bytes) : 1.0f);
             continue;
         }
