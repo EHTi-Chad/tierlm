@@ -138,7 +138,10 @@ places, each checked against a NumPy reference written from Hugging Face's `mode
   they are small (about 4 MB a layer for gpt-oss-120b), so the RAM part uses the file's and the VRAM part a whole
   copy, both looked up by the router's own picks. A pick that lives in the other part gets its bias on top of the
   zero expert's zeros and then a weight of 0, so the sum is the same as unsplit (the tests compare both with the
-  reference at several splits).
+  reference at several splits). On an RTX 5090 with 64 GB of RAM at 32K context, gpt-oss-120b (MXFP4)
+  writes 83-86 tok/s with the busiest experts in VRAM (2,043 of 4,608, doing 86-87% of the expert work) and 82
+  following the conversation, against 45 with its experts in RAM. Loading it this way takes about 3 minutes
+  instead of 74 s (to look at).
 
 Not yet for gpt-oss: a shorter KV cache for the sliding-window layers.
 
