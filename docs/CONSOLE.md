@@ -36,7 +36,7 @@ The batch file's settings:
 | `SAVED` | `yes`: start from the settings saved for this model on the page (see below); the other lines still win where filled in |
 | `CTX` | context length in tokens, per connection (`32768` = 32K); empty with `SAVED=yes` keeps the saved one |
 | `OPTIONS` | any other options from the table below, e.g. `--experts follow --guesses 2 --threads 6` |
-| `HOST` | `127.0.0.1`: this computer only; `0.0.0.0`: other devices on your network too |
+| `HOST` | empty: as set on the page (**Allow other devices** in the Connect other apps card); `127.0.0.1`: this computer only; `0.0.0.0`: other devices on your network too |
 | `PORT` | the port (8040) |
 | `KEY` | an API key other devices must send; empty: none |
 

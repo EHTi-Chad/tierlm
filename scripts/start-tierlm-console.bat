@@ -20,8 +20,9 @@ set "CTX=32768"
 rem ---- Any other options, e.g. --experts follow --guesses 2 --threads 6 --kv 8 (see docs\CONSOLE.md)
 set "OPTIONS="
 
-rem ---- Where to listen: 127.0.0.1 (this computer only) or 0.0.0.0 (other devices on your network too), and the port
-set "HOST=127.0.0.1"
+rem ---- Where to listen: empty (as set on the page: Allow other devices), 127.0.0.1 (this computer only) or 0.0.0.0
+rem      (other devices on your network too); and the port
+set "HOST="
 set "PORT=8040"
 
 rem ---- A key other devices must send (empty: none). Set one when HOST is 0.0.0.0, unless the network is yours alone.
@@ -36,14 +37,15 @@ if /i "%MODEL%"=="C:\path\to\your-model.gguf" (
   pause
   exit /b 1
 )
-set "ARGS=--no-web --host %HOST% --port %PORT%"
+set "ARGS=--no-web --port %PORT%"
+if not "%HOST%"=="" set "ARGS=%ARGS% --host %HOST%"
 if /i "%SAVED%"=="yes" set "ARGS=%ARGS% --saved"
 if not "%CTX%"=="" set "ARGS=%ARGS% --ctx %CTX%"
 if not "%KEY%"=="" set "ARGS=%ARGS% --api-key %KEY%"
 echo.
 echo  Starting tierlm with %MODEL%
 echo  When it says it's ready, point your app at http://127.0.0.1:%PORT%/v1
-if /i "%HOST%"=="0.0.0.0" echo  ^(from another device: this PC's network address instead of 127.0.0.1; tierlm prints it^)
+echo  ^(from another device: this PC's network address, which tierlm prints when other devices may connect^)
 echo.
 tierlm-server.exe "%MODEL%" %ARGS% %OPTIONS%
 echo.
