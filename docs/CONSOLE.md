@@ -29,7 +29,7 @@ Close the window (or press Ctrl+C in it) to stop tierlm. Opening `http://127.0.0
 page saying tierlm is running and what to put in your app; that's also how to check from another device that it
 can reach tierlm.
 
-The batch file's settings:
+All the settings are together at the top of the file, each explained, with ready-made examples for common setups under them (see also [Which setup do you want?](#which-setup-do-you-want)). The settings:
 
 | Line | What it is |
 |---|---|
