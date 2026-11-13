@@ -25,9 +25,9 @@ rem      (other devices on your network too); and the port
 set "HOST="
 set "PORT=8040"
 
-rem ---- The chat page for other devices: yes (they open this PC's address in their browser and chat there) or no (the
-rem      API only). No browser opens on this PC either way.
-set "PAGE=no"
+rem ---- The chat page, for whoever opens this PC's address in a browser: yes (other devices can chat on it; it costs
+rem      this PC nothing until someone opens it) or no (the API only). No browser opens on this PC either way.
+set "PAGE=yes"
 
 rem ---- A key other devices must send (empty: none). Set one when HOST is 0.0.0.0, unless the network is yours alone.
 set "KEY="

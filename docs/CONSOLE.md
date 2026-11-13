@@ -38,7 +38,7 @@ The batch file's settings:
 | `OPTIONS` | any other options from the table below, e.g. `--experts follow --guesses 2 --threads 6` |
 | `HOST` | empty: as set on the page (**Allow other devices** in the Connect other apps card); `127.0.0.1`: this computer only; `0.0.0.0`: other devices on your network too |
 | `PORT` | the port (8040) |
-| `PAGE` | `no` (default): the API only; `yes`: other devices can also open this PC's address in their browser and chat on tierlm's page (no browser opens on this PC either way) |
+| `PAGE` | `yes` (default): whoever opens this PC's address in a browser gets tierlm's chat page (it costs this PC nothing until then); `no`: the API only. No browser opens on this PC either way |
 | `KEY` | an API key other devices must send; empty: none |
 
 Or skip the batch file and run `tierlm-server.exe` in a console yourself (Command Prompt or PowerShell, in the
