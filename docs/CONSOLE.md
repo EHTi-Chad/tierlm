@@ -7,6 +7,7 @@ of MB of RAM; on a PC where every GB goes to the model, that's worth having back
 
 - [Quick start: the batch file](#quick-start-the-batch-file)
 - [Step by step: Qwen3.8 Flash-Next on one RTX 5090](#step-by-step-qwen38-flash-next-on-one-rtx-5090)
+- [Which setup do you want?](#which-setup-do-you-want)
 - [Every option](#every-option)
 - [Tune once on the page, then start from the console](#tune-once-on-the-page-then-start-from-the-console)
 - [Recipes](#recipes)
@@ -97,6 +98,63 @@ reply: VRAM experts did 93% of this reply's expert work
 ```
 
 **113 to 121 tokens per second** from a 78 GB model, on one consumer card, with no browser open.
+
+## Which setup do you want?
+
+Four common ways to run tierlm from the console, and the lines to set in `start-tierlm-console.bat` for each. In
+all four, no browser opens on the PC running tierlm: what a browser would take in RAM goes to the model.
+
+**1. Just this PC, with your own app on it** (Open WebUI Desktop, opencode, a script, on the same PC)
+
+```
+set "HOST=127.0.0.1"
+set "PAGE=no"
+```
+
+Point the app at `http://127.0.0.1:8040/v1`. Nothing is reachable from other devices.
+
+**2. This PC as the AI server, others chat in their browser** (a desktop or workstation serving laptops)
+
+```
+set "HOST=0.0.0.0"
+set "PAGE=yes"
+set "KEY=choose-a-long-key"
+```
+
+1. Start it. Under **tierlm is ready** it prints the address for other devices, e.g.
+   `Other devices can connect: http://192.168.1.50:8040`. Windows may ask about the firewall: allow it on
+   **Private networks**.
+2. On another PC, open that address in a browser: tierlm's chat page, with the model already loaded.
+3. The page asks for the key the first time.
+
+The page costs the server nothing until someone opens it; the browser runs on their PC.
+
+**3. This PC as the AI server, others use their own apps** (Open WebUI, opencode, SillyTavern, on their PCs)
+
+```
+set "HOST=0.0.0.0"
+set "PAGE=no"
+set "KEY=choose-a-long-key"
+```
+
+In each app: an **OpenAI-compatible** connection with the base URL `http://<the address it prints>/v1` and the key.
+To check a PC can reach tierlm, open `http://<the address>/v1` in its browser: it says "tierlm is running".
+See [Connecting your front end](#connecting-your-front-end) for Open WebUI's settings.
+
+**4. Both: the chat page for some, their own apps for others**
+
+```
+set "HOST=0.0.0.0"
+set "PAGE=yes"
+set "KEY=choose-a-long-key"
+```
+
+The page and the API are on the same address and port. Several people at once: add `--connections 2` (or more)
+to `OPTIONS`; each connection has its own context of `CTX` tokens, so the memory for context grows with it.
+
+**Leave `HOST` empty** to use what you set on the page (**Allow other devices** in the **Connect other apps**
+card): that's handy when you set up the network once on the page and then only start from the console. A key is
+optional on a network that's yours alone, but anyone on the network can use the PC's GPU while it's open.
 
 ## Every option
 
