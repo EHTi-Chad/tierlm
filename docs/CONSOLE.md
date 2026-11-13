@@ -6,6 +6,7 @@ front end you already use (Open WebUI, SillyTavern, a coding agent, your own scr
 of MB of RAM; on a PC where every GB goes to the model, that's worth having back.
 
 - [Quick start: the batch file](#quick-start-the-batch-file)
+- [Straight from the command line, Windows or Linux](#straight-from-the-command-line-windows-or-linux)
 - [Step by step: Qwen3.8 Flash-Next on one RTX 5090](#step-by-step-qwen38-flash-next-on-one-rtx-5090)
 - [Which setup do you want?](#which-setup-do-you-want)
 - [Every option](#every-option)
@@ -48,6 +49,57 @@ tierlm folder):
 ```
 tierlm-server.exe C:\models\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf --ctx 32768 --experts follow --guesses 2 --no-web
 ```
+
+## Straight from the command line, Windows or Linux
+
+No batch file needed: `tierlm-server` takes the model and every setting as arguments, the same on both systems,
+so it fits in your own scripts, services and terminals. `tierlm-server --help` lists every option.
+
+Windows (PowerShell or Command Prompt, in the tierlm folder):
+
+```
+.\tierlm-server.exe C:\models\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf --ctx 32768 --experts follow --guesses 2 --threads 6 --no-web
+```
+
+Linux (built from source, see the README):
+
+```bash
+./build/tierlm-server ~/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf --ctx 32768 --experts follow --guesses 2 --threads 6 --no-web
+```
+
+Things a script can count on:
+
+- **One model, loaded at start.** tierlm loads it before it starts listening; a model that can't be loaded, or
+  an option it doesn't know, is said on the error output and tierlm exits with code 1.
+- **Ready when `/v1` answers.** `GET /v1` returns `{"object":"status","running":true,...}` once tierlm is up, without
+  the API key, so a script can wait for it:
+  `until curl -sf http://127.0.0.1:8040/v1 >/dev/null; do sleep 1; done` (Linux), or the same loop with
+  `curl.exe` on Windows.
+- **The log is the error output**, one timestamped line per event (load, each prompt and reply with its speed):
+  `2> tierlm.log` to keep it.
+- **Starting from the command line never changes the saved settings**; `--saved` reads them.
+- **`--host 0.0.0.0`** serves other devices; give `--api-key` with it. Leave out `--no-web` to serve the chat page
+  to them too: no browser opens on the machine running tierlm either way.
+
+As a Linux service, with systemd (`/etc/systemd/system/tierlm.service`, then
+`sudo systemctl enable --now tierlm`):
+
+```ini
+[Unit]
+Description=tierlm
+After=network-online.target
+
+[Service]
+User=you
+WorkingDirectory=/home/you/tierlm
+ExecStart=/home/you/tierlm/build/tierlm-server /home/you/models/model.gguf --saved --ctx 32768 --host 0.0.0.0 --port 8040 --api-key choose-a-long-key
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+(Anyone who can read the unit file can read the key in it; keep it to an account that only runs tierlm.)
 
 ## Step by step: Qwen3.8 Flash-Next on one RTX 5090
 

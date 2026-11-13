@@ -222,6 +222,9 @@ Choose a folder for a chat (**+** → **Work in a folder…**, or Settings) and 
 
 ### Serving other apps
 
+- **From the command line, no page or browser**: `tierlm-server model.gguf --ctx 32768 --experts follow --guesses 2
+  --no-web` on Windows or Linux, every load setting a flag, `--saved` for what the page found, or the
+  `start-tierlm-console.bat` file with ready-made setups ([docs/CONSOLE.md](docs/CONSOLE.md)).
 - **OpenAI-compatible API** (`/v1/models`, `/v1/chat/completions` streamed or not, with **tool calling** and
   **images**, `/v1/embeddings`): Open WebUI, Continue, LibreChat, opencode, Cline and anything built on the
   OpenAI SDK can use tierlm. **Allow other devices** and an optional API key control who can connect; ready-made
@@ -493,7 +496,10 @@ cmake --build build
 ./build/tierlm-server --models ~/models --port 8040
 ```
 
-Then open http://127.0.0.1:8040. Details, CUDA versions and WSL notes: [docs/BUILD.md](docs/BUILD.md#linux-and-wsl-cpu-vulkan-or-cuda).
+Then open http://127.0.0.1:8040. Or start a model straight from the command line, for your own front end, a script
+or a systemd service:
+`./build/tierlm-server ~/models/model.gguf --ctx 32768 --experts follow --no-web` (every option:
+[docs/CONSOLE.md](docs/CONSOLE.md#straight-from-the-command-line-windows-or-linux)). Details, CUDA versions and WSL notes: [docs/BUILD.md](docs/BUILD.md#linux-and-wsl-cpu-vulkan-or-cuda).
 
 ## Tools
 
