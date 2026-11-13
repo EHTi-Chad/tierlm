@@ -99,7 +99,9 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-(Anyone who can read the unit file can read the key in it; keep it to an account that only runs tierlm.)
+`WorkingDirectory` matters: the settings file, the models folder and the caches are found from there unless
+`--settings` and `--models` say otherwise. Anyone who can read the unit file can read the key in it; keep it to an
+account that only runs tierlm.
 
 ## Step by step: Qwen3.8 Flash-Next on one RTX 5090
 
@@ -221,7 +223,7 @@ optional on a network that's yours alone, but anyone on the network can use the 
 | `--api-key KEY` | other devices must send this key (apps on this computer don't) |
 | `--no-web` | no chat page: the address answers with one line of text, and the API is all there is |
 | `--models DIR` | the models folder |
-| `--settings FILE` | the settings file (default `tierlm-settings.json` next to tierlm) |
+| `--settings FILE` | the settings file (default `tierlm-settings.json` in the folder tierlm is started from: start it from its own folder, or give this, so `--saved` finds what the page saved) |
 
 **The model** (given as the first thing after `tierlm-server.exe`)
 
