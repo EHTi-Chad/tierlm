@@ -25,6 +25,10 @@ rem      (other devices on your network too); and the port
 set "HOST="
 set "PORT=8040"
 
+rem ---- The chat page for other devices: yes (they open this PC's address in their browser and chat there) or no (the
+rem      API only). No browser opens on this PC either way.
+set "PAGE=no"
+
 rem ---- A key other devices must send (empty: none). Set one when HOST is 0.0.0.0, unless the network is yours alone.
 set "KEY="
 
@@ -37,7 +41,8 @@ if /i "%MODEL%"=="C:\path\to\your-model.gguf" (
   pause
   exit /b 1
 )
-set "ARGS=--no-web --port %PORT%"
+set "ARGS=--port %PORT%"
+if /i not "%PAGE%"=="yes" set "ARGS=%ARGS% --no-web"
 if not "%HOST%"=="" set "ARGS=%ARGS% --host %HOST%"
 if /i "%SAVED%"=="yes" set "ARGS=%ARGS% --saved"
 if not "%CTX%"=="" set "ARGS=%ARGS% --ctx %CTX%"
