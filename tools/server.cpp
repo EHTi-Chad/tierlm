@@ -108,6 +108,7 @@ struct Args {
     // from the settings saved for this model, and whether to leave the page out (the API only).
     nlohmann::json load = nlohmann::json::object();
     bool saved = false, no_web = false, threads_given = false, ctx_given = false, device_given = false;
+    int idle_eject = 30; bool idle_given = false;            // --idle-eject: minutes (0: never)
 };
 
 const char* kUsage =
@@ -124,6 +125,8 @@ const char* kUsage =
     "  --no-web              don't serve the chat page: the API only\n"
     "  --models DIR          the models folder        --settings FILE   the settings file\n"
     "  --web DIR             the folder with index.html\n"
+    "  --idle-eject MIN      put the model away after MIN minutes with nothing to do, freeing its memory; the next\n"
+    "                        request loads it again with the same settings (30; 0: never)\n"
     "\n"
     "Model (with a model given)\n"
     "  --saved               start from the settings saved for this model (what the page last used, or what Find\n"
@@ -717,12 +720,17 @@ uint64_t fnv1a(const std::string& s, uint64_t h = 1469598103934665603ULL) {
 
 // What a reply holds while it runs: the engine lock (shared when several replies run at once, so they don't block
 // each other but a model load waits for all of them) and, then, one of the connections. Released when it ends.
+// When the engine was last used (a reply or a load started or ended), in steady-clock seconds: a model with nothing
+// to do for the minutes set is put away (see "Put away when idle").
+std::atomic<long long> g_last_use{0};
+void touch_use() { g_last_use = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
 struct Hold {
     std::shared_timed_mutex* m = nullptr;
     bool shared = false;
     std::atomic<int>* free = nullptr;
     void release() {
-        if (m) { if (shared) m->unlock_shared(); else m->unlock(); m = nullptr; }
+        if (m) { if (shared) m->unlock_shared(); else m->unlock(); m = nullptr; touch_use(); }
         if (free) { ++*free; free = nullptr; }
     }
     ~Hold() { release(); }
@@ -1202,7 +1210,7 @@ bool remote_refused(const httplib::Request& req) {
     if (p.compare(0, 5, "/api/") != 0 || p.compare(0, 8, "/api/v0/") == 0) return false;   // the page, /v1, LM Studio's API
     if (req.method == "GET" || req.method == "HEAD")
         return p == "/api/log" || p == "/api/devices" || p == "/api/models";
-    return !(p == "/api/chat" || p == "/api/reset");
+    return !(p == "/api/chat" || p == "/api/reset" || p == "/api/reload");   // (/api/reload: only the model that was loaded)
 }
 
 bool is_local(const httplib::Request& req) {
@@ -1363,6 +1371,11 @@ int main(int argc, char** argv) {
         else if (k == "--settings") a.settings = next();
         else if (k == "--no-web") a.no_web = true;
         else if (k == "--saved") a.saved = true;
+        else if (k == "--idle-eject") {
+            const std::string v = next();
+            if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) { std::fprintf(stderr, "error: --idle-eject is a number of minutes (0: never)\n"); return 1; }
+            a.idle_eject = std::atoi(v.c_str()); a.idle_given = true;
+        }
         else if (k == "--experts") {
             const std::string v = next();
             if (v != "auto" && v != "layers" && v != "ram" && v != "busiest" && v != "follow") {
@@ -1428,7 +1441,7 @@ int main(int argc, char** argv) {
             const auto until = std::chrono::steady_clock::now() + max_wait;
             int shown = -1;
             for (;;) {
-                if (q.front() == me && mu.try_lock()) { q.pop_front(); cv.notify_all(); return true; }
+                if (q.front() == me && mu.try_lock()) { q.pop_front(); cv.notify_all(); touch_use(); return true; }
                 const int ahead = (int)(std::find(q.begin(), q.end(), me) - q.begin());
                 if (on_wait && ahead != shown) { shown = ahead; l.unlock(); on_wait(ahead); l.lock(); }
                 if ((gone && gone()) || std::chrono::steady_clock::now() > until) {
@@ -1453,11 +1466,11 @@ int main(int argc, char** argv) {
                 if (q.front() == me) {
                     std::atomic<int>* free = slots ? slots() : nullptr;
                     if (!free) {
-                        if (mu.try_lock()) { hold.m = &mu; hold.shared = false; q.pop_front(); cv.notify_all(); return true; }
+                        if (mu.try_lock()) { hold.m = &mu; hold.shared = false; q.pop_front(); cv.notify_all(); touch_use(); return true; }
                     } else if (mu.try_lock_shared()) {
                         int f = free->load();
                         while (f > 0 && !free->compare_exchange_weak(f, f - 1)) {}
-                        if (f > 0) { hold.m = &mu; hold.shared = true; hold.free = free; q.pop_front(); cv.notify_all(); return true; }
+                        if (f > 0) { hold.m = &mu; hold.shared = true; hold.free = free; q.pop_front(); cv.notify_all(); touch_use(); return true; }
                         mu.unlock_shared();
                     }
                 }
@@ -1527,10 +1540,29 @@ int main(int argc, char** argv) {
         return fs::u8path(p).filename().u8string();
     };
 
+    // Put away when idle: after the minutes set ("idle_eject_min" in the settings, 30 unless changed; 0: never;
+    // --idle-eject wins) with no reply and no load, the model is ejected to give its VRAM and RAM back to the PC's
+    // other programs, and the next request (the page or an app, from any device) loads it again with the settings it
+    // had. last_load says how; idle_out that it was put away (a manual Eject stays ejected).
+    struct LastLoad {
+        std::string path; LoadOptions o; int threads = 0, seed = -1; bool hot = false;
+        int draft_max = 0, lookup = -1; bool spec_on = false, thinking = false; std::string effort;
+    };
+    LastLoad last_load;                  // (under mu)
+    bool idle_out = false;               // (under mu)
+    auto idle_minutes = [&]() -> int {
+        if (a.idle_given) return a.idle_eject;
+        std::lock_guard<std::recursive_mutex> sl(settings_mu);
+        return settings.contains("idle_eject_min") && settings["idle_eject_min"].is_number_integer() ? std::max(0, settings["idle_eject_min"].get<int>()) : 30;
+    };
+    auto idle_name = [&] { return fs::u8path(last_load.path).filename().u8string(); };
+    touch_use();
+
     // hot: keep the model's busiest experts in VRAM, from what tierlm learned about it before (MoE models, experts in RAM).
     auto load = [&](const std::string& path, const LoadOptions& opt, int threads, int seed, bool hot = true) {
         json info = describe_model(path);
         if (!info.value("supported", false)) throw std::runtime_error(info.value("reason", std::string("unsupported model")));
+        idle_out = false;
         eng.save_usage(true);            // what the previous model learned
         eng.batch.finish();              // no replies run during a load (it holds the lock), so nothing is waiting
         eng.slots.clear(); eng.free_slots = 0;
@@ -1667,6 +1699,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "hot experts: %d of %d experts in VRAM, chosen from earlier use (%d layers split between VRAM and RAM); "
                          "they did %.0f%% of the expert work so far\n", pl.hot_experts, uL * uE, split, 100 * eng.hot_share);
         }
+        last_load = LastLoad{};
+        last_load.path = path; last_load.o = opt; last_load.threads = threads; last_load.seed = seed; last_load.hot = hot;
+        touch_use();
     };
     // Load settings from a /api/load body (or the settings saved for a model).
     auto load_options = [&](const json& body) {
@@ -1735,7 +1770,11 @@ int main(int argc, char** argv) {
             if (!eng.slots.empty()) j["active"] = (int)eng.slots.size() - eng.free_slots.load();   // replies running now
             res.set_content(dump(j), "application/json; charset=utf-8"); return;
         }
-        if (!eng.model) { const json none = {{"loaded", false}, {"version", TIERLM_VERSION}}; info_set(none); res.set_content(dump(none), "application/json; charset=utf-8"); return; }
+        if (!eng.model) {
+            json none = {{"loaded", false}, {"version", TIERLM_VERSION}, {"idle_eject_min", idle_minutes()}, {"idle_fixed", a.idle_given}};
+            if (idle_out) none["idle_out"] = idle_name();                // put away for being idle: the next request loads it again
+            info_set(none); res.set_content(dump(none), "application/json; charset=utf-8"); return;
+        }
         const auto& hp = eng.model->hparams();
         size_t free = 0, total = 0;
         eng.model->device_memory(free, total);
@@ -1785,6 +1824,7 @@ int main(int argc, char** argv) {
                 return ms[id]["tuned"].value("tps", 0.0);
             }()},
         };
+        j["idle_eject_min"] = idle_minutes(); j["idle_fixed"] = a.idle_given;
         info_set(j);
         res.set_content(dump(j), "application/json; charset=utf-8");
     });
@@ -2166,10 +2206,8 @@ int main(int argc, char** argv) {
     // Eject: frees the model and everything that belongs to it (its vision file, draft block, the replies'
     // caches), giving its VRAM and RAM back; {"embedding": true} frees the embedding model too (it stays the
     // saved choice, for the next start). Waits for running replies to finish.
-    svr.Post("/api/unload", [&](const httplib::Request& req, httplib::Response& res) {
-        const json body = json::parse(req.body.empty() ? "{}" : req.body, nullptr, false);
-        const bool with_embed = body.is_object() && body.value("embedding", false);
-        std::lock_guard<std::shared_timed_mutex> lk(mu);
+    // (the caller holds mu)
+    auto eject = [&](bool with_embed, bool& emb_freed) {
         const bool had = eng.model != nullptr;
         eng.save_usage(true);
         eng.batch.finish();
@@ -2181,12 +2219,65 @@ int main(int argc, char** argv) {
         eng.cached.clear();
         eng.saved.clear();                                             // (the conversations kept in RAM were this model's)
         eng.path.clear();
-        bool emb_freed = false;
+        emb_freed = false;
         if (with_embed) { std::lock_guard<std::mutex> le(emb.mu); emb_freed = emb.enc != nullptr; emb.enc.reset(); emb.id.clear(); emb.path.clear(); emb.name.clear(); }
+        return had;
+    };
+    svr.Post("/api/unload", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body.empty() ? "{}" : req.body, nullptr, false);
+        const bool with_embed = body.is_object() && body.value("embedding", false);
+        std::lock_guard<std::shared_timed_mutex> lk(mu);
+        idle_out = false;                                                // (ejected on purpose: not loaded again by the next request)
+        bool emb_freed = false;
+        const bool had = eject(with_embed, emb_freed);
         if (had || emb_freed)
             std::fprintf(stderr, "ejected: %s%s; %s memory is free again\n", had ? "the model" : "",
                          emb_freed ? (had ? " and the embedding model" : "the embedding model") : "", had && emb_freed ? "their" : "its");
         res.set_content("{\"ok\":true}", "application/json; charset=utf-8");
+    });
+    // A model put away for being idle, loaded again with the settings it had (the caller holds mu alone). False, with
+    // why in err, when that fails.
+    auto bring_back = [&](std::string& err) -> bool {
+        if (eng.model || !idle_out) return true;
+        const LastLoad l = last_load;
+        const int im = idle_minutes();
+        std::fprintf(stderr, "loading %s again (it was put away after %d minute%s with nothing to do)\n", idle_name().c_str(), im, im == 1 ? "" : "s");
+        try {
+            eng.draft_max = l.draft_max; eng.lookup = l.lookup;
+            load(l.path, l.o, l.threads, l.seed, l.hot);
+            if (!l.spec_on && eng.spec) { eng.spec.reset(); eng.spec_changed(); }
+            eng.thinking = l.thinking; eng.effort = l.effort;
+            last_load = l;
+            return true;
+        } catch (const std::exception& e) {
+            eng.spec.reset(); eng.look.reset(); eng.vision.reset(); eng.model.reset(); eng.path.clear();
+            last_load = l; idle_out = true;                                // (tried again by the next request)
+            err = "could not load " + fs::u8path(l.path).filename().u8string() + " again: " + e.what();
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return false;
+        }
+    };
+    // Load it again now (the page does this when it's opened, as that's someone about to use it).
+    svr.Post("/api/reload", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!line.enter(mu, req.is_connection_closed)) return oai_error(res, 503, "busy: waited too long for earlier replies to finish");
+        std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
+        std::string err;
+        if (!bring_back(err)) return oai_error(res, 500, err, "server_error");
+        res.set_content(dump({{"ok", true}, {"loaded", eng.model != nullptr}}), "application/json; charset=utf-8");
+    });
+
+    // How long the model may have nothing to do before it is put away: {"minutes": N} (0: never). From this computer.
+    svr.Post("/api/idle", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!is_local(req)) return oai_error(res, 403, "this can only be changed on the computer running tierlm", "permission_error");
+        const json body = json::parse(req.body, nullptr, false);
+        if (!body.is_object() || !body.contains("minutes") || !body["minutes"].is_number_integer() || body["minutes"].get<int>() < 0)
+            return oai_error(res, 400, "expected {\"minutes\": N} (0: never)");
+        const int m = std::min(7 * 24 * 60, body["minutes"].get<int>());
+        { std::lock_guard<std::recursive_mutex> sl(settings_mu); settings["idle_eject_min"] = m; write_settings(a.settings, settings); }
+        touch_use();
+        if (a.idle_given) std::fprintf(stderr, "note: --idle-eject %d on the command line wins over the page's setting\n", a.idle_eject);
+        else std::fprintf(stderr, "idle: %s\n", m > 0 ? ("the model is put away after " + std::to_string(m) + (m == 1 ? " minute" : " minutes") + " with nothing to do").c_str() : "the model stays loaded");
+        res.set_content(dump({{"ok", true}, {"minutes", idle_minutes()}, {"fixed", a.idle_given}}), "application/json; charset=utf-8");
     });
 
     svr.Post("/api/reset", [&](const httplib::Request&, httplib::Response& res) {
@@ -2882,6 +2973,11 @@ int main(int argc, char** argv) {
                 if (!gone) send({{"type", "error"}, {"message", "waited too long for earlier replies to finish"}});
                 sink.done();
                 return true;
+            }
+            if (!eng.model && idle_out) {                                  // put away for being idle: back first
+                send({{"type", "reloading"}, {"name", idle_name()}, {"minutes", idle_minutes()}});
+                std::string err;
+                if (!bring_back(err)) { send({{"type", "error"}, {"message", err}}); sink.done(); return true; }
             }
             if (!eng.model) {
                 send({{"type", "error"}, {"message", "no model loaded: choose one on the setup screen"}});
@@ -3667,13 +3763,15 @@ int main(int argc, char** argv) {
     svr.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         json data = json::array();
         std::string cur;
+        bool put_away = false;
         {
             std::unique_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
             cur = lk.owns_lock() ? loaded_id() : info_copy().value("path", std::string());
             if (!lk.owns_lock() && !cur.empty()) cur = fs::u8path(cur).filename().u8string();
+            if (lk.owns_lock() && cur.empty() && idle_out) { cur = model_key(last_load.path); put_away = true; }   // (loaded again when asked)
         }
         if (!cur.empty()) {
-            json m = {{"id", cur}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", true}, {"type", "llm"}};
+            json m = {{"id", cur}, {"object", "model"}, {"created", started}, {"owned_by", "tierlm"}, {"loaded", !put_away}, {"type", "llm"}};
             std::shared_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
             if (lk.owns_lock() && eng.vision) { m["type"] = "vlm"; m["capabilities"] = json::array({"vision"}); }   // (as LM Studio says it)
             data.push_back(m);
@@ -3779,6 +3877,11 @@ int main(int argc, char** argv) {
         if (!line.enter_reply(mu, *lock, other_model ? std::function<std::atomic<int>*()>() : std::function<std::atomic<int>*()>(reply_slots),
                               req.is_connection_closed))
             return oai_error(res, 503, "busy: waited too long for earlier replies to finish");
+        // Put away for being idle: loaded again first with the settings it had (unless another model is asked for).
+        if (!eng.model && idle_out && (!other_model || want == model_key(last_load.path))) {
+            std::string err;
+            if (!bring_back(err)) return oai_error(res, 500, err, "server_error");
+        }
         // The model asked for: the loaded one if the name matches it, or is unknown (many apps send a fixed
         // name such as "gpt-4o"); a different model in the models folder is loaded first, with its saved settings.
         if (other_model && want != loaded_id()) {
@@ -3970,6 +4073,7 @@ int main(int argc, char** argv) {
         auto lock = std::make_shared<Hold>();
         if (!line.enter_reply(mu, *lock, std::function<std::atomic<int>*()>(reply_slots), req.is_connection_closed))
             return fail(503, "busy: waited too long for earlier replies to finish", anthropic ? "overloaded_error" : "server_error");
+        if (!eng.model && idle_out) { std::string err; if (!bring_back(err)) return fail(500, err, anthropic ? "api_error" : "server_error"); }
         if (!eng.model) return fail(400, "no model is loaded: load one in tierlm first", "invalid_request_error");
         const json body = json::parse(req.body, nullptr, false);
         Sampling sp;
@@ -4906,6 +5010,7 @@ int main(int argc, char** argv) {
     // are; "dimensions" keeps the first n numbers (for models trained for it, such as nomic-embed-text v1.5) and
     // normalises again. Texts longer than the model takes are cut to fit (as sentence-transformers does).
     svr.Post(R"(/(?:v1|api/v0)/embeddings)", [&](const httplib::Request& req, httplib::Response& res) {
+        touch_use();                                                     // (someone is using tierlm)
         const json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object() || !body.contains("input")) return oai_error(res, 400, "expected a JSON body with \"input\"");
         std::vector<std::vector<int32_t>> inputs;
@@ -4978,6 +5083,32 @@ int main(int argc, char** argv) {
             catch (const std::exception& e) { std::fprintf(stderr, "embedding model %s: %s\n", id.c_str(), e.what()); }
         }
     }
+
+    // Put away when idle (see LastLoad): checked every 20 s. Only when nothing holds the engine: a reply, a load, Find
+    // the fastest settings or a request waiting in line keeps it (and replies and loads reset the clock).
+    std::atomic<bool> quit_idle{false};
+    std::thread idle_watch([&] {
+        while (!quit_idle) {
+            for (int i = 0; i < 20 && !quit_idle; ++i) std::this_thread::sleep_for(std::chrono::seconds(1));
+            const int mins = idle_minutes();
+            if (quit_idle || mins <= 0 || loading || line.waiting() > 0) continue;
+            const long long now = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
+            if (now - g_last_use < (long long)mins * 60) continue;
+            if (!mu.try_lock()) continue;
+            std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
+            if (!eng.model || last_load.path.empty()) continue;
+            // as it is now: the context length and speculation can change without a reload
+            last_load.o.max_ctx = eng.model->max_ctx();
+            last_load.draft_max = eng.draft_max; last_load.lookup = eng.lookup; last_load.spec_on = eng.spec != nullptr;
+            last_load.thinking = eng.thinking; last_load.effort = eng.effort;
+            bool emb_freed = false;
+            eject(false, emb_freed);
+            idle_out = true;
+            std::fprintf(stderr, "put away %s after %d minute%s with nothing to do: its memory is free again, and the next request loads it "
+                                 "again (--idle-eject 0, or Settings on the page, keeps it loaded)\n", idle_name().c_str(), mins, mins == 1 ? "" : "s");
+        }
+    });
+    struct JoinIdle { std::atomic<bool>& q; std::thread& t; ~JoinIdle() { q = true; if (t.joinable()) t.join(); } } join_idle{quit_idle, idle_watch};
 
     if (a.no_web)
         std::fprintf(stderr, "\n  tierlm is ready (no chat page: --no-web)\n  %s\n  OpenAI-compatible API: http://127.0.0.1:%d/v1\n"

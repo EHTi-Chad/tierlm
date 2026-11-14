@@ -21,6 +21,8 @@ rem  PAGE     yes: whoever opens this PC's address in a browser gets tierlm's ch
 rem           until someone opens it); no: the API only. No browser opens on this PC either way
 rem  KEY      an API key other devices must send; empty: none. Set one when HOST is 0.0.0.0, unless the network is
 rem           yours alone
+rem  IDLE     minutes with nothing to do before the model is put away to free its memory; the next request loads it
+rem           again (it waits for the load). 0: never, for a PC that only runs tierlm. Empty: the page's setting (30)
 
 set "MODEL=C:\path\to\your-model.gguf"
 set "SAVED=no"
@@ -30,6 +32,7 @@ set "HOST="
 set "PORT=8040"
 set "PAGE=yes"
 set "KEY="
+set "IDLE="
 
 rem ---------------------------------------------- EXAMPLES --------------------------------------------------------
 rem  Copy the lines of the one you want over the settings above (MODEL stays yours).
@@ -43,7 +46,7 @@ rem       set "HOST=0.0.0.0"     set "PAGE=yes"   set "KEY=choose-a-long-key"
 rem     tierlm prints the address to open on the other PCs, e.g. http://192.168.1.50:8040 (the page asks for the key).
 rem
 rem  3. This PC as the AI server; other PCs use their own apps (Open WebUI, opencode, SillyTavern):
-rem       set "HOST=0.0.0.0"     set "PAGE=no"    set "KEY=choose-a-long-key"
+rem       set "HOST=0.0.0.0"     set "PAGE=no"    set "KEY=choose-a-long-key"   set "IDLE=0"
 rem     Their base URL: http://<the address tierlm prints>/v1, with the key.
 rem
 rem  4. Both, for several people at once (each connection gets its own CTX of context memory):
@@ -72,6 +75,7 @@ if not "%HOST%"=="" set "ARGS=%ARGS% --host %HOST%"
 if /i "%SAVED%"=="yes" set "ARGS=%ARGS% --saved"
 if not "%CTX%"=="" set "ARGS=%ARGS% --ctx %CTX%"
 if not "%KEY%"=="" set "ARGS=%ARGS% --api-key %KEY%"
+if not "%IDLE%"=="" set "ARGS=%ARGS% --idle-eject %IDLE%"
 echo.
 echo  Starting tierlm with %MODEL%
 echo  When it says it's ready, point your app at http://127.0.0.1:%PORT%/v1

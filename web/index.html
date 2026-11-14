@@ -881,6 +881,13 @@
         <div class="help" id="wshelp" hidden></div>
         <div class="help" id="llookhelp">Same answers, faster when the reply repeats text from the conversation (editing a file, quoting
           code): tierlm guesses the repeat and the model checks it in one pass. Works with every model.</div>
+        <div class="lrow2 hostonly">
+          <label for="idlesel">Put the model away</label>
+          <select id="idlesel"><option value="0">Never</option><option value="10">After 10 minutes idle</option><option value="30">After 30 minutes idle</option>
+            <option value="60">After 1 hour idle</option><option value="120">After 2 hours idle</option><option value="240">After 4 hours idle</option></select>
+        </div>
+        <div class="help hostonly" id="idlehelp">With nothing to do for that long (no reply, from here or an app), tierlm ejects the model so its VRAM
+          and RAM are free for other programs. The next message, from here or an app, loads it again with the same settings first.</div>
         <label class="lrow" for="sysprompt">System prompt</label>
         <textarea id="sysprompt" rows="3" placeholder="Optional: instructions the model follows in every reply"></textarea>
         <div class="reloadnote">Split mode, context memory and the model itself need a reload; the context length changes right away with <b>Change length…</b> under Context.
@@ -1138,6 +1145,11 @@ async function loadInfo() {
   } catch (e) { $("devname").textContent = "server not reachable"; return; }
   if (info.version) $("ver").textContent = "v" + info.version;
   document.body.classList.toggle("guest", !!info.remote);
+  if (!info.loaded && info.idle_out) {                    // put away for being idle: someone opened the page, so bring it back
+    $("devname").textContent = "loading " + info.idle_out + " again…"; $("modelname").textContent = "";
+    try { await api("/api/reload", { method: "POST" }); info = await (await api("/api/info")).json(); } catch (e) {}
+  }
+  showIdle();
   if (!info.loaded && info.remote) {                       // another device: nothing it can set up from here
     info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "";
     showApp();
@@ -1456,6 +1468,8 @@ async function streamReply(useWs) {
         const ev = JSON.parse(line.slice(6));
         if (ev.type === "archived") archiveOldest(ev.count);
         else if (ev.type === "recall") { recall = ev.items; }
+        else if (ev.type === "reloading")                            // it was put away for being idle
+          bubble.textContent = `Loading ${ev.name} again (it was put away after ${ev.minutes} minute${ev.minutes === 1 ? "" : "s"} with nothing to do, to free its memory)…`;
         else if (ev.type === "queue") {                              // waiting in line behind other replies
           bubble.textContent = ev.ahead > 0 ? `Waiting in line: ${ev.ahead} ${ev.ahead === 1 ? "request" : "requests"} ahead of this one…`
                                             : "Waiting for another reply to finish…";
@@ -3629,6 +3643,16 @@ async function loadNetwork() {
     : n.fixed_by_command_line ? "Set by --host / --api-key on the command line."
     : n.allow_network && !n.api_key_set ? '<span class="warnline">Other devices can use tierlm without a key. Consider setting one.</span>' : "";
 }
+function showIdle() {
+  if (!info || info.idle_eject_min === undefined) return;
+  const sel = $("idlesel"), m = String(info.idle_eject_min);
+  if (![...sel.options].some(o => o.value === m)) sel.add(new Option(`After ${m} minutes idle`, m));
+  sel.value = m; sel.disabled = !!info.idle_fixed;
+  $("idlehelp").dataset.base ??= $("idlehelp").textContent;
+  $("idlehelp").textContent = $("idlehelp").dataset.base + (info.idle_fixed ? " Set by --idle-eject on the command line." : "");
+}
+$("idlesel").onchange = () => api("/api/idle", { method: "POST", headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ minutes: +$("idlesel").value }) }).then(r => r.json()).then(j => { if (info) info.idle_eject_min = j.minutes; }).catch(() => {});
 $("apinotice").onchange = () => api("/api/network", { method: "POST", headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ api_tools_notice: $("apinotice").checked }) }).catch(() => {});
 $("apitrim").onchange = () => api("/api/network", { method: "POST", headers: { "Content-Type": "application/json" },

@@ -460,7 +460,20 @@ keep everything in RAM for that load.
 
 Frees the model and everything that belongs to it (its vision file, draft block and the replies' caches), so its VRAM
 and RAM are free again; replies still being written finish first. `{"embedding": true}` frees the embedding model too
-(it stays the saved choice). The page's **Eject** button sends that. Returns `{"ok": true}`.
+(it stays the saved choice). The page's **Eject** button sends that. Returns `{"ok": true}`. A model ejected this way
+stays ejected until something loads a model.
+
+### Put away when idle
+
+After 30 minutes with nothing to do (no reply and no load), tierlm ejects the model by itself so its memory is free
+for other programs, and the next request loads it again with the settings it had: `/api/chat`, `/v1/chat/completions`
+(from any device), `/v1/messages` and `/v1/responses` wait for that load and then answer as usual. `/api/chat` first
+sends `{"type": "reloading", "name", "minutes"}`. While it's put away, `/api/info` says `"loaded": false` with
+`"idle_out": "<file name>"`, and `/v1/models` still lists it, with `"loaded": false`.
+
+- `POST /api/idle` `{"minutes": N}`: the time (0: never; the page's **Put the model away** setting). This computer
+  only. `/api/info` gives it as `idle_eject_min`, and `idle_fixed: true` when `--idle-eject` set it.
+- `POST /api/reload`: load the put-away model now (the page sends it when it's opened). `{"ok": true, "loaded"}`.
 
 ### POST /api/chat
 

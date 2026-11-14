@@ -100,6 +100,9 @@ guesses), shows each result as it goes, then keeps the fastest and saves it for 
 minute, longer for big models. Click **Start chatting** when it's done. tierlm remembers the folder, and your settings for each
 model, in `tierlm-settings.json`. **Change setup** (top right) brings this screen back. **Eject**, next to it,
 unloads the model (and the embedding model) and frees their VRAM and RAM, for when a game or another app needs the GPU.
+tierlm also does this by itself after 30 minutes with nothing to do, and loads the model again, with the same settings,
+when the next message comes (from the page or an app). **Settings**, **Put the model away**, changes the time or
+turns it off (Never).
 
 **Changing the context length while chatting:** **Change length…** under the Context card has a slider (and a box for any
 number). While you move it, it shows how much more (or less) VRAM and RAM the cache would take and whether it applies

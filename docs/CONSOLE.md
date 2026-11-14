@@ -222,6 +222,7 @@ optional on a network that's yours alone, but anyone on the network can use the 
 | `--host ADDRESS` | `127.0.0.1` (default): this computer only; `0.0.0.0`: every device on your network |
 | `--api-key KEY` | other devices must send this key (apps on this computer don't) |
 | `--no-web` | no chat page: the address answers with one line of text, and the API is all there is |
+| `--idle-eject MIN` | put the model away after MIN minutes with nothing to do (30 unless the page's Settings say otherwise; `0`: never). Its VRAM and RAM are free for other programs until the next request, from the page or an app, which loads it again with the same settings first (that request waits for the load) |
 | `--models DIR` | the models folder |
 | `--settings FILE` | the settings file (default `tierlm-settings.json` in the folder tierlm is started from: start it from its own folder, or give this, so `--saved` finds what the page saved) |
 
@@ -315,5 +316,8 @@ above. Agents send long instructions and many tools: give them 64K of context or
   in the page's **Connect other apps** card).
 - **Another device can't connect:** `--host 0.0.0.0`, the firewall allowed on private networks, and the right
   address (open `http://<address>:<port>/v1` in that device's browser: it says whether tierlm is running).
+- **An app's first message after a break takes a minute:** the model was put away after 30 minutes with nothing
+  to do (the window says so) and is loading again. `--idle-eject 0` keeps it loaded, or set a longer time; on a PC
+  that only runs tierlm, 0 is the usual choice. If the app gives up waiting, raise its timeout or send again.
 - **It's slower than on the page:** the page may have loaded it with settings Find the fastest settings found;
   start with `--saved`.
