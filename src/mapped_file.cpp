@@ -45,7 +45,17 @@ void MappedFile::open(const std::string& path) {
     HANDLE mp = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
     if (!mp) { CloseHandle(f); throw std::runtime_error("cannot map " + path + " for the SSD tier"); }
     void* v = MapViewOfFile(mp, FILE_MAP_READ, 0, 0, 0);
-    if (!v) { CloseHandle(mp); CloseHandle(f); throw std::runtime_error("cannot map " + path + " for the SSD tier (not enough address space?)"); }
+    if (!v) {
+        // Say why: Windows' error code, and in words for the memory ones (the commit limit, RAM + page file, can be
+        // nearly used up by the model's RAM part when the view is made).
+        const DWORD e = GetLastError();
+        CloseHandle(mp); CloseHandle(f);
+        std::string why = "Windows error " + std::to_string((unsigned long)e);
+        if (e == ERROR_COMMITMENT_LIMIT || e == ERROR_NOT_ENOUGH_MEMORY || e == ERROR_OUTOFMEMORY)
+            why += ": Windows' memory limit (RAM + page file) is used up. Let Windows manage the page file size, or make it "
+                   "bigger (System, About, Advanced system settings, Performance, Advanced, Virtual memory), or use a shorter context";
+        throw std::runtime_error("cannot map " + path + " for the SSD tier (" + why + ")");
+    }
     file_ = f; mapping_ = mp; data_ = (const char*)v; size_ = (size_t)sz.QuadPart;
 #else
     int fd = ::open(path.c_str(), O_RDONLY);
