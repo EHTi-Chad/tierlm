@@ -42,18 +42,30 @@ void MappedFile::open(const std::string& path) {
     if (f == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path + " for the SSD tier");
     LARGE_INTEGER sz{};
     GetFileSizeEx(f, &sz);
-    HANDLE mp = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (!mp) { CloseHandle(f); throw std::runtime_error("cannot map " + path + " for the SSD tier"); }
-    void* v = MapViewOfFile(mp, FILE_MAP_READ, 0, 0, 0);
+    // Windows counts the bookkeeping for a mapped file against its memory limit (RAM + page file), which the model's
+    // RAM part has nearly used up for a model this big. Right after a restart that limit is lower, and Windows grows
+    // the page file it manages when it runs short, so a load could fail and a later one work (RTX 5090, 64 GB,
+    // Flash-Next Q4_K_M: Windows error 1450 twice, then fine at 101 of 103 GB). So: a few more tries, a moment apart.
+    HANDLE mp = nullptr;
+    void* v = nullptr;
+    DWORD e = 0;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        if (attempt > 0) Sleep(1500);
+        mp = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (mp) {
+            v = MapViewOfFile(mp, FILE_MAP_READ, 0, 0, 0);
+            if (v) break;
+            e = GetLastError();
+            CloseHandle(mp); mp = nullptr;
+        } else e = GetLastError();
+        if (e != ERROR_NO_SYSTEM_RESOURCES && e != ERROR_COMMITMENT_LIMIT && e != ERROR_NOT_ENOUGH_MEMORY && e != ERROR_OUTOFMEMORY) break;
+        std::fprintf(stderr, "SSD tier: Windows is short of memory to map %s (error %lu); trying again\n", path.c_str(), (unsigned long)e);
+    }
     if (!v) {
-        // Say why: Windows' error code, and in words for the memory ones (the commit limit, RAM + page file, can be
-        // nearly used up by the model's RAM part when the view is made).
-        const DWORD e = GetLastError();
-        CloseHandle(mp); CloseHandle(f);
+        CloseHandle(f);
         std::string why = "Windows error " + std::to_string((unsigned long)e);
-        if (e == ERROR_COMMITMENT_LIMIT || e == ERROR_NOT_ENOUGH_MEMORY || e == ERROR_OUTOFMEMORY)
-            why += ": Windows' memory limit (RAM + page file) is used up. Let Windows manage the page file size, or make it "
-                   "bigger (System, About, Advanced system settings, Performance, Advanced, Virtual memory), or use a shorter context";
+        if (e == ERROR_NO_SYSTEM_RESOURCES || e == ERROR_COMMITMENT_LIMIT || e == ERROR_NOT_ENOUGH_MEMORY || e == ERROR_OUTOFMEMORY)
+            why += ": Windows ran out of memory to map it. Close other programs or use a shorter context, and try again";
         throw std::runtime_error("cannot map " + path + " for the SSD tier (" + why + ")");
     }
     file_ = f; mapping_ = mp; data_ = (const char*)v; size_ = (size_t)sz.QuadPart;
