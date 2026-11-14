@@ -40,7 +40,7 @@ tierlm-server.exe C:\models\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf --ctx 32768 --expert
 - **`--saved`** starts from the settings saved for that model: what the page last loaded it with, or what Find the
   fastest settings found. So you can tune once on the page and start it from a console or a script after that:
   `tierlm-server.exe model.gguf --saved --no-web`. Flags given beside `--saved` win over the saved ones.
-- **`--no-web`** leaves the chat page out: the address answers with one line of text and the API is all there is.
+- **`--no-web`** leaves the chat page out: opening the address shows the "tierlm is running" page (as `/v1` does) and the API is all there is.
   Without it the page is there as well, opened on the loaded model.
 - **`--experts`** is where a MoE model's experts go when it doesn't fit in VRAM: `layers` (whole layers in VRAM, the
   rest in RAM), `ram` (experts in RAM, everything else in VRAM), `busiest` (the busiest experts in VRAM too),

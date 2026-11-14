@@ -1550,9 +1550,11 @@ async function runTurn() {
   // With the workspace on, the model may ask for its tools: they run (reading at once, changes after Apply), their
   // results go back, and the model carries on, until it answers without a tool call.
   const useWs = wsOn();
+  let toolless = false;                           // the model wrote a tool call though this chat gives it no tools
   for (let round = 0; ; ++round) {
     const r = await streamReply(useWs);
     const calls = r.done?.tool_calls || [];
+    if (!useWs && r.reply && /<tool_call>|<function=[\w-]+>/.test(r.reply)) toolless = true;
     if (r.reply || calls.length) {
       // Sent back as the model wrote it (call included), so tierlm reuses its cache; harmony models get the calls
       // separately and their template writes them.
@@ -1589,6 +1591,31 @@ async function runTurn() {
   if (rerender) { rerender = false; renderHistory(); }
   autoPreview();
   if (lastFull) { const why = lastFull; lastFull = null; showContextFull(why); }
+  if (toolless && ws.available) showNoTools();
+}
+// The model tried to use a tool in a chat that isn't working in a folder: it had none, so the call went nowhere and
+// the reply stopped there (a chat told "I have given you a workspace" before its folder was switched on, 0.8.8).
+// Say so, with the folder a click away: switched on, the model's reply is made again with its tools.
+function showNoTools() {
+  const d = addMsg("note", "");
+  d.style.whiteSpace = "normal";
+  const name = ws.folder ? ws.folder.split(/[\\/]/).filter(Boolean).pop() : "";
+  d.innerHTML = `<b>The model tried to use a tool, but this chat has none: it isn't working in a folder.</b>
+<div class="help">${ws.folder && ws.exists ? "Switch the folder on and the model answers again, with its file tools." : "Choose a folder in the + menu to give the model its file tools, then send your message again."}</div>`;
+  if (ws.folder && ws.exists) {
+    const row = document.createElement("div"); row.className = "row";
+    const b = document.createElement("button"); b.className = "tiny primary"; b.textContent = "Work in " + name + " and answer again";
+    row.appendChild(b); d.appendChild(row);
+    b.onclick = async () => {
+      if (busy) return;
+      d.remove();
+      setChatWorkspace(true);
+      if (history.at(-1)?.role === "assistant") { history.pop(); [...$("messages").querySelectorAll(".msg.assistant")].pop()?.remove(); }
+      await saveChat();
+      await runTurn();
+    };
+  }
+  $("messages").scrollTop = $("messages").scrollHeight;
 }
 // ---------- long conversations: the archive ----------
 // When a conversation no longer fits the context, its oldest messages can be archived: they stay in the chat (and

@@ -221,7 +221,7 @@ optional on a network that's yours alone, but anyone on the network can use the 
 | `--port N` | the port to listen on (8080 when started by hand; the batch files use 8040) |
 | `--host ADDRESS` | `127.0.0.1` (default): this computer only; `0.0.0.0`: every device on your network |
 | `--api-key KEY` | other devices must send this key (apps on this computer don't) |
-| `--no-web` | no chat page: the address answers with one line of text, and the API is all there is |
+| `--no-web` | no chat page: opening the address shows the "tierlm is running" page (as `/v1` does), and the API is all there is |
 | `--idle-eject MIN` | put the model away after MIN minutes with nothing to do (off unless given here or set in the page's Settings; `0`: never). Its VRAM and RAM are free for other programs until the next request, from the page or an app, which loads it again with the same settings first (that request waits for the load) |
 | `--models DIR` | the models folder |
 | `--settings FILE` | the settings file (default `tierlm-settings.json` in the folder tierlm is started from: start it from its own folder, or give this, so `--saved` finds what the page saved) |

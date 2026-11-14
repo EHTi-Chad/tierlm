@@ -1737,8 +1737,8 @@ int main(int argc, char** argv) {
     svr.set_payload_max_length((size_t)256 << 20);
 
     svr.Get("/", [&](const httplib::Request&, httplib::Response& res) {
-        if (a.no_web) {                                                    // --no-web: the API only
-            res.set_content("tierlm is running without its chat page (--no-web). The API is at /v1 on this address.\n", "text/plain; charset=utf-8");
+        if (a.no_web) {                                                    // --no-web: the API only, so its status page
+            res.set_redirect("/v1");
             return;
         }
         std::string page = read_file(a.web + "/index.html");
@@ -4409,6 +4409,7 @@ int main(int argc, char** argv) {
             "<p>This is its OpenAI-compatible API. In your app (Open WebUI, SillyTavern, a coding agent...) set the base URL to</p>"
             "<p><code>") + base + "</code></p>" +
             (key_set ? "<p>An API key is set: the app has to send it too.</p>" : "<p>No API key is needed.</p>") +
+            (a.no_web ? "<p>There's no chat page here: tierlm was started with <code>--no-web</code>.</p>" : "") +
             "<ul><li><code>/v1/chat/completions</code> OpenAI chat</li><li><code>/v1/messages</code> Anthropic Messages</li>"
             "<li><code>/v1/responses</code> OpenAI Responses</li><li><code>/v1/models</code> the loaded model</li></ul>"
             "<p>tierlm " TIERLM_VERSION "</p></main></body></html>";
