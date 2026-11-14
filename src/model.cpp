@@ -1300,6 +1300,11 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         if (!files.back()) { gguf_free(g); throw std::runtime_error("cannot open " + p); }
     }
     std::vector<char> chunk;
+    // The VRAM part and the RAM part of a split expert tensor, put together here, kept from tensor to tensor (not made
+    // and zeroed again for each: for gpt-oss-120b that took longer than reading the file). Freed when the load ends:
+    // kept for good (static, in 0.8.8) they held up to one expert tensor's size of RAM (about 0.8 GB for Flash-Next
+    // Q4_K_M) that the model's own RAM part then lacked.
+    std::vector<char> hb, cb;
     std::map<const ggml_tensor*, std::pair<const HotLayer*, const HotSplit*>> split_of;
     std::map<const ggml_tensor*, ggml_tensor*> bias_copy;
     for (const auto& [l, hl] : hot_layers) {
@@ -1340,10 +1345,8 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             f.seekg((std::streamoff)s.offset);
             if (!f.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + paths[s.part]); }
             read_s += since(t_read);
-            // The VRAM part and the RAM part, each put together in a buffer kept from tensor to tensor (not made and
-            // zeroed again for each: for gpt-oss-120b that took longer than reading the file), then set in one go.
-            // The last expert of each part is the zero expert.
-            static std::vector<char> hb, cb;
+            // The VRAM part and the RAM part, each put together in hb and cb (above), then set in one go. The last
+            // expert of each part is the zero expert.
             const size_t hn = ggml_nbytes(sp.hot), cn = ggml_nbytes(sp.cold);
             const auto t_split = lclock::now();
             if (hb.size() < hn) hb.resize(hn);
@@ -1381,6 +1384,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         if (auto bc = bias_copy.find(s.t); bc != bias_copy.end()) ggml_backend_tensor_set(bc->second, chunk.data(), 0, n);
         set_s += since(t_set);
     }
+    std::vector<char>().swap(hb); std::vector<char>().swap(cb); std::vector<char>().swap(chunk);   // (their RAM back now)
     if (std::getenv("TIERLM_LOAD_TRACE"))
         std::fprintf(stderr, "load: reading the file %.1f s, splitting experts between VRAM and RAM %.1f s, copying the rest %.1f s\n",
                      read_s, split_s, set_s);
