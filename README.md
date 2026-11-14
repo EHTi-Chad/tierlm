@@ -14,6 +14,26 @@ gpt-oss, NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Int
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
 
+### New in 0.8.9: put the model away when idle, an easier console file, fixes
+
+- **Put the model away when idle**: after the minutes you choose with nothing to do, tierlm ejects the model so its
+  VRAM and RAM are free for games and other programs, and the next message (the page or an app) loads it again with
+  the same settings. Off by default: **Settings**, **Put the model away**, or `--idle-eject MIN`. Measured on an RTX
+  5090 with Qwen3.6-35B-A3B Q4_K_M: VRAM used went from 22.8 GB to 1.9 GB, and the next request loaded it in 11.5 s
+  and answered word for word as before.
+- **`start-tierlm-console.bat`, easier**: every setting in one block, each explained, with example setups (just this
+  PC; a server for other PCs' browsers or apps; both), and the chat page left on by default (it costs nothing until
+  someone opens it). Running
+  `tierlm-server` with your own flags, on Windows or Linux (with a systemd unit), is in
+  [docs/CONSOLE.md](docs/CONSOLE.md).
+- **Find the fastest settings** measures the VRAM experts that follow the conversation after a warm-up answer, as a
+  chat's later replies run: Qwen3.8 Flash-Next Q4_K_M on an RTX 5090, 64K context: 64.1 → 70.7 tok/s for the setting
+  it picks, closer to the 80 a chat's second reply gets.
+- **Fixes**: 0.8.8 kept up to one expert tensor of RAM (about 0.8 GB for Flash-Next Q4_K_M) after loading a model
+  with experts split between VRAM and RAM; it's freed again. A big model's first load after a restart could fail with
+  "cannot map … for the SSD tier" (Windows error 1450, while Windows grows its page file); tierlm now tries again for
+  a few seconds, and the message says Windows' reason.
+
 ### New in 0.8.8: run it from the console, gpt-oss-120b twice as fast, Nemotron 3.5
 
 | Measured on one RTX 5090 (32 GB) with 64 GB of RAM | before | **0.8.8** |

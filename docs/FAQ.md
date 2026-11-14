@@ -48,7 +48,10 @@ fit in VRAM, how many CPU threads to use, and speculative decoding with 1 to 4 g
 and saves it for that model. Answers are the same whichever settings win; only the speed differs. On a laptop RTX
 3070 it takes Qwen3.6-35B-A3B from 13 tokens/second (whole layers) to about 35. Since 0.5.1 it measures exactly the
 way a chat runs, with your sampling settings, so the speed it shows is the speed you'll see in chats (a long
-conversation slows down a little as it grows).
+conversation slows down a little as it grows). It averages three short, different questions (an explanation, a bit of
+code, a sum); long code replies are easier to guess ahead and often run faster than its number. With the VRAM experts
+following the conversation, each question is answered once before it's timed (since 0.8.9), because those experts
+move in during a topic's first reply and the later replies are the faster ones.
 
 **What are "hot experts"?**
 In a mixture-of-experts model only a few experts are picked per word, and some far more often than others. tierlm
