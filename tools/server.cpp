@@ -3137,9 +3137,18 @@ int main(int argc, char** argv) {
                 generate(json::array({json{{"role", "user"}, {"content", questions[0]}}}), meas_sp, std::max(4, n / 2), {}, nullptr, nullptr);
             }
             for (const char* q : questions) {
+                const json msgs = json::array({json{{"role", "user"}, {"content", q}}});
+                // VRAM experts that follow the conversation: they move in during a topic's first reply, so a chat's
+                // later replies run faster than its first, and a first reply alone measured them low (Flash-Next
+                // Q4_K_M, RTX 5090, 64K, 2 guesses: 54 tok/s the first reply, 81 the next; Find the fastest
+                // settings said 64). So the question is answered once untimed first, and the second answer timed.
+                if (eng.model->live_hot()) {
+                    eng.model->reset();
+                    eng.cached.clear();
+                    generate(msgs, meas_sp, std::max(4, n), {}, nullptr, nullptr);
+                }
                 eng.model->reset();
                 eng.cached.clear();
-                const json msgs = json::array({json{{"role", "user"}, {"content", q}}});
                 const Gen g = generate(msgs, meas_sp, std::max(4, n), {}, nullptr, nullptr);
                 toks += (double)g.n_gen;
                 secs += g.gen_s;
