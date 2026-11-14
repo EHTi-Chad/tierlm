@@ -127,11 +127,11 @@ prompts.
 ## Problems
 
 **The model is gone after a break, or the first message takes a minute**
-After 30 minutes with nothing to do, tierlm puts the model away so its VRAM and RAM are free for games and other
-programs; the window says `put away ... after 30 minutes with nothing to do`. The next message, from the page or an
-app on any device, loads it again with the same settings, then answers (opening the page does it too). To keep it
-loaded: **Settings**, **Put the model away**, **Never**, or `--idle-eject 0` from the console (`IDLE=0` in
-`start-tierlm-console.bat`). A PC that runs only tierlm is the usual case for Never.
+When **Settings**, **Put the model away** is set (it's **Never** unless you change it; `--idle-eject` from the console,
+`IDLE` in `start-tierlm-console.bat`), tierlm puts the model away after that many minutes with nothing to do, so its
+VRAM and RAM are free for games and other programs; the window says `put away ... with nothing to do`. The next
+message, from the page or an app on any device, loads it again with the same settings, then answers (opening the
+page does it too). Set it back to **Never** (`--idle-eject 0`) to keep the model loaded.
 
 **Open WebUI (or another app) says the conversation is longer than the context window, even in a new chat**
 The app sends more than your message. Open WebUI's built-in tools (notes, tasks, memory, web search and more) go

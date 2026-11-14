@@ -108,7 +108,7 @@ struct Args {
     // from the settings saved for this model, and whether to leave the page out (the API only).
     nlohmann::json load = nlohmann::json::object();
     bool saved = false, no_web = false, threads_given = false, ctx_given = false, device_given = false;
-    int idle_eject = 30; bool idle_given = false;            // --idle-eject: minutes (0: never)
+    int idle_eject = 0; bool idle_given = false;            // --idle-eject: minutes (0: never)
 };
 
 const char* kUsage =
@@ -126,7 +126,7 @@ const char* kUsage =
     "  --models DIR          the models folder        --settings FILE   the settings file\n"
     "  --web DIR             the folder with index.html\n"
     "  --idle-eject MIN      put the model away after MIN minutes with nothing to do, freeing its memory; the next\n"
-    "                        request loads it again with the same settings (30; 0: never)\n"
+    "                        request loads it again with the same settings (0: never, the default)\n"
     "\n"
     "Model (with a model given)\n"
     "  --saved               start from the settings saved for this model (what the page last used, or what Find\n"
@@ -1540,7 +1540,7 @@ int main(int argc, char** argv) {
         return fs::u8path(p).filename().u8string();
     };
 
-    // Put away when idle: after the minutes set ("idle_eject_min" in the settings, 30 unless changed; 0: never;
+    // Put away when idle: after the minutes set ("idle_eject_min" in the settings; 0, the default: never;
     // --idle-eject wins) with no reply and no load, the model is ejected to give its VRAM and RAM back to the PC's
     // other programs, and the next request (the page or an app, from any device) loads it again with the settings it
     // had. last_load says how; idle_out that it was put away (a manual Eject stays ejected).
@@ -1553,7 +1553,7 @@ int main(int argc, char** argv) {
     auto idle_minutes = [&]() -> int {
         if (a.idle_given) return a.idle_eject;
         std::lock_guard<std::recursive_mutex> sl(settings_mu);
-        return settings.contains("idle_eject_min") && settings["idle_eject_min"].is_number_integer() ? std::max(0, settings["idle_eject_min"].get<int>()) : 30;
+        return settings.contains("idle_eject_min") && settings["idle_eject_min"].is_number_integer() ? std::max(0, settings["idle_eject_min"].get<int>()) : 0;
     };
     auto idle_name = [&] { return fs::u8path(last_load.path).filename().u8string(); };
     touch_use();

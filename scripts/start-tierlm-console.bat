@@ -22,7 +22,7 @@ rem           until someone opens it); no: the API only. No browser opens on thi
 rem  KEY      an API key other devices must send; empty: none. Set one when HOST is 0.0.0.0, unless the network is
 rem           yours alone
 rem  IDLE     minutes with nothing to do before the model is put away to free its memory; the next request loads it
-rem           again (it waits for the load). 0: never, for a PC that only runs tierlm. Empty: the page's setting (30)
+rem           again (it waits for the load). 0: never. Empty: the page's setting (Never unless changed there)
 
 set "MODEL=C:\path\to\your-model.gguf"
 set "SAVED=no"
@@ -46,7 +46,7 @@ rem       set "HOST=0.0.0.0"     set "PAGE=yes"   set "KEY=choose-a-long-key"
 rem     tierlm prints the address to open on the other PCs, e.g. http://192.168.1.50:8040 (the page asks for the key).
 rem
 rem  3. This PC as the AI server; other PCs use their own apps (Open WebUI, opencode, SillyTavern):
-rem       set "HOST=0.0.0.0"     set "PAGE=no"    set "KEY=choose-a-long-key"   set "IDLE=0"
+rem       set "HOST=0.0.0.0"     set "PAGE=no"    set "KEY=choose-a-long-key"
 rem     Their base URL: http://<the address tierlm prints>/v1, with the key.
 rem
 rem  4. Both, for several people at once (each connection gets its own CTX of context memory):
