@@ -272,18 +272,27 @@ if __name__ == "__main__":
     if "TIERLM_DEVICE" not in os.environ and not os.environ.get("TIERLM_RPC"): exact["TIERLM_DEVICE"] = "cpu"
     for label, env, tol in (("exact", exact, 1e-4), ("normal", {}, 6e-2)):
         worst_mode, all_top = {}, True
-        for mode in ([], ["--step"]):
+        # modes: whole prompt; one token at a time; saved half way and restored after another conversation;
+        # a batch of 6 guesses checked and only some kept (as speculative decoding does), then one more token
+        for mode in ([], ["--step"], ["snapshot"], ["--rollback"]):
             worst = 0.0
             for ids in ([5], [1, 2, 3], [7, 42, 91, 0, 13, 13, 64, 8, 21, 55], mid_ids, long_ids):
-                want = reference(np.array(ids))
-                run = subprocess.run([exe, path, *mode, *map(str, ids)], capture_output=True, text=True,
-                                     encoding="utf-8", errors="replace", env={**os.environ, **env})
+                args, menv, want_ids = list(mode), dict(env), list(ids)
+                if mode == ["snapshot"]: args, menv["TIERLM_SNAPSHOT"] = [], "1"
+                if mode == ["--rollback"]:
+                    if len(ids) < 9: continue
+                    keep = len(ids) % 4                     # 0 to 3 of the 6 kept
+                    args = ["--rollback", "6", str(keep)]
+                    want_ids = ids[:len(ids) - 7 + keep] + ids[-1:]
+                want = reference(np.array(want_ids))
+                run = subprocess.run([exe, path, *args, *map(str, ids)], capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", env={**os.environ, **menv})
                 if run.returncode != 0: sys.exit(f"tierlm-logits failed: {run.stderr.strip()[-2000:]}")
                 got = np.array([float(v) for v in run.stdout.split()])
                 if len(got) != V: sys.exit(f"tierlm-logits printed {len(got)} numbers: {run.stderr.strip()[-2000:]}")
                 worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
                 all_top &= bool(got.argmax() == want.argmax())
-            worst_mode["one token at a time" if mode else "whole prompt"] = worst
+            worst_mode[{"--step": "one token at a time", "snapshot": "saved and restored", "--rollback": "guesses undone"}.get(mode[0], "") if mode else "whole prompt"] = worst
         worst = max(worst_mode.values())
         passed = worst < tol and all_top
         ok &= passed

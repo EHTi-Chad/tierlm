@@ -367,7 +367,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         else if (pre == "gpt-4o" || pre == "o200k") t.pre_ = Pre::O200k;
         else if (pre == "kimi-k2") t.pre_ = Pre::Kimi;
         else if (pre == "tekken" || pre == "pixtral") t.pre_ = Pre::Tekken;
-        else if (pre == "deepseek-v3") t.pre_ = Pre::DeepseekV3;
+        else if (pre == "deepseek-v3" || pre == "joyai-llm") t.pre_ = Pre::DeepseekV3;
         else if (pre.empty() || pre == "default" || pre == "gpt-2" || pre == "olmo" || pre == "gpt2") t.pre_ = Pre::Gpt2;
         else {
             // Unknown splitter: most recent BPE models use the Llama 3 pattern or something close to it.

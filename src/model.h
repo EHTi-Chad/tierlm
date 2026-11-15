@@ -130,6 +130,22 @@ struct Hparams {
     // The running memory of a recurrent layer, per conversation: the convolution's last inputs and the state
     int ssm_conv_dim() const { return mamba ? m_inner + 2 * m_groups * m_state : 2 * ssm_k_heads * ssm_state + ssm_v_heads * ssm_state; }
     int64_t ssm_mem_elems() const { return mamba ? (int64_t)m_state * m_inner : (int64_t)ssm_state * ssm_state * ssm_v_heads; }
+    // DeepSeek V4 (deepseek4): hyper-connections (d4_hc streams, mixed by weights made from the streams, the mixing
+    // matrix made doubly stochastic by d4_hc_iters Sinkhorn steps); attention with one key/value head that is both
+    // (head_dim wide), a learned sink per head, partial interleaved RoPE on the last n_rot dims (undone on the output),
+    // a grouped low-rank output projection (d4_og groups of d4_ol); each token sees the last d4_win tokens as they are
+    // plus compressed entries of the past: per layer d4_ratio 0 (none), 4 (CSA: overlapping windows, the indexer
+    // picks d4_itopk of them per token) or 128 (HCA: all of them). Compressed layers rotate with base d4_cbase and
+    // YaRN (rope_scale, d4_yarn_*); the others plain with rope_base. Experts: sqrt(softplus) scores, the first
+    // d4_hash layers routed by a token -> experts table, SwiGLU with clamped inputs (per layer).
+    bool dsv4 = false;
+    std::vector<int> d4_ratio;
+    int d4_hc = 0, d4_hc_iters = 20, d4_og = 0, d4_ol = 0, d4_win = 0, d4_ih = 0, d4_id = 0, d4_itopk = 0, d4_hash = 0;
+    float d4_hc_eps = 1e-6f, d4_cbase = 160000.0f, d4_yarn_fast = 32.0f, d4_yarn_slow = 1.0f;
+    int d4_yarn_orig = 0;
+    std::vector<float> d4_clamp, d4_clamp_s;
+    std::vector<float> d4_rope_ff;    // the compressed layers' YaRN, as per-dimension frequency factors (see rope_ff)
+    int d4_ratio_at(int il) const { return il >= 0 && il < (int)d4_ratio.size() ? d4_ratio[il] : 0; }
 };
 using OlmoeHparams = Hparams;
 
@@ -401,6 +417,9 @@ private:
         ggml_tensor* routing = nullptr;          // all of them joined: [n_used, n_tok * n_layer], one read
         std::vector<std::pair<ggml_tensor*, int>> owner;   // every op tensor of each layer, with its layer
         std::vector<ggml_tensor*> cpu_ops;       // small ops that must run on the CPU (hot-expert bookkeeping)
+        // inputs made with the graph (DeepSeek V4: which ring rows and entries each step reads and writes, masks)
+        std::vector<std::pair<ggml_tensor*, std::vector<int32_t>>> in_i32;
+        std::vector<std::pair<ggml_tensor*, std::vector<float>>> in_f32;
     };
     // A batch's tokens, conversation by conversation (contiguous): n tokens of conversation seq.
     struct SeqGroup { int seq, n; };
@@ -495,6 +514,21 @@ private:
         ggml_tensor *hc_head_norm = nullptr, *hc_head_down = nullptr, *hc_head_up = nullptr;   // (Flash-Next's draft block: its own last mixer)
         ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
         std::vector<ggml_tensor*> conv_states, ssm_states;   // per conversation ([0]: conv_state, ssm_state_t)
+        // DeepSeek V4: the stream mixers (fn, base, scale; [0] before attention, [1] before the experts), attention
+        // (q down/norm/up, the one key/value head and its norm, grouped output down and up), the compressor (kv,
+        // gate, its positional bias, norm) and the indexer (query up, head weights, and its own compressor); the
+        // first layers' token -> experts table. Their memory: the last tokens' keys (a ring by position), the
+        // compressed entries, and the last tokens' compressor inputs (rings): see Model::d4_ring.
+        ggml_tensor *d4_hc_fn[2] = {}, *d4_hc_base[2] = {}, *d4_hc_scale[2] = {};
+        ggml_tensor *d4_q_a = nullptr, *d4_q_a_norm = nullptr, *d4_q_b = nullptr, *d4_kv = nullptr, *d4_kv_norm = nullptr;
+        ggml_tensor *d4_o_a = nullptr, *d4_o_b = nullptr;
+        ggml_tensor *d4_c_kv = nullptr, *d4_c_gate = nullptr, *d4_c_ape = nullptr, *d4_c_norm = nullptr;
+        ggml_tensor *d4_i_q_b = nullptr, *d4_i_proj = nullptr;
+        ggml_tensor *d4_ic_kv = nullptr, *d4_ic_gate = nullptr, *d4_ic_ape = nullptr, *d4_ic_norm = nullptr;
+        ggml_tensor *d4_tid2eid = nullptr;
+        ggml_tensor *d4_win = nullptr;                       // [head_dim, ring]: the last tokens' keys (= values)
+        ggml_tensor *d4_ce = nullptr, *d4_ie = nullptr;      // [head_dim | index dim, entries]: compressed entries
+        ggml_tensor *d4_c_rkv = nullptr, *d4_c_rgate = nullptr, *d4_i_rkv = nullptr, *d4_i_rgate = nullptr;   // [width, ring]
     };
     Hparams hp_;
     ggml_backend* main_ = nullptr;               // device holding weights + cache (the first GPU)
@@ -527,6 +561,13 @@ private:
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
     ggml_tensor *ple_embd_ = nullptr;            // Flash-Next: the PLE n-gram table [ple_dim, rows]
     ggml_tensor *out_hc_norm_ = nullptr, *out_hc_down_ = nullptr, *out_hc_up_ = nullptr;   // the last stream mixer
+    ggml_tensor *d4_out_fn_ = nullptr, *d4_out_base_ = nullptr, *d4_out_scale_ = nullptr;  // DeepSeek V4: the last stream mixer
+    // DeepSeek V4's rings: positions are kept in slot pos % size, with room for d4_slack positions more than the
+    // window or compressor needs, so a step of up to d4_slack tokens can be undone (speculative decoding) and the
+    // conversation cut back that far; further back it is read again (truncate).
+    static constexpr int d4_slack = 64;
+    int d4_ring(int need) const { return need + d4_slack; }
+    Graph build_dsv4(int n_tok, int n_past, bool want_routing, int n_logits, bool want_hidden, std::vector<uint8_t>* mem);
     std::vector<std::vector<int32_t>> seq_tok_;  // Flash-Next: each conversation's tokens (for the n-grams)
     // QSA (Flash-Next's sparse attention): each indexed layer's raw indexer keys, per conversation, by position
     // (qsa_dim numbers each), and that layer's norm weights; kept in RAM, read by the mask-making op.

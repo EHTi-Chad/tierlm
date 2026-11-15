@@ -22,7 +22,7 @@
 
 namespace tierlm {
 
-static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint", "deepseek2", "qwen4exp", "nemotron_h_moe" };
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint", "deepseek2", "qwen4exp", "nemotron_h_moe", "deepseek4" };
 bool arch_supported(const std::string& arch) {
     for (const char* a : kArchs) if (arch == a) return true;
     return false;
@@ -463,6 +463,60 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.group_sum2 = hp.expert_sigmoid;
         if (hp.n_group <= 1 || hp.topk_group <= 0 || hp.topk_group >= hp.n_group || hp.n_expert % std::max(1, hp.n_group)) hp.n_group = hp.topk_group = 0;
     }
+    if (arch == "deepseek4") {
+        // DeepSeek V4 (see Hparams::dsv4). The file's YaRN is the compressed layers' (their own base); the
+        // sliding-window-only layers rotate plainly with rope.freq_base, as Hugging Face's DeepseekV4Config sets it.
+        hp.dsv4 = true;
+        hp.rope_neox = false;                                     // interleaved pairs
+        hp.rope_ff.clear(); hp.rope_attn_factor = 1.0f; hp.rope_scale = 1.0f;
+        hp.n_head_kv = 1;
+        hp.q_lora   = (int)u32(arch + ".attention.q_lora_rank", true);
+        hp.d4_win   = (int)u32(arch + ".attention.sliding_window", true);
+        hp.d4_og    = (int)u32(arch + ".attention.output_group_count", true);
+        hp.d4_ol    = (int)u32(arch + ".attention.output_lora_rank", true);
+        hp.d4_ih    = (int)u32(arch + ".attention.indexer.head_count", false);
+        hp.d4_id    = (int)u32(arch + ".attention.indexer.key_length", false);
+        hp.d4_itopk = (int)u32(arch + ".attention.indexer.top_k", false);
+        hp.d4_hc    = (int)u32(arch + ".hyper_connection.count", true);
+        hp.d4_hc_iters = std::max(1, (int)u32(arch + ".hyper_connection.sinkhorn_iterations", false));
+        hp.d4_hc_eps = f32(arch + ".hyper_connection.epsilon", 1e-6f);
+        hp.d4_hash  = (int)u32(arch + ".hash_layer_count", false);
+        hp.d4_cbase = f32(arch + ".attention.compress_rope_freq_base", 160000.0f);
+        hp.d4_ratio = per_layer(arch + ".attention.compress_ratios", hp.n_layer);
+        auto floats = [&](const std::string& k, float def) {
+            std::vector<float> v((size_t)hp.n_layer, def);
+            const int64_t id = gguf_find_key(g, k.c_str());
+            if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, id) == GGUF_TYPE_FLOAT32) {
+                const float* d = (const float*)gguf_get_arr_data(g, id);
+                for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, id); ++i) v[i] = d[i];
+            } else if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_FLOAT32) std::fill(v.begin(), v.end(), gguf_get_val_f32(g, id));
+            return v;
+        };
+        hp.d4_clamp = floats(arch + ".swiglu_clamp_exp", 0.0f);
+        hp.d4_clamp_s = floats(arch + ".swiglu_clamp_shexp", 0.0f);
+        {
+            const int64_t id = gguf_find_key(g, (arch + ".expert_weights_norm").c_str());
+            hp.expert_renorm = id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL && gguf_get_val_bool(g, id);
+        }
+        hp.expert_softmax_first = true;                           // (the scores below are what's picked and weighted)
+        if (u32(arch + ".expert_gating_func", false) != 4) { gguf_free(g); throw std::runtime_error("this DeepSeek V4 file's expert scoring isn't known (expected sqrt-softplus)"); }
+        // the compressed layers' YaRN, as Hugging Face computes it (truncated ramp ends), as frequency factors
+        const float factor = f32(arch + ".rope.scaling.factor", 1.0f);
+        const double orig = u32(arch + ".rope.scaling.original_context_length", false);
+        if (str((arch + ".rope.scaling.type").c_str()) == "yarn" && factor > 1.0f && orig > 0) {
+            const int dim = hp.n_rot;
+            const double base = hp.d4_cbase;
+            const double bf = f32(arch + ".rope.scaling.yarn_beta_fast", 32.0f), bs = f32(arch + ".rope.scaling.yarn_beta_slow", 1.0f);
+            auto corr = [&](double rot) { return dim * std::log(orig / (rot * 2 * 3.14159265358979323846)) / (2 * std::log(base)); };
+            double lo = std::max(std::floor(corr(bf)), 0.0), hi = std::min(std::ceil(corr(bs)), (double)dim - 1);
+            if (lo == hi) hi += 0.001;
+            hp.d4_rope_ff.resize(dim / 2);
+            for (int i = 0; i < dim / 2; ++i) {
+                const double e = 1.0 - std::min(1.0, std::max(0.0, (i - lo) / (hi - lo)));
+                hp.d4_rope_ff[i] = (float)(1.0 / ((1.0 - e) / factor + e));
+            }
+        }
+    }
     // Qwen3.8 Flash-Next: Qwen3.5's DeltaNet and gated-attention layers and experts, plus hyper-connections, the
     // per-layer n-gram embedding and sparse attention (see Hparams::hc, ple_layer, qsa_budget).
     if (arch == "qwen4exp") {
@@ -647,6 +701,17 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             return ((size_t)(hp.ssm_conv - 1) * hp.ssm_conv_dim() + (size_t)hp.ssm_mem_elems()) * 4 *
                    (size_t)std::max(1, opt.parallel);
         if (hp.block_kind(il) == Hparams::kFfn) return 0;          // Nemotron's expert blocks keep nothing
+        if (hp.dsv4 && il < hp.n_layer) {                           // DeepSeek V4: see make_kv
+            const int r = hp.d4_ratio_at(il);
+            const size_t es = m->kv_t_ == GGML_TYPE_F32 ? 4 : 2, hd = hp.head_dim, id = hp.d4_id;
+            size_t b = hd * 4 * (size_t)m->d4_ring(hp.d4_win);
+            if (r) {
+                const size_t ne = (size_t)m->max_ctx_ / r + 1, rr = m->d4_ring(r == 4 ? 8 : r);
+                b += es * hd * ne + 2 * (r == 4 ? 2 : 1) * hd * 4 * rr;
+                if (r == 4) b += es * id * ne + 2 * 2 * id * 4 * rr;
+            }
+            return b;
+        }
         // keys and values; MLA keeps one compressed vector per token, which is both
         return (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, (int64_t)hp.head_dim * hp.n_head_kv) * (size_t)m->max_ctx_;
     };
@@ -781,7 +846,8 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         std::vector<Cand> cs;
         for (int l = 0; l < hp.n_layer; ++l)
             for (int e = 0; e < E; ++e)
-                if (per[l] && usage[(size_t)l * E + e] > 0) cs.push_back({usage[(size_t)l * E + e], l, e});
+                if (per[l] && usage[(size_t)l * E + e] > 0 && !(hp.dsv4 && l < hp.d4_hash))   // (V4's table-routed layers: whole)
+                    cs.push_back({usage[(size_t)l * E + e], l, e});
         std::stable_sort(cs.begin(), cs.end(), [](const Cand& a, const Cand& b) { return a.u > b.u; });
         std::vector<std::vector<char>> taken(hp.n_layer, std::vector<char>(E, 0));
         auto take = [&](int l, int e) {
@@ -1470,6 +1536,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         m->out_hc_up_   = T("output_hc_up.weight");
         if (hp.any_ple()) m->ple_embd_ = T("per_layer_token_embd.weight");
     }
+    if (hp.dsv4) {
+        m->d4_out_fn_ = T("output_hc_fn.weight"); m->d4_out_base_ = T("output_hc_base.weight"); m->d4_out_scale_ = T("output_hc_scale.weight");
+    }
     m->output_     = T("output.weight", false);
     m->rope_freqs_ = T("rope_freqs.weight", false);   // Llama 3.1+ long-context frequency factors
     if (!m->output_) m->output_ = m->tok_embd_;      // tied embeddings
@@ -1532,6 +1601,38 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             }
         }
         L.recurrent = hp.is_recurrent(i);
+        if (hp.dsv4) {                                                // DeepSeek V4 (see Hparams::dsv4, Layer::d4_*)
+            const char* site[2] = {"attn", "ffn"};
+            for (int k = 0; k < 2; ++k) {
+                L.d4_hc_fn[k] = T(b + "hc_" + site[k] + "_fn.weight");
+                L.d4_hc_base[k] = T(b + "hc_" + site[k] + "_base.weight");
+                L.d4_hc_scale[k] = T(b + "hc_" + site[k] + "_scale.weight");
+            }
+            L.d4_q_a = T(b + "attn_q_a.weight"); L.d4_q_a_norm = T(b + "attn_q_a_norm.weight"); L.d4_q_b = T(b + "attn_q_b.weight");
+            L.d4_kv = T(b + "attn_kv.weight"); L.d4_kv_norm = T(b + "attn_kv_a_norm.weight");
+            L.d4_o_a = T(b + "attn_output_a.weight"); L.d4_o_b = T(b + "attn_output_b.weight");
+            L.sinks = T(b + "attn_sinks.weight");
+            const int ratio = hp.d4_ratio_at(i);
+            if (ratio) {
+                L.d4_c_kv = T(b + "attn_compressor_kv.weight"); L.d4_c_gate = T(b + "attn_compressor_gate.weight");
+                L.d4_c_ape = T(b + "attn_compressor_ape.weight"); L.d4_c_norm = T(b + "attn_compressor_norm.weight");
+                if (ratio == 4) {
+                    L.d4_i_q_b = T(b + "indexer.attn_q_b.weight"); L.d4_i_proj = T(b + "indexer.proj.weight");
+                    L.d4_ic_kv = T(b + "indexer_compressor_kv.weight"); L.d4_ic_gate = T(b + "indexer_compressor_gate.weight");
+                    L.d4_ic_ape = T(b + "indexer_compressor_ape.weight"); L.d4_ic_norm = T(b + "indexer_compressor_norm.weight");
+                }
+            }
+            L.attn_norm = T(b + "attn_norm.weight");
+            L.ffn_norm = T(b + "ffn_norm.weight");
+            L.router = T(b + "ffn_gate_inp.weight");
+            if (i < hp.d4_hash) L.d4_tid2eid = T(b + "ffn_gate_tid2eid.weight");
+            else L.exp_probs_b = T(b + "exp_probs_b.bias", false);
+            L.gate_up_x = T(b + "ffn_gate_up_exps.weight", false);
+            if (!L.gate_up_x) { L.gate_x = T(b + "ffn_gate_exps.weight"); L.up_x = T(b + "ffn_up_exps.weight"); }
+            L.down_x = T(b + "ffn_down_exps.weight");
+            L.up_s = T(b + "ffn_up_shexp.weight"); L.gate_s = T(b + "ffn_gate_shexp.weight"); L.down_s = T(b + "ffn_down_shexp.weight");
+            return L;
+        }
         if (hp.mamba) {                                               // Nemotron: one of three kinds of block
             L.kind = hp.block_kind(i);
             L.rope = false;
@@ -1755,7 +1856,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
     // of the context), so it is not re-planned on every token.
     const int n_res = std::min(m->batch_, m->max_ctx_);
-    Graph worst = m->build(n_res, m->max_ctx_, true);
+    Graph worst = m->hp_.dsv4 ? m->build_dsv4(n_res, m->max_ctx_ - n_res, true, 1, false, nullptr) : m->build(n_res, m->max_ctx_, true);
     m->pin_cpu_layers(worst);
     bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
     ggml_free(worst.ctx);
@@ -1960,7 +2061,7 @@ void Model::seq_reset(int s) {
 void Model::seq_truncate(int s, int n) {
     if (s == 0) { truncate(n); return; }
     if (n >= seq_past(s)) return;
-    if (hp_.hybrid) { seq_reset(s); return; }                  // the running memory can't be rewound
+    if (hp_.hybrid || hp_.dsv4) { seq_reset(s); return; }      // the running memory can't be rewound
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // (another conversation's step uses the cell tables)
     free_cells_from(s, n);
 }
@@ -2011,6 +2112,9 @@ void Model::checkpoint() {
 void Model::truncate(int n) {
     release_pending();
     if (n >= n_past_) return;
+    // DeepSeek V4: its rings keep d4_slack positions more than they need, so going back that far is just forgetting;
+    // further back, what's needed may have been written over: start again
+    if (hp_.dsv4 && n_past_ - n > d4_slack) { reset(); return; }
     if (hp_.hybrid) {                                           // the running memory can't be rewound...
         while (!ckpts_.empty() && (ckpts_.back().n_past > n || ckpts_.back().n_past > n_past_)) ckpts_.pop_back();
         if (ckpts_.empty()) { reset(); return; }
@@ -2070,6 +2174,12 @@ Model::Snapshot Model::save() const {
         if (L.conv_state) { grab(L.conv_state, ggml_nbytes(L.conv_state)); grab(L.ssm_state_t, ggml_nbytes(L.ssm_state_t)); }
         if (!L.ple_states.empty()) grab(L.ple_states[0], ggml_nbytes(L.ple_states[0]));
         if (L.k_cache) { grab_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) grab_rows(L.v_cache, mtp ? by_pos : runs); }
+        if (L.d4_win) {                                           // DeepSeek V4: its rings whole, the entries made so far
+            const int m = hp_.d4_ratio_at(L.index);
+            grab(L.d4_win, ggml_nbytes(L.d4_win));
+            for (ggml_tensor* t : {L.d4_c_rkv, L.d4_c_rgate, L.d4_i_rkv, L.d4_i_rgate}) if (t) grab(t, ggml_nbytes(t));
+            for (ggml_tensor* t : {L.d4_ce, L.d4_ie}) if (t) grab(t, std::min(ggml_nbytes(t), (size_t)(n_past_ / m) * t->nb[1]));
+        }
     };
     for (const auto& L : layers_) layer(L, false);
     if (mtp_) layer(*mtp_, true);
@@ -2119,6 +2229,10 @@ void Model::restore(const Snapshot& s) {
         if (L.conv_state) { put(L.conv_state); put(L.ssm_state_t); }
         if (!L.ple_states.empty()) put(L.ple_states[0]);
         if (L.k_cache) { put_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) put_rows(L.v_cache, mtp ? by_pos : runs); }
+        if (L.d4_win) {
+            put(L.d4_win);
+            for (ggml_tensor* t : {L.d4_c_rkv, L.d4_c_rgate, L.d4_i_rkv, L.d4_i_rgate, L.d4_ce, L.d4_ie}) if (t) put(t);
+        }
     };
     for (const auto& L : layers_) layer(L, false);
     if (mtp_) layer(*mtp_, true);
@@ -2556,7 +2670,8 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         if (L.router_b) scores = ggml_add(c, scores, L.router_b);
         // Most families: softmax over all experts, then the top ones' probabilities. gpt-oss: the top scores, then
         // softmax over just those (same top experts either way: softmax keeps the order).
-        ggml_tensor* probs = hp.expert_sigmoid ? ggml_sigmoid(c, scores)          // Flint: each expert's own sigmoid
+        ggml_tensor* probs = hp.dsv4 ? ggml_sqrt(c, ggml_softplus(c, scores))     // DeepSeek V4: sqrt(softplus)
+                           : hp.expert_sigmoid ? ggml_sigmoid(c, scores)          // Flint: each expert's own sigmoid
                            : hp.expert_softmax_first ? ggml_soft_max(c, scores) : scores;
         // Which experts: by probs, or (DeepSeek V3) by probs plus a per-expert bias, and only from the best groups.
         ggml_tensor* choice = L.exp_probs_b ? ggml_add(c, probs, L.exp_probs_b) : probs;
@@ -2584,6 +2699,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         if (hot_only_ && L.hot_bias_g) choice = ggml_add(c, choice, L.hot_bias_g);   // (set_hot_only: the best of those in VRAM)
         ggml_tensor* order = ggml_argsort(c, choice, GGML_SORT_ORDER_DESC); // [n_expert, n_tok] best first
         ggml_tensor* sel   = ggml_view_2d(c, order, NU, n_tok, order->nb[1], 0);   // top n_used
+        if (L.d4_tid2eid) sel = ggml_get_rows(c, L.d4_tid2eid, g.inp);    // DeepSeek V4's first layers: a table by token
         // Routing for the dashboard and expert learning: just the chosen experts, copied out compactly. The rankings
         // themselves are not made outputs, so the GPU can still fuse the router's steps; all layers are joined and
         // read back in one go at the end (see build), instead of one GPU read per layer.
@@ -2621,6 +2737,11 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             }
             if (up_b)   up   = ggml_add_id(c, up, up_b, bias_ids);            // each pick gets its own expert's bias
             if (gate_b) gate = ggml_add_id(c, gate, gate_b, bias_ids);
+            if (hp.dsv4 && hp.d4_clamp[L.index] > 0) {                      // DeepSeek V4: SwiGLU's inputs clamped
+                const float lim = hp.d4_clamp[L.index];
+                gate = ggml_clamp(c, ggml_cont(c, gate), -INFINITY, lim);
+                up = ggml_clamp(c, ggml_cont(c, up), -lim, lim);
+            }
             ggml_tensor* act  = hp.expert_relu2 ? ggml_sqr(c, ggml_relu(c, up))
                               : hp.swiglu_oai ? ggml_swiglu_oai(c, gate_up_x ? ggml_cont(c, gate) : gate,
                                                                 gate_up_x ? ggml_cont(c, up) : up, 1.702f, 7.0f)
@@ -2639,7 +2760,12 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         ggml_tensor* sh_early = nullptr;                                     // the shared expert, if made before the RAM experts
         auto shared_expert = [&]() {
             if (!L.gate_s) return ggml_mul_mat(c, L.down_s, ggml_sqr(c, ggml_relu(c, ggml_mul_mat(c, L.up_s, h))));   // Nemotron
-            ggml_tensor* sh = ggml_swiglu_split(c, ggml_mul_mat(c, L.gate_s, h), ggml_mul_mat(c, L.up_s, h));
+            ggml_tensor *sg = ggml_mul_mat(c, L.gate_s, h), *su = ggml_mul_mat(c, L.up_s, h);
+            if (hp.dsv4 && hp.d4_clamp_s[L.index] > 0) {
+                const float lim = hp.d4_clamp_s[L.index];
+                sg = ggml_clamp(c, sg, -INFINITY, lim); su = ggml_clamp(c, su, -lim, lim);
+            }
+            ggml_tensor* sh = ggml_swiglu_split(c, sg, su);
             sh = ggml_mul_mat(c, L.down_s, sh);                              // [n_embd, n_tok]
             if (L.gate_inp_s) sh = ggml_mul(c, sh, ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h)));   // gate: [1, n_tok]
             return sh;
@@ -3237,6 +3363,335 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
 //   x = eh_proj([rms(embed(token)) * enorm ; rms(h) * hnorm]), then one full-attention layer with its own KV
 //   cache, then the shared final norm and output head.
 // Its own final hidden state can stand in for the model's, to draft several tokens ahead.
+// ---------------- DeepSeek V4 (deepseek4) ----------------
+// The stream mixers' weights for each token (Hugging Face's DeepseekV4HyperConnection, after its projection): in
+// a = [pre (hc) | post (hc) | comb (hc x hc, row k = the input stream, column j = the output stream)] raw, with
+// b = base, c = scale [3]. Out, in the same layout: pre = sigmoid(raw scale0 + base) + eps, post = 2 sigmoid(...),
+// comb = softmax over j (+ eps), then made doubly stochastic: columns, then rows and columns again (iters in all).
+// On the CPU: a few dozen numbers a token, where ggml would need a long chain of tiny steps.
+struct D4HcParams { int hc, iters; float eps; };
+static void d4_hc_weights(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b, const ggml_tensor* c, int ith, int nth, void* ud) {
+    const D4HcParams& P = *(const D4HcParams*)ud;
+    const int HC = P.hc, W = (2 + HC) * HC;
+    const float* base = (const float*)b->data;
+    const float* scale = (const float*)c->data;
+    for (int64_t t = ith; t < a->ne[1]; t += nth) {
+        const float* m = (const float*)((const char*)a->data + t * a->nb[1]);
+        float* o = (float*)((char*)dst->data + t * dst->nb[1]);
+        for (int i = 0; i < HC; ++i) {
+            o[i] = 1.0f / (1.0f + std::exp(-(m[i] * scale[0] + base[i]))) + P.eps;
+            o[HC + i] = 2.0f / (1.0f + std::exp(-(m[HC + i] * scale[1] + base[HC + i])));
+        }
+        float* cm = o + 2 * HC;                                       // cm[k * HC + j]
+        for (int k = 0; k < HC; ++k) {
+            float mx = -INFINITY;
+            for (int j = 0; j < HC; ++j) { cm[k * HC + j] = m[2 * HC + k * HC + j] * scale[2] + base[2 * HC + k * HC + j]; mx = std::max(mx, cm[k * HC + j]); }
+            float s = 0;
+            for (int j = 0; j < HC; ++j) { cm[k * HC + j] = std::exp(cm[k * HC + j] - mx); s += cm[k * HC + j]; }
+            for (int j = 0; j < HC; ++j) cm[k * HC + j] = cm[k * HC + j] / s + P.eps;
+        }
+        auto cols = [&] { for (int j = 0; j < HC; ++j) { float s = 0; for (int k = 0; k < HC; ++k) s += cm[k * HC + j]; for (int k = 0; k < HC; ++k) cm[k * HC + j] /= s + P.eps; } };
+        auto rows = [&] { for (int k = 0; k < HC; ++k) { float s = 0; for (int j = 0; j < HC; ++j) s += cm[k * HC + j]; for (int j = 0; j < HC; ++j) cm[k * HC + j] /= s + P.eps; } };
+        cols();
+        for (int it = 1; it < P.iters; ++it) { rows(); cols(); }
+        (void)W;
+    }
+}
+
+Model::Graph Model::build_dsv4(int n_tok, int n_past, bool want_routing, int n_logits, bool want_hidden, std::vector<uint8_t>* mem) {
+    const Hparams& hp = hp_;
+    const int E = hp.n_embd, HC = hp.d4_hc, H = hp.n_head, HD = hp.head_dim, ROT = hp.n_rot, W = hp.d4_win;
+    const int ID = hp.d4_id, IH = hp.d4_ih, OG = hp.d4_og, OL = hp.d4_ol;
+    const int p0 = n_past, p1 = n_past + n_tok;
+    if (!mem) drop_reuse();
+    Graph g;
+    std::vector<uint8_t>& gm = mem ? *mem : graph_mem(n_tok == 1 ? 0 : 1, n_tok);
+    ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
+    ggml_context* c = g.ctx = ggml_init(ip);
+    g.gf = ggml_new_graph_custom(c, graph_size_, false);
+    g.inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok); ggml_set_input(g.inp);
+    g.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok); ggml_set_input(g.pos);
+    g.cells = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok); ggml_set_input(g.cells);   // (unused: step sets it if placed)
+    auto in_i32 = [&](std::vector<int32_t> v, int64_t ne0, int64_t ne1 = 1) {
+        ggml_tensor* t = ggml_new_tensor_2d(c, GGML_TYPE_I32, ne0, ne1); ggml_set_input(t);
+        g.in_i32.push_back({t, std::move(v)});
+        return t;
+    };
+    auto in_f32 = [&](std::vector<float> v, int64_t ne0, int64_t ne1 = 1) {
+        ggml_tensor* t = ggml_new_tensor_2d(c, GGML_TYPE_F32, ne0, ne1); ggml_set_input(t);
+        g.in_f32.push_back({t, std::move(v)});
+        return t;
+    };
+    std::vector<ggml_tensor*> writes;                                    // memory updates: run after everything reads it
+    // positions: the tokens', and negated (the output is rotated back)
+    std::vector<int32_t> negp(n_tok);
+    for (int t = 0; t < n_tok; ++t) negp[t] = -(p0 + t);
+    ggml_tensor* pos_neg = in_i32(negp, n_tok);
+    ggml_tensor* cff = hp.d4_rope_ff.empty() ? nullptr : in_f32(hp.d4_rope_ff, (int64_t)hp.d4_rope_ff.size());
+    // RoPE on the last ROT dims of each row of t [dim, heads, n]: plain (base rope_base) or the compressed layers'
+    auto rope = [&](ggml_tensor* t, ggml_tensor* pos, bool comp) {
+        ggml_tensor* r = ggml_rope_ext(c, t, pos, comp ? cff : nullptr, ROT, 0, 0, comp ? hp.d4_cbase : hp.rope_base,
+                                       1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        return ggml_rope_set_offset(r, (int)t->ne[0] - ROT);
+    };
+    auto rms_w = [&](ggml_tensor* t, ggml_tensor* w) { return ggml_mul(c, ggml_rms_norm(c, t, hp.rms_eps), w); };
+
+    // ---- what this step reads and writes, the same for every layer of a kind ----
+    // the window: the keys of positions [qa, p1), from the ring (before p0) and this step (from p0)
+    const int WR = d4_ring(W), qa = std::max(0, p0 - (W - 1)), nk = p1 - qa;
+    std::vector<int32_t> widx(nk);
+    for (int q = qa; q < p1; ++q) widx[q - qa] = q < p0 ? q % WR : WR + (q - p0);
+    std::vector<float> wmask((size_t)nk * n_tok, -INFINITY);
+    for (int t = 0; t < n_tok; ++t)
+        for (int q = qa; q < p1; ++q) if (q <= p0 + t && q > p0 + t - W) wmask[(size_t)t * nk + (q - qa)] = 0.0f;
+    ggml_tensor* w_idx = in_i32(widx, nk);
+    ggml_tensor* w_mask = in_f32(wmask, nk, n_tok);
+    const int nw = std::min(n_tok, WR);                                  // ring writes: the last nw positions
+    std::vector<int32_t> wslot(nw);
+    for (int i = 0; i < nw; ++i) wslot[i] = (p1 - nw + i) % WR;
+    ggml_tensor* w_slot = in_i32(wslot, nw);
+    // compression at ratio m: the entries that complete in this step, the rows each reads, padding, positions;
+    // and which entries each token may see
+    struct Comp { int m = 0, ea = 0, eb = 0, rr = 0, nr = 0; ggml_tensor *idx = nullptr, *pad = nullptr, *epos = nullptr, *eidx = nullptr, *slot = nullptr, *vis = nullptr; };
+    std::map<int, Comp> comps;
+    for (int il = 0; il < hp.n_layer; ++il) {
+        const int m = hp.d4_ratio_at(il);
+        if (!m || comps.count(m)) continue;
+        Comp k; k.m = m;
+        const bool ov = m == 4;
+        const int S = ov ? 2 * m : m;
+        k.rr = d4_ring(ov ? 8 : m);
+        k.ea = (p0 + m) / m - 1; k.eb = p1 / m;
+        const int ne = std::max(0, k.eb - k.ea);
+        if (ne > 0) {
+            std::vector<int32_t> idx((size_t)S * ne), ep(ne), ei(ne);
+            std::vector<float> pad((size_t)S * ne, 0.0f);
+            for (int e = k.ea; e < k.eb; ++e) {
+                const int i = e - k.ea;
+                ep[i] = e * m; ei[i] = e;
+                for (int j = 0; j < S; ++j) {
+                    const int q = ov ? (e - 1) * m + j : e * m + j;
+                    if (q < 0) { idx[(size_t)i * S + j] = 0; pad[(size_t)i * S + j] = -INFINITY; continue; }
+                    idx[(size_t)i * S + j] = q < p0 ? q % k.rr : k.rr + (q - p0);
+                }
+            }
+            k.idx = in_i32(idx, (int64_t)S * ne);
+            k.pad = in_f32(pad, S, ne);
+            k.epos = in_i32(ep, ne);
+            k.eidx = in_i32(ei, ne);
+        }
+        k.nr = std::min(n_tok, k.rr);
+        std::vector<int32_t> sl(k.nr);
+        for (int i = 0; i < k.nr; ++i) sl[i] = (p1 - k.nr + i) % k.rr;
+        k.slot = in_i32(sl, k.nr);
+        if (k.eb > 0) {
+            std::vector<float> vis((size_t)k.eb * n_tok, -INFINITY);
+            for (int t = 0; t < n_tok; ++t) for (int e = 0; e < k.eb && e < (p0 + t + 1) / m; ++e) vis[(size_t)t * k.eb + e] = 0.0f;
+            k.vis = in_f32(vis, k.eb, n_tok);
+        }
+        comps[m] = k;
+    }
+
+    // ---- the streams ----
+    ggml_tensor* x = ggml_get_rows(c, tok_embd_, g.inp);                // [E, n]
+    ggml_tensor* X = ggml_reshape_2d(c, ggml_repeat_4d(c, ggml_reshape_3d(c, x, E, 1, n_tok), E, HC, n_tok, 1), (int64_t)E * HC, n_tok);
+    static D4HcParams hcp;
+    hcp = {HC, hp.d4_hc_iters, hp.d4_hc_eps};
+    // a block's input from the streams, and how its output goes back (see d4_hc_weights)
+    auto hc_in = [&](ggml_tensor* Xs, const Layer& L, int k, ggml_tensor** post, ggml_tensor** comb) {
+        ggml_tensor* mix = ggml_mul_mat(c, L.d4_hc_fn[k], ggml_rms_norm(c, Xs, hp.rms_eps));       // [(2+HC)HC, n]
+        ggml_tensor* w = ggml_map_custom3(c, mix, L.d4_hc_base[k], L.d4_hc_scale[k], d4_hc_weights, 1, &hcp);
+        g.cpu_ops.push_back(w);
+        const size_t es = ggml_element_size(w);
+        ggml_tensor* pre = ggml_view_2d(c, w, HC, n_tok, w->nb[1], 0);
+        *post = ggml_view_2d(c, w, HC, n_tok, w->nb[1], (size_t)HC * es);
+        *comb = ggml_view_3d(c, w, HC, HC, n_tok, (size_t)HC * es, w->nb[1], (size_t)2 * HC * es);   // [j, k, n]
+        ggml_tensor* X3 = ggml_reshape_3d(c, Xs, E, HC, n_tok);
+        ggml_tensor* s = nullptr;
+        for (int i = 0; i < HC; ++i) {
+            ggml_tensor* v = ggml_mul(c, ggml_view_2d(c, X3, E, n_tok, X3->nb[2], (size_t)i * X3->nb[1]),
+                                      ggml_view_2d(c, pre, 1, n_tok, pre->nb[1], (size_t)i * es));
+            s = s ? ggml_add(c, s, v) : v;
+        }
+        return s;                                                        // [E, n]
+    };
+    auto hc_out = [&](ggml_tensor* Xs, ggml_tensor* y, ggml_tensor* post, ggml_tensor* comb) {
+        ggml_tensor* X3 = ggml_reshape_3d(c, Xs, E, HC, n_tok);
+        ggml_tensor* Xt = ggml_cont(c, ggml_permute(c, X3, 1, 0, 2, 3));                 // [HC (k), E, n]
+        ggml_tensor* Ck = ggml_cont(c, ggml_permute(c, comb, 1, 0, 2, 3));               // [k, j, n]
+        ggml_tensor* R  = ggml_mul_mat(c, Xt, Ck);                                       // [E, j, n]
+        ggml_tensor* yr = ggml_repeat_4d(c, ggml_reshape_3d(c, ggml_cont(c, y), E, 1, n_tok), E, HC, n_tok, 1);
+        ggml_tensor* pw = ggml_mul(c, yr, ggml_reshape_3d(c, ggml_cont(c, post), 1, HC, n_tok));
+        return ggml_reshape_2d(c, ggml_add(c, R, pw), (int64_t)E * HC, n_tok);
+    };
+
+    // ---- the compressor: entries completed in this step, [D, ne] (null if none); ring writes queued ----
+    auto compress = [&](const Layer& L, ggml_tensor* hs, const Comp& k, ggml_tensor* kvw, ggml_tensor* gw, ggml_tensor* ape,
+                        ggml_tensor* nrm, ggml_tensor* rkv, ggml_tensor* rgate, int D) -> ggml_tensor* {
+        const bool ov = k.m == 4;
+        const int wid = ov ? 2 * D : D, S = ov ? 2 * k.m : k.m, ne = std::max(0, k.eb - k.ea);
+        ggml_tensor* kvb = ggml_mul_mat(c, kvw, hs);                         // [wid, n]
+        ggml_tensor* gb  = ggml_mul_mat(c, gw, hs);
+        (void)L;
+        // ring writes: the last nr positions' raw rows
+        auto tail = [&](ggml_tensor* t) { return ggml_view_2d(c, t, wid, k.nr, t->nb[1], (size_t)(n_tok - k.nr) * t->nb[1]); };
+        writes.push_back(ggml_set_rows(c, rkv, tail(kvb), k.slot));
+        writes.push_back(ggml_set_rows(c, rgate, tail(gb), k.slot));
+        if (ne == 0) return nullptr;
+        ggml_tensor* skv = ggml_get_rows(c, ggml_concat(c, rkv, kvb, 1), k.idx);   // [wid, S ne]
+        ggml_tensor* sg  = ggml_get_rows(c, ggml_concat(c, rgate, gb, 1), k.idx);
+        sg = ggml_add(c, ggml_reshape_3d(c, sg, wid, k.m, (int64_t)(S / k.m) * ne), ape);   // + positional bias per slot
+        ggml_tensor *kv3, *g3;                                                // [D, S, ne]
+        if (ov) {
+            // slots [0, m): the window before (its first D channels); [m, 2m): this window (its last D)
+            ggml_tensor* k4 = ggml_reshape_4d(c, skv, wid, k.m, 2, ne);
+            ggml_tensor* g4 = ggml_reshape_4d(c, sg, wid, k.m, 2, ne);
+            const size_t ek = ggml_element_size(k4), eg = ggml_element_size(g4);
+            auto half = [&](ggml_tensor* t4, int which, size_t es) {
+                return ggml_view_3d(c, t4, D, k.m, ne, t4->nb[1], t4->nb[3], (size_t)which * (D * es + t4->nb[2]));
+            };
+            kv3 = ggml_concat(c, half(k4, 0, ek), half(k4, 1, ek), 1);
+            g3  = ggml_concat(c, half(g4, 0, eg), half(g4, 1, eg), 1);
+        } else {
+            kv3 = ggml_reshape_3d(c, skv, D, S, ne);
+            g3  = ggml_reshape_3d(c, sg, D, S, ne);
+        }
+        g3 = ggml_add(c, g3, ggml_reshape_3d(c, k.pad, 1, S, ne));         // padding (the first window's "before")
+        ggml_tensor* gt = ggml_soft_max(c, ggml_cont(c, ggml_permute(c, g3, 1, 0, 2, 3)));   // [S, D, ne], over S
+        ggml_tensor* kt = ggml_cont(c, ggml_permute(c, kv3, 1, 0, 2, 3));
+        ggml_tensor* s  = ggml_reshape_2d(c, ggml_sum_rows(c, ggml_mul(c, kt, gt)), D, ne);   // [D, ne]
+        s = rms_w(s, nrm);
+        return ggml_reshape_2d(c, rope(ggml_reshape_3d(c, s, D, 1, ne), k.epos, true), D, ne);
+    };
+    // every entry so far, [D, eb]: the cache's (before ea) and this step's; this step's are written to the cache
+    auto entries = [&](const Comp& k, ggml_tensor* cache, ggml_tensor* fresh, int D) -> ggml_tensor* {
+        ggml_tensor* old = nullptr;
+        if (k.ea > 0) {
+            old = ggml_view_2d(c, cache, D, k.ea, cache->nb[1], 0);
+            if (old->type != GGML_TYPE_F32) old = ggml_cast(c, old, GGML_TYPE_F32);
+        }
+        if (fresh) writes.push_back(ggml_set_rows(c, cache, fresh, k.eidx));
+        if (!fresh) return old;
+        return old ? ggml_concat(c, old, fresh, 1) : fresh;
+    };
+
+    for (int li = 0; li < (int)layers_.size(); ++li) {
+        const Layer& L = layers_[li];
+        const int m = hp.d4_ratio_at(li);
+        const bool comp = m != 0;
+        // ---- attention ----
+        ggml_tensor *post, *comb;
+        ggml_tensor* hs = rms_w(hc_in(X, L, 0, &post, &comb), L.attn_norm);        // [E, n]
+        ggml_tensor* qr = rms_w(ggml_mul_mat(c, L.d4_q_a, hs), L.d4_q_a_norm);       // [QL, n]
+        ggml_tensor* q  = ggml_rms_norm(c, ggml_reshape_3d(c, ggml_mul_mat(c, L.d4_q_b, qr), HD, H, n_tok), hp.rms_eps);
+        q = rope(q, g.pos, comp);                                                  // [HD, H, n]
+        ggml_tensor* kv = rms_w(ggml_mul_mat(c, L.d4_kv, hs), L.d4_kv_norm);
+        kv = ggml_reshape_2d(c, rope(ggml_reshape_3d(c, kv, HD, 1, n_tok), g.pos, comp), HD, n_tok);
+        ggml_tensor* Kw = ggml_get_rows(c, ggml_concat(c, L.d4_win, kv, 1), w_idx);   // [HD, nk]
+        writes.push_back(ggml_set_rows(c, L.d4_win, ggml_view_2d(c, kv, HD, nw, kv->nb[1], (size_t)(n_tok - nw) * kv->nb[1]), w_slot));
+        ggml_tensor* Ks = Kw;
+        ggml_tensor* Ms = w_mask;                                                  // [keys, n]
+        ggml_tensor *Ksel = nullptr, *Msel = nullptr;                              // CSA: [HD, K, n], [K, 1, n]
+        if (comp) {
+            const Comp& k = comps.at(m);
+            ggml_tensor* fresh = compress(L, hs, k, L.d4_c_kv, L.d4_c_gate, L.d4_c_ape, L.d4_c_norm, L.d4_c_rkv, L.d4_c_rgate, HD);
+            // CSA reads only the top_k entries a token picks: gathered straight from the cache (this step's written
+            // first), not all of them converted every step. HCA attends to every entry: [HD, eb] in f32.
+            ggml_tensor* ce = nullptr;
+            if (m == 4 && k.eb > 0)
+                ce = ggml_view_2d(c, fresh ? ggml_set_rows(c, L.d4_ce, fresh, k.eidx) : L.d4_ce, HD, k.eb, L.d4_ce->nb[1], 0);
+            else if (m != 4) ce = entries(k, L.d4_ce, fresh, HD);              // (null: none yet)
+            if (m == 4) {
+                ggml_tensor* ifresh = compress(L, hs, k, L.d4_ic_kv, L.d4_ic_gate, L.d4_ic_ape, L.d4_ic_norm, L.d4_i_rkv, L.d4_i_rgate, ID);
+                ggml_tensor* ie = entries(k, L.d4_ie, ifresh, ID);                 // [ID, eb]
+                if (ce && ie) {
+                    // the indexer: score every entry, keep the top_k per token
+                    ggml_tensor* iq = rope(ggml_reshape_3d(c, ggml_mul_mat(c, L.d4_i_q_b, qr), ID, IH, n_tok), g.pos, true);
+                    // per token: sum over heads of w[h] relu(entry . q[h]); scored in chunks of tokens, so the
+                    // scores ([heads, entries] a token) of a long prompt never all exist at once
+                    ggml_tensor* wts = ggml_scale(c, ggml_mul_mat(c, L.d4_i_proj, hs), 1.0f / std::sqrt((float)IH * ID));  // [IH, n]
+                    const int K = std::min(hp.d4_itopk, k.eb);
+                    const int tc = (int)std::max<int64_t>(1, std::min<int64_t>(n_tok, ((int64_t)1 << 25) / ((int64_t)k.eb * IH)));
+                    ggml_tensor* top = nullptr;
+                    for (int t0 = 0; t0 < n_tok; t0 += tc) {
+                        const int nt = std::min(tc, n_tok - t0);
+                        ggml_tensor* iqc = ggml_view_2d(c, iq, ID, (int64_t)IH * nt, iq->nb[1], (size_t)t0 * iq->nb[2]);
+                        ggml_tensor* sc = ggml_relu_inplace(c, ggml_mul_mat(c, iqc, ie));                       // [IH nt, eb]
+                        ggml_tensor* sp = ggml_permute(c, ggml_reshape_3d(c, sc, IH, nt, k.eb), 0, 2, 1, 3);   // [IH, eb, nt]
+                        ggml_tensor* wc = ggml_reshape_3d(c, ggml_view_2d(c, wts, IH, nt, wts->nb[1], (size_t)t0 * wts->nb[1]), IH, 1, nt);
+                        ggml_tensor* score = ggml_reshape_2d(c, ggml_mul_mat(c, ggml_cont(c, sp), wc), k.eb, nt);
+                        score = ggml_add(c, score, ggml_view_2d(c, k.vis, k.eb, nt, k.vis->nb[1], (size_t)t0 * k.vis->nb[1]));
+                        ggml_tensor* tk = ggml_cont(c, ggml_top_k(c, score, K));                                // [K, nt]
+                        top = top ? ggml_concat(c, top, tk, 1) : tk;
+                    }
+                    Ksel = ggml_reshape_3d(c, ggml_get_rows(c, ce, ggml_reshape_1d(c, top, (int64_t)K * n_tok)), HD, K, n_tok);
+                    Msel = ggml_reshape_3d(c, ggml_get_rows(c, ggml_reshape_3d(c, k.vis, 1, k.eb, n_tok), top), K, 1, n_tok);
+                }
+            } else if (ce) {                                                       // HCA: every entry, masked by position
+                Ks = ggml_concat(c, Kw, ce, 1);
+                Ms = ggml_concat(c, w_mask, k.vis, 0);
+            }
+        }
+        // logits [keys, n, H]; a sink per head; one shared head of keys = values
+        const float scale = 1.0f / std::sqrt((float)HD);
+        ggml_tensor* qp = ggml_permute(c, q, 0, 2, 1, 3);                         // [HD, n, H]
+        ggml_tensor* lg = ggml_add(c, ggml_mul_mat(c, Ks, qp), ggml_reshape_3d(c, Ms, Ms->ne[0], n_tok, 1));
+        const int64_t Kn = Ks->ne[1];
+        int64_t Kc = 0;
+        if (Ksel) {
+            ggml_tensor* lc = ggml_add(c, ggml_mul_mat(c, Ksel, q), Msel);        // [K, H, n]
+            Kc = lc->ne[0];
+            lg = ggml_concat(c, lg, ggml_cont(c, ggml_permute(c, lc, 0, 2, 1, 3)), 0);   // [Kn + K, n, H]
+        }
+        ggml_tensor* pr = ggml_soft_max_ext(c, lg, nullptr, scale, 0.0f);
+        ggml_soft_max_add_sinks(pr, L.sinks);
+        ggml_tensor* ps = ggml_view_3d(c, pr, Kn, n_tok, H, pr->nb[1], pr->nb[2], 0);
+        ggml_tensor* out = ggml_mul_mat(c, ggml_cont(c, ggml_transpose(c, Ks)), ps);   // [HD, n, H]
+        if (Ksel) {
+            ggml_tensor* pc = ggml_cont(c, ggml_permute(c, ggml_view_3d(c, pr, Kc, n_tok, H, pr->nb[1], pr->nb[2], (size_t)Kn * ggml_element_size(pr)), 0, 2, 1, 3));   // [K, H, n]
+            ggml_tensor* oc = ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, Ksel, 1, 0, 2, 3)), pc);   // [HD, H, n]
+            out = ggml_add(c, out, ggml_permute(c, oc, 0, 2, 1, 3));
+        }
+        out = ggml_cont(c, ggml_permute(c, out, 0, 2, 1, 3));                    // [HD, H, n]
+        out = rope(out, pos_neg, comp);                                           // rotated back by its own position
+        // grouped output projection: each group of heads down to OL, then all of them up to E
+        const int64_t per = (int64_t)H * HD / OG;
+        ggml_tensor* og = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, out, per, OG, n_tok), 0, 2, 1, 3));   // [per, n, OG]
+        ggml_tensor* oa = ggml_mul_mat(c, ggml_reshape_3d(c, L.d4_o_a, per, OL, OG), og);   // [OL, n, OG]
+        ggml_tensor* ao = ggml_mul_mat(c, L.d4_o_b, ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, oa, 0, 2, 1, 3)), (int64_t)OG * OL, n_tok));
+        X = hc_out(X, ao, post, comb);
+        // ---- experts ----
+        ggml_tensor* hf = rms_w(hc_in(X, L, 1, &post, &comb), L.ffn_norm);
+        X = hc_out(X, ffn_block(c, g, L, hf, n_tok, want_routing), post, comb);
+    }
+    if (!g.orders.empty()) {
+        ggml_tensor* r = g.orders[0];
+        for (size_t l = 1; l < g.orders.size(); ++l) r = ggml_concat(c, r, g.orders[l], 1);
+        ggml_set_output(r); ggml_build_forward_expand(g.gf, r); g.routing = r;
+    }
+    // the last mixer: the streams into one (sigmoid weights, no Sinkhorn), then the final norm
+    ggml_tensor* mix = ggml_mul_mat(c, d4_out_fn_, ggml_rms_norm(c, X, hp.rms_eps));   // [HC, n]
+    ggml_tensor* pre = ggml_scale_bias(c, ggml_sigmoid(c, ggml_add(c, ggml_mul(c, mix, d4_out_scale_), d4_out_base_)), 1.0f, hp.d4_hc_eps);
+    {
+        ggml_tensor* X3 = ggml_reshape_3d(c, X, E, HC, n_tok);
+        ggml_tensor* s = nullptr;
+        for (int i = 0; i < HC; ++i) {
+            ggml_tensor* v = ggml_mul(c, ggml_view_2d(c, X3, E, n_tok, X3->nb[2], (size_t)i * X3->nb[1]),
+                                      ggml_view_2d(c, pre, 1, n_tok, pre->nb[1], (size_t)i * ggml_element_size(pre)));
+            s = s ? ggml_add(c, s, v) : v;
+        }
+        x = rms_w(s, out_norm_);
+    }
+    if (want_hidden) { g.hidden = x; ggml_set_output(x); }
+    n_logits = std::max(1, std::min(n_logits, n_tok));
+    ggml_tensor* last = ggml_view_2d(c, x, E, n_logits, x->nb[1], (size_t)(n_tok - n_logits) * x->nb[1]);
+    g.logits = ggml_mul_mat(c, output_, last);
+    ggml_set_output(g.logits);
+    ggml_build_forward_expand(g.gf, g.logits);
+    for (ggml_tensor* w : writes) ggml_build_forward_expand(g.gf, w);   // (after everything that reads the memory)
+    return g;
+}
+
 Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem) {
     const Hparams& hp = hp_;
     const Layer& L = *mtp_;
@@ -3396,7 +3851,7 @@ void Model::make_kv(int ctx, int n_seq) {
     const Hparams& hp = hp_;
     const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), G = (int)gpus_.size(), hd = hp.head_dim;
     const ggml_type kv_type = (ggml_type)kv_t_;
-    ggml_init_params kp{ (size_t)3 * nl_all * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
+    ggml_init_params kp{ (size_t)(hp.dsv4 ? 8 : 3) * nl_all * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     kvctx_ = ggml_init(kp);
     std::vector<std::vector<ggml_tensor*>> kv_t(G + 1);              // per GPU, then RAM
     for (int i = 0; i < nl_all; ++i) {
@@ -3423,6 +3878,26 @@ void Model::make_kv(int ctx, int n_seq) {
             continue;
         }
         if (L.kind == Hparams::kFfn) continue;                       // Nemotron's expert blocks keep nothing
+        if (hp.dsv4) {                                               // DeepSeek V4: rings and compressed entries
+            const int ratio = hp.d4_ratio_at(i), ID = hp.d4_id;
+            const ggml_type et = kv_type == GGML_TYPE_F32 ? GGML_TYPE_F32 : GGML_TYPE_F16;   // (entries: f16 unless exact)
+            L.d4_win = ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, hd, d4_ring(hp.d4_win));
+            dst.push_back(L.d4_win);
+            if (ratio) {
+                const int64_t ne = ctx / ratio + 1, wid = (ratio == 4 ? 2 : 1) * (int64_t)hd, rr = d4_ring(ratio == 4 ? 8 : ratio);
+                L.d4_ce = ggml_new_tensor_2d(kvctx_, et, hd, ne);
+                L.d4_c_rkv = ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, wid, rr);
+                L.d4_c_rgate = ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, wid, rr);
+                for (ggml_tensor* t : {L.d4_ce, L.d4_c_rkv, L.d4_c_rgate}) dst.push_back(t);
+                if (ratio == 4) {
+                    L.d4_ie = ggml_new_tensor_2d(kvctx_, et, ID, ne);
+                    L.d4_i_rkv = ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, 2 * ID, rr);
+                    L.d4_i_rgate = ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, 2 * ID, rr);
+                    for (ggml_tensor* t : {L.d4_ie, L.d4_i_rkv, L.d4_i_rgate}) dst.push_back(t);
+                }
+            }
+            continue;
+        }
         L.k_cache = ggml_new_tensor_3d(kvctx_, kv_type, hd, hp.n_head_kv, ctx);
         dst.push_back(L.k_cache);
         if (hp.mla) { L.v_cache = nullptr; continue; }               // MLA: the values are part of the one cache
@@ -3448,8 +3923,12 @@ size_t Model::kv_bytes_per_token(size_t* in_vram) const {
     const int nl_all = hp_.n_layer + (mtp_ ? 1 : 0);
     for (int i = 0; i < nl_all; ++i) {
         const auto& L = i < hp_.n_layer ? layers_[i] : *mtp_;
-        if (L.recurrent || !L.k_cache) continue;
-        const size_t b = L.k_cache->nb[2] + (L.v_cache ? L.v_cache->nb[2] : 0);
+        size_t b = 0;
+        if (L.d4_ce) {                                             // DeepSeek V4: an entry per 4 or 128 tokens
+            const int r = hp_.d4_ratio_at(i);
+            b = (L.d4_ce->nb[1] + (L.d4_ie ? L.d4_ie->nb[1] : 0) + r - 1) / r;
+        } else if (L.recurrent || !L.k_cache) continue;
+        else b = L.k_cache->nb[2] + (L.v_cache ? L.v_cache->nb[2] : 0);
         all += b;
         if (layer_dev_[i] >= 0) vram += b;
     }
@@ -3486,7 +3965,11 @@ void Model::resize_ctx(int new_ctx) {
     for (int i = 0; i < nl_all; ++i) {
         auto& L = i < hp.n_layer ? layers_[i] : *mtp_;
         for (ggml_tensor* t : L.ple_states) kept[i].ple.push_back(get(t, ggml_nbytes(t)));
-        if (L.recurrent) {
+        if (L.d4_win) {                                           // DeepSeek V4: rings whole, entries up to hi_
+            for (ggml_tensor* t : {L.d4_win, L.d4_c_rkv, L.d4_c_rgate, L.d4_i_rkv, L.d4_i_rgate, L.d4_ce, L.d4_ie})
+                kept[i].conv.push_back(t ? get(t, std::min(ggml_nbytes(t), t == L.d4_ce || t == L.d4_ie ?
+                                                           (size_t)(hi_ / hp.d4_ratio_at(i) + 1) * t->nb[1] : ggml_nbytes(t))) : std::vector<uint8_t>());
+        } else if (L.recurrent) {
             for (int s = 0; s < n_seq; ++s) {
                 kept[i].conv.push_back(get(L.conv_states[s], ggml_nbytes(L.conv_states[s])));
                 kept[i].ssm.push_back(get(L.ssm_states[s], ggml_nbytes(L.ssm_states[s])));
@@ -3512,7 +3995,13 @@ void Model::resize_ctx(int new_ctx) {
         auto& L = i < hp.n_layer ? layers_[i] : *mtp_;
         for (size_t s = 0; s < L.ple_states.size() && s < kept[i].ple.size(); ++s)
             ggml_backend_tensor_set(L.ple_states[s], kept[i].ple[s].data(), 0, kept[i].ple[s].size());
-        if (L.recurrent) {
+        if (L.d4_win) {
+            size_t j = 0;
+            for (ggml_tensor* t : {L.d4_win, L.d4_c_rkv, L.d4_c_rgate, L.d4_i_rkv, L.d4_i_rgate, L.d4_ce, L.d4_ie}) {
+                const auto& d = kept[i].conv[j++];
+                if (t && !d.empty()) ggml_backend_tensor_set(t, d.data(), 0, std::min(d.size(), ggml_nbytes(t)));
+            }
+        } else if (L.recurrent) {
             for (int s = 0; s < n_seq; ++s) {
                 ggml_backend_tensor_set(L.conv_states[s], kept[i].conv[s].data(), 0, kept[i].conv[s].size());
                 ggml_backend_tensor_set(L.ssm_states[s], kept[i].ssm[s].data(), 0, kept[i].ssm[s].size());
@@ -3531,7 +4020,7 @@ void Model::resize_ctx(int new_ctx) {
     free_lo_ = std::min(free_lo_, max_ctx_);
     // 5. compute memory for the largest graph at the new size
     const int n_res = std::min(batch_, max_ctx_);
-    Graph worst = build(n_res, max_ctx_, true);
+    Graph worst = hp_.dsv4 ? build_dsv4(n_res, max_ctx_ - n_res, true, 1, false, nullptr) : build(n_res, max_ctx_, true);
     pin_cpu_layers(worst);
     drop_reuse();
     ggml_backend_sched_reset(sched_);
@@ -3709,16 +4198,19 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     // something about it changes (any other graph, or a new span). Saves ~3 ms a token. TIERLM_REUSE=0: always build.
     static const bool reuse_on = !(std::getenv("TIERLM_REUSE") && !std::strcmp(std::getenv("TIERLM_REUSE"), "0")) &&
                                  !std::getenv("TIERLM_DUMP_SCHED");
-    const bool cacheable = reuse_on && n_tok == 1 && !groups && !any_image && snapshots <= 1;
+    // (DeepSeek V4: its graph's inputs depend on the position, so it's built every step)
+    if (hp.dsv4 && groups && groups->size() > 1) throw std::runtime_error("DeepSeek V4 runs one conversation at a time");
+    const bool cacheable = reuse_on && n_tok == 1 && !groups && !any_image && snapshots <= 1 && !hp.dsv4;
     // A check of guesses (an undoable step) has a scheduler of its own, where its graph stays placed (see Plan).
-    const bool plan = reuse_on && check_.sched && snapshots > 1 && !groups && !any_image;
+    const bool plan = reuse_on && check_.sched && snapshots > 1 && !groups && !any_image && !hp.dsv4;
     const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_};
     const bool reuse = plan ? check_.g.ctx && key == check_.key : cacheable && reuse_.ctx && key == reuse_key_;
     ggml_backend_sched* const sc = plan ? check_.sched : sched_;
     Graph built;
     if (!reuse) {
         if (plan) drop_plan(check_);
-        built = build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups, plan ? &check_.mem : nullptr);
+        built = hp.dsv4 ? build_dsv4(n_tok, tok_pos[0], routing != nullptr, n_logits, want_hidden, nullptr)
+                        : build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups, plan ? &check_.mem : nullptr);
         if (plan) { built.kept = true; check_.g = built; check_.key = key; }
     }
     Graph& g = plan ? check_.g : reuse ? reuse_ : built;
@@ -3822,7 +4314,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             MappedFile::prefetch_many(r);
         }
     }
-    fill_masks(g, n_kv, tok_seq, tok_pos);
+    if (!hp.dsv4) fill_masks(g, n_kv, tok_seq, tok_pos);
     if (g.out_idx) {                                               // each conversation's last token
         std::vector<int32_t> idx;
         int t = 0;
@@ -3830,6 +4322,8 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         ggml_backend_tensor_set(g.out_idx, idx.data(), 0, sizeof(int32_t) * idx.size());
     }
     if (g.rope_ff) ggml_backend_tensor_set(g.rope_ff, hp.rope_ff.data(), 0, sizeof(float) * hp.rope_ff.size());
+    for (auto& [t, v] : g.in_i32) if (t->buffer) ggml_backend_tensor_set(t, v.data(), 0, sizeof(int32_t) * v.size());
+    for (auto& [t, v] : g.in_f32) if (t->buffer) ggml_backend_tensor_set(t, v.data(), 0, sizeof(float) * v.size());
     set_n_threads(cpu_, n_threads);
     n_threads_last_ = n_threads;
     auto t3 = clk::now();

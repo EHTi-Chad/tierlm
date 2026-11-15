@@ -282,6 +282,7 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
         const std::string bos = "<\xEF\xBD\x9C" "begin\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>";
         const std::string eos = "<\xEF\xBD\x9C" "end\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>";
         const std::string& ct = tok.chat_template();
+        const bool sw = ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos;   // V3.1, V4
         if (tok.find(bos) >= 0) s = bos;
         std::string sys;                                  // system prompts come first, joined
         for (const auto& m : messages) if (m.value("role", "") == "system") sys += (sys.empty() ? "" : "\n\n") + m.value("content", std::string());
@@ -293,12 +294,12 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
             else if (role == "assistant") {               // earlier answers without their reasoning, as the template does
                 const size_t e = c.rfind("</think>");
                 if (e != std::string::npos) c = c.substr(e + 8);
-                s += A + c + eos;
+                s += A + (sw ? "</think>" : "") + c + eos;   // (V3.1 and V4: earlier answers after an empty thought)
             }
         }
         s += A;
         if (ct.find("<think>\\n") != std::string::npos && ct.find("thinking") == std::string::npos) return s + "<think>\n";   // R1: always thinks
-        if (ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos)                         // V3.1: a switch
+        if (sw)                                                                                                          // V3.1, V4: a switch
             return s + (think == 1 ? "<think>" : "</think>");
         return s;
     }
@@ -1010,6 +1011,17 @@ json describe_model(const std::string& path, bool header_only = false) {
     if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * kv_layers * (kv_heads ? kv_heads : heads) * head_dim * 2;
     if (arch == "deepseek2" && layers)                    // latent attention: one compressed vector per token per layer
         j["kv_bytes_per_token"] = kv_layers * (u32(arch + ".attention.kv_lora_rank") + u32(arch + ".rope.dimension_count")) * 2;
+    if (arch == "deepseek4") {                            // compressed: a 512-wide entry per 4 or 128 tokens per layer
+        const int64_t id = gguf_find_key(g, "deepseek4.attention.compress_ratios");
+        const int64_t hd = head_dim ? head_dim : 512, ik = u32(arch + ".attention.indexer.key_length");
+        double per = 0;
+        if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, id) == GGUF_TYPE_INT32)
+            for (size_t i = 0; i < gguf_get_arr_n(g, id) && (int64_t)i < layers; ++i) {
+                const int r = ((const int32_t*)gguf_get_arr_data(g, id))[i];
+                if (r > 0) per += 2.0 * (hd + (r == 4 ? ik : 0)) / r;
+            }
+        j["kv_bytes_per_token"] = (int64_t)std::ceil(per);
+    }
     const std::string tk = str("tokenizer.ggml.model");
     if (is_encoder_arch(arch)) {
         // An embedding model: it turns text into vectors for search and comparison, alongside a chat model.
