@@ -67,6 +67,11 @@ For a model that fits in VRAM it takes a minute or two. For one much bigger than
 way of splitting it and measures each at that model's speed, so it can take half an hour or more (DeepSeek V4 Flash,
 96 GB, on an RTX 5090): start it and come back later.
 
+Its tok/s is measured on three short test questions (an explanation, a bit of code, a sum), so a chat can run faster
+or slower than it: code and text that repeats itself are easier to guess ahead. What it gets right is which settings
+are fastest. Qwen3.8 Flash-Next Q4_K_M on an RTX 5090, 64K context, temperature 0: it measured 69.4 tok/s for the
+setting it picked, and a 1,500-token C++ program then ran at 90.0 and 100.5 tok/s (a fresh load, two replies).
+
 **What are "hot experts"?**
 In a mixture-of-experts model only a few experts are picked per word, and some far more often than others. tierlm
 counts which ones each model uses as you chat (only the counts, kept next to its settings file), and the next time

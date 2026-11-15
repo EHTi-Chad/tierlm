@@ -2074,7 +2074,7 @@ function showSavedTune() {
   // in from it), so there's no need to measure again.
   const day = t.when ? new Date(t.when.replace(" ", "T")).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
   tin.hidden = false;
-  tin.innerHTML = `✓ <b>Load and start chatting</b> uses the fastest settings found for this model${day ? " on " + esc(day) : ""} (${(+t.tps).toFixed(1)} tok/s): they're the settings above. Changing a setting above uses yours instead.`;
+  tin.innerHTML = `✓ <b>Load and start chatting</b> uses the fastest settings found for this model${day ? " on " + esc(day) : ""} (${(+t.tps).toFixed(1)} tok/s on its test questions): they're the settings above. Changing a setting above uses yours instead.`;
   // Measured on other hardware, or with another tierlm: still used, but they may no longer be the fastest
   const otherPc = t.pc && md.pc && t.pc !== md.pc, otherVer = t.version && md.version && t.version !== md.version;
   if (otherPc || otherVer) {
@@ -2095,7 +2095,7 @@ function showSavedTune() {
     list.appendChild(li);
   }
   done.hidden = false;
-  done.innerHTML = `<span>Fastest: <b>${(+t.tps).toFixed(1)} tok/s</b>, in use for this model every time it loads, so there's no need to run it again. Run it again after a tierlm update, a change to the PC (graphics card, RAM) or a much different context length.</span>`;
+  done.innerHTML = `<span>Fastest: <b>${(+t.tps).toFixed(1)} tok/s</b>, in use for this model every time it loads, so there's no need to run it again. Run it again after a tierlm update, a change to the PC (graphics card, RAM) or a much different context length.</span><div class="help" style="margin-top:4px">Measured on three short test questions: chats run faster or slower than this depending on what's written (code and repeated text are easier to guess ahead).</div>`;
 }
 function applySaved() {
   showSavedTune();
@@ -2558,7 +2558,7 @@ $("tunebtn").onclick = async () => {
     for (const li of rows) if (Math.abs(+li.dataset.tps - fin.tps) < 0.05) { li.classList.add("best"); break; }
     $("tunestat").textContent = ""; $("tunetitle").textContent = "Fastest settings for this PC"; watchProgress(false);
     done.hidden = false;
-    done.innerHTML = `<span>Fastest: <b>${fin.tps.toFixed(1)} tok/s</b> with ${esc(parts.join(", "))}. Saved for this model.</span>`;
+    done.innerHTML = `<span>Fastest: <b>${fin.tps.toFixed(1)} tok/s</b> with ${esc(parts.join(", "))}. Saved for this model.</span><div class="help" style="margin-top:4px">Measured on three short test questions: chats run faster or slower than this depending on what's written (code and repeated text are easier to guess ahead).</div>`;
     const go = document.createElement("button"); go.className = "primary"; go.textContent = "Start chatting";
     go.onclick = async () => { resetConversation(); await loadInfo(); updateHits(); noteRamShort(); };
     done.appendChild(go);
