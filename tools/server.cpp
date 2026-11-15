@@ -1396,6 +1396,25 @@ bool verbose_line(const std::string& t) {
 
 }  // namespace
 
+// The PC Find the fastest settings measured on, as saved with its results: the graphics cards and RAM. The page
+// compares it with this PC's, to say when the saved settings may no longer be the fastest.
+static std::string this_pc() {
+    std::string pc;
+    for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+        ggml_backend_dev_t dv = ggml_backend_dev_get(d);
+        if (ggml_backend_dev_type(dv) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        const std::string nm = ggml_backend_dev_description(dv);
+        if (pc.find(nm) != std::string::npos) continue;      // (the same card through CUDA and Vulkan)
+        if (!pc.empty()) pc += " + ";
+        pc += nm;
+    }
+    size_t fr = 0, tot = 0;
+    if (ggml_backend_dev_t cd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(cd, &fr, &tot);
+    if (!pc.empty()) pc += ", ";
+    pc += std::to_string((tot + (512ull << 20)) >> 30) + " GB RAM";
+    return pc;
+}
+
 int main(int argc, char** argv) {
     Args a;                              // (read before the window's lines are captured, so --help and mistakes show)
     for (int i = 1; i < argc; ++i) {
@@ -1969,7 +1988,7 @@ int main(int argc, char** argv) {
         json per_model = smodels();
         json j = {{"folder", fs::absolute(base, ec).make_preferred().u8string()}, {"exists", exists}, {"recursive", recursive},
                   {"models", list}, {"default_ctx", a.ctx}, {"current", eng.path}, {"suggestions", suggest},
-                  {"saved", per_model}, {"last_model", sget("last_model")}, {"bundled", json::array()},
+                  {"saved", per_model}, {"last_model", sget("last_model")}, {"pc", this_pc()}, {"version", TIERLM_VERSION}, {"bundled", json::array()},
 #ifdef _WIN32
                   {"can_pick", true},
 #else
@@ -3624,21 +3643,7 @@ int main(int argc, char** argv) {
                 saved["settings_v"] = 2;
                 if (want_conn > 1) { saved["connections"] = conns; saved["min_tps"] = floor_tps; }
                 // when, with which tierlm and on what hardware: shown with the results next time this model is picked
-                std::string pc;
-                for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
-                    ggml_backend_dev_t dv = ggml_backend_dev_get(d);
-                    if (ggml_backend_dev_type(dv) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-                    const std::string nm = ggml_backend_dev_description(dv);
-                    if (pc.find(nm) != std::string::npos) continue;      // (the same card through CUDA and Vulkan)
-                    if (!pc.empty()) pc += " + ";
-                    pc += nm;
-                }
-                {
-                    size_t fr = 0, tot = 0;
-                    if (ggml_backend_dev_t cd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(cd, &fr, &tot);
-                    if (!pc.empty()) pc += ", ";
-                    pc += std::to_string((tot + (512ull << 20)) >> 30) + " GB RAM";
-                }
+                const std::string pc = this_pc();
                 const std::time_t now = std::time(nullptr);
                 char when[32] = {0};
                 std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", std::localtime(&now));

@@ -391,6 +391,7 @@
   #loadmsg.err { color: var(--danger); }
   #tunedin { flex-basis: 100%; font-size: 13px; color: var(--muted); }
   #tunedin b { color: var(--ink); }
+  #tunedin .warnline { color: var(--ram); }
   #tunebox { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 13px; }
   #tunebox .tunehead { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
   #tunestat { color: var(--muted); }
@@ -2074,6 +2075,13 @@ function showSavedTune() {
   const day = t.when ? new Date(t.when.replace(" ", "T")).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
   tin.hidden = false;
   tin.innerHTML = `✓ <b>Load and start chatting</b> uses the fastest settings found for this model${day ? " on " + esc(day) : ""} (${(+t.tps).toFixed(1)} tok/s): they're the settings above. Changing a setting above uses yours instead.`;
+  // Measured on other hardware, or with another tierlm: still used, but they may no longer be the fastest
+  const otherPc = t.pc && md.pc && t.pc !== md.pc, otherVer = t.version && md.version && t.version !== md.version;
+  if (otherPc || otherVer) {
+    const why = otherPc ? `on other hardware (${esc(t.pc)}; this PC: ${esc(md.pc)})` : `with tierlm ${esc(t.version)} (this is ${esc(md.version)})`;
+    tin.innerHTML = `<span class="warnline">⚠ These settings were found ${why}. <b>Load and start chatting</b> still uses them; ` +
+      `<b>Find the fastest settings</b> measures again for ${otherPc ? "this PC" : "this tierlm"}.</span>`;
+  }
   $("tunetitle").textContent = "Fastest settings for this PC, last measured";
   const bits = [t.when ? new Date(t.when.replace(" ", "T")).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "earlier",
                 t.version ? "tierlm " + t.version : "", t.pc || ""].filter(Boolean);
