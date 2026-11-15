@@ -10,9 +10,38 @@ in [docs/GGML_CHANGES.md](docs/GGML_CHANGES.md); the tokenizers, model graphs, K
 encoder, server and web page are all tierlm's own. It does not use llama.cpp.
 
 It runs **Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8 dense and MoE, Qwen3-Next,
-gpt-oss, NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
+gpt-oss, DeepSeek V2/V3/V4 and Kimi K2 (early), NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
+
+### New in 0.9.0: guessing ahead for MoE models with no draft layer, DeepSeek V4 Flash, settings that stay found
+
+- **Speculative decoding without a draft layer** (mixture-of-experts models with part of their experts in RAM): the
+  model guesses the next few words using only its experts that are in VRAM, which keeps each guess on the GPU, then
+  checks them all in one pass with all its experts, so the answers are exactly the ones it would give anyway.
+  **Speculative decoding** on the setup screen now works for these models (4 guesses by default; 4 to 6 usually do
+  best), and **Find the fastest settings** tries it. On an RTX 5090 (Ryzen 9 9950X3D, 64 GB DDR5-6000):
+  gpt-oss-120b MXFP4, busiest experts in VRAM, 32K context, 12 threads: 84.7 → 100.4 tok/s with 6 guesses;
+  Qwen3.6-35B-A3B Q4_K_M held to 8 GB of VRAM (`--vram-limit 8000`, an 8 GB card's share), the same: 72.4 → 100.1.
+  It doesn't help every model: on DeepSeek V4 Flash, whose experts are mostly in RAM, every guess setting was slower.
+  Not for Qwen3.8 Flash-Next (it has its own draft file) or Nemotron.
+- **DeepSeek V4 Flash** (`deepseek4`), early: its hyper-connections, its attention (a sliding window plus two kinds of
+  compressed memory, with an indexer that picks the parts each word reads) and its hash-routed first layers, checked
+  against Hugging Face's own code on a tiny test model, on the CPU and on CUDA. Unsloth's UD-IQ3_XXS (about 96 GB) on
+  an RTX 5090 with 64 GB RAM and the SSD tier: 13.1 tok/s in Find the fastest settings (VRAM experts following the
+  conversation, 16 threads, no guessing), 9.6 to 10.8 in chats; right answers and working code. Tool calls in its own
+  format aren't read yet.
+- **Find the fastest settings, once per model**: the setup screen now says, next to **Load and start chatting**, that
+  it uses the settings found for that model (when, and how fast), and warns when they were found on other hardware or
+  with another tierlm. It loads the model one time fewer (the busiest and the following VRAM experts are measured from
+  one load: about 4 minutes saved on a model the size of Flash-Next), and says its tok/s comes from three short test
+  questions: a chat runs faster or slower depending on what's written.
+- **Copy specs**: **Model info** and the benchmark result copy this PC (OS, CPU, RAM, graphics cards, NVIDIA driver
+  and CUDA), the model and its quant, what ran in VRAM, RAM and on the SSD, the settings and the latest speeds, as one
+  line, a table (Markdown, for Reddit and GitHub) or JSON. Also `GET /api/specs`.
+- **Moonlight and other Kimi-tokenizer files** converted before the tokenizer had its own name now split text the way
+  the model expects. **A tool call in a chat with no folder on** now says so, with the folder a click away.
+  `--no-web`: the address shows a status page instead of nothing.
 
 ### New in 0.8.9: put the model away when idle, an easier console file, fixes
 
@@ -474,6 +503,7 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | Flint (`flint`: Flint 40B-A2.5B) | model math verified (sigmoid router, dense first layers, sinks, rotation only on sliding layers); tokenizer splitting and chat format pending the real files |
 | gpt-oss (`gpt-oss`: gpt-oss-20b, gpt-oss-120b, HyperNova-60B, ...) | gpt-oss-120b MXFP4 on one RTX 5090 with 34 GB of it in RAM (38.5 tok/s in a chat), gpt-oss-20b on an RTX 5090 (about 270 tok/s); model math verified, including OpenAI's chat format and tools |
 | DeepSeek V3 / R1 / V3.1, Kimi K2.x, Moonlight, DeepSeek V2 (`deepseek2`) | **early**: model math checked against Hugging Face's own code (multi-head latent attention, grouped routing with its choosing bias, YaRN), tokenizers checked against Hugging Face's; tested on the real Moonlight-16B-A3B (about 300 tok/s on an RTX 5090), the 600 GB-class ones not yet. They need the SSD tier |
+| DeepSeek V4 Flash (`deepseek4`) | **early**: model math checked against Hugging Face's own code (hyper-connections, sliding-window and compressed attention with its indexer, hash-routed first layers) on the CPU and CUDA; tested on the real DeepSeek-V4-Flash UD-IQ3_XXS (about 96 GB) on an RTX 5090 with 64 GB RAM and the SSD tier: 9.6 to 10.8 tok/s in chats (since 0.9.0). Tool calls not yet |
 | Qwen3.8 Flash-Next (`qwen4exp`) | model math checked against Hugging Face's own code (hyper-connections, the n-gram embedding, sparse attention past 2,048 tokens, the MTP draft block), text only for now; the real 120 GB Q4_K_M with Unsloth's MTP file at 80.3 tok/s in a chat (88.8 in Find the fastest settings) on an RTX 5090 with 64 GB RAM, with its n-gram table on the SSD tier; UD-IQ3_XXS (77.9 GiB) at 94.8 tok/s on the same PC (Ryzen 9 9950X3D, 64 GB DDR5-6000, VRAM experts following the conversation, 4 guesses, temperature 0.7; 0.8.7) |
 
 Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-MiniLM, e5) and Nomic
@@ -482,7 +512,7 @@ Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-Min
 Images: Qwen3.5 / 3.6 with their `mmproj` vision file (`qwen3vl_merger`), checked against Hugging Face's code and
 tested with Qwen3.5-9B (RTX 3070 laptop) and Qwen3.6-35B-A3B (RTX 5090).
 
-Not yet: Gemma, Phi, DeepSeek V4 and others. Nemotron 3.5 (Mamba-2 and LatentMoE) is in since 0.8.8, checked on a tiny test model and on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s). The setup screen says which
+Not yet: Gemma, Phi and others. Nemotron 3.5 (Mamba-2 and LatentMoE) is in since 0.8.8, checked on a tiny test model and on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s). The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
 
 ## Build from source (Windows)
@@ -592,6 +622,9 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [ ] Flint 40B-A2.5B: tokenizer and chat format (the model itself is in and checked)
 - [ ] Nemotron 3.5 (Mamba-2, LatentMoE): runs on the real Bolt file on an RTX 5090; next smaller cards (experts in RAM, and in VRAM by use) and images
 - [x] gpt-oss: the busiest experts in VRAM, and VRAM experts following the conversation (the experts' biases kept whole beside the split weights)
+- [x] Speculative decoding for MoE models without a draft layer, guessing from the VRAM experts (0.9.0)
+- [x] DeepSeek V4 Flash, early (0.9.0)
+- [ ] DeepSeek V4: tool calls in its own format; its stream mixing on the GPU (it runs on the CPU in every layer now)
 
 ## Credits and licence
 

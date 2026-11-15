@@ -86,7 +86,9 @@ The setup screen shows:
    **CPU threads**, and **Speculative decoding** for models that include a draft layer (most Qwen3.5 / 3.6 / 3.8
    files, or with a matching `mtp-*.gguf` file in the same folder; the model card says "Speculative decoding"): the
    draft layer guesses a few words ahead and the model checks them all at once, for faster replies with the same
-   answers. It's on by default when available; the chat shows how many tokens each check produced. **Advanced** has more: flash attention, prompt batch size,
+   answers. It's on by default when available; the chat shows how many tokens each check produced. Since 0.9.0 it
+   also works for mixture-of-experts models with no draft layer when part of their experts are in RAM: the guesses
+   come from the experts in VRAM (see the [FAQ](FAQ.md)). **Advanced** has more: flash attention, prompt batch size,
    active experts per token, a seed for repeatable replies, how to split a model that doesn't fit in VRAM,
    **Keep the busiest experts in VRAM** (off by default; see the [FAQ](FAQ.md)), a **VRAM limit**, and **Force CPU**.
    Or click **Find the fastest settings** and let tierlm measure what's fastest on your PC.
@@ -336,9 +338,10 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | Embedding models: BERT-style | `bert` | bge-small/base/large, all-MiniLM-L6-v2, e5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
 | Embedding models: Nomic | `nomic-bert` | nomic-embed-text v1, v1.5 | Loaded as the embedding model; model math and tokenizer verified, real-model test pending |
 | DeepSeek V3 / R1 / V3.1, Kimi K2 / K2.5 / K2.6, Moonlight, DeepSeek V2 / V2-Lite | `deepseek2` | DeepSeek-V3-0324, DeepSeek-R1, Kimi-K2-Instruct, Moonlight-16B-A3B, DeepSeek-V2-Lite | Early. Model math checked against Hugging Face's own code (latent attention, grouped routing, YaRN); tokenizers (DeepSeek V3, Kimi K2) checked against Hugging Face's tokenizers; tested on the real Moonlight-16B-A3B Instruct Q4_K_M (right answers in English and Chinese, code; about 300 tok/s on an RTX 5090). The big ones need the SSD tier |
+| DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash | Early (since 0.9.0). Model math checked against Hugging Face's own code (hyper-connections, sliding-window and compressed attention with its indexer, hash-routed first layers), on the CPU and on CUDA; tested on Unsloth's real UD-IQ3_XXS (about 96 GB) on an RTX 5090 with 64 GB RAM and the SSD tier: 9.6 to 10.8 tok/s in chats. Tool calls in its own format aren't read yet |
 | Qwen3.8 Flash-Next | `qwen4exp` | Qwen3.8-Flash-Next (512 experts, 10 active) | Model math checked against Hugging Face's own code, including its hyper-connections, the n-gram embedding on layer 1 and its sparse attention past 2,048 tokens, and against llama.cpp; tested on the real model (Q4_K_M, 120 GB): 37 tok/s on an RTX 5090 with 64 GB RAM and the SSD tier. Its draft file (Unsloth's `mtp-...-shared-Q8_0.gguf`, in the same folder) is used for speculative decoding since 0.8.5: UD-IQ3_XXS on the same PC at 84 tok/s with 4 guesses (62 without). Text only for now (its vision file isn't used yet). Its 35 GB n-gram table is the first thing the SSD tier moves to the SSD; the rows each step needs are asked for all at once |
 | NVIDIA Nemotron 3.5 (Mamba-2, LatentMoE) | `nemotron_h_moe` | Nemotron-3.5-Bolt-74B-A9B | Tested: Bolt 74B-A9B on an RTX 5090, all in VRAM and with its experts in RAM; images not yet |
-| Gemma, Phi, GLM, DeepSeek V4, ... | various | | Not yet |
+| Gemma, Phi, GLM, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision file**: tierlm loads it with the model so it can read
 images (Qwen3.5 / 3.6; see [Reading images](#reading-images)). Checked against Hugging Face's code; tested with Qwen3.5-9B on an RTX 3070 laptop.

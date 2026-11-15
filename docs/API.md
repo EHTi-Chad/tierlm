@@ -327,7 +327,7 @@ name doesn't exist), and `no_gpu` when a GPU build finds no GPU.
 
 ```json
 {"folder": "C:\\tierlm\\models", "exists": true, "recursive": true, "default_ctx": 4096, "current": "",
- "can_pick": true, "last_model": "", "saved": {},
+ "can_pick": true, "last_model": "", "saved": {}, "pc": "NVIDIA GeForce RTX 5090, 64 GB RAM", "version": "0.9.0",
  "suggestions": [{"name": "LM Studio models", "folder": "C:\\Users\\you\\.lmstudio\\models"}],
  "models": [
    {"id": "OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf", "folder": "", "file": "OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf", "name": "OLMoE 1B 7B 0924 Instruct", "arch": "olmoe",
@@ -339,11 +339,17 @@ name doesn't exist), and `no_gpu` when a GPU build finds no GPU.
 
 Only the file headers are read, so this is fast. `kv_bytes_per_token` is the KV cache cost per token of
 context (f16), useful for estimating memory: model bytes + `kv_bytes_per_token` × context.
+`"mtp": true` means the file (or an `mtp-*.gguf` next to it) has a draft block for speculative decoding;
+`"self_draft": true` (since 0.9.0) means a mixture-of-experts model with no draft block that can guess ahead from its
+VRAM experts once part of its experts are in RAM. `/api/info` says whether the loaded model can (`self_draft`).
 
 `id` is the model's path relative to the folder; pass it to `/api/load`. A model split over several files is
 listed once, by its first part, with `"parts": N` and the total size of all parts; parts 2..N are not listed. With `recursive` on, subfolders are
 searched too (up to 4 levels, as LM Studio stores models as `publisher/model/file.gguf`). `suggestions` lists
-other model folders found on this computer. `saved` holds the settings last used for each model, by `id`.
+other model folders found on this computer. `saved` holds the settings last used for each model, by `id`; a model
+measured by Find the fastest settings also has `tuned` there (its results, `tps`, `when`, the tierlm `version` and
+the `pc` it ran on). `pc` and `version` at the top level are this computer's and this tierlm's (since 0.9.0), so an app
+can tell when saved results came from other hardware or another version, as the setup page does.
 
 ### POST /api/folder
 

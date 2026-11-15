@@ -340,6 +340,33 @@ add, sum), token by token, keeping the states between the tokens. Both give the 
 on CUDA the scan is faster (139 against 114 tok/s on an RTX 5090). `TIERLM_MAMBA_UNROLL=N` writes it out for
 batches of up to N tokens anywhere, `TIERLM_MAMBA_UNROLL=0` never.
 
+## DeepSeek V4
+
+DeepSeek V4 Flash (`deepseek4`; 43 layers, 256 experts with 6 used per token) is checked against a NumPy version of
+Hugging Face's own code (`tests/tiny_deepseek4.py`, which is checked against the `transformers` model itself by
+`tests/tiny_deepseek4_hf.py`).
+
+- **Hyper-connections**: the model carries 4 streams of its width instead of one. Before each attention and expert
+  block, a small projection of the streams gives, per token, how much of each stream goes in, how much of the block's
+  output goes back to each, and a 4x4 mixing of the streams, made doubly stochastic by 20 rounds of Sinkhorn. That
+  last part is a few dozen numbers a token, worked out on the CPU (`d4_hc_weights`); moving it to the GPU is next,
+  because it makes the GPU wait twice in every layer. A last mixing turns the streams into one before the output.
+- **Attention**: one shared key-value head 512 wide (the values are the keys), attention sinks, rotary position on
+  the last 64 dimensions only and rotated back on the output, and a grouped output projection. Each layer is one of
+  three kinds: a **sliding window** of 128 tokens alone; **CSA**, which also compresses every 4 tokens into one entry
+  (overlapping windows, softmax-weighted) and lets each token read the 512 entries an **indexer** scores highest
+  (its own small queries and keys, ReLU, weighted per head); or **HCA**, which compresses every 128 tokens into one
+  entry and reads them all. The compressed layers use another rotary base, with YaRN.
+- **Memory** per conversation: rings for the window and for the rows not yet compressed (kept 64 positions longer
+  than needed, so a check of guesses can be undone by position), and the compressed entries, about 6.6 KB per token
+  of context in all. Going back further than 64 positions starts the conversation again. The rows CSA picks are read
+  straight from the cache; the indexer scores long prompts in chunks of tokens, so its scores never all exist at once.
+- **Experts**: sqrt(softplus) scores, the first 3 layers routed by a table from the token id (hash routing, so they
+  are never split by use), weights renormalised and scaled by 1.5, and SwiGLU with clamped inputs (10) in the routed
+  and the shared expert.
+- Its tokenizer is DeepSeek V3's; its chat format is V3.1's, with a thinking switch. Tool calls in its own format
+  (DSML) aren't read yet.
+
 ## Speculative decoding
 
 When a model doesn't fit in VRAM, generating a token is limited by how fast its weights in RAM can be read: a dense
@@ -461,6 +488,21 @@ temperature 0): 61.6 tok/s without guessing, **84.3** with it, 3.1-3.6 tokens pe
 costs about 35 ms against 18 ms for one word: each distinct expert the words pick is read once, and most of them are
 already in VRAM. With the experts in RAM instead, checks cost too much and guessing lost (47 against 48 tok/s), which
 is why Find the fastest settings measures the VRAM-expert splits with guesses too.
+
+**Guessing from the VRAM experts (self-draft, 0.9.0).** A mixture-of-experts model with no draft block can still
+guess ahead when its experts are split between VRAM and RAM: the RAM experts are what makes a step slow, so a step
+that uses only the VRAM experts is a cheap, rough copy of the model. While guessing, `Model::set_hot_only` adds a bias
+to the router's scores (0 for an expert in VRAM, -1e9 otherwise), so each layer picks its best experts among those
+in VRAM; the picks are mapped to the VRAM copies with the same maps live hot experts keep up to date, so the whole
+guessing step runs on the GPU (a first version did that bookkeeping on the CPU and was slower than not guessing).
+The guesses are then checked with all the experts in one pass, as with a draft block, so the reply is exactly the
+model's own. Before guessing, `draft_mark` copies the running memories of hybrid models (DeltaNet states) and
+`draft_rewind` puts them back after. Not for Qwen3.8 Flash-Next (its sparse attention), Mamba or PLE models, or when
+some layer has fewer experts in VRAM than it uses per token. Measured on an RTX 5090 (Ryzen 9 9950X3D, 64 GB
+DDR5-6000, 12 threads): gpt-oss-120b MXFP4, busiest experts in VRAM, 32K: 84.7 tok/s without guessing, 94.5 with 3
+guesses, 100.4 with 6, 77.7 with 8; Qwen3.6-35B-A3B Q4_K_M with `--vram-limit 8000`: 72.4, 87.3 with 4, 100.1 with 6.
+With most experts in RAM the guesses miss more and cost more: DeepSeek V4 Flash (about 96 GB on 32 GB of VRAM) was
+slower with every guess count.
 
 **KV cache precision.** The cache can be stored at 8 bits (`q8_0`, about 1% from exact) or 4 bits (`q4_0`), which
 leaves VRAM for more of the model's layers. Quantized caches are read by flash attention, which turns on with them.
@@ -707,7 +749,12 @@ fairly. Only the replies are timed. Threads and speculation only win by a clear 
 pick them, and hot experts are kept on only if they measured fastest. With a draft layer, the VRAM-expert splits
 (busiest, or following the conversation) within 15% of the winner without guessing are measured with guesses too:
 guessing makes checks cheap only when most experts are in VRAM, so a split that lost without guessing can win with
-it (0.8.5). The **Benchmark** in the side menu measures
+it (0.8.5). Without a draft block, an MoE model whose experts are split tries guessing from its VRAM experts (3,
+4 and 6 guesses; 0.9.0). The busiest-experts split is measured on a load that can follow the conversation, with
+following held off (`Model::set_live_frozen`), and the following split right after, without loading again (0.9.0; a
+big model takes minutes to load; `TIERLM_TUNE_SEPARATE=1` loads them separately to compare). Its tok/s comes from
+three short test questions, so chats run faster or slower than it depending on the text; what it is for is ranking
+the settings. The **Benchmark** in the side menu measures
 the same way. (Before 0.5.1 it generated a fixed text greedily, which overstated chat speed by a quarter to a third;
 part of that gap was the chat reading each layer's experts back from the GPU separately, now one read per token.)
 
@@ -734,6 +781,7 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 | Hybrid Qwen3.5 | Plain NumPy implementation of Hugging Face's Qwen3_5 forward pass on a tiny random model written the way the converter writes it (`tests/tiny_qwen35.py`), also split between GPU and RAM | ~1e-5 relative with an f32 cache; deliberately wrong file conventions fail |
 | Tokenizers without models | Small tokenizers trained with Hugging Face `tokenizers` and `sentencepiece` (`tests/trained_tokenizers.py`) | Exact token IDs for GPT-2, Llama 3 and Qwen2 splitting and SentencePiece |
 | Splits | Every model split between one or two stand-in GPUs (ggml's RPC backend) and RAM at many VRAM sizes, by layers, by experts and with made-up hot-expert usage | Same results as unsplit (~1e-6 with an f32 cache) |
+| DeepSeek V4 | NumPy version of Hugging Face's DeepseekV4 (itself checked against `transformers` to 5e-7) on a tiny random model (`tests/tiny_deepseek4.py`): whole prompt, one token at a time, saved and restored, guesses undone; also split over RPC, and on CUDA | ~2e-6 relative with an f32 cache (CPU); on an RTX 5090 (f16 cache) about 5e-4 one token at a time, and up to 3.6e-2 for a 120-token prompt read at once (within the test's limit; the cause isn't pinned down yet) |
 | Real model | "The capital of France is" | " Paris" at 62–64% on CPU and GPU |
 
 ## Design decisions so far
@@ -757,4 +805,4 @@ There is no llama.cpp to compare against, so every piece is checked against an i
    with the next step.
 4. **Faster CPU expert multiplies.**
 5. **Usage-based precision** (rarely used experts stored at lower precision) and **expert-aware speculation**.
-6. **More families**: Gemma 4, Phi, DeepSeek V4 and more real-model tests.
+6. **More families**: Gemma 4, Phi and more real-model tests (DeepSeek V4 Flash is in since 0.9.0).

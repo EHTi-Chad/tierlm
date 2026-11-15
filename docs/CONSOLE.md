@@ -235,7 +235,7 @@ optional on a network that's yours alone, but anyone on the network can use the 
 | `-t N`, `--threads N` | CPU threads (half the cores) |
 | `-d NAME`, `--device NAME` | `auto`, `cpu`, `gpu`, or a device as `tierlm-devices` lists it (`CUDA0`, `Vulkan0`) |
 | `--experts MODE` | where a MoE model's experts go when it doesn't fit in VRAM: `auto` (tierlm decides), `layers` (whole layers in VRAM, the rest in RAM), `ram` (experts in RAM, everything else in VRAM), `busiest` (the busiest experts in VRAM too), `follow` (the VRAM experts follow the conversation) |
-| `--guesses N` | speculative decoding with the model's draft block (its MTP file): N guesses ahead; 0 off |
+| `--guesses N` | speculative decoding: N guesses ahead; 0 off. With the model's draft block (its MTP file), or for a mixture-of-experts model with no draft block and part of its experts in RAM, with its VRAM experts (since 0.9.0) |
 | `--lookup N` | guess from the conversation's own text, N tokens; 0 off, -1 automatic (default) |
 | `--kv BITS` | context memory precision: `32`, `16` (default), `8`, `5` or `4`; fewer bits fit a longer context |
 | `--batch N` | prompt tokens read at once |

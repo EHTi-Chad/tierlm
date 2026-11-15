@@ -252,6 +252,9 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_LIVE_EXPERTS=1` | Load with live hot experts (as `live_experts` in `/api/load`); needs hot experts (usage counts) |
 | `TIERLM_TRACE_CACHE=1` | `tierlm-server`: for each request, how much of the prompt cache it reuses and where it stops matching |
 | `TIERLM_LIVE_SHARE=0.08` | Live hot experts: the share of each step's time that moving experts may take |
+| `TIERLM_SELF_DRAFT=N` | Guess ahead from the VRAM experts with N guesses even when speculative decoding is off (experimental; `tierlm-logits --gen-spec` too). The setting on the page does the same since 0.9.0 |
+| `TIERLM_COLD_SKIP=x` | Experimental, **not exact**: a RAM expert pick whose share of the picks' weight is below x (0.05, say) is left out and the rest scaled up. Faster with most experts in RAM, but the answers differ from the model's own |
+| `TIERLM_TUNE_SEPARATE=1` | `tierlm-server`: Find the fastest settings loads each VRAM-expert split on its own, as before 0.9.0 (to compare the two ways) |
 | `TIERLM_LIVE_MB=32` / `TIERLM_LIVE_PER_LAYER=2` | Live hot experts: most MB moved per step (both ways), most swaps per layer per step |
 | `TIERLM_LIVE_PROMPT_MS=250` / `TIERLM_LIVE_PROMPT_HIT=0.62` | Live hot experts: the longest burst of moves after a prompt batch the VRAM experts served poorly (0: never), and the share of the batch's picks served from VRAM under which it starts (full length 17 points lower) |
 | `TIERLM_LIVE_TRACE=1` | Live hot experts: prints, for each prompt batch, the share of its picks the VRAM experts served and what was moved |

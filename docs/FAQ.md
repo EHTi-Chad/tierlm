@@ -32,6 +32,16 @@ helping. **Guesses per check** defaults to 3 for dense models, the fastest on ou
 off, 3.9 with 2, 5.3 with 3, 4.1 with 4); try 2 or 4 for your model and PC. For mixture-of-experts models the default is 2 (Qwen3.6-35B-A3B on the same laptop:
 35 tok/s with 1 or 2, 28 with 3), because each guess the model checks pulls in its own experts.
 
+**Can a mixture-of-experts model with no draft layer guess ahead?**
+Yes, since 0.9.0, when part of its experts are in RAM (the busiest ones, or the ones following the conversation, in
+VRAM). It guesses using only its experts that are in VRAM, which never waits on RAM, then checks the guesses with all
+its experts, so the answers stay exactly the same. **Speculative decoding** is no longer greyed out for these models;
+4 to 6 guesses usually do best (gpt-oss-120b on an RTX 5090, busiest experts in VRAM: 84.7 tok/s off, 100.4 with 6
+guesses). It helps most when the VRAM experts already do most of the work; with most experts in RAM (DeepSeek V4
+Flash on 32 GB of VRAM) the guesses miss too often and it's slower, which **Find the fastest settings** finds out
+for you. Not for Qwen3.8 Flash-Next (it uses its own draft file) or Nemotron, or with every expert in VRAM (there's
+nothing faster to guess with).
+
 **Does tierlm use two graphics cards?**
 Yes, when they're the same kind (two NVIDIA cards with CUDA, say): the model fills the first card, then the second,
 then system RAM. The setup screen shows a VRAM bar for each card. Different kinds (an NVIDIA and an AMD card) aren't
@@ -46,9 +56,9 @@ yourself.
 It loads the model and measures, on your PC, the settings that only change speed: how to split a model that doesn't
 fit in VRAM, how many CPU threads to use, and speculative decoding with 1 to 4 guesses per check. It keeps the fastest
 and saves it for that model. Answers are the same whichever settings win; only the speed differs. On a laptop RTX
-3070 it takes Qwen3.6-35B-A3B from 13 tokens/second (whole layers) to about 35. Since 0.5.1 it measures exactly the
-way a chat runs, with your sampling settings, so the speed it shows is the speed you'll see in chats (a long
-conversation slows down a little as it grows). It averages three short, different questions (an explanation, a bit of
+3070 it takes Qwen3.6-35B-A3B from 13 tokens/second (whole layers) to about 35. It measures the way a chat runs,
+with your sampling settings, but on three short test questions, so a chat runs faster or slower than its number
+depending on what's written. It averages three short, different questions (an explanation, a bit of
 code, a sum); long code replies are easier to guess ahead and often run faster than its number. With the VRAM experts
 following the conversation, each question is answered once before it's timed (since 0.8.9), because those experts
 move in during a topic's first reply and the later replies are the faster ones.
