@@ -3433,12 +3433,13 @@ int main(int argc, char** argv) {
                         // following held off, so the following set is measured next without loading again (a big model
                         // takes minutes to load). Not enough RAM to spare for following: that load is plain hot.
                         const std::string sfx = one ? "@1" : "";
-                        const std::string want = base_m == "hot" ? "live" + sfx : m;
+                        static const bool separate = std::getenv("TIERLM_TUNE_SEPARATE") != nullptr;   // (0.8.9's way, to compare)
+                        const std::string want = base_m == "hot" && !separate ? "live" + sfx : m;
                         if (loaded_mode != want && !(base_m == "live" && loaded_mode == "hot" + sfx)) {
                             if (!status("Loading with " + label)) throw std::runtime_error("cancelled");
                             load_mode(want);
                         }
-                        eng.model->set_live_frozen(base_m == "hot");
+                        eng.model->set_live_frozen(base_m == "hot" && !separate);
                         if (base_m == "live" && !eng.model->live_hot()) continue;   // not enough RAM to spare: loaded as hot
                         if ((base_m == "hot" || base_m == "live") && eng.model->placement().hot_experts == 0) {
                             no_hot = true;                           // nothing to gain: no VRAM left (or several GPUs)
