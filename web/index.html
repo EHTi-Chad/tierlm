@@ -3847,7 +3847,8 @@ function specsLine(sp) {
     `${d.context}`, d.threads && d.threads + " threads", d.speculative === "off" ? "no speculation" : "speculative " + (sp.inf.draft_max || "")].filter(Boolean);
   let out = parts.join(" | ");
   if (lastBench) out += ` -> prompt ${lastBench.prompt_tps.toFixed(1)} tok/s, generation ${lastBench.gen_tps.toFixed(1)} tok/s (benchmark)`;
-  else if (lastReply && lastReply.gen_tps) out += ` -> generation ${lastReply.gen_tps.toFixed(1)} tok/s on a ${lastReply.n_prompt.toLocaleString()}-token chat`;
+  else if (lastReply && lastReply.gen_tps) out += ` -> generation ${lastReply.gen_tps.toFixed(1)} tok/s (${lastReply.n_prompt.toLocaleString()}-token prompt` +
+    (lastReply.n_gen ? `, ${lastReply.n_gen.toLocaleString()}-token reply)` : `)`);
   return out;
 }
 function specsMarkdown(sp) {
