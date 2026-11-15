@@ -858,6 +858,17 @@ struct Engine {
         if (spec) spec->set_lookup(L);
         look.reset();
         if (!spec && L > 0 && model) { look = std::make_unique<Speculator>(*model, 0); look->set_lookup(L); }
+        // Guessing with the model cut down to its VRAM experts (no draft block; experts split between VRAM and RAM).
+        // TIERLM_SELF_DRAFT=N: N guesses per check (experimental).
+        if (!spec && model) {
+            const char* e = std::getenv("TIERLM_SELF_DRAFT");
+            const int n = e ? std::atoi(e) : 0;
+            if (n > 0) {
+                auto sd = std::make_unique<Speculator>(*model, n);
+                sd->set_self_draft(true);
+                if (sd->self_draft_ok()) { sd->set_lookup(L); look = std::move(sd); }
+            }
+        }
     }
     std::string path, name;
     int threads = 1, seed = -1;

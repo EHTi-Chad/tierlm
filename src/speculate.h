@@ -63,6 +63,13 @@ public:
     void set_sampling(Dist dist, std::mt19937* rng) { dist_ = std::move(dist); rng_ = rng; }
     void clear_sampling() { dist_ = nullptr; rng_ = nullptr; }
 
+    // Guessing with the model itself, cut down to the experts in VRAM (Model::set_hot_only), for models with experts
+    // split between VRAM and RAM and no draft block: each guess is a step on the GPU alone, and the whole model then
+    // checks them all in one pass, reading its RAM experts once for several tokens. Not for models whose running
+    // memory can't be rewound step by step (hybrid, Mamba): self_draft_ok() says whether it can be used.
+    void set_self_draft(bool on) { self_ = on; }
+    bool self_draft() const { return self_; }
+    bool self_draft_ok() const;
     // Testing: guesses come from this function instead of the draft block (pos = position of x).
     using DraftSource = std::function<std::vector<int32_t>(int pos, int32_t x, int n)>;
     void set_draft_source(DraftSource f) { draft_src_ = std::move(f); }
@@ -103,6 +110,7 @@ private:
     std::vector<State> marks_;    // the states at the model's checkpoints (mark), in order of position
     SpecStats st_;
     DraftSource draft_src_;
+    bool self_ = false;
     int lookup_max_ = 0, lookup_min_ = 3;
     int look_len_ = 0;            // guesses to make next time: shrinks after misses, grows back after hits
     std::vector<int32_t> hist_;   // the tokens in the model's cache, for prompt lookup

@@ -302,6 +302,12 @@ public:
     const LiveStats& live_stats() const { return live_stats_; }
     void reset_live_stats() { live_stats_ = LiveStats(); }
     bool live_hot() const { return !live_.empty(); }
+    // Guessing ahead with the model itself, cut down to what's in VRAM: while on, each split expert layer uses only
+    // the router's picks that are in VRAM (their weights scaled up to the picks' whole weight) and skips the RAM part,
+    // so a step runs on the GPU alone. An approximation of the model, for guesses that the whole model then checks.
+    void set_hot_only(bool on) { hot_only_ = on; }
+    bool hot_only() const { return hot_only_; }
+    bool has_split_experts() const;
     void restore(const Snapshot& s);          // the cache becomes exactly the saved conversation
     int n_past() const { return n_past_; }
     int max_ctx() const { return max_ctx_; }
@@ -540,10 +546,10 @@ private:
     // a reply's one-token graph, kept to run again (see step)
     struct ReuseKey {
         int n_kv = 0; bool routing = false; int n_logits = 0; bool qsa_long = false; bool hidden = false;
-        int n_tok = 1, snapshots = 1;
+        int n_tok = 1, snapshots = 1; bool hot_only = false;
         bool operator==(const ReuseKey& o) const {
             return n_kv == o.n_kv && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden &&
-                   n_tok == o.n_tok && snapshots == o.snapshots;
+                   n_tok == o.n_tok && snapshots == o.snapshots && hot_only == o.hot_only;
         }
     };
     Graph reuse_;
@@ -561,6 +567,7 @@ private:
     void drop_plan(Plan& p);
     void drop_plans();                                             // reuse_ and both plans (the cache changes size)
     bool overlap_ = true;                                          // CPU and GPU at once on split expert layers
+    bool hot_only_ = false;                                        // set_hot_only: only the experts in VRAM
     std::vector<Snapshot> ckpts_;                                  // (see checkpoint) in order of position
     int n_threads_last_ = 0;                                       // (for the profile)
     void profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms, double build_ms = 0, double alloc_ms = 0);

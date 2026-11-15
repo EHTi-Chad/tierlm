@@ -2114,6 +2114,11 @@ void Model::restore(const Snapshot& s) {
 
 const char* Model::kv_type() const { return ggml_type_name((ggml_type)kv_t_); }
 
+bool Model::has_split_experts() const {
+    for (const Layer& L : layers_) if (L.map_hot) return true;
+    return false;
+}
+
 bool Model::integrated_gpu() const {
     return dev_ && ggml_backend_dev_type((ggml_backend_dev_t)dev_) == GGML_BACKEND_DEVICE_TYPE_IGPU;
 }
@@ -2589,6 +2594,30 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             ggml_tensor* mask   = ggml_reshape_3d(c, mcont, 1, NU, n_tok);
             ggml_tensor* w_hot  = ggml_mul(c, w, mask);                     // [1, n_used, n_tok]
             ggml_tensor* w_cold = ggml_sub(c, w, w_hot);
+            if (hot_only_) {
+                // Only the VRAM part (set_hot_only): the picks in VRAM, their weights scaled up so they add up to all
+                // the picks' weight, as if the RAM ones had voted the same way. Nothing runs on the CPU but this
+                // bookkeeping. Not the model's sum: used only for guesses, which the whole model checks.
+                ggml_tensor* sw  = ggml_sum_rows(c, ggml_reshape_2d(c, ggml_cont(c, w), NU, n_tok));      // [1, n_tok]
+                ggml_tensor* shw = ggml_sum_rows(c, ggml_reshape_2d(c, ggml_cont(c, w_hot), NU, n_tok));
+                ggml_tensor* sc  = ggml_div(c, sw, ggml_clamp(c, shw, 1e-12f, INFINITY));
+                ggml_tensor* w_h = ggml_mul(c, w_hot, ggml_reshape_3d(c, sc, 1, 1, n_tok));
+                ggml_tensor* ids_h = remap(L.map_hot, L.down_xh, true);
+                ggml_tensor* ids_b = nullptr;
+                if (L.up_xb || L.gate_xb || L.down_xb) { ids_b = ggml_cont(c, sel); g.cpu_ops.push_back(ids_b); }
+                for (ggml_tensor* t : {mcont->src[0]->view_src, mcont, w_hot, ids_h, ids_h->src[0]->src[0]->view_src})
+                    if (t) g.cpu_ops.push_back(t);
+                std::function<void(ggml_tensor*, int)> on_cpu = [&](ggml_tensor* t, int depth) {
+                    if (!t || t == probs || t == order || depth > 12) return;
+                    const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+                    if (!view && t->op != GGML_OP_NONE) g.cpu_ops.push_back(t);
+                    for (ggml_tensor* src : t->src) if (src && src != probs && src != order) on_cpu(src, depth + 1);
+                };
+                on_cpu(w_h, 0);
+                ggml_build_forward_expand(g.gf, w_h);
+                ggml_build_forward_expand(g.gf, ids_h);
+                moe = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_h, L.gate_xbh, L.up_xbh, L.down_xbh, ids_b);
+            } else {
             // Handing the RAM experts' work to the GPU means copying all of a layer's RAM experts over for the batch,
             // the same cost whatever its size, so it only pays for big batches (see cold_offload_min_): below that
             // the CPU computes just the picks that are in RAM, as it does for a reply's steps.
@@ -2642,6 +2671,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                 pin(cold);
             }
             moe = ggml_add(c, cold, hot);                                   // cold first: the graph runs the RAM part, then the VRAM part
+            }
         } else {
             ggml_tensor* ids = sel;
             if (L.ssd && n_tok < 32) {                                       // experts on the drive: read the picks ahead
@@ -3591,7 +3621,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     const bool cacheable = reuse_on && n_tok == 1 && !groups && !any_image && snapshots <= 1;
     // A check of guesses (an undoable step) has a scheduler of its own, where its graph stays placed (see Plan).
     const bool plan = reuse_on && check_.sched && snapshots > 1 && !groups && !any_image;
-    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots};
+    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_};
     const bool reuse = plan ? check_.g.ctx && key == check_.key : cacheable && reuse_.ctx && key == reuse_key_;
     ggml_backend_sched* const sc = plan ? check_.sched : sched_;
     Graph built;

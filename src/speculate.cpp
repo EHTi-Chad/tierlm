@@ -93,6 +93,11 @@ float Speculator::prob_of(const std::vector<std::pair<int32_t, float>>& w, int32
     return 0.0f;
 }
 
+bool Speculator::self_draft_ok() const {
+    const Hparams& hp = m_.hparams();
+    return m_.has_split_experts() && !hp.hybrid && !hp.mamba;
+}
+
 std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop,
                                       std::vector<int32_t>* routing) {
     const int P = m_.n_past(), E = m_.hparams().hidden_width(), V = m_.hparams().n_vocab;
@@ -116,14 +121,17 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
         for (size_t i = 0; i < look.size(); ++i)
             if (stop(look[i])) { look.resize(i + 1); break; }
     }
+    const bool self_used = self_ && !draft_src_ && !m_.has_mtp() && self_draft_ok();
     if (draft_src_) {
         drafts = draft_src_(P, x, n_max);
         if ((int)drafts.size() > n_max) drafts.resize(n_max);
-    } else if (m_.has_mtp() && h_pos_ == P - 1 && n_max > 0) {
+    } else if (((m_.has_mtp() && h_pos_ == P - 1) || self_used) && n_max > 0) {
         int32_t tok = x;
         std::vector<float> h = h_last_, hn;
+        if (self_used) m_.set_hot_only(true);
         for (int i = 0; i < n_max; ++i) {
-            std::vector<float> lg = m_.mtp_eval(&tok, h.data(), 1, P + i, n_threads, &hn);
+            std::vector<float> lg = self_used ? m_.eval_ex(&tok, 1, n_threads, 1, false, 1).logits
+                                              : m_.mtp_eval(&tok, h.data(), 1, P + i, n_threads, &hn);
             int32_t d;
             if (dist_) {                              // sampling: draw the guess from the draft block's probabilities
                 std::vector<int32_t> ctx(1, x);
@@ -148,13 +156,14 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
             tok = d;
             h.swap(hn);
         }
+        if (self_used) { m_.set_hot_only(false); m_.truncate(P); }   // the check writes those positions again
     }
     // With the draft block's guesses, lookup only extends them: when lookup's guess starts with all of the draft
     // block's, two independent guessers agree and the longer guess is worth checking; when they differ, the draft block (usually the better
     // guesser) is trusted. Without a draft block, lookup's guesses are the only ones.
     int from_lookup = 0;
     if (!look.empty()) {
-        const bool agree = drafts.empty() ? !m_.has_mtp() || h_pos_ != P - 1 || n_max == 0
+        const bool agree = drafts.empty() ? (!m_.has_mtp() && !self_used) || (!self_used && h_pos_ != P - 1) || n_max == 0
                                           : look.size() > drafts.size() && std::equal(drafts.begin(), drafts.end(), look.begin());
         if (agree) { drafts = look; from_lookup = (int)look.size(); }
     }
