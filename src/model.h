@@ -306,6 +306,12 @@ public:
     // the router's picks that are in VRAM (their weights scaled up to the picks' whole weight) and skips the RAM part,
     // so a step runs on the GPU alone. An approximation of the model, for guesses that the whole model then checks.
     void set_hot_only(bool on) { hot_only_ = on; }
+    // Guessing with the model itself writes its own memory: draft_mark() remembers where the conversation is (and
+    // copies the running memories of DeltaNet layers, which can't be rewound otherwise, next to them in the same
+    // memory), draft_rewind() puts it back there. False if this model has memory that can't be put back this way.
+    bool draft_mark();
+    void draft_rewind();
+    bool draft_ok() const;
     bool hot_only() const { return hot_only_; }
     bool has_split_experts() const;
     void restore(const Snapshot& s);          // the cache becomes exactly the saved conversation
@@ -572,6 +578,10 @@ private:
     void drop_plans();                                             // reuse_ and both plans (the cache changes size)
     bool overlap_ = true;                                          // CPU and GPU at once on split expert layers
     bool hot_only_ = false;                                        // set_hot_only: only the experts in VRAM
+    int draft_pos_ = -1;                                           // draft_mark: where the conversation was
+    std::vector<std::pair<ggml_tensor*, ggml_tensor*>> draft_keep_; // (a running memory, its copy)
+    std::vector<ggml_context*> draft_ctx_;
+    std::vector<struct ggml_backend_buffer*> draft_buf_;
     float cold_skip_ = 0.0f;                                       // TIERLM_COLD_SKIP (see the split expert layers)
     std::vector<Snapshot> ckpts_;                                  // (see checkpoint) in order of position
     int n_threads_last_ = 0;                                       // (for the profile)

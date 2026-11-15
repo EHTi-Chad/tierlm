@@ -137,6 +137,10 @@ int main(int argc, char** argv) {
             } else {
                 Speculator sp(*m, std::getenv("TIERLM_DRAFT_N") ? std::atoi(std::getenv("TIERLM_DRAFT_N")) : 3);
                 if (const char* lk = std::getenv("TIERLM_LOOKUP")) sp.set_lookup(std::atoi(lk), 2);
+                if (std::getenv("TIERLM_SELF_DRAFT")) {                   // guesses from the VRAM experts only
+                    sp.set_self_draft(true);
+                    std::fprintf(stderr, "self draft: %s\n", sp.self_draft_ok() ? "on" : "not possible here");
+                }
                 if (const char* sc = std::getenv("TIERLM_DRAFT_SCRIPT")) {
                     std::vector<int32_t> script;
                     std::stringstream ss(sc);

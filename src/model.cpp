@@ -33,6 +33,8 @@ static constexpr int kGraphSize = 16384;
 
 Model::~Model() {
     release_pending();
+    for (auto* b : draft_buf_) ggml_backend_buffer_free(b);
+    for (ggml_context* c : draft_ctx_) ggml_free(c);
     drop_plans();
     if (check_.sched) ggml_backend_sched_free(check_.sched);
     if (mtp1_.sched) ggml_backend_sched_free(mtp1_.sched);
@@ -2124,6 +2126,54 @@ void Model::restore(const Snapshot& s) {
 }
 
 const char* Model::kv_type() const { return ggml_type_name((ggml_type)kv_t_); }
+
+bool Model::draft_ok() const {
+    if (!qsa_.empty() || hp_.mamba) return false;                  // (Flash-Next's indexer keys, Mamba: not yet)
+    for (const Layer& L : layers_) if (!L.ple_states.empty()) return false;
+    return true;
+}
+
+bool Model::draft_mark() {
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    if (!draft_ok()) return false;
+    if (draft_keep_.empty() && hp_.hybrid) {                       // the copies, made once, beside the originals
+        std::map<ggml_backend_buffer_type_t, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> by;
+        std::map<ggml_backend_buffer_type_t, ggml_context*> ctxs;
+        for (const Layer& L : layers_)
+            for (ggml_tensor* t : {L.ssm_state_t, L.conv_state}) {
+                if (!t || !t->buffer) continue;
+                ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(t->buffer);
+                if (!ctxs.count(bt)) {
+                    ggml_init_params ip{ ggml_tensor_overhead() * 2 * layers_.size() + 1024, nullptr, true };
+                    ctxs[bt] = ggml_init(ip);
+                }
+                by[bt].push_back({t, ggml_dup_tensor(ctxs[bt], t)});
+            }
+        for (auto& [bt, ctx] : ctxs) {
+            ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx, bt);
+            if (!b) { for (auto& [b2, c2] : ctxs) ggml_free(c2); for (auto bb : draft_buf_) ggml_backend_buffer_free(bb); draft_buf_.clear(); return false; }
+            draft_buf_.push_back(b); draft_ctx_.push_back(ctx);
+            for (auto& pr : by[bt]) draft_keep_.push_back(pr);
+        }
+    }
+    release_pending();
+    draft_pos_ = n_past_;
+    for (auto& [orig, copy] : draft_keep_) ggml_backend_tensor_copy(orig, copy);
+    return true;
+}
+
+void Model::draft_rewind() {
+    std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
+    if (draft_pos_ < 0) return;
+    release_pending();
+    if (n_past_ > draft_pos_) {
+        n_past_ = draft_pos_;
+        free_cells_from(0, n_past_);
+        rope_truncate(0, n_past_);
+    }
+    for (auto& [orig, copy] : draft_keep_) ggml_backend_tensor_copy(copy, orig);
+    draft_pos_ = -1;
+}
 
 bool Model::has_split_experts() const {
     // (and set_hot_only can be used: every split layer has at least as many experts in VRAM as a token picks)
