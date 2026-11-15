@@ -22,8 +22,10 @@ serves your other apps, also with no page or browser at all: start it from the c
   **Speculative decoding** on the setup screen now works for these models (4 guesses by default; 4 to 6 usually do
   best), and **Find the fastest settings** tries it. On an RTX 5090 (Ryzen 9 9950X3D, 64 GB DDR5-6000):
   gpt-oss-120b MXFP4, busiest experts in VRAM, 32K context, 12 threads: 84.7 → 100.4 tok/s with 6 guesses;
-  Qwen3.6-35B-A3B Q4_K_M held to 8 GB of VRAM (`--vram-limit 8000`, an 8 GB card's share), the same: 72.4 → 100.1.
-  It doesn't help every model: on DeepSeek V4 Flash, whose experts are mostly in RAM, every guess setting was slower.
+  Qwen3.6-35B-A3B Q4_K_M held to 8 GB of VRAM (`--vram-limit 8000`, an 8 GB card's share), the same, with VRAM experts
+  learned on that kind of reply (they did 77% of the expert work): 72.4 → 100.1. The gain depends on how much of the
+  work the VRAM experts do: with experts learned from other chats (36% of this reply's work) the same reply ran at 63
+  tok/s with 4 guesses. On DeepSeek V4 Flash, whose experts are mostly in RAM, every guess setting was slower.
   Not for Qwen3.8 Flash-Next (it has its own draft file) or Nemotron.
 - **DeepSeek V4 Flash** (`deepseek4`), early: its hyper-connections, its attention (a sliding window plus two kinds of
   compressed memory, with an indexer that picks the parts each word reads) and its hash-routed first layers, checked

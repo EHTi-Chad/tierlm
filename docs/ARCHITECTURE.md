@@ -500,7 +500,8 @@ model's own. Before guessing, `draft_mark` copies the running memories of hybrid
 `draft_rewind` puts them back after. Not for Qwen3.8 Flash-Next (its sparse attention), Mamba or PLE models, or when
 some layer has fewer experts in VRAM than it uses per token. Measured on an RTX 5090 (Ryzen 9 9950X3D, 64 GB
 DDR5-6000, 12 threads): gpt-oss-120b MXFP4, busiest experts in VRAM, 32K: 84.7 tok/s without guessing, 94.5 with 3
-guesses, 100.4 with 6, 77.7 with 8; Qwen3.6-35B-A3B Q4_K_M with `--vram-limit 8000`: 72.4, 87.3 with 4, 100.1 with 6.
+guesses, 100.4 with 6, 77.7 with 8; Qwen3.6-35B-A3B Q4_K_M with `--vram-limit 8000`, its VRAM experts learned on that kind of reply (77% of the expert
+work): 72.4, 87.3 with 4, 100.1 with 6; with experts learned from other chats (36% of the reply's work), 63 with 4.
 With most experts in RAM the guesses miss more and cost more: DeepSeek V4 Flash (about 96 GB on 32 GB of VRAM) was
 slower with every guess count.
 
