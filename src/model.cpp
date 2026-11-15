@@ -3646,6 +3646,8 @@ Model::Graph Model::build_dsv4(int n_tok, int n_past, bool want_routing, int n_l
         ggml_tensor* pr = ggml_soft_max_ext(c, lg, nullptr, scale, 0.0f);
         ggml_soft_max_add_sinks(pr, L.sinks);
         ggml_tensor* ps = ggml_view_3d(c, pr, Kn, n_tok, H, pr->nb[1], pr->nb[2], 0);
+        // (contiguous: CUDA's matrix-vector kernel needs the rows' stride even when the keys are, and Kn + K may not be)
+        if (Ksel) ps = ggml_cont(c, ps);
         ggml_tensor* out = ggml_mul_mat(c, ggml_cont(c, ggml_transpose(c, Ks)), ps);   // [HD, n, H]
         if (Ksel) {
             ggml_tensor* pc = ggml_cont(c, ggml_permute(c, ggml_view_3d(c, pr, Kc, n_tok, H, pr->nb[1], pr->nb[2], (size_t)Kn * ggml_element_size(pr)), 0, 2, 1, 3));   // [K, H, n]
