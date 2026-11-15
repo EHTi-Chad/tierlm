@@ -852,6 +852,21 @@ struct Engine {
     }
     // The speculator replies use: the draft block's (which also does prompt lookup), or prompt lookup alone.
     Speculator* active_spec() { return spec ? spec.get() : look.get(); }
+    // Guessing d tokens per check: with the draft block when the model has one loaded, else with the model itself
+    // cut down to its experts in VRAM (experts split between VRAM and RAM, no draft block). Null: neither.
+    std::unique_ptr<Speculator> make_spec(int d) {
+        if (!model || d <= 0) return nullptr;
+        auto sp = std::make_unique<Speculator>(*model, d, draft_p_min);
+        if (model->has_mtp()) return sp;
+        sp->set_self_draft(true);
+        return sp->self_draft_ok() ? std::move(sp) : nullptr;
+    }
+    bool can_guess() const {
+        if (!model) return false;
+        if (model->has_mtp()) return true;
+        Speculator sp(*model, 1);
+        return sp.self_draft_ok();
+    }
     // Call after `spec` or `lookup` changes.
     void spec_changed() {
         const int L = lookup_len();
@@ -1019,6 +1034,9 @@ json describe_model(const std::string& path, bool header_only = false) {
         j["reason"] = "Vision file (mmproj): lets the model next to it read images. It loads with that model.";
     }
     else j["reason"] = "the " + (arch.empty() ? std::string("unknown") : arch) + " architecture is not supported yet";
+    // Guessing ahead with the model itself, cut down to its experts in VRAM, for MoE models without a draft layer
+    // (whether it can be used depends on the load: experts split between VRAM and RAM; see Speculator::self_draft).
+    if (j.value("experts", 0) > 0 && !j.value("mtp", false) && arch != "nemotron_h_moe" && arch != "qwen4exp") j["self_draft"] = true;
     gguf_free(g);
     return j;
 }
@@ -1618,7 +1636,9 @@ int main(int argc, char** argv) {
         // Each guess an MoE model checks pulls in its own experts, so shorter guesses pay off there
         // (Qwen3.6-35B-A3B, RTX 3070 laptop: 35 tok/s with 1 or 2, 28 with 3); dense models do best with 3.
         if (eng.draft_max <= 0) eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
-        if (opt.mtp && eng.model->has_mtp()) eng.spec = std::make_unique<Speculator>(*eng.model, eng.draft_max, eng.draft_p_min);
+        if (opt.mtp) eng.spec = eng.make_spec(eng.draft_max);      // (no draft layer: guesses from the VRAM experts, if split)
+        if (eng.spec && !eng.model->has_mtp())
+            std::fprintf(stderr, "speculative decoding: guesses from the experts in VRAM, %d per check\n", eng.draft_max);
         eng.spec_changed();
         // Its eyes: an mmproj (vision) file in the same folder, for models that read images (Qwen3.5 / 3.6).
         // (Not Flash-Next yet: its images aren't tested, so it runs text only and doesn't say it reads images.)
@@ -1812,7 +1832,7 @@ int main(int argc, char** argv) {
             {"think_switch", eng.think_switch}, {"thinking", eng.thinking}, {"reasoning_effort", eng.chat == ChatFmt::Harmony ? eng.effort : std::string()},
             {"vision_device", eng.vision ? eng.vision->device_name() : std::string()}, {"image_tokens", eng.image_tokens_for(0)},
             {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}, {"lookup_setting", eng.lookup}, {"has_draft_block", hp.n_nextn > 0},
-            {"mtp_loaded", eng.model->has_mtp()}, {"ffn_vram", eng.model->placement().ffn_vram},
+            {"mtp_loaded", eng.model->has_mtp()}, {"self_draft", !eng.model->has_mtp() && eng.can_guess()}, {"ffn_vram", eng.model->placement().ffn_vram},
             {"hot_experts", eng.model->placement().hot_experts}, {"hot_share", eng.hot_share}, {"hot", eng.model->placement().hot},
             {"live_experts", eng.model->live_hot()},
             {"ssd_weights", eng.model->placement().ssd_weights}, {"ssd_layers", eng.model->placement().ssd_layers}, {"ssd_ngram", eng.model->placement().ssd_ngram},
@@ -3136,7 +3156,7 @@ int main(int argc, char** argv) {
         };
         std::unique_ptr<Speculator> saved = std::move(eng.spec);
         const int saved_seed = eng.seed;
-        if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft, eng.draft_p_min);
+        if (draft > 0) eng.spec = eng.make_spec(draft);
         eng.spec_changed();
         eng.seed = 4242;
         eng.learn = false;
@@ -3392,11 +3412,17 @@ int main(int argc, char** argv) {
                         if (!record(label + ", " + threads_text(eng.threads) + ", no speculative decoding", {{"split_mode", m}}, t))
                             throw std::runtime_error("cancelled");
                         cands.push_back({m, label, 0, t});
-                        if (try_guess && eng.model->has_mtp()) {
-                            // 2 and 3 guesses, and 4 when 3 beat 2
+                        if (eng.can_guess()) {
+                            // With the draft layer: 2 and 3 guesses, and 4 when 3 beat 2. Without one (guesses from the
+                            // VRAM experts, which are right more often but cost a step on the GPU each): 3 and 4, and 6
+                            // when 4 beat 3 (gpt-oss-120b, RTX 5090, busiest experts in VRAM: 84.7 tok/s without,
+                            // 94.5 with 3, 91 with 4, 100.4 with 6, 77.7 with 8).
+                            const bool self = !eng.model->has_mtp();
+                            const int ds[3] = {self ? 3 : 2, self ? 4 : 3, self ? 6 : 4};
                             double t2 = 0, t3 = 0;
-                            for (int d = 2; d <= 4; ++d) {
-                                if (d == 4 && t3 <= t2) break;
+                            for (int k = 0; k < 3; ++k) {
+                                const int d = ds[k];
+                                if (k == 2 && t3 <= t2) break;
                                 if (!status("Measuring " + label + ", speculative decoding " + std::to_string(d) + " guesses"))
                                     throw std::runtime_error("cancelled");
                                 const double tg = measure(n_gen, d);
@@ -3404,7 +3430,7 @@ int main(int argc, char** argv) {
                                             {{"split_mode", m}, {"draft_max", d}}, tg))
                                     throw std::runtime_error("cancelled");
                                 cands.push_back({m, label, d, tg});
-                                if (d == 2) t2 = tg; else if (d == 3) t3 = tg;
+                                if (k == 0) t2 = tg; else if (k == 1) t3 = tg;
                             }
                         }
                     }
@@ -3559,7 +3585,7 @@ int main(int argc, char** argv) {
                 // ---- the winner: keep it loaded and remember it ----
                 eng.draft_max = draft > 0 ? draft : 0;
                 eng.spec.reset();
-                if (draft > 0) eng.spec = std::make_unique<Speculator>(*eng.model, draft, eng.draft_p_min);
+                if (draft > 0) eng.spec = eng.make_spec(draft);
                 else eng.draft_max = eng.model->hparams().is_moe() ? 2 : 3;
                 eng.spec_changed();
                 eng.model->reset();
@@ -3675,14 +3701,16 @@ int main(int argc, char** argv) {
         if (body.contains("draft_p_min") && body["draft_p_min"].is_number()) eng.draft_p_min = std::max(0.0f, std::min(1.0f, body["draft_p_min"].get<float>()));
         const bool on = body.value("speculative", eng.spec != nullptr);
         const int d = std::min(8, std::max(1, body.value("draft_max", eng.draft_max > 0 ? eng.draft_max : 2)));
-        if (on && !eng.model->has_mtp()) {
+        if (on && !eng.can_guess()) {
             res.status = 409;
-            res.set_content(dump({{"error", "this model was loaded without its draft layer: turn on Speculative decoding on the setup screen and load it again"}}), "application/json; charset=utf-8");
+            res.set_content(dump({{"error", eng.model->hparams().n_nextn > 0
+                ? "this model was loaded without its draft layer: turn on Speculative decoding on the setup screen and load it again"
+                : "this model has no draft layer, and guessing with its experts in VRAM needs them split between VRAM and RAM"}}), "application/json; charset=utf-8");
             return;
         }
         eng.draft_max = d;
         eng.spec.reset();
-        if (on) eng.spec = std::make_unique<Speculator>(*eng.model, d, eng.draft_p_min);
+        if (on) eng.spec = eng.make_spec(d);
         eng.spec_changed();
         eng.cached.clear();                                     // the draft block's cache starts over with the next reply
         eng.model->reset();

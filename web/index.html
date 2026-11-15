@@ -2116,13 +2116,18 @@ function applySaved() {
   if (cr.length) $("connrec").textContent = "Measured: " + cr.map(r => `${r.connections} at once: ${r.tps} tok/s each`).join(" · ") +
     `. Recommended: ${s.connections || 1} (every reply at least ${s.min_tps || 5} tok/s).`;
   $("liveexp").checked = s.live_experts === true;
-  const canSpec = !!(selModel && selModel.mtp);
+  const canSpec = !!(selModel && (selModel.mtp || selModel.self_draft));
+  const selfSpec = !!(selModel && !selModel.mtp && selModel.self_draft);
   $("specon").disabled = !canSpec; $("specn").disabled = !canSpec;
-  $("specon").checked = canSpec && s.speculative !== false;     // on by default when the model has a draft layer
+  // On by default when the model has a draft layer; without one (guesses from the experts in VRAM) only once chosen
+  // or measured faster by Find the fastest settings.
+  $("specon").checked = canSpec && (selfSpec ? s.speculative === true : s.speculative !== false);
   // Each guess an MoE model checks pulls in its own experts from RAM, so 2 does best there; 3 for dense models.
-  $("specn").value = String(s.draft_max || (E ? 2 : 3));
+  $("specn").value = String(s.draft_max || (selfSpec ? 4 : E ? 2 : 3));
   $("llook").value = String(s.lookup ?? -1);
-  $("spechelp").textContent = canSpec
+  $("spechelp").textContent = selfSpec
+    ? "Faster replies with the same answers: the model guesses the next few words using only its experts that are in VRAM, then checks them all in one pass with all its experts. Works when part of the experts are in RAM; 4 to 6 guesses usually do best."
+    : canSpec
     ? "Faster replies with the same answers: the model's small built-in draft layer guesses the next few words, and the model checks them all in one pass. Helps most when the model doesn't fit in VRAM."
     : "Not available for this model: its file has no built-in draft layer (Qwen3.5, 3.6 and 3.8 files usually include one).";
   $("setnote").textContent = selModel ? (md.saved && md.saved[selModel.id] ? "Using your saved settings for this model" : "Settings are remembered per model") : "";
@@ -2630,14 +2635,15 @@ function renderMiniMem() {
 // ---------- speculative decoding while chatting (when the draft layer is loaded) ----------
 function syncLiveSpec() {
   if (!info) return;
-  const can = !!info.mtp_loaded;
+  const can = !!info.mtp_loaded || !!info.self_draft;
   $("lspecrow").hidden = !info.has_draft_block && !can;
   $("lspec").disabled = $("lspecn").disabled = !can;
   $("lspec").checked = !!info.speculative;
   $("lspecn").value = String(info.draft_max || (info.experts ? 2 : 3));
   $("llook").value = String(info.lookup_setting ?? -1);
   $("llook").title = info.lookup ? "Now guessing up to " + info.lookup + " tokens per check" : "Off";
-  $("lspechelp").textContent = can ? "Faster replies with the same answers. 2 guesses usually suit MoE models, 3 dense ones; the benchmark below shows which is faster here."
+  $("lspechelp").textContent = info.self_draft ? "Faster replies with the same answers: guesses made with the experts in VRAM, checked with all of them. 4 to 6 guesses usually do best; the benchmark below shows which is faster here."
+    : can ? "Faster replies with the same answers. 2 guesses usually suit MoE models, 3 dense ones; the benchmark below shows which is faster here."
     : info.has_draft_block ? "This model has a draft layer, but it was loaded without it: turn on Speculative decoding on the setup screen and load it again." : "";
 }
 async function setLiveSpec() {
