@@ -568,6 +568,7 @@ private:
     void drop_plans();                                             // reuse_ and both plans (the cache changes size)
     bool overlap_ = true;                                          // CPU and GPU at once on split expert layers
     bool hot_only_ = false;                                        // set_hot_only: only the experts in VRAM
+    float cold_skip_ = 0.0f;                                       // TIERLM_COLD_SKIP (see the split expert layers)
     std::vector<Snapshot> ckpts_;                                  // (see checkpoint) in order of position
     int n_threads_last_ = 0;                                       // (for the profile)
     void profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms, double build_ms = 0, double alloc_ms = 0);

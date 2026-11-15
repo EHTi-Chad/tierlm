@@ -1736,6 +1736,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // CPU and GPU at once on split expert layers (TIERLM_OVERLAP=0: one after the other, as before)
     // (TIERLM_OVERLAP=2, for tests: the same graph, but each step still waits for the one before)
     { const char* e = std::getenv("TIERLM_OVERLAP"); m->overlap_ = !(e && !std::strcmp(e, "0")); }
+    if (const char* e = std::getenv("TIERLM_COLD_SKIP")) m->cold_skip_ = std::max(0.0f, (float)std::atof(e));
     ggml_backend_sched_set_overlap(m->sched_, m->overlap_ && !(std::getenv("TIERLM_OVERLAP") && !std::strcmp(std::getenv("TIERLM_OVERLAP"), "2")));
     m->graph_mem_size_ = ggml_tensor_overhead() * m->graph_size_ + ggml_graph_overhead_custom(m->graph_size_, false);
 
@@ -2420,6 +2421,18 @@ static void distinct_ids(ggml_tensor* dst, const ggml_tensor* a, int ith, int nt
 // For the RAM part of a split layer when the CPU computes it (a few tokens): picks that point at the zero expert
 // (the part's last one; userdata is the part's size) become -1, which the CPU kernel skips, writing zeros. So
 // the CPU computes only the experts that live in RAM, instead of multiplying the zero expert out as well.
+// A RAM pick left out (TIERLM_COLD_SKIP): its id becomes -1, so the CPU skips it, where its weight b is 0.
+static void drop_unweighted_ids(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b, int ith, int nth, void* userdata) {
+    (void)nth; (void)userdata;
+    if (ith != 0) return;
+    for (int64_t t = 0; t < a->ne[1]; ++t) {
+        const int32_t* in = (const int32_t*)((const char*)a->data + t * a->nb[1]);
+        const float* w = (const float*)((const char*)b->data + t * b->nb[2]);
+        int32_t* out = (int32_t*)((char*)dst->data + t * dst->nb[1]);
+        for (int64_t k = 0; k < a->ne[0]; ++k) out[k] = w[k * (b->nb[1] / sizeof(float))] == 0.0f ? -1 : in[k];
+    }
+}
+
 static void skip_zero_ids(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void* userdata) {
     if (ith != 0) return;
     (void)nth;
@@ -2625,6 +2638,31 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             const bool cold_gpu = n_tok >= std::max(offload_batch, cold_offload_min_);
             ggml_tensor* ids_c  = remap(L.map_cold, L.down_xc, cold_gpu);
             ggml_tensor* ids_h  = remap(L.map_hot, L.down_xh, true);
+            if (cold_skip_ > 0.0f && !cold_gpu) {
+                // TIERLM_COLD_SKIP=x (experimental): a RAM pick whose share of the picks' weight is below x is left out
+                // (the CPU skips it), and the rest are scaled up to the picks' whole weight. The VRAM picks always
+                // run. Faster (RAM experts are the slow part), but not the model's exact sum: an approximation.
+                ggml_tensor* wc   = ggml_cont(c, w);                                              // [1, NU, n_tok]
+                ggml_tensor* sw   = ggml_sum_rows(c, ggml_reshape_2d(c, wc, NU, n_tok));           // [1, n_tok]
+                ggml_tensor* sh   = ggml_div(c, wc, ggml_reshape_3d(c, ggml_clamp(c, sw, 1e-12f, INFINITY), 1, 1, n_tok));
+                ggml_tensor* keep = ggml_step(c, ggml_scale_bias(c, sh, 1.0f, -cold_skip_));      // 1: share above x
+                ggml_tensor* cm   = ggml_scale_bias(c, mask, -1.0f, 1.0f);                         // 1: a RAM pick
+                ggml_tensor* drop = ggml_mul(c, cm, ggml_scale_bias(c, keep, -1.0f, 1.0f));        // 1: left out
+                ggml_tensor* wk   = ggml_mul(c, wc, ggml_scale_bias(c, drop, -1.0f, 1.0f));        // the weights kept
+                ggml_tensor* sk   = ggml_sum_rows(c, ggml_reshape_2d(c, wk, NU, n_tok));
+                ggml_tensor* sc   = ggml_reshape_3d(c, ggml_div(c, sw, ggml_clamp(c, sk, 1e-12f, INFINITY)), 1, 1, n_tok);
+                w_hot  = ggml_mul(c, w_hot, sc);
+                w_cold = ggml_mul(c, ggml_mul(c, w_cold, ggml_scale_bias(c, drop, -1.0f, 1.0f)), sc);
+                ids_c  = ggml_map_custom2(c, ids_c, w_cold, drop_unweighted_ids, 1, nullptr);
+                std::set<ggml_tensor*> seen;                                // all of it on the CPU, with the other bookkeeping
+                std::function<void(ggml_tensor*)> put = [&](ggml_tensor* t) {
+                    if (!t || t == probs || t == order || t->op == GGML_OP_NONE || !seen.insert(t).second) return;
+                    const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+                    if (!view) g.cpu_ops.push_back(t);
+                    for (ggml_tensor* src : t->src) put(src);
+                };
+                for (ggml_tensor* t : {w_hot, w_cold, ids_c}) put(t);
+            }
             // Biases (gpt-oss) aren't split: each part has all of them (RAM: the file's; VRAM: a copy) and adds them
             // by the router's own ids. A pick that lives in the other part gets a bias here too, on top of the zero
             // expert's zeros, and then its weight of 0, so it still adds nothing.
