@@ -391,6 +391,13 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         t.id_to_token_[i] = gguf_get_arr_str(g, tk, i);
         t.token_to_id_.emplace(t.id_to_token_[i], (int32_t)i);
     }
+    // Kimi's tokenizer (Moonlight, Kimi K2) in files converted before it had a name of its own: they say "gpt-2"
+    // (Moonlight-16B-A3B Q4_K_M from mmnga), and GPT-2's splitting cuts Chinese text where Kimi's keeps it whole,
+    // so the model saw unfamiliar pieces (its Chinese replies went round in a loop). Its own tokens give it away.
+    if (t.kind_ == Kind::Bpe && t.pre_ == Pre::Gpt2 && t.token_to_id_.count("<|im_middle|>") && t.token_to_id_.count("<|im_assistant|>")) {
+        std::fprintf(stderr, "tokenizer: Kimi's (the file says GPT-2's, from before Kimi's had a name)\n");
+        t.pre_ = Pre::Kimi;
+    }
     int64_t yk = gguf_find_key(g, "tokenizer.ggml.token_type");
     t.token_type_.assign(nt, 1);
     if (yk >= 0 && gguf_get_arr_type(g, yk) == GGUF_TYPE_INT32 && gguf_get_arr_n(g, yk) == nt) {
