@@ -3435,7 +3435,7 @@ int main(int argc, char** argv) {
                         const std::string sfx = one ? "@1" : "";
                         static const bool separate = std::getenv("TIERLM_TUNE_SEPARATE") != nullptr;   // (0.8.9's way, to compare)
                         const std::string want = base_m == "hot" && !separate ? "live" + sfx : m;
-                        if (loaded_mode != want && !(base_m == "live" && loaded_mode == "hot" + sfx)) {
+                        if (loaded_mode != want) {
                             if (!status("Loading with " + label)) throw std::runtime_error("cancelled");
                             load_mode(want);
                         }
