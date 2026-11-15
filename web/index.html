@@ -811,6 +811,14 @@
         <div class="note" id="hotnote" hidden></div>
         <button class="tiny ghost" id="hotforget" hidden>Forget what tierlm learned about this model</button>
         <div class="note" id="densenote" hidden></div>
+        <div class="subhead">Copy specs</div>
+        <div class="help">Everything people ask for next to a speed result: this PC, the model and quantization, what ran in VRAM, RAM and on the SSD,
+          the settings, and the latest speeds with how long the prompt and reply were. Paste it with your numbers.</div>
+        <div class="apirow">
+          <button class="tiny" id="specsline" title="One line, for chats and comments">Copy one line</button>
+          <button class="tiny" id="specsmd" title="A table for Reddit, GitHub and forums">Copy table (Markdown)</button>
+          <button class="tiny ghost" id="specsjson" title="Every value, for bug reports">Copy JSON</button>
+        </div>
         <div class="subhead">Memory right now</div>
         <div id="minimem"></div>
         <div id="mapcard">
@@ -937,7 +945,10 @@
           <div class="bstat"><div class="bl">Generation</div><div class="bv"><span id="b-gen">–</span> <small>tok/s</small></div></div>
         </div>
         <div class="help" id="benchline"></div>
-        <button class="tiny" id="benchcopy" hidden>Copy result</button>
+        <div class="apirow" id="benchcopyrow" hidden>
+          <button class="tiny" id="benchcopy" title="One line with this PC, the model, where it ran, the settings and these speeds">Copy result</button>
+          <button class="tiny" id="benchcopymd" title="A table for Reddit, GitHub and forums">Copy table (Markdown)</button>
+        </div>
       </div>
     </div>
   </aside>
@@ -1163,6 +1174,7 @@ async function loadInfo() {
   if (!info.loaded) { info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "setup"; showSetup(); return; }
   showApp();
   loadEmbed();
+  if (info.path !== specsPath) { specsPath = info.path; lastBench = lastReply = null; }   // speeds from another model don't carry over
   L = info.layers; E = info.experts || 0; K = info.experts_used || 0;
   counts = new Float64Array(L * E); flash = new Float64Array(L * E);
   $("slots").max = Math.max(1, E); $("slots").value = Math.max(1, Math.round(E / 4));
@@ -1709,6 +1721,7 @@ async function summariseArchive(btn) {
   renderHistory();
 }
 function onPrompt(ev) {
+  lastReply = { n_prompt: ev.n_prompt, n_new: ev.n_new, prompt_tps: ev.prompt_tps, prompt_s: ev.prompt_s };
   for (let i = 0; i < ev.counts.length; i++) counts[i] += ev.counts[i];
   totalPicks += ev.n_new * L * K;
   $("ptps").textContent = Math.round(ev.prompt_tps).toLocaleString() + " tok/s (" + ev.n_new.toLocaleString() + " new)";
@@ -1733,6 +1746,7 @@ function onToken(ev) {
   if (tokCount % 4 === 0) updateHits();
 }
 function onDone(ev) {
+  if (lastReply) Object.assign(lastReply, { n_gen: ev.n_gen, gen_s: ev.gen_s, gen_tps: ev.gen_tps });
   $("tps").firstChild.nodeValue = ev.gen_tps.toFixed(1); $("rtps").textContent = ev.gen_tps.toFixed(1);
   $("lastreply").textContent = ev.n_gen + " tokens in " + ev.gen_s.toFixed(1) + " s";
   setContext(ev.n_past);
@@ -3623,21 +3637,144 @@ renderChats(); renderPresets(); initChats();
 $("chatsfolder").onclick = () => chatApi("/api/chats-folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
   .then(r => r.json()).then(j => { if (!j.opened) addMsg("note", "Your chats are saved in " + j.folder); }).catch(() => {});
 
+// ---------- Copy specs ----------
+// Everything people ask for next to a speed result, in three forms: one line, a Markdown table (Reddit, GitHub)
+// and JSON. Built from /api/info (the model and where it went), /api/specs (this PC, the model file) and the
+// latest benchmark and reply. Plain separators only ("|", "->"): fancy ones turn into "?" in some places pasted to.
+var lastBench = null, lastReply = null, specsPath = "";   // (var: loadInfo may run before this line)
+const gbs = b => (b / 1e9).toFixed(1) + " GB";
+async function getSpecs() {
+  let inf = info, pc = {};
+  try { const j = await (await api("/api/info")).json(); if (j.loaded) inf = j; } catch (e) {}   // (first: /api/specs reads its snapshot)
+  try { pc = await (await api("/api/specs")).json(); } catch (e) {}
+  return { pc, inf };
+}
+function quantOf(pc, inf) {
+  if (pc.quant) return pc.quant;
+  const m = /(?:^|[-_.])((?:UD-)?(?:I?Q[1-8](?:_[0-9A-Z]+)*|MXFP4|BF16|F16))/i.exec((inf.path || "").split(/[\\/]/).pop() || "");
+  return m ? m[1].toUpperCase() : "";
+}
+// What went where, in words: "VRAM 14.2 GB (attention + KV cache, 31% of experts) | RAM 9.8 GB (experts) | SSD 0 GB"
+function placementOf(inf) {
+  if (!inf.on_gpu) return { short: "CPU only", vram: "", ram: gbs(inf.ram_weights || inf.weights_bytes || 0) + " (everything)", ssd: "" };
+  const moe = inf.experts > 0;
+  const kv = inf.kv_on_gpu ? "KV cache" : inf.kv_gpu_layers > 0 ? `KV cache of ${inf.kv_gpu_layers}/${inf.layers} layers` : "";
+  let vin, rin, short;
+  if (inf.all_on_gpu || !(inf.ram_weights > 0)) { vin = "everything"; rin = ""; short = "all in VRAM"; }
+  else if (inf.split_mode === "experts") {
+    const fullLayers = (inf.ffn_vram || []).filter(Boolean).length;
+    const ex = inf.hot_experts > 0
+      ? `the ${inf.hot_experts.toLocaleString()} busiest of ${(inf.layers * inf.experts).toLocaleString()} experts${inf.live_experts ? ", following the conversation" : ""}`
+      : fullLayers > 0 ? `experts of ${fullLayers}/${inf.layers} layers` : "";
+    vin = ["attention", kv, ex].filter(Boolean).join(" + ");
+    rin = inf.hot_experts > 0 || fullLayers > 0 ? "the rest of the experts" : "experts";
+    short = "experts in RAM";
+  } else {
+    vin = `${inf.ffn_gpu}/${inf.layers} layers` + (kv ? " + " + kv : "");
+    rin = `${inf.layers - inf.ffn_gpu}/${inf.layers} layers`;
+    short = "whole layers in RAM";
+  }
+  const ssd = inf.ssd_weights > 0 ? `${gbs(inf.ssd_weights)} (${inf.ssd_layers} ${moe ? "expert " : ""}layers${inf.ssd_file ? ", " + inf.ssd_file : ""})` : "";
+  return { short: short + (inf.ssd_weights > 0 ? " + SSD" : ""), vram: `${gbs(inf.vram_weights || 0)} (${vin})`, ram: inf.ram_weights > 0 ? `${gbs(inf.ram_weights)} (${rin})` : "", ssd };
+}
+function gpusOf(pc, inf) {
+  if (pc.gpus && pc.gpus.length) return pc.gpus.map(g => `${g.name} ${Math.round(g.vram / 1073741824)} GB` + (g.backend ? ` (${g.backend})` : ""));
+  return inf.on_gpu ? [inf.device] : [];
+}
+function specsData({ pc, inf }) {
+  const s = samplingBody();
+  const d = {
+    tierlm: inf.version || pc.version,
+    os: pc.os || "",
+    cpu: [pc.cpu, pc.hw_threads ? pc.hw_threads + " threads" : ""].filter(Boolean).join(", "),
+    cpu_engine: pc.cpu_features || "",
+    ram: pc.ram_total ? Math.round(pc.ram_total / 1073741824) + " GB" : "",
+    gpus: gpusOf(pc, inf),
+    driver: [pc.nvidia_driver ? "NVIDIA " + pc.nvidia_driver : "", pc.cuda_runtime ? "CUDA " + pc.cuda_runtime + " engine" : "",
+             pc.cuda_driver ? "driver supports CUDA " + pc.cuda_driver : ""].filter(Boolean).join(", "),
+    model: inf.name, arch: inf.arch, quant: quantOf(pc, inf),
+    file: pc.model_file ? `${pc.model_file}, ${gbs(pc.model_bytes || 0)}${pc.model_parts ? " in " + pc.model_parts + " parts" : ""}` : "",
+    moe: inf.experts > 0 ? `${inf.layers} layers x ${inf.experts} experts, ${inf.experts_used} active per token` : `${inf.layers} layers, dense`,
+    placement: placementOf(inf),
+    expert_hits: inf.live && inf.live.picks > 0 ? Math.round(100 * inf.live.hits / inf.live.picks) + "% of expert picks from VRAM" : inf.hot_share > 0 ? Math.round(inf.hot_share * 100) + "% of expert work by the VRAM experts" : "",
+    context: `${inf.ctx.toLocaleString()} tokens, KV cache ${inf.kv_type}`,
+    flash_attn: inf.flash_attn ? "on" : "off",
+    batch: inf.batch,
+    threads: inf.on_gpu && inf.all_on_gpu ? "" : String(inf.threads),
+    connections: inf.connections || 1,
+    speculative: inf.speculative ? `on, ${inf.draft_max} ${inf.draft_max === 1 ? "guess" : "guesses"} per check (${inf.mtp_loaded ? "MTP draft layer" : "self-draft"})` : "off",
+    lookup: inf.lookup > 0 ? `up to ${inf.lookup} tokens` : "off",
+    thinking: inf.reasoning_effort ? "reasoning " + inf.reasoning_effort : inf.think_switch ? (inf.thinking ? "on" : "off") : "",
+    sampling: `temp ${s.temperature}, top_k ${s.top_k}, top_p ${s.top_p}, min_p ${s.min_p}`,
+    load_time: inf.load_s ? inf.load_s.toFixed(1) + " s" : "",
+  };
+  if (lastBench) {
+    const ttft = 512 / lastBench.prompt_tps + 1 / Math.max(lastBench.gen_tps, 1e-9);
+    d.benchmark = `prompt ${lastBench.prompt_tps.toFixed(1)} tok/s (${lastBench.prompt_tokens || 512}-token prompt), ` +
+      `generation ${lastBench.gen_tps.toFixed(1)} tok/s (${lastBench.questions || 3} answers of up to ${lastBench.gen_tokens || 160} tokens), ` +
+      `first token after ~${ttft.toFixed(2)} s`;
+  }
+  if (lastReply && lastReply.gen_tps) {
+    d.last_reply = `${lastReply.n_prompt.toLocaleString()}-token prompt (${lastReply.n_new.toLocaleString()} new, read at ${Math.round(lastReply.prompt_tps)} tok/s in ${lastReply.prompt_s.toFixed(2)} s), ` +
+      `${lastReply.n_gen.toLocaleString()} tokens generated at ${lastReply.gen_tps.toFixed(1)} tok/s`;
+  }
+  return d;
+}
+function specsLine(sp) {
+  const d = specsData(sp), p = d.placement, speed = lastBench || lastReply;
+  const tiers = [p.vram && "VRAM " + p.vram.split(" (")[0], p.ram && "RAM " + p.ram.split(" (")[0], p.ssd && "SSD " + p.ssd.split(" (")[0]].filter(Boolean);
+  const parts = [`tierlm ${d.tierlm}`, `${d.model}${d.quant ? " " + d.quant : ""}`, d.gpus.join(" + "),
+    [d.cpu.split(",")[0], d.ram && d.ram + " RAM"].filter(Boolean).join(", "),
+    p.short + (tiers.length > 1 ? " (" + tiers.join(" / ") + ")" : ""),
+    `${d.context}`, d.threads && d.threads + " threads", d.speculative === "off" ? "no speculation" : "speculative " + (sp.inf.draft_max || "")].filter(Boolean);
+  let out = parts.join(" | ");
+  if (lastBench) out += ` -> prompt ${lastBench.prompt_tps.toFixed(1)} tok/s, generation ${lastBench.gen_tps.toFixed(1)} tok/s (benchmark)`;
+  else if (lastReply && lastReply.gen_tps) out += ` -> generation ${lastReply.gen_tps.toFixed(1)} tok/s on a ${lastReply.n_prompt.toLocaleString()}-token chat`;
+  return out;
+}
+function specsMarkdown(sp) {
+  const d = specsData(sp), p = d.placement;
+  const rows = [
+    ["Engine", `tierlm ${d.tierlm}`], ["OS", d.os], ["CPU", d.cpu], ["CPU engine", d.cpu_engine], ["RAM", d.ram],
+    [d.gpus.length > 1 ? "GPUs" : "GPU", d.gpus.length ? d.gpus.join(" + ") : "none (CPU only)"], ["Driver", d.driver],
+    ["Model", `${d.model} (${d.arch})`], ["Quant", d.quant], ["File", d.file], ["Shape", d.moe],
+    ["In VRAM", p.vram], ["In RAM", p.ram], ["On SSD", p.ssd], ["Expert cache", d.expert_hits],
+    ["Context", d.context], ["Flash attention", d.flash_attn], ["Batch", d.batch], ["CPU threads", d.threads],
+    ["Connections", d.connections > 1 ? d.connections : ""], ["Speculative decoding", d.speculative], ["Prompt lookup", d.lookup],
+    ["Thinking", d.thinking], ["Sampling", d.sampling], ["Load time", d.load_time],
+    ["Benchmark", d.benchmark || ""], ["Last chat reply", d.last_reply || ""],
+  ].filter(r => r[1] !== "" && r[1] != null);
+  const cell = v => String(v).replace(/\|/g, "\\|");
+  return "| tierlm specs | |\n|---|---|\n" + rows.map(r => `| **${r[0]}** | ${cell(r[1])} |`).join("\n") + "\n";
+}
+function specsJson(sp) {
+  return JSON.stringify({ summary: specsData(sp), system: sp.pc, model: sp.inf, benchmark: lastBench, last_reply: lastReply }, null, 2);
+}
+async function copySpecs(kind, btn) {
+  if (!info) return;
+  const sp = await getSpecs();
+  copyText(kind === "md" ? specsMarkdown(sp) : kind === "json" ? specsJson(sp) : specsLine(sp), btn);
+}
+$("specsline").onclick = e => copySpecs("line", e.currentTarget);
+$("specsmd").onclick = e => copySpecs("md", e.currentTarget);
+$("specsjson").onclick = e => copySpecs("json", e.currentTarget);
+$("benchcopy").onclick = e => copySpecs("line", e.currentTarget);
+$("benchcopymd").onclick = e => copySpecs("md", e.currentTarget);
+
 // ---------- benchmark ----------
 $("benchbtn").onclick = async () => {
   if (busy || !info) return;
   setBusy(true); $("status").textContent = "benchmarking…";
-  $("b-prompt").textContent = $("b-gen").textContent = "…"; $("benchline").textContent = ""; $("benchcopy").hidden = true;
+  $("b-prompt").textContent = $("b-gen").textContent = "…"; $("benchline").textContent = ""; $("benchcopyrow").hidden = true;
   try {
     const r = await api("/api/bench", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(samplingBody()) });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || r.statusText);
     $("b-prompt").textContent = j.prompt_tps.toFixed(1); $("b-gen").textContent = j.gen_tps.toFixed(1);
-    const line = `tierlm ${info.version} · ${info.name} · ${info.device} · ${info.ctx.toLocaleString()} context, ${info.kv_type} · ` +
-      `${!info.on_gpu ? "CPU only" : info.ram_weights > 0 && !info.all_on_gpu ? (info.split_mode === "experts" ? "experts in RAM" : "whole layers in RAM") : "all in VRAM"} · ${j.threads} threads · ` +
-      `${j.speculative ? "speculative " + j.draft_max : "no speculation"} → prompt ${j.prompt_tps.toFixed(1)} tok/s, generation ${j.gen_tps.toFixed(1)} tok/s`;
-    $("benchline").textContent = line; $("benchcopy").hidden = false;
-    $("benchcopy").onclick = () => navigator.clipboard?.writeText(line);
+    lastBench = { ...j, sampling: samplingBody(), at: new Date().toISOString() };
+    const sp = await getSpecs();
+    $("benchline").textContent = specsLine(sp);
+    $("benchcopyrow").hidden = false;
   } catch (e) { $("benchline").textContent = "Could not run: " + e.message; $("b-prompt").textContent = $("b-gen").textContent = "–"; }
   setBusy(false);
   setContext(0);

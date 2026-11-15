@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -371,6 +374,125 @@ std::string cpu_features() {
         out += f->name;
     }
     return out;
+}
+
+namespace {
+// The CPU's own name, from CPUID's brand string (x86), else /proc/cpuinfo.
+std::string cpu_name() {
+    std::string s;
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    unsigned r[12] = {0};
+#ifdef _MSC_VER
+    int a[4];
+    __cpuid(a, (int)0x80000000);
+    if ((unsigned)a[0] >= 0x80000004u)
+        for (int i = 0; i < 3; ++i) { __cpuid(a, (int)(0x80000002u + i)); std::memcpy(r + 4 * i, a, 16); }
+#else
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u), "c"(0));
+    if (a >= 0x80000004u)
+        for (unsigned i = 0; i < 3; ++i) {
+            __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000002u + i), "c"(0));
+            r[4 * i] = a; r[4 * i + 1] = b; r[4 * i + 2] = c; r[4 * i + 3] = d;
+        }
+#endif
+    s.assign((const char*)r, strnlen((const char*)r, sizeof(r)));
+#endif
+#ifndef _WIN32
+    if (s.empty()) {
+        if (FILE* f = std::fopen("/proc/cpuinfo", "r")) {
+            char line[512];
+            while (std::fgets(line, sizeof(line), f))
+                if (std::strncmp(line, "model name", 10) == 0 || std::strncmp(line, "Model", 5) == 0) {
+                    const char* c = std::strchr(line, ':');
+                    if (c) { s = c + 1; break; }
+                }
+            std::fclose(f);
+        }
+    }
+#endif
+    // (brand strings are padded with spaces, and some have runs of them inside)
+    std::string out;
+    for (char ch : s) { if (ch == '\n' || ch == '\r') continue; if (ch == ' ' && (out.empty() || out.back() == ' ')) continue; out += ch; }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+std::string os_name() {
+#ifdef _WIN32
+    // GetVersionEx reports what the program's manifest asks for; RtlGetVersion reports the real version.
+    struct OsInfo { unsigned long size, major, minor, build, platform; wchar_t csd[128]; } v{};
+    v.size = sizeof(v);
+    using rtl_fn = long (WINAPI*)(OsInfo*);
+    if (HMODULE nt = GetModuleHandleA("ntdll.dll"))
+        if (auto fn = (rtl_fn)GetProcAddress(nt, "RtlGetVersion"); fn && fn(&v) == 0 && v.major > 0)
+            return std::string(v.major == 10 && v.build >= 22000 ? "Windows 11" : v.major == 10 ? "Windows 10" : "Windows " + std::to_string(v.major)) +
+                   " (build " + std::to_string(v.build) + ")";
+    return "Windows";
+#elif defined(__APPLE__)
+    return "macOS";
+#else
+    if (FILE* f = std::fopen("/etc/os-release", "r")) {
+        char line[512];
+        std::string name;
+        while (std::fgets(line, sizeof(line), f))
+            if (std::strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                name = line + 12;
+                name.erase(std::remove_if(name.begin(), name.end(), [](char c) { return c == '"' || c == '\n'; }), name.end());
+                break;
+            }
+        std::fclose(f);
+        if (!name.empty()) return name;
+    }
+    return "Linux";
+#endif
+}
+
+// CUDA versions are numbers like 12090: "12.9".
+std::string cuda_ver(int v) { return v > 0 ? std::to_string(v / 1000) + "." + std::to_string((v % 1000) / 10) : std::string(); }
+
+// The CUDA runtime the CUDA engine has loaded (it ships next to tierlm), asked without loading anything new.
+int cuda_runtime_version() {
+    using ver_fn = int (*)(int*);
+    int v = 0;
+#ifdef _WIN32
+    for (const char* n : {"cudart64_13.dll", "cudart64_12.dll", "cudart64_110.dll"})
+        if (HMODULE h = GetModuleHandleA(n))
+            if (auto fn = (ver_fn)GetProcAddress(h, "cudaRuntimeGetVersion"); fn && fn(&v) == 0 && v > 0) return v;
+#else
+    for (const char* n : {"libcudart.so.13", "libcudart.so.12", "libcudart.so"})
+        if (void* h = dlopen(n, RTLD_NOW | RTLD_NOLOAD)) {
+            auto fn = (ver_fn)dlsym(h, "cudaRuntimeGetVersion");
+            const bool ok = fn && fn(&v) == 0 && v > 0;
+            dlclose(h);
+            if (ok) return v;
+        }
+#endif
+    return 0;
+}
+} // namespace
+
+SystemSpecs system_specs() {
+    SystemSpecs s;
+    s.os = os_name();
+    s.cpu = cpu_name();
+    s.cuda_runtime = cuda_ver(cuda_runtime_version());
+    const char* why = nullptr;
+    if (void* lib = open_nvml(why)) {                           // NVIDIA driver present
+        auto init = (nvml_fn0)sym(lib, "nvmlInit_v2");
+        auto shut = (nvml_fn0)sym(lib, "nvmlShutdown");
+        auto drv = (int (*)(char*, unsigned))sym(lib, "nvmlSystemGetDriverVersion");
+        auto cv = (int (*)(int*))sym(lib, "nvmlSystemGetCudaDriverVersion_v2");
+        if (!cv) cv = (int (*)(int*))sym(lib, "nvmlSystemGetCudaDriverVersion");
+        if (init && shut && init() == 0) {
+            char d[96] = {0};
+            if (drv && drv(d, sizeof(d)) == 0) s.nvidia_driver = d;
+            int v = 0;
+            if (cv && cv(&v) == 0) s.cuda_driver = cuda_ver(v);
+            shut();
+        }
+    }
+    return s;
 }
 
 bool add_rpc_server(const char* endpoints) {

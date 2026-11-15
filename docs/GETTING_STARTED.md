@@ -137,6 +137,11 @@ fold the menu away and give the chat more room.
   shows them in Explorer. (Opened from another device, the page keeps its chats in that browser instead.)
 - **Benchmark**: one click measures prompt reading and generation speed with the current settings, with a line to
   copy and share.
+- **Copy specs** (in **Model info**, and next to a benchmark result): copies everything people ask for when you post
+  a speed: this PC (CPU, RAM, GPU and VRAM, driver and CUDA versions), the model, its quantization and file size, what
+  went in VRAM, RAM and on the SSD, the settings, and the latest benchmark and chat speeds with the prompt and reply
+  lengths behind them. **Copy one line** for chats, **Copy table (Markdown)** for Reddit, GitHub and forums,
+  **Copy JSON** for bug reports.
 
 **Speed and Context** sit at the top of the menu: **Speed** (tokens per second; a token is roughly ¾ of a word) with
 a chart of speed as the conversation grows, and **Context** (how much of the model's memory of this conversation is

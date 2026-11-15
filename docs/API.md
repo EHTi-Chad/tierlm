@@ -9,6 +9,7 @@ on **Allow other devices**; see [Other devices and API keys](#other-devices-and-
 | GET | `/` | The web page (`web/index.html`) |
 | GET | `/api/info` | Model, device and memory details (`{"loaded": false}` before a model is loaded) |
 | GET | `/api/devices` | GPUs and CPU the engine can use, with free memory |
+| GET | `/api/specs` | This computer (OS, CPU, RAM, GPUs, NVIDIA driver and CUDA versions) and the loaded model's file, for Copy specs |
 | GET | `/api/models` | `.gguf` files in the models folder (and subfolders), and whether each is supported |
 | POST | `/api/folder` | Change the models folder (saved for next time) |
 | POST | `/api/pick-folder` | Open a folder picker on the computer running tierlm (Windows) |
@@ -297,6 +298,24 @@ will page and replies will be slow), with `ram_need_at_load` and `ram_free_at_lo
  "threads": 4, "hw_threads": 8, "version": "0.5.0", "warnings": []}
 ```
 
+### GET /api/specs
+
+What the page's **Copy specs** buttons add to `/api/info`: the details people ask for next to a speed result.
+
+```json
+{"version": "0.8.9", "os": "Windows 11 (build 26100)", "cpu": "AMD Ryzen 7 5800X 8-Core Processor", "hw_threads": 16,
+ "cpu_features": "AVX2 FMA F16C ...", "ram_total": 68719476736,
+ "gpus": [{"id": "CUDA0", "name": "NVIDIA GeForce RTX 4060 Ti", "backend": "CUDA", "vram": 17179869184, "integrated": false}],
+ "nvidia_driver": "581.57", "cuda_driver": "13.0", "cuda_runtime": "12.9",
+ "model_file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "model_bytes": 22100000000, "quant": "UD-Q4_K_XL"}
+```
+
+A card that shows up through both CUDA and Vulkan is listed once, as CUDA. `cuda_runtime` is the CUDA version
+tierlm's CUDA engine runs on, `cuda_driver` the newest the installed driver supports; both are empty without an
+NVIDIA card, and anything that can't be read is an empty string. `quant` comes from the file name when it names one
+(the more exact name, such as `UD-Q4_K_XL`), else from the GGUF's `general.file_type`. The `model_*` and `quant`
+fields are there only with a model loaded.
+
 `type` is `gpu` (dedicated), `igpu` (integrated, shares system memory) or `cpu`. Pass `id` as the `device`
 when loading.
 
@@ -387,7 +406,8 @@ server-sent events: `{"type":"status","text":"Measuring experts in RAM"}` while 
 Measures the loaded model with its current settings: reads a 512-token prompt, then answers two questions exactly
 as `/api/chat` would. The optional body sets the sampling to measure with (`temperature`, `top_k`, `top_p`, `min_p`,
 `repeat_penalty`, as in `/api/chat`). `gen_tps` is the speed a chat runs at.
-Returns `{"prompt_tps": 143.0, "gen_tps": 22.3, "speculative": true, "draft_max": 2, "threads": 8}`.
+Returns `{"prompt_tps": 143.0, "gen_tps": 22.3, "speculative": true, "draft_max": 2, "threads": 8, "prompt_tokens": 512,
+"gen_tokens": 160, "questions": 3}` (the last three: what the speeds were measured on, up to `gen_tokens` per answer).
 
 ### POST /api/spec
 

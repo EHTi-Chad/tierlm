@@ -930,6 +930,34 @@ static std::string threads_text(int n) { return std::to_string(n) + (n == 1 ? " 
 
 // Header-only look at a GGUF file: what it is, how big, and whether tierlm can run it. header_only: the file is just
 // the first megabytes of a model's first file (Get models), so its other parts aren't looked for.
+// A model file's quantization as people name it: from the file name when it says (it's the more exact name:
+// "UD-Q4_K_XL", "Q4_K_M", "MXFP4"), else from the GGUF's general.file_type ("Q4_K_M"); empty when neither says.
+std::string model_quant(const std::string& path) {
+    const std::string file = fs::u8path(path).stem().u8string();
+    static const std::regex q(R"((?:^|[-_.])((?:UD-)?(?:I?Q[1-8](?:_[0-9A-Z]+)*|MXFP4(?:_MOE)?|NVFP4|BF16|F16|F32)))", std::regex::icase);
+    std::string best;
+    for (auto it = std::sregex_iterator(file.begin(), file.end(), q); it != std::sregex_iterator(); ++it) best = (*it)[1];   // the last one
+    if (!best.empty()) { for (char& c : best) c = (char)std::toupper((unsigned char)c); return best; }
+    gguf_init_params p{ true, nullptr };
+    gguf_context* g = gguf_init_from_file(path.c_str(), p);
+    if (!g) return "";
+    std::string out;
+    const int64_t id = gguf_find_key(g, "general.file_type");
+    if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32) {
+        // llama.cpp's file type numbers, which GGUF writers use for this key
+        static const std::map<uint32_t, const char*> names = {
+            {0, "F32"}, {1, "F16"}, {2, "Q4_0"}, {3, "Q4_1"}, {7, "Q8_0"}, {8, "Q5_0"}, {9, "Q5_1"}, {10, "Q2_K"},
+            {11, "Q3_K_S"}, {12, "Q3_K_M"}, {13, "Q3_K_L"}, {14, "Q4_K_S"}, {15, "Q4_K_M"}, {16, "Q5_K_S"}, {17, "Q5_K_M"},
+            {18, "Q6_K"}, {19, "IQ2_XXS"}, {20, "IQ2_XS"}, {21, "Q2_K_S"}, {22, "IQ3_XS"}, {23, "IQ3_XXS"}, {24, "IQ1_S"},
+            {25, "IQ4_NL"}, {26, "IQ3_S"}, {27, "IQ3_M"}, {28, "IQ2_S"}, {29, "IQ2_M"}, {30, "IQ4_XS"}, {31, "IQ1_M"},
+            {32, "BF16"}, {36, "TQ1_0"}, {37, "TQ2_0"}, {38, "MXFP4"}};
+        const auto f = names.find(gguf_get_val_u32(g, id));
+        if (f != names.end()) out = f->second;
+    }
+    gguf_free(g);
+    return out;
+}
+
 json describe_model(const std::string& path, bool header_only = false) {
     json j = {{"file", std::filesystem::u8path(path).filename().u8string()}, {"supported", false}};
     std::error_code ec;
@@ -1922,6 +1950,43 @@ int main(int argc, char** argv) {
         json j = {{"devices", list}, {"threads", a.threads}, {"hw_threads", (int)std::thread::hardware_concurrency()},
                   {"cpu_features", cpu_features()},
                   {"warnings", hardware_warnings(have_gpu)}, {"version", TIERLM_VERSION}};
+        res.set_content(dump(j), "application/json; charset=utf-8");
+    });
+
+    // Everything Copy specs needs beyond /api/info: this computer (OS, CPU, RAM, every GPU with its VRAM, NVIDIA
+    // driver and CUDA versions) and the model file (size on the drive, quantization). Answers while a reply runs.
+    svr.Get("/api/specs", [&](const httplib::Request&, httplib::Response& res) {
+        const SystemSpecs s = system_specs();
+        json gpus = json::array();
+        size_t ram_total = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(d, &free, &total);
+            const auto t = ggml_backend_dev_type(d);
+            if (t == GGML_BACKEND_DEVICE_TYPE_CPU) { ram_total = total; continue; }
+            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
+            const std::string backend = reg ? ggml_backend_reg_name(reg) : "", desc = ggml_backend_dev_description(d);
+            bool dup = false;                                   // one NVIDIA card is both CUDA0 and Vulkan0: list it once
+            for (auto& g : gpus)
+                if (g["name"] == desc) { dup = true; if (backend == "CUDA") { g["id"] = ggml_backend_dev_name(d); g["backend"] = backend; } }
+            if (!dup) gpus.push_back({{"id", ggml_backend_dev_name(d)}, {"name", desc}, {"backend", backend},
+                                      {"vram", total}, {"integrated", t == GGML_BACKEND_DEVICE_TYPE_IGPU}});
+        }
+        json j = {{"version", TIERLM_VERSION}, {"os", s.os}, {"cpu", s.cpu}, {"hw_threads", (int)std::thread::hardware_concurrency()},
+                  {"cpu_features", cpu_features()}, {"ram_total", ram_total}, {"gpus", gpus},
+                  {"nvidia_driver", s.nvidia_driver}, {"cuda_driver", s.cuda_driver}, {"cuda_runtime", s.cuda_runtime}};
+        // The loaded model's file, from the last /api/info snapshot (no lock: a reply may be running).
+        const json last = info_copy();
+        const std::string path = last.value("path", std::string());
+        if (last.value("loaded", false) && !path.empty()) {
+            const json m = describe_model(path);
+            j["model_file"] = m.value("file", std::string());
+            j["model_bytes"] = m.value("bytes", (uint64_t)0);
+            if (m.contains("parts")) j["model_parts"] = m["parts"];
+            j["quant"] = model_quant(path);
+        }
         res.set_content(dump(j), "application/json; charset=utf-8");
     });
 
@@ -3700,7 +3765,9 @@ int main(int argc, char** argv) {
             eng.cached.clear();
             std::fprintf(stderr, "benchmark: prompt %.1f tok/s, generation %.1f tok/s\n", p, g);
             res.set_content(dump({{"prompt_tps", std::round(p * 10) / 10}, {"gen_tps", std::round(g * 10) / 10},
-                                  {"speculative", draft > 0}, {"draft_max", draft}, {"threads", eng.threads}}), "application/json; charset=utf-8");
+                                  {"speculative", draft > 0}, {"draft_max", draft}, {"threads", eng.threads},
+                                  // (what the numbers come from, for Copy specs)
+                                  {"prompt_tokens", 512}, {"gen_tokens", 160}, {"questions", 3}}), "application/json; charset=utf-8");
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(dump({{"error", e.what()}}), "application/json; charset=utf-8");

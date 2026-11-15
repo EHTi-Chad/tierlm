@@ -29,6 +29,12 @@ void forget_cpu_backend(ggml_backend* backend);             // before freeing a 
 // The CPU engine in use and the instruction sets it uses, e.g. "AVX2 FMA F16C" or "AVX512 AVX512_VNNI ...".
 std::string cpu_features();
 
+// What this computer is, for Copy specs (the details people ask for next to a speed result). Any part that can't be
+// read is left empty: os "Windows 11 (build 26100)", cpu "AMD Ryzen 9 9950X3D 16-Core Processor", nvidia_driver
+// "581.57", cuda_driver "13.0" (the newest CUDA the driver runs), cuda_runtime "12.9" (the CUDA tierlm's engine uses).
+struct SystemSpecs { std::string os, cpu, nvidia_driver, cuda_driver, cuda_runtime; };
+SystemSpecs system_specs();
+
 // With two models loaded (a chat model and an embedding model), one computes at a time: each step holds this
 // lock, so the two take turns between steps instead of competing for the GPU.
 std::recursive_mutex& device_mutex();
