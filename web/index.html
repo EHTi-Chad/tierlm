@@ -5,6 +5,82 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tierlm</title>
 <script>try { const t = localStorage.getItem("tierlm.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script>
+// Secret Fit: the page's look (colours, font, text size, corners, a backdrop behind the chat), saved in this browser.
+// Here in the head so a saved Fit is on before the first paint. Each look names six colours; the rest are mixed
+// from them. While a Fit with its own colours is on, it sets light or dark itself (code colours and the browser's
+// scrollbars follow), and the Light/Dark switch in the top bar takes over again with the Default look.
+window.FIT = (() => {
+  const P = {   // name: [light/dark, background, panels, text, muted text, accent, your messages]
+    "Midnight Neon": ["dark", "#0b0f1a", "#121829", "#e6ecff", "#8f9bbd", "#00e5ff", "#5b2bd0"],
+    "Synthwave":     ["dark", "#1a0f2e", "#241640", "#f7e9ff", "#b79ad6", "#ff3ea5", "#3a1f7a"],
+    "Matrix":        ["dark", "#050a05", "#0b140b", "#c8ffc8", "#6fae6f", "#22ff55", "#0f3d1a"],
+    "Ember":         ["dark", "#17110e", "#211915", "#f5e6dc", "#b39c8c", "#ff7a1a", "#7a2e12"],
+    "Deep Ocean":    ["dark", "#0a1620", "#10212e", "#dcecf5", "#8aa6b8", "#3fb8ff", "#134a6e"],
+    "Crimson":       ["dark", "#120d0e", "#1c1416", "#f2e6e8", "#a8959a", "#ff3b3b", "#5c1a20"],
+    "High Contrast": ["dark", "#000000", "#0a0a0a", "#ffffff", "#d0d0d0", "#ffd400", "#1a3cff"],
+    "Paper":         ["light", "#f4efe6", "#fffaf2", "#2b2620", "#74695c", "#b5651d", "#3d3328"],
+    "Arctic":        ["light", "#eef4f8", "#ffffff", "#142433", "#5d7184", "#1f8fd6", "#1f4e79"],
+    "Sakura":        ["light", "#fbf1f4", "#fffafb", "#3a2430", "#8a6878", "#d6457a", "#6b2d4a"],
+    "Mint":          ["light", "#eef7f2", "#ffffff", "#18302a", "#5b7a70", "#12a37f", "#1c4b3f"],
+  };
+  const FONTS = {
+    "Default": "", "Rounded": '"Segoe UI Variable Display", ui-rounded, "Nunito", "Varela Round", system-ui, sans-serif',
+    "Serif": 'Georgia, Cambria, "Times New Roman", serif', "Mono": 'ui-monospace, "Cascadia Mono", Consolas, monospace',
+    "Bahnschrift": 'Bahnschrift, "DIN Alternate", "Arial Narrow", sans-serif', "Verdana": "Verdana, Geneva, sans-serif",
+    "Comic": '"Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive',
+  };
+  // Backdrops behind the conversation, drawn in the look's own colours.
+  const BACK = {
+    "None": "",
+    "Glow": "radial-gradient(ellipse 70% 55% at 85% 0%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 70%), radial-gradient(ellipse 60% 50% at 0% 100%, color-mix(in srgb, var(--user) 18%, transparent), transparent 70%)",
+    "Grid": "linear-gradient(color-mix(in srgb, var(--line) 70%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in srgb, var(--line) 70%, transparent) 1px, transparent 1px)",
+    "Dots": "radial-gradient(color-mix(in srgb, var(--faint) 55%, transparent) 1.2px, transparent 1.4px)",
+    "Stripes": "repeating-linear-gradient(135deg, color-mix(in srgb, var(--accent) 6%, transparent) 0 14px, transparent 14px 28px)",
+  };
+  const BACK_SIZE = { "Grid": "28px 28px", "Dots": "18px 18px" };
+  const VARS = ["--bg", "--panel", "--panel-2", "--ink", "--muted", "--faint", "--line", "--accent", "--accent-ink", "--accent-soft",
+                "--user", "--user-ink", "--vram", "--flash", "--heat-lo", "--other"];
+  const lum = h => { const n = parseInt(h.slice(1), 16), c = [n >> 16, (n >> 8) & 255, n & 255].map(v => { v /= 255; return v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4; });
+                     return .2126 * c[0] + .7152 * c[1] + .0722 * c[2]; };
+  const on = h => lum(h) > .4 ? "#0b0d12" : "#ffffff";     // readable text on a colour
+  const mix = (a, pa, b) => `color-mix(in srgb, ${a} ${pa}%, ${b})`;
+  function colours(c) {    // c: {bg, panel, ink, muted, accent, user}
+    return { "--bg": c.bg, "--panel": c.panel, "--panel-2": mix(c.panel, 92, c.ink), "--ink": c.ink, "--muted": c.muted,
+             "--faint": mix(c.muted, 62, c.bg), "--line": mix(c.panel, 84, c.ink), "--accent": c.accent, "--accent-ink": on(c.accent),
+             "--accent-soft": mix(c.accent, 20, c.bg), "--user": c.user, "--user-ink": on(c.user), "--vram": c.accent,
+             "--flash": mix(c.accent, 70, "#ffffff"), "--heat-lo": mix(c.panel, 90, c.ink), "--other": mix(c.panel, 72, c.ink) };
+  }
+  const fromPreset = n => { const a = P[n]; return a && { scheme: a[0], bg: a[1], panel: a[2], ink: a[3], muted: a[4], accent: a[5], user: a[6] }; };
+  function load() { try { return JSON.parse(localStorage.getItem("tierlm.fit") || "null") || {}; } catch (e) { return {}; } }
+  function save(f) { try { localStorage.setItem("tierlm.fit", JSON.stringify(f)); } catch (e) {} }
+  function baseTheme() { let t = "auto"; try { t = localStorage.getItem("tierlm.theme") || "auto"; } catch (e) {} return t; }
+  function apply(f) {
+    const r = document.documentElement, st = r.style;
+    for (const v of VARS) st.removeProperty(v);
+    st.removeProperty("color-scheme");
+    const c = f.colors;
+    if (c) {
+      for (const [k, v] of Object.entries(colours(c))) st.setProperty(k, v);
+      st.setProperty("color-scheme", c.scheme === "light" ? "light" : "dark");
+      r.dataset.theme = c.scheme === "light" ? "light" : "dark";   // code colours and warnings follow the look
+      r.dataset.fit = "on";
+    } else {
+      delete r.dataset.fit;
+      const t = baseTheme();
+      if (t === "light" || t === "dark") r.dataset.theme = t; else delete r.dataset.theme;
+    }
+    st.setProperty("--fit-font", FONTS[f.font] || "");
+    if (FONTS[f.font]) r.dataset.fitFont = ""; else delete r.dataset.fitFont;
+    st.setProperty("--fit-zoom", String((f.size || 100) / 100));
+    if (f.radius != null) { st.setProperty("--fit-r", f.radius + "px"); r.dataset.fitR = ""; } else { st.removeProperty("--fit-r"); delete r.dataset.fitR; }
+    st.setProperty("--fit-back", BACK[f.backdrop] || "none");
+    st.setProperty("--fit-back-size", BACK_SIZE[f.backdrop] || "auto");
+  }
+  apply(load());
+  return { P, FONTS, BACK, BACK_SIZE, colours, fromPreset, load, save, apply };
+})();
+</script>
 <style>
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --ink: #1d2230; --muted: #636a7a; --faint: #9aa0ad;
@@ -488,6 +564,46 @@
   body.guest .hostonly, body.guest .ricon[data-sec="settings"], body.guest .ricon[data-sec="console"], body.guest .ricon[data-sec="model"],
   body.guest .ricon[data-sec="bench"], body.guest .sec[data-sec="settings"], body.guest .sec[data-sec="console"],
   body.guest .sec[data-sec="model"], body.guest .sec[data-sec="bench"], body.guest #setupbtn, body.guest #ejectbtn, body.guest #m-folder, body.guest #m-recent { display: none !important; }
+  /* ---- Secret Fit ---- */
+  :root[data-fit-font] body, :root[data-fit-font] button, :root[data-fit-font] input, :root[data-fit-font] select, :root[data-fit-font] textarea { font-family: var(--fit-font); }
+  body { zoom: var(--fit-zoom, 1); }
+  :root[data-fit-r] :is(.card, .msg, #composer, textarea, input[type="text"], select, .ricon, button.primary, button.tiny) { border-radius: var(--fit-r) !important; }
+  #messages { background-image: var(--fit-back, none); background-size: var(--fit-back-size, auto); background-attachment: local; }
+  #fitbtn { width: 22px; height: 22px; padding: 0; border: 0; background: transparent; color: var(--faint); opacity: .18; font-size: 13px; line-height: 22px;
+            cursor: pointer; border-radius: 50%; transition: opacity .25s, transform .4s, color .25s; }
+  #fitbtn:hover, #fitbtn:focus-visible { opacity: 1; color: var(--accent); transform: rotate(72deg) scale(1.25); }
+  #fit { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;
+         background: color-mix(in srgb, #000 45%, transparent); backdrop-filter: blur(3px); }
+  #fit[hidden] { display: none; }
+  #fit .fitbox { width: min(760px, 100%); max-height: 100%; overflow-y: auto; background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+                 border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.35); padding: 18px 20px 16px; animation: fitin .22s ease-out; }
+  @keyframes fitin { from { transform: translateY(10px) scale(.98); opacity: 0; } }
+  #fit h2 { margin: 0; font-size: 19px; letter-spacing: -.2px; } #fit h2 span { color: var(--accent); }
+  #fit .fitsub { color: var(--muted); font-size: 12.5px; margin: 2px 0 10px; }
+  #fit h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 16px 0 8px; font-weight: 600; }
+  .fitgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 10px; }
+  .fitsw { padding: 0; border: 2px solid var(--line); border-radius: 12px; background: none; cursor: pointer; overflow: hidden; text-align: left; color: var(--ink); transition: transform .12s, border-color .12s; }
+  .fitsw:hover { transform: translateY(-2px); }
+  .fitsw.on { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .fitsw .mini { height: 74px; display: flex; flex-direction: column; gap: 5px; padding: 0 0 6px; }
+  .fitsw .mini .bar { height: 12px; display: flex; align-items: center; gap: 4px; padding: 0 6px; }
+  .fitsw .mini .bar i { width: 18px; height: 4px; border-radius: 2px; } .fitsw .mini .bar b { margin-left: auto; width: 7px; height: 7px; border-radius: 50%; }
+  .fitsw .mini .u { align-self: flex-end; margin-right: 7px; width: 52%; height: 13px; border-radius: 6px 6px 2px 6px; }
+  .fitsw .mini .a { margin-left: 7px; width: 66%; height: 20px; border-radius: 6px 6px 6px 2px; padding: 4px 6px; display: flex; flex-direction: column; gap: 3px; }
+  .fitsw .mini .a i { height: 3px; border-radius: 2px; } .fitsw .mini .a i + i { width: 60%; }
+  .fitsw .nm { display: block; padding: 5px 8px; font-size: 12px; font-weight: 600; background: var(--panel-2); }
+  .fitcols { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 14px; }
+  .fitcols label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .fitcols input[type="color"] { width: 34px; height: 26px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: none; cursor: pointer; }
+  .fitchips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .fitchips button { padding: 5px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel-2); color: var(--ink); cursor: pointer; font-size: 13px; }
+  .fitchips button.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+  .fitchips .bk { width: 64px; height: 40px; padding: 0; border-radius: 8px; background-color: var(--bg); font-size: 10.5px; display: flex; align-items: flex-end; justify-content: center; padding-bottom: 2px; }
+  .fitrange { display: grid; grid-template-columns: 110px 1fr 52px; align-items: center; gap: 10px; font-size: 13px; margin: 4px 0; }
+  .fitrange input { width: 100%; }
+  .fitrange output { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  .fitfoot { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .fitfoot .grow { flex: 1; } .fitfoot .note { color: var(--faint); font-size: 12px; }
 </style>
 <script src="vendor/katex.min.js"></script>
 </head>
@@ -749,6 +865,7 @@
     <button class="ricon" data-sec="console" aria-label="Console" title="Console"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><line x1="12" y1="15" x2="17" y2="15"/></svg></button>
     <button class="ricon" data-sec="bench" aria-label="Benchmark" title="Benchmark"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="16" y2="11"/></svg></button>
     <span class="grow"></span>
+    <button id="fitbtn" aria-label="Secret Fit" title="✦">✦</button>
     <div id="railstat" title="Speed and context"><b id="rtps">–</b><small>tok/s</small><div class="rbar"><div id="rctx"></div></div><small id="rctxt">ctx</small></div>
     <button class="ricon" id="railtoggle" aria-label="Collapse menu" title="Collapse menu"><svg aria-hidden="true" viewBox="0 0 24 24"><path id="railarrow" d="M15 6l-6 6 6 6"/></svg></button>
   </nav>
@@ -2638,6 +2755,7 @@ function setTheme(t) {
   if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
   document.querySelectorAll(".themesw button").forEach(b => { const on = b.dataset.theme === t; b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on)); });
   try { localStorage.setItem("tierlm.theme", t); } catch (e) {}
+  if (window.FIT) FIT.apply(FIT.load());   // a Secret Fit look with its own colours keeps its own light or dark
 }
 document.querySelectorAll(".themesw button").forEach(b => b.onclick = () => setTheme(b.dataset.theme));
 { let t = "auto"; try { t = localStorage.getItem("tierlm.theme") || "auto"; } catch (e) {} setTheme(t); }
@@ -3942,6 +4060,129 @@ loadNetwork = async function () {
 };
 loadNetwork();
 loadWorkspace();
+</script>
+<div id="fit" hidden role="dialog" aria-modal="true" aria-labelledby="fittitle">
+  <div class="fitbox">
+    <h2 id="fittitle"><span>✦</span> Secret Fit</h2>
+    <div class="fitsub">You found it. Dress tierlm up: it's saved in this browser, and Default puts everything back.</div>
+    <h3>Looks</h3>
+    <div class="fitgrid" id="fitlooks"></div>
+    <h3>Colours</h3>
+    <div class="fitcols" id="fitcols"></div>
+    <h3>Font</h3>
+    <div class="fitchips" id="fitfonts"></div>
+    <h3>Size and shape</h3>
+    <div class="fitrange"><span>Text size</span><input type="range" id="fitsize" min="85" max="130" step="5"><output id="fitsizev"></output></div>
+    <div class="fitrange"><span>Corners</span><input type="range" id="fitrad" min="0" max="22" step="1"><output id="fitradv"></output></div>
+    <h3>Backdrop behind the chat</h3>
+    <div class="fitchips" id="fitbacks"></div>
+    <div class="fitfoot">
+      <button class="tiny" id="fitcopy" title="Copy this Fit as a code to share">Copy Fit code</button>
+      <button class="tiny" id="fitpaste" title="Use a Fit code someone shared">Paste Fit code</button>
+      <span class="grow"></span>
+      <span class="note" id="fitnote"></span>
+      <button class="tiny ghost" id="fitreset">Reset all</button>
+      <button class="primary" id="fitdone">Done</button>
+    </div>
+  </div>
+</div>
+<script>
+// ---------- Secret Fit menu ----------
+(() => {
+  const F = window.FIT, el = id => document.getElementById(id);
+  let fit = F.load();
+  const COLS = [["bg", "Background"], ["panel", "Panels"], ["ink", "Text"], ["muted", "Muted text"], ["accent", "Accent"], ["user", "Your messages"]];
+  // The colours shown in the pickers: the Fit's own, else what the page is using now (Default, light or dark).
+  function current() {
+    if (fit.colors) return fit.colors;
+    const cs = getComputedStyle(document.documentElement), g = v => cs.getPropertyValue(v).trim();
+    const dark = document.documentElement.dataset.theme === "dark" || (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches);
+    return { scheme: dark ? "dark" : "light", bg: g("--bg"), panel: g("--panel"), ink: g("--ink"), muted: g("--muted"), accent: g("--accent"), user: g("--user") };
+  }
+  function set(change) { fit = { ...fit, ...change }; F.save(fit); F.apply(fit); render(); }
+  function mini(c) {
+    const m = document.createElement("div"); m.className = "mini"; m.style.background = c.bg;
+    m.innerHTML = `<div class="bar" style="background:${c.panel}"><i style="background:${c.ink}"></i><b style="background:${c.accent}"></b></div>` +
+      `<div class="u" style="background:${c.user}"></div>` +
+      `<div class="a" style="background:${c.panel}"><i style="background:${c.ink}"></i><i style="background:${c.muted}"></i></div>`;
+    return m;
+  }
+  function render() {
+    const looks = el("fitlooks"); looks.innerHTML = "";
+    // Default's preview: the page's own light or dark colours (the Light/Dark switch decides which)
+    let base = "auto"; try { base = localStorage.getItem("tierlm.theme") || "auto"; } catch (e) {}
+    const dark = base === "dark" || (base === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+    const defC = dark ? { bg: "#12151b", panel: "#1a1e26", ink: "#e6e8ee", muted: "#a0a6b4", accent: "#2bb39e", user: "#2f5d93" }
+                      : { bg: "#f6f7f9", panel: "#ffffff", ink: "#1d2230", muted: "#636a7a", accent: "#0f7b6c", user: "#1e3a5f" };
+    const items = [["Default", null], ...Object.keys(F.P).map(n => [n, F.fromPreset(n)])];
+    if (fit.look === "Custom") items.push(["Custom", fit.colors]);
+    for (const [name, c] of items) {
+      const b = document.createElement("button"); b.className = "fitsw"; b.type = "button";
+      b.classList.toggle("on", (fit.look || "Default") === name);
+      b.append(mini(c || defC));
+      const n = document.createElement("span"); n.className = "nm"; n.textContent = name; b.append(n);
+      b.onclick = () => set({ look: name, colors: c });
+      looks.append(b);
+    }
+    const cols = el("fitcols"); cols.innerHTML = "";
+    const cur = current();
+    for (const [k, label] of COLS) {
+      const l = document.createElement("label"), i = document.createElement("input");
+      i.type = "color"; i.value = /^#[0-9a-f]{6}$/i.test(cur[k]) ? cur[k] : "#888888";
+      i.oninput = () => { const c = { ...current(), [k]: i.value }; fit = { ...fit, look: "Custom", colors: c }; F.save(fit); F.apply(fit); };
+      i.onchange = () => render();
+      l.append(i, document.createTextNode(label)); cols.append(l);
+    }
+    const fonts = el("fitfonts"); fonts.innerHTML = "";
+    for (const name of Object.keys(F.FONTS)) {
+      const b = document.createElement("button"); b.type = "button"; b.textContent = name;
+      if (F.FONTS[name]) b.style.fontFamily = F.FONTS[name];
+      b.classList.toggle("on", (fit.font || "Default") === name);
+      b.onclick = () => set({ font: name });
+      fonts.append(b);
+    }
+    el("fitsize").value = fit.size || 100; el("fitsizev").textContent = (fit.size || 100) + "%";
+    el("fitrad").value = fit.radius ?? 10; el("fitradv").textContent = fit.radius == null ? "usual" : fit.radius + " px";
+    const backs = el("fitbacks"); backs.innerHTML = "";
+    for (const name of Object.keys(F.BACK)) {
+      const b = document.createElement("button"); b.type = "button"; b.className = "bk"; b.textContent = name;
+      b.style.backgroundImage = F.BACK[name] || "none"; if (F.BACK_SIZE[name]) b.style.backgroundSize = name === "Grid" ? "12px 12px" : "8px 8px";
+      b.classList.toggle("on", (fit.backdrop || "None") === name);
+      b.onclick = () => set({ backdrop: name });
+      backs.append(b);
+    }
+    el("fitnote").textContent = fit.colors ? "The Light/Dark switch rests while a look is on" : "";
+  }
+  el("fitsize").oninput = e => set({ size: +e.target.value });
+  el("fitrad").oninput = e => set({ radius: +e.target.value });
+  el("fitreset").onclick = () => { fit = {}; F.save(fit); F.apply(fit); render(); };
+  const note = t => { el("fitnote").textContent = t; setTimeout(render, 1600); };
+  el("fitcopy").onclick = () => {
+    const code = "tierlm-fit:" + btoa(unescape(encodeURIComponent(JSON.stringify(fit))));
+    if (typeof copyText === "function") copyText(code, el("fitcopy")); else navigator.clipboard?.writeText(code);
+  };
+  el("fitpaste").onclick = async () => {
+    let t = "";
+    try { t = await navigator.clipboard.readText(); } catch (e) {}
+    if (!t.startsWith("tierlm-fit:")) t = prompt("Paste a Fit code (it starts with tierlm-fit:)") || "";
+    try {
+      const f = JSON.parse(decodeURIComponent(escape(atob(t.trim().slice(11)))));
+      if (typeof f !== "object" || !f) throw 0;
+      const hex = v => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);      // only colours and known names get in
+      const c = f.colors && COLS.every(([k]) => hex(f.colors[k])) ? { scheme: f.colors.scheme === "light" ? "light" : "dark", ...Object.fromEntries(COLS.map(([k]) => [k, f.colors[k]])) } : null;
+      fit = { look: c ? (F.P[f.look] ? f.look : "Custom") : "Default", colors: c, font: F.FONTS[f.font] !== undefined ? f.font : "Default",
+              size: Math.min(130, Math.max(85, +f.size || 100)), radius: f.radius == null ? undefined : Math.min(22, Math.max(0, +f.radius || 0)),
+              backdrop: F.BACK[f.backdrop] !== undefined ? f.backdrop : "None" };
+      F.save(fit); F.apply(fit); render(); note("Fit applied");
+    } catch (e) { if (t) note("That isn't a Fit code"); }
+  };
+  const open = () => { fit = F.load(); render(); el("fit").hidden = false; el("fitdone").focus(); };
+  const close = () => { el("fit").hidden = true; el("fitbtn").focus(); };
+  el("fitbtn").onclick = open;
+  el("fitdone").onclick = close;
+  el("fit").onclick = e => { if (e.target === el("fit")) close(); };
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && !el("fit").hidden) close(); });
+})();
 </script>
 </body>
 </html>
