@@ -482,7 +482,7 @@ Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-Min
 Images: Qwen3.5 / 3.6 with their `mmproj` vision file (`qwen3vl_merger`), checked against Hugging Face's code and
 tested with Qwen3.5-9B (RTX 3070 laptop) and Qwen3.6-35B-A3B (RTX 5090).
 
-Not yet: Gemma, Phi, DeepSeek V4 and others. Nemotron 3.5 (Mamba-2 and LatentMoE) is in the source, checked on a tiny test model and running on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s); not yet in a release. The setup screen says which
+Not yet: Gemma, Phi, DeepSeek V4 and others. Nemotron 3.5 (Mamba-2 and LatentMoE) is in since 0.8.8, checked on a tiny test model and on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s). The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
 
 ## Build from source (Windows)
