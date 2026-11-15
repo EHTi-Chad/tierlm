@@ -389,6 +389,8 @@
   #loadrow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   #loadmsg { font-size: 13px; color: var(--muted); }
   #loadmsg.err { color: var(--danger); }
+  #tunedin { flex-basis: 100%; font-size: 13px; color: var(--muted); }
+  #tunedin b { color: var(--ink); }
   #tunebox { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 13px; }
   #tunebox .tunehead { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
   #tunestat { color: var(--muted); }
@@ -665,6 +667,7 @@
         <button class="ghost" id="tunecancel" hidden title="Stops Find the fastest settings; nothing is saved">Cancel</button>
         <button class="ghost" id="backbtn" hidden>Back to chat</button>
         <span id="loadmsg"></span>
+        <div id="tunedin" hidden></div>
         <div id="loadprog" hidden><div></div></div>
       </div>
       <div id="tunebox" hidden>
@@ -2063,8 +2066,14 @@ function showSavedTune() {
   if (tuning) return;
   const t = selModel && md.saved && md.saved[selModel.id] && md.saved[selModel.id].tuned;
   const box = $("tunebox"), list = $("tunelist"), done = $("tunedone");
-  if (!t || !(t.results || []).length) { box.hidden = true; return; }
+  const tin = $("tunedin");
+  if (!t || !(t.results || []).length) { box.hidden = true; tin.hidden = true; return; }
   box.hidden = false;
+  // Said next to the load button too: Load and start chatting uses what was found (the settings above were filled
+  // in from it), so there's no need to measure again.
+  const day = t.when ? new Date(t.when.replace(" ", "T")).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+  tin.hidden = false;
+  tin.innerHTML = `✓ <b>Load and start chatting</b> uses the fastest settings found for this model${day ? " on " + esc(day) : ""} (${(+t.tps).toFixed(1)} tok/s): they're the settings above. Changing a setting above uses yours instead.`;
   $("tunetitle").textContent = "Fastest settings for this PC, last measured";
   const bits = [t.when ? new Date(t.when.replace(" ", "T")).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "earlier",
                 t.version ? "tierlm " + t.version : "", t.pc || ""].filter(Boolean);
@@ -2495,6 +2504,7 @@ $("tunebtn").onclick = async () => {
   const btns = [$("loadbtn"), $("tunebtn")], msg = $("loadmsg"), list = $("tunelist"), done = $("tunedone");
   btns.forEach(b => b.disabled = true);
   tuning = true;
+  $("tunedin").hidden = true;
   msg.className = ""; msg.textContent = "";
   $("tunebox").hidden = false; $("tunetitle").textContent = "Finding the fastest settings"; list.innerHTML = ""; done.hidden = true; done.innerHTML = "";
   $("tunestat").textContent = "Loading " + selModel.file + "… about a minute, longer for big models.";
