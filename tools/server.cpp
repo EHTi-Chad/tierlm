@@ -3185,7 +3185,7 @@ int main(int argc, char** argv) {
                 // later replies run faster than its first, and a first reply alone measured them low (Flash-Next
                 // Q4_K_M, RTX 5090, 64K, 2 guesses: 54 tok/s the first reply, 81 the next; Find the fastest
                 // settings said 64). So the question is answered once untimed first, and the second answer timed.
-                if (eng.model->live_hot()) {
+                if (eng.model->live_hot() && !eng.model->live_frozen()) {
                     eng.model->reset();
                     eng.cached.clear();
                     generate(msgs, meas_sp, std::max(4, n), {}, nullptr, nullptr);
@@ -3410,10 +3410,16 @@ int main(int argc, char** argv) {
                             if (!status("Learning which experts this model uses")) throw std::runtime_error("cancelled");
                             calibrate();
                         }
-                        if (loaded_mode != m) {
+                        // The fixed VRAM experts are measured on a load that can follow the conversation, with
+                        // following held off, so the following set is measured next without loading again (a big model
+                        // takes minutes to load). Not enough RAM to spare for following: that load is plain hot.
+                        const std::string sfx = one ? "@1" : "";
+                        const std::string want = base_m == "hot" ? "live" + sfx : m;
+                        if (loaded_mode != want && !(base_m == "live" && loaded_mode == "hot" + sfx)) {
                             if (!status("Loading with " + label)) throw std::runtime_error("cancelled");
-                            load_mode(m);
+                            load_mode(want);
                         }
+                        eng.model->set_live_frozen(base_m == "hot");
                         if (base_m == "live" && !eng.model->live_hot()) continue;   // not enough RAM to spare: loaded as hot
                         if ((base_m == "hot" || base_m == "live") && eng.model->placement().hot_experts == 0) {
                             no_hot = true;                           // nothing to gain: no VRAM left (or several GPUs)
@@ -3472,6 +3478,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     mode = win->mode; mode_text = win->label; draft = win->draft; best = win->tps;
+                    eng.model->set_live_frozen(false);
                     if (loaded_mode != mode) {
                         if (!status("Loading the faster split again")) throw std::runtime_error("cancelled");
                         load_mode(mode);

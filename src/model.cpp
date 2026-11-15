@@ -4182,7 +4182,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     }
     const int n_kv_end = cells_end(), n_kv = kv_span(n_kv_end);
     std::vector<int32_t> live_routing;                            // live hot experts need the picks even if the caller doesn't
-    if (!routing && !live_.empty()) routing = &live_routing;
+    if (!routing && !live_.empty() && !live_frozen_) routing = &live_routing;
     build_images_ = any_image; build_mrope_ = any_image;
     if (!qsa_.empty()) {                                          // QSA: who's who in this step, and is anyone past the budget
         qsa_batch_ = QsaBatch();
@@ -4416,7 +4416,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             }
         }
     }
-    if (routing && !live_.empty()) adapt_hot(*routing, n_tok);
+    if (routing && !live_.empty() && !live_frozen_) adapt_hot(*routing, n_tok);
     for (auto [qi, kr] : g.qsa_k) {                                // QSA: this step's indexer keys, kept by position
         const int D = hp.qsa_dim;
         std::vector<float> k((size_t)D * n_tok);

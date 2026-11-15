@@ -318,6 +318,10 @@ public:
     const LiveStats& live_stats() const { return live_stats_; }
     void reset_live_stats() { live_stats_ = LiveStats(); }
     bool live_hot() const { return !live_.empty(); }
+    // Find the fastest settings: the VRAM experts held where they are (frozen, a live load serves as the fixed set the
+    // busiest experts gave it), so the fixed and the following set are both measured from one load
+    void set_live_frozen(bool f) { live_frozen_ = f; }
+    bool live_frozen() const { return live_frozen_; }
     // Guessing ahead with the model itself, cut down to what's in VRAM: while on, each split expert layer uses only
     // the router's picks that are in VRAM (their weights scaled up to the picks' whole weight) and skips the RAM part,
     // so a step runs on the GPU alone. An approximation of the model, for guesses that the whole model then checks.
@@ -451,6 +455,7 @@ private:
     };
     std::vector<LiveLayer> live_;
     mutable LiveStats live_stats_;
+    bool live_frozen_ = false;
     void adapt_hot(const std::vector<int32_t>& routing, int n_tok);
     std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way)
     double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
