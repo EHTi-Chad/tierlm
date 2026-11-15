@@ -422,6 +422,7 @@ private:
         std::vector<float> score;                // learned use, then recent picks (fading)
         std::vector<LivePart> parts;
         ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *mask = nullptr;
+        ggml_tensor *map_hot_g = nullptr, *hot_bias_g = nullptr;   // (their VRAM copies, see Layer)
     };
     std::vector<LiveLayer> live_;
     mutable LiveStats live_stats_;
@@ -466,6 +467,9 @@ private:
         ggml_tensor *gate_xc = nullptr, *up_xc = nullptr, *down_xc = nullptr, *gate_up_xc = nullptr;
         ggml_tensor *gate_xbh = nullptr, *up_xbh = nullptr, *down_xbh = nullptr;   // the biases' VRAM copies (gpt-oss; whole)
         ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *hot_mask = nullptr;   // [1, n_expert]
+        // set_hot_only: the same in VRAM, so a step with only the VRAM experts doesn't visit the CPU: map_hot, and
+        // a bias on the router's choice (0 in VRAM, -1e9 not), so the picks are the best of those in VRAM.
+        ggml_tensor *map_hot_g = nullptr, *hot_bias_g = nullptr;
         bool cold_mapped = false;                // the RAM part is the file's whole expert tensor (see load: RAM short)
         ggml_tensor *up_s = nullptr, *gate_s = nullptr, *down_s = nullptr, *gate_inp_s = nullptr;   // shared expert
         ggml_tensor *k_cache = nullptr, *v_cache = nullptr;   // [head_dim, n_head_kv, max_ctx]

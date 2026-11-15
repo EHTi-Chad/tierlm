@@ -747,6 +747,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // the RAM part and a whole copy goes into VRAM for the VRAM part, both looked up with the router's own ids.)
     struct HotLayer { std::vector<int> ids; std::vector<HotSplit> parts; std::vector<std::pair<ggml_tensor*, ggml_tensor*>> bias;
                       ggml_tensor *map_hot = nullptr, *map_cold = nullptr, *mask = nullptr;
+                      ggml_tensor *map_hot_g = nullptr, *hot_bias_g = nullptr;
                       bool cold_mapped = false; };
     std::map<int, HotLayer> hot_layers;
     const int E = hp.n_expert;
@@ -852,6 +853,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                 hl.map_cold = ggml_new_tensor_2d(m->wctx_, GGML_TYPE_I32, 1, E); ggml_set_name(hl.map_cold, (b + "map_cold").c_str());
                 hl.mask = ggml_new_tensor_2d(m->wctx_, GGML_TYPE_F32, 1, E);    ggml_set_name(hl.mask, (b + "mask").c_str());
                 on_cpu.push_back(hl.map_hot); on_cpu.push_back(hl.map_cold); on_cpu.push_back(hl.mask);
+                hl.map_hot_g = ggml_new_tensor_2d(m->wctx_, GGML_TYPE_I32, 1, E);   ggml_set_name(hl.map_hot_g, (b + "map_hot_g").c_str());
+                hl.hot_bias_g = ggml_new_tensor_2d(m->wctx_, GGML_TYPE_F32, E, 1);  ggml_set_name(hl.hot_bias_g, (b + "hot_bias_g").c_str());
+                on_gpu.push_back(hl.map_hot_g); on_gpu.push_back(hl.hot_bias_g);
                 continue;
             }
             size_t need = gr.bytes + (by_layer && gr.prio == 2 && gr.layer >= 0 && gr.layer < nl_all ? layer_mem(gr.layer) : 0);
@@ -1323,6 +1327,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         ggml_backend_tensor_set(hl.map_hot, mh.data(), 0, ggml_nbytes(hl.map_hot));
         ggml_backend_tensor_set(hl.map_cold, mc.data(), 0, ggml_nbytes(hl.map_cold));
         ggml_backend_tensor_set(hl.mask, mk.data(), 0, ggml_nbytes(hl.mask));
+        std::vector<float> hb(E);
+        for (int e = 0; e < E; ++e) hb[e] = is_hot[e] ? 0.0f : -1e9f;
+        ggml_backend_tensor_set(hl.map_hot_g, mh.data(), 0, ggml_nbytes(hl.map_hot_g));
+        ggml_backend_tensor_set(hl.hot_bias_g, hb.data(), 0, ggml_nbytes(hl.hot_bias_g));
     }
     size_t total_bytes = 0, done_bytes = 0, next_report = 0;
     for (const Source& s : sources) if ((s.t->buffer && !ssd_set.count(s.t)) || split_of.count(s.t)) total_bytes += ggml_nbytes(s.t);
@@ -1482,6 +1490,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             else if (nm.find("ffn_down_exps") != std::string::npos) L.down_xbh = vram;
         }
         L.map_hot = it->second.map_hot; L.map_cold = it->second.map_cold; L.hot_mask = it->second.mask;
+        L.map_hot_g = it->second.map_hot_g; L.hot_bias_g = it->second.hot_bias_g;
         L.cold_mapped = it->second.cold_mapped;
         if (live && !it->second.cold_mapped) {                        // the starting set; adapt_hot moves experts from here
             LiveLayer ll;
@@ -1500,6 +1509,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             for (int e = 0; e < E; ++e) ll.score[e] = mx > 0 ? 3.0f * usage[(size_t)i * E + e] / mx : 0.0f;
             for (const HotSplit& sp : it->second.parts) ll.parts.push_back({sp.hot, sp.cold});
             ll.map_hot = it->second.map_hot; ll.map_cold = it->second.map_cold; ll.mask = it->second.mask;
+            ll.map_hot_g = it->second.map_hot_g; ll.hot_bias_g = it->second.hot_bias_g;
             m->live_.push_back(std::move(ll));
         }
     };
@@ -2116,8 +2126,14 @@ void Model::restore(const Snapshot& s) {
 const char* Model::kv_type() const { return ggml_type_name((ggml_type)kv_t_); }
 
 bool Model::has_split_experts() const {
-    for (const Layer& L : layers_) if (L.map_hot) return true;
-    return false;
+    // (and set_hot_only can be used: every split layer has at least as many experts in VRAM as a token picks)
+    bool any = false;
+    for (const Layer& L : layers_) {
+        if (!L.map_hot) continue;
+        if (!L.map_hot_g || !L.down_xh || L.down_xh->ne[2] - 1 < hp_.n_used_at(L.index)) return false;
+        any = true;
+    }
+    return any;
 }
 
 bool Model::integrated_gpu() const {
@@ -2515,6 +2531,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             c3 = ggml_add(c, c3, ggml_repeat(c, ggml_reshape_3d(c, pen, 1, G, n_tok), c3));
             choice = ggml_reshape_2d(c, c3, NE, n_tok);
         }
+        if (hot_only_ && L.hot_bias_g) choice = ggml_add(c, choice, L.hot_bias_g);   // (set_hot_only: the best of those in VRAM)
         ggml_tensor* order = ggml_argsort(c, choice, GGML_SORT_ORDER_DESC); // [n_expert, n_tok] best first
         ggml_tensor* sel   = ggml_view_2d(c, order, NU, n_tok, order->nb[1], 0);   // top n_used
         // Routing for the dashboard and expert learning: just the chosen experts, copied out compactly. The rankings
@@ -2607,29 +2624,15 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             ggml_tensor* mask   = ggml_reshape_3d(c, mcont, 1, NU, n_tok);
             ggml_tensor* w_hot  = ggml_mul(c, w, mask);                     // [1, n_used, n_tok]
             ggml_tensor* w_cold = ggml_sub(c, w, w_hot);
-            if (hot_only_) {
-                // Only the VRAM part (set_hot_only): the picks in VRAM, their weights scaled up so they add up to all
-                // the picks' weight, as if the RAM ones had voted the same way. Nothing runs on the CPU but this
-                // bookkeeping. Not the model's sum: used only for guesses, which the whole model checks.
-                ggml_tensor* sw  = ggml_sum_rows(c, ggml_reshape_2d(c, ggml_cont(c, w), NU, n_tok));      // [1, n_tok]
-                ggml_tensor* shw = ggml_sum_rows(c, ggml_reshape_2d(c, ggml_cont(c, w_hot), NU, n_tok));
-                ggml_tensor* sc  = ggml_div(c, sw, ggml_clamp(c, shw, 1e-12f, INFINITY));
-                ggml_tensor* w_h = ggml_mul(c, w_hot, ggml_reshape_3d(c, sc, 1, 1, n_tok));
-                ggml_tensor* ids_h = remap(L.map_hot, L.down_xh, true);
-                ggml_tensor* ids_b = nullptr;
-                if (L.up_xb || L.gate_xb || L.down_xb) { ids_b = ggml_cont(c, sel); g.cpu_ops.push_back(ids_b); }
-                for (ggml_tensor* t : {mcont->src[0]->view_src, mcont, w_hot, ids_h, ids_h->src[0]->src[0]->view_src})
-                    if (t) g.cpu_ops.push_back(t);
-                std::function<void(ggml_tensor*, int)> on_cpu = [&](ggml_tensor* t, int depth) {
-                    if (!t || t == probs || t == order || depth > 12) return;
-                    const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
-                    if (!view && t->op != GGML_OP_NONE) g.cpu_ops.push_back(t);
-                    for (ggml_tensor* src : t->src) if (src && src != probs && src != order) on_cpu(src, depth + 1);
-                };
-                on_cpu(w_h, 0);
-                ggml_build_forward_expand(g.gf, w_h);
-                ggml_build_forward_expand(g.gf, ids_h);
-                moe = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_h, L.gate_xbh, L.up_xbh, L.down_xbh, ids_b);
+            if (hot_only_ && L.map_hot_g) {
+                // Only the VRAM part (set_hot_only): the router picked the best of the experts in VRAM (see hot_bias_g
+                // above), so every pick is there and the RAM part is skipped. Their places in the VRAM part come from
+                // its VRAM copy of the map, so the whole step stays on the GPU. Not the model's sum: used only for
+                // guesses, which the whole model checks.
+                ggml_tensor* sidx  = ggml_reshape_1d(c, ggml_cont(c, sel), (int64_t)NU * n_tok);
+                ggml_tensor* ids_h = ggml_reshape_2d(c, ggml_get_rows(c, L.map_hot_g, sidx), NU, n_tok);
+                ggml_tensor* ids_b = (L.up_xb || L.gate_xb || L.down_xb) ? ggml_cont(c, sel) : nullptr;
+                moe = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w, L.gate_xbh, L.up_xbh, L.down_xbh, ids_b);
             } else {
             // Handing the RAM experts' work to the GPU means copying all of a layer's RAM experts over for the batch,
             // the same cost whatever its size, so it only pays for big batches (see cold_offload_min_): below that
@@ -4041,6 +4044,13 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
             ggml_backend_tensor_set(ll.map_cold, &c_out, sizeof(int32_t) * out, sizeof(int32_t));
             ggml_backend_tensor_set(ll.mask, &m_in, sizeof(float) * in, sizeof(float));
             ggml_backend_tensor_set(ll.mask, &m_out, sizeof(float) * out, sizeof(float));
+            if (ll.map_hot_g) {
+                const float b_in = 0.0f, b_out = -1e9f;
+                ggml_backend_tensor_set(ll.map_hot_g, &h_in, sizeof(int32_t) * in, sizeof(int32_t));
+                ggml_backend_tensor_set(ll.map_hot_g, &h_out, sizeof(int32_t) * out, sizeof(int32_t));
+                ggml_backend_tensor_set(ll.hot_bias_g, &b_in, sizeof(float) * in, sizeof(float));
+                ggml_backend_tensor_set(ll.hot_bias_g, &b_out, sizeof(float) * out, sizeof(float));
+            }
             ll.slot_of[in] = slot; ll.slot_of[out] = -1; ll.in_slot[slot] = in;
             ll.cold_of[out] = cs; ll.cold_of[in] = -1;
             spent += per_expert;
