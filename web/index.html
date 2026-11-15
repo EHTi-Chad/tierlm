@@ -661,7 +661,7 @@
       <div id="rec"></div>
       <div id="loadrow">
         <button class="primary" id="loadbtn">Load and start chatting</button>
-        <button id="tunebtn" title="Loads the model and measures the settings that affect speed, then keeps the fastest">Find the fastest settings</button>
+        <button id="tunebtn" title="Loads the model and measures the settings that affect speed, then keeps the fastest for this model. Once per model is enough: run it again after a tierlm update, a change to the PC, or a much different context length">Find the fastest settings</button>
         <button class="ghost" id="tunecancel" hidden title="Stops Find the fastest settings; nothing is saved">Cancel</button>
         <button class="ghost" id="backbtn" hidden>Back to chat</button>
         <span id="loadmsg"></span>
@@ -2078,7 +2078,7 @@ function showSavedTune() {
     list.appendChild(li);
   }
   done.hidden = false;
-  done.innerHTML = `<span>Fastest: <b>${(+t.tps).toFixed(1)} tok/s</b>, in use for this model. <b>Find the fastest settings</b> measures again (after a tierlm update, say).</span>`;
+  done.innerHTML = `<span>Fastest: <b>${(+t.tps).toFixed(1)} tok/s</b>, in use for this model every time it loads, so there's no need to run it again. Run it again after a tierlm update, a change to the PC (graphics card, RAM) or a much different context length.</span>`;
 }
 function applySaved() {
   showSavedTune();

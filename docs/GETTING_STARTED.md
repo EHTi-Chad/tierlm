@@ -97,7 +97,10 @@ first time on a GPU it can take a little longer while the graphics driver prepar
 **Find the fastest settings** (next to it) does the experimenting for you: it loads the model and measures the
 settings that change speed on your PC (how to split the model, CPU threads, and speculative decoding with 1 to 4
 guesses), shows each result as it goes, then keeps the fastest and saves it for that model. It takes about a
-minute, longer for big models. Click **Start chatting** when it's done. tierlm remembers the folder, and your settings for each
+minute, and much longer for models far bigger than VRAM (half an hour or more: it loads the model once per way of
+splitting it). **Once per model is enough**: every later load uses what it found. Run it again after a tierlm update,
+a change to the PC (graphics card, RAM), another quant of the model, or a much different context length (see the
+[FAQ](FAQ.md)). Click **Start chatting** when it's done. tierlm remembers the folder, and your settings for each
 model, in `tierlm-settings.json`. **Change setup** (top right) brings this screen back. **Eject**, next to it,
 unloads the model (and the embedding model) and frees their VRAM and RAM, for when a game or another app needs the GPU.
 tierlm can also do this by itself: **Settings**, **Put the model away** (Never unless you choose a time) ejects it after

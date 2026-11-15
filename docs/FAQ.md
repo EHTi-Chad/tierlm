@@ -53,6 +53,20 @@ code, a sum); long code replies are easier to guess ahead and often run faster t
 following the conversation, each question is answered once before it's timed (since 0.8.9), because those experts
 move in during a topic's first reply and the later replies are the faster ones.
 
+**Do I have to run "Find the fastest settings" every time?**
+No, once per model is enough. It saves the winner for that model in `tierlm-settings.json`, and every later **Load
+and start chatting** (and `start-tierlm-console.bat` with `SAVED=yes`) loads it that way. The setup screen shows what it
+measured and when. Run it again only when something it measured changes:
+- **a tierlm update** (new versions are often faster, and can change which split wins);
+- **the PC**: another graphics card, more RAM, or the same card with less VRAM free (a game left open, say);
+- **the model file**: another quant is another model, and a model moved to another folder or renamed starts with no
+  saved settings;
+- **a much longer or shorter context**: the context's memory comes out of the VRAM the model's experts use.
+
+For a model that fits in VRAM it takes a minute or two. For one much bigger than VRAM it loads the model once for each
+way of splitting it and measures each at that model's speed, so it can take half an hour or more (DeepSeek V4 Flash,
+96 GB, on an RTX 5090): start it and come back later.
+
 **What are "hot experts"?**
 In a mixture-of-experts model only a few experts are picked per word, and some far more often than others. tierlm
 counts which ones each model uses as you chat (only the counts, kept next to its settings file), and the next time

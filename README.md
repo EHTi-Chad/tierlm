@@ -75,7 +75,7 @@ the GPU to read a short prompt, and saves a conversation's opening on the SSD. R
 | **Works on your projects** | the model lists, reads and searches a folder and proposes changes you see side by side and approve, one by one; each chat keeps its own folder |
 | **Never hits a wall** | chats are saved as readable files; when a conversation fills the context, the oldest messages are archived and looked back at when they matter |
 | **Serves your apps** | from the page or the console, no browser needed; OpenAI-compatible API with tool calling and images, an embedding model alongside, a queue, and several replies at once: **4 at once, 364 tok/s in all** on one RTX 5090 |
-| **Tunes itself** | Find the fastest settings measures your PC (split, threads, guessing, connections) and keeps the fastest |
+| **Tunes itself** | Find the fastest settings measures your PC (split, threads, guessing, connections) and keeps the fastest; once per model, remembered for every later load |
 
 ### Spotlight: Qwen3.8 Flash-Next on one RTX 5090
 
