@@ -207,6 +207,12 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         m->device_memory(vfree, vtotal);
         m->cold_offload_min_ = vtotal >= ((size_t)23 << 30) && !m->integrated_gpu() ? 512 : 128;
     }
+    // Whole layers (or all of a layer's experts) in RAM: ggml's CUDA engine hands their work to the GPU from 32 tokens
+    // (GGML_OP_OFFLOAD_MIN_BATCH, read once), copying all of them over every batch. Since 0.9.1 they can be (pinned,
+    // not repacked), so the same size as above, or a short message pays for the copy: gpt-oss-120b, 38 GB of experts
+    // in RAM, read a 34-token message in 0.7 s on the GPU. (Unless it's set.)
+    if (m->main_ != m->cpu_ && !std::getenv("GGML_OP_OFFLOAD_MIN_BATCH"))
+        set_process_env("GGML_OP_OFFLOAD_MIN_BATCH", std::to_string(m->cold_offload_min_));
 
     // ---- read the headers: tensor shapes/types only, no data yet ----
     // A model may be split over several files; part 1 has the settings, every part has some tensors.
@@ -1137,9 +1143,27 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // Q2_K with AVX-512, on x86): blocks of several rows interleaved, which its matrix kernels read faster. Only for
     // weights used in matrix multiplies (not the embedding table, which is looked up by row). TIERLM_NO_REPACK=1 or
     // LoadOptions::repack = false keeps the plain layout.
+    // The weights in RAM in pinned (page-locked) memory, from the first GPU's engine when that's CUDA: the GPU
+    // copies them over at full PCIe speed for a long prompt (ggml's op offload) and for the live VRAM experts.
+    // From ordinary memory the driver goes through a staging copy: about 10 GB/s on the RTX 5090 (a 2,048-token
+    // batch of Flash-Next spent 3 s copying its 28 GB of RAM experts). Only with room to spare (pinned memory can't
+    // be paged out: Windows needs what's left), and ggml falls back to ordinary memory if pinning fails.
+    // TIERLM_PIN_WEIGHTS=0: never, =1: whenever there's a CUDA GPU.
+    ggml_backend_buffer_type_t pin_buft = nullptr;
+    {
+        const char* e = std::getenv("TIERLM_PIN_WEIGHTS");
+        ggml_backend_dev_t gd = G > 0 ? ggml_backend_get_device(m->gpus_[0]) : nullptr;
+        const bool cuda = gd && std::strncmp(ggml_backend_dev_name(gd), "CUDA", 4) == 0;
+        const bool room = m->place_.ram_free >= m->place_.ram_need + ((uint64_t)8 << 30);
+        const bool want = e ? std::strcmp(e, "0") != 0 && cuda : cuda && room && !on_cpu.empty() && !m->integrated_gpu();
+        if (want) pin_buft = ggml_backend_dev_host_buffer_type(gd);
+    }
+    // ... and then not repacked for the CPU (below): the GPU can't read a repacked tensor, so it can't take over the
+    // RAM weights' work for a prompt. gpt-oss-120b on the RTX 5090 (38 GB of experts in RAM), a 32K prompt: 240 tok/s
+    // repacked (all of it on the CPU), 2,149 pinned in the file's layout; replies 41 tok/s against 39-40.
     std::vector<ggml_tensor*> on_repack;
     ggml_backend_buffer_type_t repack_buft = nullptr;
-    if (opt.repack && !std::getenv("TIERLM_NO_REPACK")) {
+    if (opt.repack && !std::getenv("TIERLM_NO_REPACK") && !pin_buft) {
         ggml_backend_dev_t cdev = ggml_backend_get_device(m->cpu_);
         auto get_extra = (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(cdev), "ggml_backend_dev_get_extra_bufts");
@@ -1187,28 +1211,17 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             alloc(bufts[d], on_dev[d], m->place_.gpus[d].weights);
             m->place_.gpu_weights += m->place_.gpus[d].weights;
         }
-        // The weights in RAM in pinned (page-locked) memory, from the first GPU's engine when that's CUDA: the GPU
-        // copies them over at full PCIe speed for a long prompt (ggml's op offload) and for the live VRAM experts.
-        // From ordinary memory the driver goes through a staging copy: about 10 GB/s on the RTX 5090 (a 2,048-token
-        // batch of Flash-Next spent 3 s copying its 28 GB of RAM experts). Only with room to spare (pinned memory can't
-        // be paged out: Windows needs what's left), and ggml falls back to ordinary memory if pinning fails.
-        // TIERLM_PIN_WEIGHTS=0: never, =1: whenever there's a CUDA GPU.
-        {
-            const char* e = std::getenv("TIERLM_PIN_WEIGHTS");
-            ggml_backend_dev_t gd = G > 0 ? ggml_backend_get_device(m->gpus_[0]) : nullptr;
-            const bool cuda = gd && std::strncmp(ggml_backend_dev_name(gd), "CUDA", 4) == 0;
-            const bool room = m->place_.ram_free >= m->place_.ram_need + ((uint64_t)8 << 30);
-            const bool want = e ? std::strcmp(e, "0") != 0 && cuda : cuda && room && !on_cpu.empty() && !m->integrated_gpu();
-            ggml_backend_buffer_type_t pin = want ? ggml_backend_dev_host_buffer_type(gd) : nullptr;
-            if (pin) {
-                const size_t before = m->place_.cpu_weights;
-                alloc(pin, on_cpu, m->place_.cpu_weights);
-                m->place_.pinned_weights = m->wbufs_.empty() || !ggml_backend_buffer_is_host(m->wbufs_.back()) ||
-                    std::strcmp(ggml_backend_buffer_name(m->wbufs_.back()), ggml_backend_buft_name(pin)) != 0 ? 0 : m->place_.cpu_weights - before;
-                std::fprintf(stderr, "RAM: %.1f GB of weights %s\n", (m->place_.cpu_weights - before) / 1e9,
-                                 m->place_.pinned_weights ? "pinned" : "in ordinary memory (pinning failed)");
-                on_cpu.clear();
-            }
+        if (pin_buft) {                                        // (see pin_buft above)
+            const size_t before = m->place_.cpu_weights;
+            alloc(pin_buft, on_cpu, m->place_.cpu_weights);
+            m->place_.pinned_weights = m->wbufs_.empty() || !ggml_backend_buffer_is_host(m->wbufs_.back()) ||
+                std::strcmp(ggml_backend_buffer_name(m->wbufs_.back()), ggml_backend_buft_name(pin_buft)) != 0 ? 0 : m->place_.cpu_weights - before;
+            std::fprintf(stderr, "RAM: %.1f GB of weights %s\n", (m->place_.cpu_weights - before) / 1e9,
+                         m->place_.pinned_weights ? "pinned" : "in ordinary memory (pinning failed)");
+            on_cpu.clear();
+            // Prompt batch size "auto" (0): 2,048 when the RAM weights are pinned, so a long prompt goes in batches big
+            // enough for the GPU to take over their work (from cold_offload_min_ tokens); 256 otherwise.
+            if (opt.batch <= 0 && m->place_.pinned_weights > 0) m->batch_ = std::min(2048, std::max(256, max_ctx));
         }
         alloc(cpu_buft, on_cpu, m->place_.cpu_weights);
         if (!on_repack.empty()) alloc(repack_buft, on_repack, m->place_.cpu_weights);

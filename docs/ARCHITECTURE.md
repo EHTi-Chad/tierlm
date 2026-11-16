@@ -719,6 +719,26 @@ Prompt reading, tok/s (each run loads the model fresh; the live VRAM experts mak
 A batch of 2,048 needs about 1.3 GB more working memory in VRAM (10,226 VRAM experts instead of 10,854). Batches of
 4,096 were no faster per token (3.4 s each): the copy is no longer what limits it.
 
+**Repacked RAM weights can't go to the GPU.** On x86, weights the CPU computes with are rearranged for its matrix
+kernels (ggml's repack: MXFP4, Q4_0, Q4_K, IQ4_NL, Q2_K). The GPU can't read that layout, so ggml never hands their
+work to it: gpt-oss-120b (14 of 36 expert layers in VRAM, 38 GB of experts in RAM) read every prompt on the CPU, at
+about 240 tok/s whatever its length. When the RAM weights are pinned they now stay in the file's layout:
+
+| gpt-oss-120b MXFP4, 64K context | 2K prompt | 8K | 16K | 32K | reply, 256 tokens | 2,048 tokens |
+|---|---|---|---|---|---|---|
+| repacked, on the CPU | 232 | 237 | 237 | 235 | 41.0 | 40.8 |
+| pinned, the GPU's for batches of 512+ | 1,412 | 2,086 | 2,197 | 2,149 | 38.6 | 40.3 |
+
+A short message stays on the CPU: ggml's CUDA engine takes whole RAM layers' work from 32 tokens
+(`GGML_OP_OFFLOAD_MIN_BATCH`), copying all of them for the batch, so tierlm sets it to the size above (512 on a 24 GB
+card or more, 128 otherwise) unless it's set. The prompt batch size defaults to "auto": 2,048 with pinned RAM weights,
+256 otherwise.
+
+**MXFP4 on Blackwell.** ggml's CUDA engine already multiplies MXFP4 weights by 4-bit activations with the RTX 50-series'
+FP4 tensor cores (built for `120a`, which ggml's build picks for `120`). It is worth little here: the same gpt-oss-120b
+32K prompt with 8-bit activations instead (`GGML_CUDA_MMQ_PREC=q8`) read at 2,057 tok/s against 2,125, because copying
+the RAM experts is what limits it.
+
 ## Several conversations at once
 
 With `LoadOptions::parallel` > 1 the model holds several conversations and `eval_seqs` advances any of them in one

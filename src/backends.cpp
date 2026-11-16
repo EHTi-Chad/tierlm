@@ -265,6 +265,8 @@ void hide_unsupported_cuda() {
                      g.name.c_str(), g.major, g.minor, cuda_built_for().c_str());
 }
 } // namespace
+void set_process_env(const char* k, const std::string& v) { set_env(k, v); }
+
 
 const std::vector<SkippedGpu>& skipped_cuda_gpus() { load_backends(); return g_skipped; }
 

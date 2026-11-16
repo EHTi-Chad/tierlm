@@ -704,8 +704,8 @@ window.FIT = (() => {
           </div>
           <div>
             <label for="batchsel">Prompt batch size</label>
-            <select id="batchsel"><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option><option>2048</option></select>
-            <div class="help">Tokens read at once when processing a prompt. Bigger can be faster for long prompts but needs more VRAM to work in.</div>
+            <select id="batchsel"><option value="0" selected>Auto</option><option>64</option><option>128</option><option>256</option><option>512</option><option>1024</option><option>2048</option><option>4096</option></select>
+            <div class="help">Tokens read at once when processing a prompt. Auto: 2048 when part of the model is in RAM on an NVIDIA card (the card then does that part's work for long prompts), 256 otherwise. Bigger can be faster for long prompts but needs more VRAM to work in.</div>
           </div>
           <div>
             <label for="experts">Active experts per token: <span id="expv"></span></label>
@@ -2247,7 +2247,7 @@ function applySaved() {
   buildCtx(s.ctx || defCtx);
   $("fa").checked = s.flash_attn !== false;
   syncFa();
-  $("batchsel").value = String(s.batch || 256);
+  $("batchsel").value = String(s.batch && s.batch !== 256 ? s.batch : 0);   // (256 was the default before Auto, in 0.9.1)
   const E = (selModel && selModel.experts) || 0, K = (selModel && selModel.experts_used) || 0;
   $("experts").disabled = !E; $("experts").max = Math.max(1, E);
   $("experts").value = s.experts_used || K || 1; $("expv").textContent = E ? $("experts").value : "n/a";

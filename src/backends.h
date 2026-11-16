@@ -11,6 +11,8 @@ struct ggml_backend;
 struct ggml_backend_buffer_type;
 
 namespace tierlm {
+// Sets an environment variable for the whole process (the GPU engines' DLLs read it too).
+void set_process_env(const char* k, const std::string& v);
 
 // Loads the engine files next to the program (once; does nothing when the engines are built in).
 void load_backends();
