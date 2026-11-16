@@ -58,6 +58,14 @@
   .pass { color: var(--accent); font-weight: 600; } .fail { color: var(--danger); font-weight: 600; }
   .note { color: var(--faint); font-size: 12px; }
   a { color: var(--accent); }
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; margin-top: 14px; }
+  .chart { background: var(--panel-2); border-radius: 10px; padding: 10px 12px; }
+  .chart h4 { margin: 0; font-size: 13px; } .chart .n { color: var(--faint); font-size: 11.5px; margin-bottom: 6px; }
+  .chart svg { width: 100%; height: auto; display: block; }
+  .chart svg text { fill: var(--muted); font-size: 10px; font-family: system-ui, sans-serif; }
+  .chart svg .v { fill: var(--ink); font-weight: 600; } .chart svg line { stroke: var(--line); }
+  .chart svg path { fill: none; stroke: var(--accent); stroke-width: 2.2; } .chart svg circle { fill: var(--accent); }
+  .chart table { margin-top: 6px; font-size: 12px; } .chart td, .chart th { padding: 3px 6px; }
 </style>
 </head>
 <body>
@@ -70,12 +78,14 @@
 <main>
   <section class="card">
     <h2>Benchmark this model on this PC</h2>
-    <p class="sub">Speed (reading a prompt, writing a reply, with an empty and a filled context, guessing ahead on and off) and a
+    <p class="sub">Speed (reading prompts of 512 to 32K tokens from scratch and again with them cached, the time to the first
+      word, writing replies of different lengths, writing after a long context, guessing ahead on and off) and a
       short fixed set of 30 questions from public benchmarks, the same every time: maths, knowledge, code and following
       instructions. Answers are at temperature 0 with thinking off. It uses the loaded model and its settings, and takes
       from under a minute (a model all in VRAM) to 10 minutes or more (a big model mostly in RAM). Chats wait while it runs.</p>
     <div class="picks" id="picks">
-      <label><input type="checkbox" value="speed" checked> Speed <small>2-3 min</small></label>
+      <label><input type="checkbox" value="speed" checked> Speed <small>prompts to 32K, replies to 2K</small></label>
+      <label><input type="checkbox" value="long"> Long replies <small>8K and 16K tokens: slow models take a while</small></label>
       <label><input type="checkbox" value="gsm8k" checked> Maths <small>10, GSM8K</small></label>
       <label><input type="checkbox" value="mc" checked> Knowledge <small>10, MMLU and ARC</small></label>
       <label><input type="checkbox" value="code" checked> Code <small>5, HumanEval in JavaScript</small></label>
@@ -95,6 +105,7 @@
       <button id="copyline">Copy one line</button><button id="copymd">Copy table (Markdown)</button><button id="copyjson">Copy JSON</button></div>
     <p class="spec" id="rspec"></p>
     <h3>Speed</h3><div class="stats" id="rspeed"></div>
+    <div class="charts" id="rcharts"></div>
     <h3>Accuracy</h3><div class="stats" id="rscore"></div>
     <details style="margin-top:14px"><summary>Every question and answer</summary><div id="rdetail"></div></details>
   </section>
@@ -126,14 +137,14 @@ const post = (url, body) => api(url, { method: "POST", headers: { "Content-Type"
 // ---------- one request through the chat endpoint, timed ----------
 // Returns the text, the server's own timings (prompt tokens, reused, prompt seconds, generated tokens, generation
 // seconds, guessing stats) and the time to the first token as this page saw it.
-async function chat(content, { max_tokens = 512, temperature = 0, prefix = null } = {}) {
+async function chat(content, { max_tokens = 512, temperature = 0, prefix = null, ignore_eos = false } = {}) {
   if (stopping) throw new Error("stopped");
   controller = new AbortController();
   const t0 = performance.now();
   const messages = [{ role: "user", content: (prefix || "") + content }];
   const r = await api("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
     body: JSON.stringify({ messages, max_tokens, temperature, top_k: 1, top_p: 1, min_p: 0, repeat_penalty: 1, presence_penalty: 0,
-                           frequency_penalty: 0, seed: 1234, thinking: false }) });
+                           frequency_penalty: 0, seed: 1234, thinking: false, ignore_eos }) });
   if (!r.ok || !r.body) throw new Error("the chat request failed (" + r.status + ")");
   const rd = r.body.getReader(), dec = new TextDecoder();
   let buf = "", text = "", first = 0, done = null;
@@ -185,64 +196,74 @@ const settle = (d, msg, ok) => { d.className = ok ? "ok" : "no"; d.textContent =
 let stepsDone = 0, stepsAll = 1;
 const tick = () => { stepsDone++; $("prog").style.width = Math.min(100, 100 * stepsDone / stepsAll) + "%"; };
 
-async function speedTests(R) {
-  const S = R.speed = {};
+async function speedTests(R, which) {
+  const S = R.speed = { prefill: [], decode: [] };
   const ctx = info.ctx || 4096;
-  let longT = Math.max(1024, Math.min(8192, Math.floor(ctx * 0.5)));
   const nonce = () => `Reference number ${Math.random().toString(36).slice(2)}.\n\n`;   // a new start: nothing reused
   let seed = 7;
-  const pf = async (label, tokens, key) => {
-    const d = log(label);
-    const r = await chat(filler(tokens, ++seed) + "\n\nReply with the single word OK.", { max_tokens: 4, prefix: nonce() });
-    const read = r.n_prompt - (r.reused || 0);
-    S[key] = { tps: read / Math.max(r.prompt_s, 1e-9), tokens: read, ttft: r.ttft };
-    settle(d, `${label}: ${read.toLocaleString()} tokens at ${S[key].tps.toFixed(0)} tok/s, first word after ${r.ttft ? r.ttft.toFixed(2) + " s" : "-"}`, true);
-    tick();
-  };
   // How many tokens this model's tokenizer makes of the filler, so the prompts come out at the sizes asked for
   {
     const base = await chat("Reply with the single word OK.", { max_tokens: 2, prefix: nonce() });
     const words = 300, cal = await chat(filler(300 * tokPerWord, 1) + "\n\nReply with the single word OK.", { max_tokens: 2, prefix: nonce() });
     tokPerWord = Math.max(0.5, Math.min(6, (cal.n_prompt - base.n_prompt) / (words * 15 / 14)));
   }
-  await pf("Prompt reading, short, first time", 512, "pf_short_cold");
-  await pf("Prompt reading, short, again", 512, "pf_short_warm");
-  await pf(`Prompt reading, long (about ${longT.toLocaleString()} tokens), first time`, longT, "pf_long_cold");
-  // the long prompt again, kept so the next test can write after it
-  const longText = filler(longT, 99), longPrefix = nonce();
-  let d = log(`Prompt reading, long, again`);
-  let r = await chat(longText + "\n\nReply with the single word OK.", { max_tokens: 4, prefix: longPrefix });
-  S.pf_long_warm = { tps: (r.n_prompt - (r.reused || 0)) / Math.max(r.prompt_s, 1e-9), tokens: r.n_prompt - (r.reused || 0), ttft: r.ttft };
-  settle(d, `Prompt reading, long, again: ${S.pf_long_warm.tokens.toLocaleString()} tokens at ${S.pf_long_warm.tps.toFixed(0)} tok/s, first word after ${r.ttft ? r.ttft.toFixed(2) + " s" : "-"}`, true); tick();
-
-  const story = "Write a story of about 250 words about a lighthouse keeper who finds a message in a bottle.";
-  d = log("Writing, empty context");
-  r = await chat(story, { max_tokens: 320, prefix: nonce() });
-  S.gen_empty = { tps: r.gen_tps, tokens: r.n_gen };
-  settle(d, `Writing, empty context: ${r.n_gen} tokens at ${r.gen_tps.toFixed(1)} tok/s`, true); tick();
-  d = log(`Writing after ${S.pf_long_warm.tokens.toLocaleString()} tokens of context`);
-  r = await chat(longText + "\n\n" + story, { max_tokens: 320, prefix: longPrefix });
-  S.gen_deep = { tps: r.gen_tps, tokens: r.n_gen, depth: r.n_prompt };
-  settle(d, `Writing after ${r.n_prompt.toLocaleString()} tokens of context: ${r.n_gen} tokens at ${r.gen_tps.toFixed(1)} tok/s`, true); tick();
-
+  // Prompt reading at each size: from scratch (nothing of it cached), then the same prompt again (cached: only
+  // the end is read; "effective" = the whole prompt over the time to the first word, as other benchmarks show it)
+  const sizes = [512, 2048, 8192, 16384, 32768].filter(n => n <= ctx - 700);
+  let deepest = null;
+  for (const n of sizes) {
+    const d = log(`Prompt reading, ${n.toLocaleString()} tokens`);
+    const text = filler(n, ++seed) + "\n\nReply with the single word OK.", pre = nonce();
+    const c = await chat(text, { max_tokens: 4, prefix: pre });
+    const read = c.n_prompt - (c.reused || 0);
+    const w = await chat(text, { max_tokens: 4, prefix: pre });
+    const row = { size: n, tokens: read, tps: read / Math.max(c.prompt_s, 1e-9), ttft: c.ttft,
+                  cached_ttft: w.ttft, cached_tps: w.ttft ? w.n_prompt / w.ttft : null };
+    S.prefill.push(row);
+    deepest = { text, pre, tokens: c.n_prompt };
+    settle(d, `Prompt reading, ${read.toLocaleString()} tokens: ${row.tps.toFixed(0)} tok/s, first word after ${c.ttft ? c.ttft.toFixed(2) : "-"} s; cached: ${w.ttft ? w.ttft.toFixed(2) : "-"} s`, true);
+    tick();
+  }
+  // Writing: replies of set lengths (the end-of-reply token held back so each runs to its length)
+  const story = "Write a long, detailed story about a lighthouse keeper who finds a message in a bottle, with many chapters.";
+  const lens = [256, 2048].concat(which.includes("long") ? [8192, 16384] : []).filter(n => n <= ctx - 300);
+  for (const n of lens) {
+    const d = log(`Writing a ${n.toLocaleString()}-token reply`);
+    const r = await chat(story, { max_tokens: n, prefix: nonce(), ignore_eos: true });
+    S.decode.push({ len: n, tokens: r.n_gen, tps: r.gen_tps });
+    settle(d, `Writing a ${r.n_gen.toLocaleString()}-token reply: ${r.gen_tps.toFixed(1)} tok/s`, true); tick();
+  }
+  // Writing after a long context: the longest prompt above, still cached, then a reply after it
+  if (deepest) {
+    const d = log(`Writing after ${deepest.tokens.toLocaleString()} tokens of context`);
+    const r = await chat(deepest.text.replace(/Reply with the single word OK\.$/, "") + story, { max_tokens: 256, prefix: deepest.pre, ignore_eos: true });
+    S.gen_deep = { tps: r.gen_tps, tokens: r.n_gen, depth: r.n_prompt };
+    settle(d, `Writing after ${r.n_prompt.toLocaleString()} tokens of context: ${r.n_gen} tokens at ${r.gen_tps.toFixed(1)} tok/s`, true); tick();
+  }
   // Guessing ahead, on and off, on code (easy to guess) if this model can
   const code = "Write a Python function that parses one line of CSV with quoted fields, and three short tests for it.";
   const was = { speculative: !!info.speculative, draft_max: info.draft_max || 2 };
-  const runCode = async (label) => { const x = await chat(code, { max_tokens: 320, prefix: nonce() }); return { tps: x.gen_tps, tokens: x.n_gen, spec: x.spec || null, label }; };
-  d = log("Guessing ahead, on and off");
+  const runCode = async () => { const x = await chat(code, { max_tokens: 320, prefix: nonce() }); return { tps: x.gen_tps, tokens: x.n_gen, spec: x.spec || null }; };
+  const d = log("Guessing ahead, on and off");
   const set = async (on, dm) => { const q = await post("/api/spec", on ? { speculative: true, draft_max: dm } : { speculative: false }); return q.ok; };
   try {
     if (was.speculative) {
-      const on = await runCode("on"); await set(false); const off = await runCode("off"); await set(true, was.draft_max);
+      const on = await runCode(); await set(false); const off = await runCode(); await set(true, was.draft_max);
       S.spec = { on, off, guesses: was.draft_max };
     } else if (await set(true, 3)) {
-      const on = await runCode("on"); await set(false); const off = await runCode("off");
+      const on = await runCode(); await set(false); const off = await runCode();
       S.spec = { on, off, guesses: 3 };
     }
   } catch (e) { if (was.speculative) await set(true, was.draft_max).catch(() => {}); else await set(false).catch(() => {}); throw e; }
   if (S.spec) settle(d, `Code, guessing ahead (${S.spec.guesses}): ${S.spec.on.tps.toFixed(1)} tok/s; without: ${S.spec.off.tps.toFixed(1)} tok/s`, true);
   else settle(d, "Guessing ahead: not available for this model as loaded (skipped)", true);
   tick();
+}
+// The number of speed steps, for the progress bar
+function speedSteps(which) {
+  const ctx = (info && info.ctx) || 4096;
+  return [512, 2048, 8192, 16384, 32768].filter(n => n <= ctx - 700).length +
+         [256, 2048].concat(which.includes("long") ? [8192, 16384] : []).filter(n => n <= ctx - 300).length + 2;
 }
 
 // ---------- accuracy ----------
@@ -325,7 +346,8 @@ async function run() {
   if (!which.length) return;
   stopping = false; $("run").disabled = true; $("stop").disabled = false; $("log").textContent = ""; $("result").hidden = true;
   stepsDone = 0;
-  stepsAll = (which.includes("speed") ? 7 : 0) + (which.includes("gsm8k") ? 10 : 0) + (which.includes("mc") ? 10 : 0) +
+  info = await getJSON("/api/info").catch(() => info);
+  stepsAll = (which.includes("speed") ? speedSteps(which) : 0) + (which.includes("gsm8k") ? 10 : 0) + (which.includes("mc") ? 10 : 0) +
              (which.includes("code") ? 5 : 0) + (which.includes("ifeval") ? 5 : 0);
   const t0 = performance.now();
   const R = { id: Date.now().toString(36), when: new Date().toISOString(), tests: which, data_version: D.version };
@@ -335,7 +357,7 @@ async function run() {
     R.model = info.name; R.file = specs && specs.model_file; R.quant = specs && specs.quant;
     R.pc = pcLine(); R.settings = settingsLine(); R.tierlm = info.version;
     $("status").textContent = "Running…";
-    if (which.includes("speed")) await speedTests(R);
+    if (which.includes("speed")) await speedTests(R, which);
     await accuracy(R, which);
     R.minutes = (performance.now() - t0) / 60000;
     last = R;
@@ -363,21 +385,65 @@ function settingsLine() {
 // ---------- showing a run ----------
 const pct = a => a && a.of ? Math.round(100 * a.right / a.of) : null;
 function stat(l, v, unit, note) { return `<div class="stat"><div class="l">${esc(l)}</div><div class="v">${v}${unit ? ` <small>${unit}</small>` : ""}</div>${note ? `<div class="n">${esc(note)}</div>` : ""}</div>`; }
+// The figures shown in the table and the one line, from runs saved in either layout (the first had fewer sizes)
+function headline(S) {
+  S = S || {};
+  const pre = S.prefill && S.prefill.length ? (S.prefill.find(x => x.size === 8192) || S.prefill[S.prefill.length - 1])
+            : S.pf_long_warm ? { tokens: S.pf_long_warm.tokens, tps: S.pf_long_warm.tps, ttft: S.pf_long_warm.ttft } : null;
+  const dec = S.decode && S.decode.length ? S.decode[0] : S.gen_empty ? { len: S.gen_empty.tokens, tps: S.gen_empty.tps } : null;
+  const first = S.prefill && S.prefill.length ? S.prefill[0] : S.pf_short_warm || null;
+  return { pre, dec, first, deep: S.gen_deep || null, spec: S.spec || null };
+}
+// A line chart: x on a log scale (sizes), the value of each point written above it
+function chartSVG(points, fmt) {
+  const W = 340, H = 150, L = 40, Rm = 14, T = 18, B = 26;
+  const xs = points.map(p => Math.log2(p.x)), ys = points.map(p => p.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), top = Math.max(...ys) * 1.15 || 1;
+  // a round step for the grid (1, 2 or 5 times a power of ten), four of them up to above the highest point
+  const raw = top / 4, mag = Math.pow(10, Math.floor(Math.log10(raw))), step = [1, 2, 5, 10].map(m => m * mag).find(v => v >= raw);
+  const ymax = step * 4;
+  const X = v => points.length === 1 ? (L + W - Rm) / 2 : L + 18 + (W - L - Rm - 36) * (v - x0) / (x1 - x0 || 1);
+  const Y = v => T + (H - T - B) * (1 - v / ymax);
+  let g = "";
+  for (let i = 0; i <= 4; i++) { const v = step * i, y = Y(v); g += `<line x1="${L}" x2="${W - Rm}" y1="${y}" y2="${y}"/><text x="${L - 4}" y="${y + 3}" text-anchor="end">${fmt(v, true)}</text>`; }
+  const path = points.map((p, i) => `${i ? "L" : "M"}${X(xs[i]).toFixed(1)},${Y(p.y).toFixed(1)}`).join("");
+  const dots = points.map((p, i) => `<circle cx="${X(xs[i])}" cy="${Y(p.y)}" r="3.5"/><text class="v" x="${X(xs[i])}" y="${Y(p.y) - 7}" text-anchor="middle">${fmt(p.y)}</text>` +
+    `<text x="${X(xs[i])}" y="${H - 8}" text-anchor="middle">${p.label}</text>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" role="img">${g}<path d="${path}"/>${dots}</svg>`;
+}
+const kTok = n => n >= 1024 ? (n / 1024).toFixed(n % 1024 ? 1 : 0) + "K" : String(n);
+const fmtTps = (v, axis) => v >= 10000 ? +(v / 1000).toFixed(axis ? 1 : 1) + "k" : v >= 100 || axis ? String(+v.toFixed(axis ? 1 : 0)) : v.toFixed(1);
+function chartCard(title, note, points, fmt, rows) {
+  if (!points.length) return "";
+  return `<div class="chart"><h4>${esc(title)}</h4><div class="n">${esc(note)}</div>${chartSVG(points, fmt)}` +
+    (rows ? `<table>${rows}</table>` : "") + `</div>`;
+}
 function show(R) {
   $("result").hidden = false;
   $("rspec").textContent = `${R.model}${R.quant ? " " + R.quant : ""} | ${R.pc} | ${R.settings} | tierlm ${R.tierlm}`;
-  const S = R.speed, out = [];
+  const S = R.speed, h = headline(S), out = [], charts = [];
   if (S) {
-    const f = x => x ? x.tps.toFixed(0) : "-";
-    out.push(stat("Prompt reading, short", f(S.pf_short_warm), "tok/s", `first time ${f(S.pf_short_cold)}; ${S.pf_short_warm ? S.pf_short_warm.tokens : "?"} tokens`));
-    out.push(stat("Prompt reading, long", f(S.pf_long_warm), "tok/s", `first time ${f(S.pf_long_cold)}; ${S.pf_long_warm ? S.pf_long_warm.tokens.toLocaleString() : "?"} tokens`));
-    out.push(stat("First word, short prompt", S.pf_short_warm && S.pf_short_warm.ttft ? S.pf_short_warm.ttft.toFixed(2) : "-", "s", S.pf_long_warm && S.pf_long_warm.ttft ? `long prompt: ${S.pf_long_warm.ttft.toFixed(2)} s` : ""));
-    out.push(stat("Writing, empty context", S.gen_empty ? S.gen_empty.tps.toFixed(1) : "-", "tok/s", S.gen_empty ? `${S.gen_empty.tokens} tokens` : ""));
-    out.push(stat("Writing, filled context", S.gen_deep ? S.gen_deep.tps.toFixed(1) : "-", "tok/s", S.gen_deep ? `after ${S.gen_deep.depth.toLocaleString()} tokens` : ""));
-    if (S.spec) out.push(stat(`Code, guessing ahead (${S.spec.guesses})`, S.spec.on.tps.toFixed(1), "tok/s", `without: ${S.spec.off.tps.toFixed(1)} tok/s`));
+    if (h.pre) out.push(stat(`Prompt reading, ${kTok(h.pre.tokens)} tokens`, fmtTps(h.pre.tps), "tok/s", "from scratch"));
+    if (h.first && h.first.ttft) out.push(stat("First word", h.first.ttft.toFixed(2), "s", `${(h.first.tokens || 0).toLocaleString()}-token prompt from scratch`));
+    if (h.dec) out.push(stat("Writing", h.dec.tps.toFixed(1), "tok/s", `a ${(h.dec.len || 0).toLocaleString()}-token reply, empty context`));
+    if (h.deep) out.push(stat("Writing, filled context", h.deep.tps.toFixed(1), "tok/s", `after ${h.deep.depth.toLocaleString()} tokens`));
+    if (h.spec) out.push(stat(`Code, guessing ahead (${h.spec.guesses})`, h.spec.on.tps.toFixed(1), "tok/s", `without: ${h.spec.off.tps.toFixed(1)} tok/s`));
     else out.push(stat("Guessing ahead", "–", "", "not available as loaded (no draft layer, or every expert in VRAM)"));
+    const P = S.prefill || [];
+    charts.push(chartCard("Prompt reading, from scratch", "Higher is better. Nothing of the prompt cached: every token read.",
+      P.map(p => ({ x: p.size, y: p.tps, label: kTok(p.size) })), fmtTps,
+      `<tr><th>Prompt</th><th class="num">tok/s</th><th class="num">First word</th></tr>` + P.map(p => `<tr><td>${p.tokens.toLocaleString()}</td><td class="num">${fmtTps(p.tps)}</td><td class="num">${p.ttft ? p.ttft.toFixed(2) + " s" : "-"}</td></tr>`).join("")));
+    const PC = P.filter(p => p.cached_tps);
+    charts.push(chartCard("Prompt reading, cached", "The same prompt again: only its end is read. Effective tok/s = the whole prompt / time to the first word.",
+      PC.map(p => ({ x: p.size, y: p.cached_tps, label: kTok(p.size) })), fmtTps,
+      `<tr><th>Prompt</th><th class="num">Effective tok/s</th><th class="num">First word</th></tr>` + PC.map(p => `<tr><td>${p.tokens.toLocaleString()}</td><td class="num">${fmtTps(p.cached_tps)}</td><td class="num">${p.cached_ttft.toFixed(2)} s</td></tr>`).join("")));
+    const Dd = S.decode || [];
+    charts.push(chartCard("Writing speed by reply length", "Higher is better. Replies run to their length (the end-of-reply token held back).",
+      Dd.map(p => ({ x: p.len, y: p.tps, label: kTok(p.len) })), (v, axis) => axis ? String(+v.toFixed(1)) : v.toFixed(v >= 100 ? 0 : 1),
+      `<tr><th>Reply</th><th class="num">tok/s</th></tr>` + Dd.map(p => `<tr><td>${p.tokens.toLocaleString()} tokens</td><td class="num">${p.tps.toFixed(1)}</td></tr>`).join("")));
   }
   $("rspeed").innerHTML = out.join("") || `<div class="note">Not measured in this run.</div>`;
+  $("rcharts").innerHTML = charts.join("");
   const A = R.acc || {}, sc = [];
   const names = { maths: "Maths (GSM8K)", knowledge: "Knowledge (MMLU, ARC)", code: "Code (HumanEval, JS)", instructions: "Instructions (IFEval)" };
   let right = 0, of = 0;
@@ -388,34 +454,33 @@ function show(R) {
     `<details><summary>Question and answer</summary><div class="ans">${esc(x.prompt)}</div><div class="ans" style="margin-top:4px">${esc(x.answer || "(no answer)")}</div></details></div>`).join("");
 }
 function summary(R) {
-  const S = R.speed || {}, A = R.acc || {};
+  const A = R.acc || {};
   let right = 0, of = 0; for (const k in A) { right += A[k].right; of += A[k].of; }
-  return { S, A, right, of };
+  return { h: headline(R.speed), A, right, of };
 }
 function lineOf(R) {
-  const { S, A, right, of } = summary(R);
+  const { h, A, right, of } = summary(R);
   const parts = [`tierlm ${R.tierlm}`, `${R.model}${R.quant ? " " + R.quant : ""}`, R.pc, R.settings];
   const sp = [];
-  if (S.pf_long_warm) sp.push(`prompt ${S.pf_long_warm.tps.toFixed(0)} tok/s (${S.pf_long_warm.tokens} tokens)`);
-  if (S.gen_empty) sp.push(`generation ${S.gen_empty.tps.toFixed(1)} tok/s`);
-  if (S.gen_deep) sp.push(`${S.gen_deep.tps.toFixed(1)} tok/s at ${S.gen_deep.depth} tokens of context`);
+  if (h.pre) sp.push(`prompt ${fmtTps(h.pre.tps)} tok/s (${h.pre.tokens.toLocaleString()} tokens)`);
+  if (h.dec) sp.push(`generation ${h.dec.tps.toFixed(1)} tok/s (${(h.dec.len || 0).toLocaleString()}-token reply)`);
+  if (h.deep) sp.push(`${h.deep.tps.toFixed(1)} tok/s after ${h.deep.depth.toLocaleString()} tokens of context`);
+  if (h.spec) sp.push(`code ${h.spec.on.tps.toFixed(1)} tok/s guessing ahead, ${h.spec.off.tps.toFixed(1)} without`);
   if (of) sp.push(`accuracy ${right}/${of} (` + Object.entries(A).map(([k, v]) => `${k} ${v.right}/${v.of}`).join(", ") + ")");
   return parts.join(" | ") + " -> " + sp.join(", ");
 }
 function mdOf(R) {
-  const { S, A, right, of } = summary(R), rows = [["", ""]];
-  rows.length = 0;
+  const { A, right, of } = summary(R), S = R.speed || {}, rows = [];
   rows.push(["tierlm", R.tierlm], ["Model", `${R.model}${R.quant ? " " + R.quant : ""}`], ["PC", R.pc], ["Settings", R.settings]);
-  const f = x => x ? `${x.tps.toFixed(1)} tok/s (${(x.tokens || 0).toLocaleString()} tokens)` : "";
-  if (S.pf_short_warm) rows.push(["Prompt reading, short (first time)", `${f(S.pf_short_warm)} (${S.pf_short_cold ? S.pf_short_cold.tps.toFixed(1) : "-"})`]);
-  if (S.pf_long_warm) rows.push(["Prompt reading, long (first time)", `${f(S.pf_long_warm)} (${S.pf_long_cold ? S.pf_long_cold.tps.toFixed(1) : "-"})`]);
-  if (S.pf_short_warm && S.pf_short_warm.ttft) rows.push(["First word", `${S.pf_short_warm.ttft.toFixed(2)} s (short prompt)`]);
-  if (S.gen_empty) rows.push(["Writing, empty context", f(S.gen_empty)]);
-  if (S.gen_deep) rows.push(["Writing after " + S.gen_deep.depth.toLocaleString() + " tokens", f(S.gen_deep)]);
+  for (const p of S.prefill || []) rows.push([`Prompt reading, ${p.tokens.toLocaleString()} tokens`,
+    `${fmtTps(p.tps)} tok/s, first word ${p.ttft ? p.ttft.toFixed(2) : "-"} s (cached: ${p.cached_ttft ? p.cached_ttft.toFixed(2) : "-"} s)`]);
+  for (const p of S.decode || []) rows.push([`Writing a ${p.tokens.toLocaleString()}-token reply`, `${p.tps.toFixed(1)} tok/s`]);
+  if (S.gen_deep) rows.push([`Writing after ${S.gen_deep.depth.toLocaleString()} tokens of context`, `${S.gen_deep.tps.toFixed(1)} tok/s`]);
   if (S.spec) rows.push([`Code, guessing ahead (${S.spec.guesses}) / without`, `${S.spec.on.tps.toFixed(1)} / ${S.spec.off.tps.toFixed(1)} tok/s`]);
   for (const [k, v] of Object.entries(A)) rows.push([`Accuracy: ${k}`, `${v.right}/${v.of}`]);
   if (of) rows.push(["Accuracy: all", `${right}/${of} (${Math.round(100 * right / of)}%)`]);
-  return "| | |\n|---|---|\n" + rows.map(r => `| ${r[0]} | ${String(r[1]).replace(/\|/g, "/")} |`).join("\n") + "\n\n(tierlm benchmark: temperature 0, thinking off; 30 fixed questions from GSM8K, MMLU, ARC-Challenge, HumanEval and IFEval)";
+  return "| | |\n|---|---|\n" + rows.map(r => `| ${r[0]} | ${String(r[1]).replace(/\|/g, "/")} |`).join("\n") +
+    "\n\n(tierlm benchmark: temperature 0, thinking off; 30 fixed questions from GSM8K, MMLU, ARC-Challenge, HumanEval and IFEval)";
 }
 async function copy(t, btn) { try { await navigator.clipboard.writeText(t); const o = btn.textContent; btn.textContent = "Copied"; setTimeout(() => btn.textContent = o, 1200); } catch (e) {} }
 $("copyline").onclick = e => last && copy(lineOf(last), e.target);
@@ -429,14 +494,14 @@ async function loadHistory() {
   $("histnote").textContent = runs.length ? `${runs.length} run${runs.length === 1 ? "" : "s"}` : "";
   if (!runs.length) { $("hist").innerHTML = `<tr><td class="note">No runs yet.</td></tr>`; return; }
   const sc = (A, k) => A && A[k] ? `${A[k].right}/${A[k].of}` : "";
-  $("hist").innerHTML = `<tr><th>When</th><th>Model</th><th>Settings</th><th class="num">Prompt tok/s</th><th class="num">Writing tok/s</th><th class="num">Filled ctx</th>` +
+  $("hist").innerHTML = `<tr><th>When</th><th>Model</th><th>Settings</th><th class="num">Prompt tok/s<div class="note">8K</div></th><th class="num">Writing tok/s</th><th class="num">Filled ctx</th>` +
     `<th class="num">Maths</th><th class="num">Knowl.</th><th class="num">Code</th><th class="num">Instr.</th><th class="num">All</th><th></th></tr>` +
     runs.slice().reverse().map(R => {
-      const { S, A, right, of } = summary(R);
+      const { h, A, right, of } = summary(R);
       return `<tr data-id="${esc(R.id)}"><td>${esc(new Date(R.when).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }))}</td>` +
         `<td>${esc(R.model)}${R.quant ? `<div class="note">${esc(R.quant)}</div>` : ""}</td><td class="spec">${esc(R.settings || "")}</td>` +
-        `<td class="num">${S.pf_long_warm ? S.pf_long_warm.tps.toFixed(0) : ""}</td><td class="num">${S.gen_empty ? S.gen_empty.tps.toFixed(1) : ""}</td>` +
-        `<td class="num">${S.gen_deep ? S.gen_deep.tps.toFixed(1) : ""}</td><td class="num">${sc(A, "maths")}</td><td class="num">${sc(A, "knowledge")}</td>` +
+        `<td class="num">${h.pre ? fmtTps(h.pre.tps) : ""}</td><td class="num">${h.dec ? h.dec.tps.toFixed(1) : ""}</td>` +
+        `<td class="num">${h.deep ? h.deep.tps.toFixed(1) : ""}</td><td class="num">${sc(A, "maths")}</td><td class="num">${sc(A, "knowledge")}</td>` +
         `<td class="num">${sc(A, "code")}</td><td class="num">${sc(A, "instructions")}</td><td class="num">${of ? Math.round(100 * right / of) + "%" : ""}</td>` +
         `<td class="acts"><button class="tiny" data-show="${esc(R.id)}">Show</button> <button class="tiny" data-del="${esc(R.id)}" title="Remove this run">✕</button></td></tr>`;
     }).join("");

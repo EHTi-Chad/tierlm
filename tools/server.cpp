@@ -2472,6 +2472,7 @@ int main(int argc, char** argv) {
     static thread_local int tl_past = 0;
     static thread_local int tl_image_tokens = 0;      // this request's image detail (0: automatic)
     static thread_local int tl_think = -1;            // this request's thinking: 1 on, 0 off, -1 the model's setting
+    static thread_local bool tl_ignore_eos = false;   // this request writes max_tokens whatever (the benchmark page)
     // gpt-oss: this request's reasoning effort, 1 low, 2 medium, 3 high, 0 the model's setting (a number: a thread-local
     // std::string used from the route lambdas isn't set up on their threads with GCC)
     static thread_local int tl_effort = 0;
@@ -2832,6 +2833,20 @@ int main(int argc, char** argv) {
             if (harm) return t == h_return || t == h_call || t == h_eot || (t == tok.eos() && t != h_end);
             return t == tok.eos() || t == tok.eot() || tok.is_control(t);
         };
+        // "ignore_eos": the reply goes on to max_tokens (to time long replies): the end-of-reply tokens are never
+        // picked (their scores set to -inf in a copy of each row)
+        std::vector<int32_t> no_end;
+        std::vector<float> unended;
+        const bool ignore_eos = tl_ignore_eos;
+        tl_ignore_eos = false;                                    // (one request's: the thread serves others later)
+        if (ignore_eos && max_tokens > 0)
+            for (int32_t t = 0; t < (int32_t)tok.vocab_size(); ++t) if (is_end(t)) no_end.push_back(t);
+        auto unend = [&](const float* row, size_t n) -> const float* {
+            if (no_end.empty()) return row;
+            unended.assign(row, row + n);
+            for (int32_t t : no_end) if ((size_t)t < n) unended[t] = -INFINITY;
+            return unended.data();
+        };
         // Recent tokens for the repetition penalty (the cache, then `extra`), leaving out control tokens such as the
         // end-of-reply marker: penalising those would stop the model from finishing.
         auto recent_with = [&](const std::vector<int32_t>& extra) {
@@ -2879,7 +2894,7 @@ int main(int argc, char** argv) {
         if (!spx) {
             for (;;) {
                 if ((int)out.size() >= max_tokens) { r.stop = "length"; break; }
-                const int32_t id = sample(lg.data(), lg.size(), sp, recent_with({}), rng);
+                const int32_t id = sample(unend(lg.data(), lg.size()), lg.size(), sp, recent_with({}), rng);
                 if (is_end(id)) { r.stop = "end"; break; }
                 if (npast() + 1 >= ctx_lim) { r.stop = "context"; break; }
                 lg = evalm({id}, &routing);                               // also tells us which experts it used
@@ -2900,7 +2915,7 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> extra;
                 if (cur >= 0) extra.push_back(cur);
                 extra.insert(extra.end(), acc.begin(), acc.end());
-                return sample(row, (size_t)hp.n_vocab, sp, recent_with(extra), rng);
+                return sample(unend(row, (size_t)hp.n_vocab), (size_t)hp.n_vocab, sp, recent_with(extra), rng);
             };
             // Sampling: speculative sampling (guesses drawn from the draft block's own probabilities, kept by the
             // ratio of the model's to the draft block's); the reply follows the model's distribution exactly either
@@ -2908,7 +2923,7 @@ int main(int argc, char** argv) {
             // TIERLM_SPEC_SAMPLING=0: guess the best, keep it if the model's draw agrees.
             static const bool spec_sampling = !(std::getenv("TIERLM_SPEC_SAMPLING") && !std::strcmp(std::getenv("TIERLM_SPEC_SAMPLING"), "0"));
             struct ClearSampling { Speculator* s; ~ClearSampling() { s->clear_sampling(); } } clear_sampling{spx};
-            if (sp.temperature > 0.0f && spec_sampling)
+            if (sp.temperature > 0.0f && spec_sampling && no_end.empty())
                 spx->set_sampling([&](const float* row, const std::vector<int32_t>& ctx) {
                     return distribution(row, (size_t)hp.n_vocab, sp, recent_with(ctx));
                 }, &rng);
@@ -3232,6 +3247,7 @@ int main(int argc, char** argv) {
                         return true;
                     }
                 }
+                tl_ignore_eos = body.value("ignore_eos", false);
                 Gen g = generate(messages, sp, max_tokens, {},
                     [&](const json& p) { json j = p; j["type"] = "prompt"; send(j); },
                     [&](const std::string& delta, double tps, const std::vector<int32_t>& routing) {

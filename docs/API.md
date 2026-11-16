@@ -418,7 +418,8 @@ Returns `{"prompt_tps": 143.0, "gen_tps": 22.3, "speculative": true, "draft_max"
 ### GET /bench, GET /api/benchruns, POST /api/benchruns
 
 `/bench` is the benchmark page (since 0.9.1); it runs everything through `/api/chat`, `/api/spec`, `/api/info` and
-`/api/specs`. Its questions are in `/bench-data.js` (made by `scripts/make-bench-data.py` from GSM8K, MMLU,
+`/api/specs`. `/api/chat` takes `"ignore_eos": true` with `max_tokens` for that: the reply runs to its length (the
+end-of-reply tokens are never picked), to time replies of a set length. Its questions are in `/bench-data.js` (made by `scripts/make-bench-data.py` from GSM8K, MMLU,
 ARC-Challenge, HumanEval and IFEval; sources and licences in the file). `GET /api/benchruns` returns the saved runs (a
 JSON array, oldest first, kept in `tierlm-bench.json` next to the settings); `POST /api/benchruns` with
 `{"run": {...}}` adds one and `{"delete": "<id>"}` removes one, from this computer only (403 from other devices).

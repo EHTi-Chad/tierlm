@@ -138,8 +138,10 @@ fold the menu away and give the chat more room.
   readable file you can open in Notepad, VS Code or Obsidian, and the files you attached. **Open the chats folder**
   shows them in Explorer. (Opened from another device, the page keeps its chats in that browser instead.)
 - **Benchmark**: **Open the full benchmark** opens a page of its own (`/bench`) that tests the loaded model on this
-  PC, in under a minute for a model all in VRAM to 10 minutes or more for a big one mostly in RAM: prompt reading (short and long, the first time and again), time to the first word,
-  writing speed with an empty and a filled context, guessing ahead on and off, and 30 fixed questions from public
+  PC, in under a minute for a model all in VRAM to 10 minutes or more for a big one mostly in RAM: prompt reading
+  at 512 to 32K tokens (from scratch, and again with the prompt cached), the time to the first word, writing speed
+  for replies of 256 and 2K tokens (8K and 16K with **Long replies**) and after a long context, guessing ahead on and
+  off, with charts, and 30 fixed questions from public
   benchmarks: 10 maths (GSM8K), 10 knowledge (MMLU and ARC-Challenge), 5 code (HumanEval, written in JavaScript and
   run against its tests in the page) and 5 instructions to follow (IFEval). The questions are the same every run, at
   temperature 0 with thinking off, so runs compare across models, quantizations and PCs; every run is kept on this PC
