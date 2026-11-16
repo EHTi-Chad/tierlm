@@ -349,8 +349,10 @@ Hugging Face's own code (`tests/tiny_deepseek4.py`, which is checked against the
 - **Hyper-connections**: the model carries 4 streams of its width instead of one. Before each attention and expert
   block, a small projection of the streams gives, per token, how much of each stream goes in, how much of the block's
   output goes back to each, and a 4x4 mixing of the streams, made doubly stochastic by 20 rounds of Sinkhorn. That
-  last part is a few dozen numbers a token, worked out on the CPU (`d4_hc_weights`); moving it to the GPU is next,
-  because it makes the GPU wait twice in every layer. A last mixing turns the streams into one before the output.
+  last part is a few dozen numbers a token: since 0.9.1 ggml's fused hyper-connection ops (`ggml_dsv4_hc_comb`,
+  `_pre`, `_post`) do it on the GPU, where 0.9.0 worked it out on the CPU (`d4_hc_weights`, still used for other
+  stream counts), which made the GPU wait twice in every layer. A last mixing turns the streams into one before the
+  output.
 - **Attention**: one shared key-value head 512 wide (the values are the keys), attention sinks, rotary position on
   the last 64 dimensions only and rotated back on the output, and a grouped output projection. Each layer is one of
   three kinds: a **sliding window** of 128 tokens alone; **CSA**, which also compresses every 4 tokens into one entry

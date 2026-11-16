@@ -626,7 +626,8 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] gpt-oss: the busiest experts in VRAM, and VRAM experts following the conversation (the experts' biases kept whole beside the split weights)
 - [x] Speculative decoding for MoE models without a draft layer, guessing from the VRAM experts (0.9.0)
 - [x] DeepSeek V4 Flash, early (0.9.0)
-- [ ] DeepSeek V4: tool calls in its own format; its stream mixing on the GPU (it runs on the CPU in every layer now)
+- [x] DeepSeek V4: its stream mixing on the GPU (ggml's fused hyper-connection ops)
+- [ ] DeepSeek V4: tool calls in its own format
 
 ## Credits and licence
 

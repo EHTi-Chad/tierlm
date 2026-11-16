@@ -3497,16 +3497,30 @@ Model::Graph Model::build_dsv4(int n_tok, int n_past, bool want_routing, int n_l
     ggml_tensor* X = ggml_reshape_2d(c, ggml_repeat_4d(c, ggml_reshape_3d(c, x, E, 1, n_tok), E, HC, n_tok, 1), (int64_t)E * HC, n_tok);
     static D4HcParams hcp;
     hcp = {HC, hp.d4_hc_iters, hp.d4_hc_eps};
-    // a block's input from the streams, and how its output goes back (see d4_hc_weights)
+    // a block's input from the streams, and how its output goes back. With 4 streams (DeepSeek V4), ggml's fused
+    // hyper-connection ops (dsv4_hc_comb, _pre, _post), which run on the GPU; otherwise d4_hc_weights on the CPU.
+    const bool fused = HC == 4;
     auto hc_in = [&](ggml_tensor* Xs, const Layer& L, int k, ggml_tensor** post, ggml_tensor** comb) {
         ggml_tensor* mix = ggml_mul_mat(c, L.d4_hc_fn[k], ggml_rms_norm(c, Xs, hp.rms_eps));       // [(2+HC)HC, n]
+        ggml_tensor* X3 = ggml_reshape_3d(c, Xs, E, HC, n_tok);
+        if (fused) {
+            const size_t es = ggml_element_size(mix);
+            auto lin = [&](int which) {                                  // raw * scale[which] + base, [HC, n]
+                ggml_tensor* v = ggml_view_2d(c, mix, HC, n_tok, mix->nb[1], (size_t)which * HC * es);
+                v = ggml_mul(c, v, ggml_view_1d(c, L.d4_hc_scale[k], 1, (size_t)which * ggml_element_size(L.d4_hc_scale[k])));
+                return ggml_add(c, v, ggml_view_1d(c, L.d4_hc_base[k], HC, (size_t)which * HC * ggml_element_size(L.d4_hc_base[k])));
+            };
+            ggml_tensor* pre = ggml_scale_bias(c, ggml_sigmoid(c, lin(0)), 1.0f, hp.d4_hc_eps);
+            *post = ggml_scale(c, ggml_sigmoid(c, lin(1)), 2.0f);
+            *comb = ggml_dsv4_hc_comb(c, mix, L.d4_hc_scale[k], L.d4_hc_base[k], hp.d4_hc_eps, hp.d4_hc_iters);   // [j, k, n]
+            return ggml_dsv4_hc_pre(c, X3, pre);                         // [E, n]
+        }
         ggml_tensor* w = ggml_map_custom3(c, mix, L.d4_hc_base[k], L.d4_hc_scale[k], d4_hc_weights, 1, &hcp);
         g.cpu_ops.push_back(w);
         const size_t es = ggml_element_size(w);
         ggml_tensor* pre = ggml_view_2d(c, w, HC, n_tok, w->nb[1], 0);
         *post = ggml_view_2d(c, w, HC, n_tok, w->nb[1], (size_t)HC * es);
         *comb = ggml_view_3d(c, w, HC, HC, n_tok, (size_t)HC * es, w->nb[1], (size_t)2 * HC * es);   // [j, k, n]
-        ggml_tensor* X3 = ggml_reshape_3d(c, Xs, E, HC, n_tok);
         ggml_tensor* s = nullptr;
         for (int i = 0; i < HC; ++i) {
             ggml_tensor* v = ggml_mul(c, ggml_view_2d(c, X3, E, n_tok, X3->nb[2], (size_t)i * X3->nb[1]),
@@ -3517,6 +3531,7 @@ Model::Graph Model::build_dsv4(int n_tok, int n_past, bool want_routing, int n_l
     };
     auto hc_out = [&](ggml_tensor* Xs, ggml_tensor* y, ggml_tensor* post, ggml_tensor* comb) {
         ggml_tensor* X3 = ggml_reshape_3d(c, Xs, E, HC, n_tok);
+        if (fused) return ggml_reshape_2d(c, ggml_dsv4_hc_post(c, ggml_cont(c, y), X3, post, comb), (int64_t)E * HC, n_tok);
         ggml_tensor* Xt = ggml_cont(c, ggml_permute(c, X3, 1, 0, 2, 3));                 // [HC (k), E, n]
         ggml_tensor* Ck = ggml_cont(c, ggml_permute(c, comb, 1, 0, 2, 3));               // [k, j, n]
         ggml_tensor* R  = ggml_mul_mat(c, Xt, Ck);                                       // [E, j, n]
