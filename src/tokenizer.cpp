@@ -376,8 +376,10 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         }
     } else if (model == "bert") {
         t.kind_ = Kind::Wpm;                          // WordPiece (BERT-style embedding models)
-    } else if (model == "llama") {
-        t.kind_ = Kind::Spm;                          // SentencePiece (Llama 2, Mistral 7B, Mixtral, ...)
+    } else if (model == "llama" || model == "gemma4") {
+        // SentencePiece (Llama 2, Mistral 7B, Mixtral, Gemma 3, ...). Gemma 4's ("gemma4") is the same in Hugging
+        // Face's terms: spaces made "▁", pieces merged in the order of the file's merges list, bytes for the rest.
+        t.kind_ = Kind::Spm;
         t.add_space_prefix_ = bval("tokenizer.ggml.add_space_prefix", true);
     } else {
         gguf_free(g);
