@@ -33,6 +33,12 @@ static constexpr int kGraphSize = 16384;
 
 Model::~Model() {
     release_pending();
+    if (stream_.copy) ggml_backend_synchronize(stream_.copy);
+    for (auto* e : stream_.ev) if (e) ggml_backend_event_free(e);
+    if (stream_.buf) ggml_backend_buffer_free(stream_.buf);
+    if (stream_.zeros) ggml_backend_buffer_free(stream_.zeros);
+    if (stream_.ctx) ggml_free(stream_.ctx);
+    if (stream_.copy) ggml_backend_free(stream_.copy);
     for (auto* b : draft_buf_) ggml_backend_buffer_free(b);
     for (ggml_context* c : draft_ctx_) ggml_free(c);
     drop_plans();
@@ -207,12 +213,6 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         m->device_memory(vfree, vtotal);
         m->cold_offload_min_ = vtotal >= ((size_t)23 << 30) && !m->integrated_gpu() ? 512 : 128;
     }
-    // Whole layers (or all of a layer's experts) in RAM: ggml's CUDA engine hands their work to the GPU from 32 tokens
-    // (GGML_OP_OFFLOAD_MIN_BATCH, read once), copying all of them over every batch. Since 0.9.1 they can be (pinned,
-    // not repacked), so the same size as above, or a short message pays for the copy: gpt-oss-120b, 38 GB of experts
-    // in RAM, read a 34-token message in 0.7 s on the GPU. (Unless it's set.)
-    if (m->main_ != m->cpu_ && !std::getenv("GGML_OP_OFFLOAD_MIN_BATCH"))
-        set_process_env("GGML_OP_OFFLOAD_MIN_BATCH", std::to_string(m->cold_offload_min_));
 
     // ---- read the headers: tensor shapes/types only, no data yet ----
     // A model may be split over several files; part 1 has the settings, every part has some tensors.
@@ -1893,15 +1893,22 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
 
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
     // of the context), so it is not re-planned on every token.
+    m->setup_stream();
+    // Auto prompt batch size: 4,096 when streamed (see setup_stream: the copies then hide behind the work; 2,048
+    // was copy-bound, 8,192's working memory pushed experts out of VRAM)
+    if (opt.batch <= 0 && !m->stream_.layers.empty()) m->batch_ = std::min(4096, std::max(256, m->max_ctx_));
     const int n_res = std::min(m->batch_, m->max_ctx_);
     m->qsa_long_ = m->qsa_gpu_ = !m->qsa_.empty() && m->max_ctx_ % m->qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
+    m->stream_on_ = m->stream_ready(n_res);
+    if (std::getenv("TIERLM_STREAM_DEBUG")) std::fprintf(stderr, "stream: building the worst graph (streamed: %d)\n", (int)m->stream_on_);
     Graph worst = m->hp_.dsv4 ? m->build_dsv4(n_res, m->max_ctx_ - n_res, true, 1, false, nullptr) : m->build(n_res, m->max_ctx_, true);
-    m->qsa_long_ = m->qsa_gpu_ = false;
+    m->qsa_long_ = m->qsa_gpu_ = m->stream_on_ = false;
+    if (std::getenv("TIERLM_STREAM_DEBUG")) std::fprintf(stderr, "stream: worst graph built\n");
     m->pin_cpu_layers(worst);
     bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
     ggml_free(worst.ctx);
     if (!ok) throw std::runtime_error("failed to reserve compute memory");
-    if (!m->gpus_.empty()) m->place_.compute_gpu = ggml_backend_sched_get_buffer_size(m->sched_, m->gpus_[0]);
+    if (!m->gpus_.empty()) m->place_.compute_gpu = ggml_backend_sched_get_buffer_size(m->sched_, m->gpus_[0]) + m->stream_.bytes;
     if (std::getenv("TIERLM_PROFILE") && !m->gpus_.empty())
         std::fprintf(stderr, "profile: working memory for the largest batch: %.0f MB of VRAM\n", m->place_.compute_gpu / 1048576.0);
     // A draft block: schedulers of their own for the check and for the block's one-token step (see Plan), with
@@ -2911,6 +2918,12 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             // the CPU computes just the picks that are in RAM, as it does for a reply's steps.
             static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
             const bool cold_gpu = n_tok >= std::max(offload_batch, cold_offload_min_);
+            // Streamed (see setup_stream): the RAM experts are read from their VRAM slot, filled ahead on another queue
+            const bool streamed = cold_gpu && stream_on_ && L.stream_turn >= 0;
+            ggml_tensor* gu_c = streamed ? L.gate_up_xs : L.gate_up_xc;
+            ggml_tensor* g_c  = streamed ? L.gate_xs : L.gate_xc;
+            ggml_tensor* u_c  = streamed ? L.up_xs : L.up_xc;
+            ggml_tensor* d_c  = streamed ? L.down_xs : L.down_xc;
             ggml_tensor* ids_c  = remap(L.map_cold, L.down_xc, cold_gpu);
             ggml_tensor* ids_h  = remap(L.map_hot, L.down_xh, true);
             if (cold_skip_ > 0.0f && !cold_gpu) {
@@ -2968,13 +2981,14 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                 ggml_build_forward_expand(g.gf, hot);
                 if (L.up_s) { sh_early = shared_expert(); ggml_build_forward_expand(g.gf, sh_early); }
                 xin = h_cpu;
-                cold = experts(L.gate_up_xc, L.gate_xc, L.up_xc, L.down_xc, ids_c, w_cold, L.gate_xb, L.up_xb, L.down_xb, ids_b);
+                cold = experts(gu_c, g_c, u_c, d_c, ids_c, w_cold, L.gate_xb, L.up_xb, L.down_xb, ids_b);
                 xin = h3;
             } else {
-                cold = experts(L.gate_up_xc, L.gate_xc, L.up_xc, L.down_xc, ids_c, w_cold, L.gate_xb, L.up_xb, L.down_xb, ids_b);
+                cold = experts(gu_c, g_c, u_c, d_c, ids_c, w_cold, L.gate_xb, L.up_xb, L.down_xb, ids_b);
                 hot  = experts(L.gate_up_xh, L.gate_xh, L.up_xh, L.down_xh, ids_h, w_hot, L.gate_xbh, L.up_xbh, L.down_xbh, ids_b);
             }
-            if (!cold_gpu && n_tok >= offload_batch) {                      // (the scheduler would hand it to the GPU: keep it on the CPU)
+            if (!cold_gpu) {                                                // (the scheduler may hand it to the GPU: keep it on the CPU,
+                                                                            // whose ids skip the VRAM part's picks with -1)
                 std::set<ggml_tensor*> seen;
                 std::function<void(ggml_tensor*)> pin = [&](ggml_tensor* t) {
                     if (!t || t == ids_c || t == ids_b || t == w_cold || t == h3 || t == xin || t->op == GGML_OP_NONE || !seen.insert(t).second) return;
@@ -2982,6 +2996,11 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                     for (ggml_tensor* src : t->src) pin(src);
                 };
                 pin(cold);
+            }
+            if (streamed) {                                                 // the slot is free once this is done
+                ggml_tensor* mk = cold;
+                while (mk->op == GGML_OP_VIEW || mk->op == GGML_OP_RESHAPE) mk = mk->src[0];
+                g.stream_marks.push_back({mk, L.stream_turn});
             }
             moe = ggml_add(c, cold, hot);                                   // cold first: the graph runs the RAM part, then the VRAM part
             }
@@ -2994,6 +3013,22 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                 g.cpu_ops.push_back(ids);
             }
             moe = experts(L.gate_up_x, L.gate_x, L.up_x, L.down_x, ids, w, L.gate_xb, L.up_xb, L.down_xb);
+            // All of a layer's experts in RAM (not split): ggml's CUDA engine hands their work to the GPU from 32 tokens,
+            // copying all of them over for the batch. Since 0.9.1 it can (pinned, not repacked), so below the same size
+            // as split layers (cold_offload_min_) they stay on the CPU, or a short message pays for the copy:
+            // gpt-oss-120b (38 GB of experts in RAM) took 0.7 s for a 34-token message.
+            const ggml_tensor* wx = L.down_x;
+            const bool in_ram = wx && wx->buffer && ggml_backend_buffer_is_host(wx->buffer) && main_ != cpu_;
+            if (in_ram && n_tok > 1 && n_tok < cold_offload_min_) {
+                std::set<ggml_tensor*> seen;
+                std::function<void(ggml_tensor*)> pin = [&](ggml_tensor* t) {
+                    if (!t || t == ids || t == w || t == h3 || t == xin || t->op == GGML_OP_NONE || !seen.insert(t).second) return;
+                    const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+                    if (!view) g.cpu_ops.push_back(t);
+                    for (ggml_tensor* src : t->src) pin(src);
+                };
+                pin(moe);
+            }
         }
         if (L.lat_up) moe = ggml_mul_mat(c, L.lat_up, moe);                  // back to the model's width
         if (L.up_s) moe = ggml_add(c, moe, sh_early ? sh_early : shared_expert());   // shared expert
@@ -3005,7 +3040,19 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
 // TIERLM_PROFILE=1: every 64 graphs of up to 8 tokens (replies, not prompts), prints where the time per graph
 // went: preparing it, and per device the input copies and the work. Each split is waited for while this is on.
 void Model::profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms, double build_ms, double alloc_ms) {
-    if (n_tok > 8) { ggml_backend_sched_profile(nullptr, nullptr, nullptr, nullptr, nullptr, true); prof_ = {}; return; }
+    if (n_tok > 8) {                                              // a prompt batch: its split times, one line
+        double copy[16] = {}, work[16] = {}; int64_t splits[16] = {}, inputs[16] = {}, graphs = 0;
+        ggml_backend_sched_profile(copy, work, splits, inputs, &graphs, true);
+        if (n_tok > 64) {
+            std::fprintf(stderr, "profile: %d-token batch:", n_tok);
+            for (int b = 0; b < ggml_backend_sched_get_n_backends(sched_) && b < 16; ++b)
+                if (splits[b]) std::fprintf(stderr, " %s copies %.0f ms, work %.0f ms (%lld splits);", ggml_backend_name(ggml_backend_sched_get_backend(sched_, b)),
+                                            copy[b] / 1000, work[b] / 1000, (long long)splits[b]);
+            std::fprintf(stderr, "\n");
+        }
+        prof_ = {};
+        return;
+    }
     prof_.graphs++; prof_.tokens += n_tok; prof_.prep += prep_ms; prof_.compute += compute_ms; prof_.out += out_ms;
     prof_.build += build_ms; prof_.alloc += alloc_ms;
     if (prof_.graphs < 64) return;
@@ -3943,6 +3990,110 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     return out;
 }
 
+// Streamed prompt batches. With a prompt batch big enough for the GPU to do the RAM experts' work (cold_offload_min_),
+// ggml's scheduler copies each split layer's RAM experts over just before the layer, and the card waits for the copy:
+// Flash-Next on the RTX 5090 (30 GB of them, pinned), about 0.9 s of each 2,048- or 4,096-token batch. Here they go
+// into one of two VRAM slots on a second queue of the card instead, the next layer's while this one computes. A
+// layer's slot is filled again (for the layer two on) once its RAM experts' result is made; the card waits for a
+// layer's copy only when it gets there. One CUDA card, layers whose RAM part is pinned (not read from the file).
+// TIERLM_STREAM=0: as before.
+void Model::setup_stream() {
+    if (const char* e = std::getenv("TIERLM_STREAM"); e && !std::strcmp(e, "0")) return;
+    if (gpus_.size() != 1 || main_ == cpu_) return;
+    ggml_backend_dev_t dev = ggml_backend_get_device(gpus_[0]);
+    if (std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) != 0) return;
+    {   // (24 GB cards and up for now: the two slots hold the biggest layer's RAM experts, about 1 GB each for Flash-Next)
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(dev, &fr, &tot);
+        const char* e = std::getenv("TIERLM_STREAM");
+        if (tot < ((size_t)23 << 30) && !(e && !std::strcmp(e, "1"))) return;
+    }
+    ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(dev);
+    if (!host) return;
+    ggml_backend_buffer_type_t vbuft = ggml_backend_get_default_buffer_type(gpus_[0]);
+    auto bytes_of = [&](const ggml_tensor* t) -> size_t { return t ? GGML_PAD(ggml_backend_buft_get_alloc_size(vbuft, t), 256) : 0; };   // (CUDA pads quantized rows)
+    std::vector<int> ls;
+    size_t per = 0;
+    for (int i = 0; i < (int)layers_.size(); ++i) {
+        const Layer& L = layers_[i];
+        if (!L.map_hot || L.cold_mapped || !L.down_xc || !L.down_xc->buffer) continue;
+        if (ggml_backend_buffer_get_type(L.down_xc->buffer) != host) continue;   // (not pinned)
+        ls.push_back(i);
+        per = std::max(per, bytes_of(L.gate_up_xc) + bytes_of(L.gate_xc) + bytes_of(L.up_xc) + bytes_of(L.down_xc));
+    }
+    if (ls.size() < 2) return;
+    static const bool dbg = std::getenv("TIERLM_STREAM_DEBUG") != nullptr;
+    if (dbg) std::fprintf(stderr, "stream: %zu layers, %zu bytes a slot\n", ls.size(), per);
+    Stream& S = stream_;
+    S.copy = ggml_backend_dev_init(dev, nullptr);
+    S.ev[0] = S.copy ? ggml_backend_event_new(dev) : nullptr;
+    S.ev[1] = S.copy ? ggml_backend_event_new(dev) : nullptr;
+    S.buf = S.ev[0] && S.ev[1] ? ggml_backend_buft_alloc_buffer(vbuft, 2 * per) : nullptr;
+    if (!S.buf) {
+        std::fprintf(stderr, "note: long prompts: no second GPU queue or no room for its two slots (%.0f MB); copied as before\n", 2.0 * per / 1048576.0);
+        for (auto*& e : S.ev) { if (e) ggml_backend_event_free(e); e = nullptr; }
+        if (S.copy) ggml_backend_free(S.copy);
+        S.copy = nullptr;
+        return;
+    }
+    if (dbg) std::fprintf(stderr, "stream: queue, events and slots made\n");
+    ggml_init_params ip{ 8 * ls.size() * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
+    S.ctx = ggml_init(ip);
+    char* base = (char*)ggml_backend_buffer_get_base(S.buf);
+    size_t zero_need = 0;
+    for (size_t k = 0; k < ls.size(); ++k) {
+        Layer& L = layers_[ls[k]];
+        L.stream_turn = (int)k;
+        size_t off = (k % 2) * per;
+        S.pads.emplace_back();
+        auto slot = [&](const ggml_tensor* src) -> ggml_tensor* {
+            if (!src) return nullptr;
+            ggml_tensor* t = ggml_dup_tensor(S.ctx, src);
+            ggml_backend_tensor_alloc(S.buf, t, base + off);
+            // CUDA pads a quantized tensor whose rows aren't a multiple of 512 wide and its matrix kernels read the
+            // padding expecting zeros; the two layers sharing a slot lay out differently, so one's padding can hold
+            // the other's weights (read as NaN scales: the reply came out as "!!!!"). Zeroed after each copy.
+            const size_t pad = ggml_backend_buft_get_alloc_size(vbuft, src) - ggml_nbytes(src);
+            if (pad > 0) {
+                ggml_tensor* p = ggml_new_tensor_1d(S.ctx, GGML_TYPE_I8, (int64_t)pad);
+                ggml_backend_tensor_alloc(S.buf, p, (char*)t->data + ggml_nbytes(src));
+                S.pads.back().push_back(p);
+                zero_need = std::max(zero_need, pad);
+            }
+            off += bytes_of(src);
+            return t;
+        };
+        L.gate_up_xs = slot(L.gate_up_xc); L.gate_xs = slot(L.gate_xc); L.up_xs = slot(L.up_xc); L.down_xs = slot(L.down_xc);
+        if (dbg && (k == 0 || k + 1 == ls.size())) std::fprintf(stderr, "stream: layer %d's slot tensors made\n", ls[k]);
+    }
+    if (zero_need) {
+        S.zeros = ggml_backend_buft_alloc_buffer(host, zero_need);
+        if (!S.zeros) { std::fprintf(stderr, "note: long prompts: no pinned memory for the slots' padding; copied as before\n"); return; }
+        ggml_backend_buffer_clear(S.zeros, 0);
+    }
+    S.layers = ls;
+    S.bytes = 2 * per;
+    std::fprintf(stderr, "long prompts: %zu split layers' RAM experts streamed through two %.0f MB VRAM slots\n", ls.size(), per / 1048576.0);
+}
+
+bool Model::stream_ready(int n_tok) const {
+    static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
+    return !stream_.layers.empty() && n_tok >= std::max(offload_batch, cold_offload_min_) &&
+           !std::getenv("TIERLM_OPPROF") && !std::getenv("TIERLM_TRACE");
+}
+
+void Model::stream_send(int turn) {
+    if (turn < 0 || turn >= (int)stream_.layers.size()) return;
+    const Layer& L = layers_[stream_.layers[turn]];
+    const std::pair<ggml_tensor*, ggml_tensor*> parts[4] = { {L.gate_up_xs, L.gate_up_xc}, {L.gate_xs, L.gate_xc},
+                                                             {L.up_xs, L.up_xc}, {L.down_xs, L.down_xc} };
+    for (auto [dst, src] : parts)
+        if (dst && src) ggml_backend_tensor_set_async(stream_.copy, dst, src->data, 0, ggml_nbytes(src));
+    const void* z = stream_.zeros ? ggml_backend_buffer_get_base(stream_.zeros) : nullptr;
+    for (ggml_tensor* p : stream_.pads[turn]) if (z) ggml_backend_tensor_set_async(stream_.copy, p, z, 0, ggml_nbytes(p));
+    ggml_backend_event_record(stream_.ev[turn % 2], stream_.copy);
+}
+
 // Long prompts are processed in batches of batch_ tokens, which bounds the memory a single graph needs.
 std::vector<float> Model::eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing) {
     if (ids.empty()) return {};
@@ -4143,8 +4294,9 @@ void Model::resize_ctx(int new_ctx) {
     // 5. compute memory for the largest graph at the new size
     const int n_res = std::min(batch_, max_ctx_);
     qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
+    stream_on_ = stream_ready(n_res);
     Graph worst = hp_.dsv4 ? build_dsv4(n_res, max_ctx_ - n_res, true, 1, false, nullptr) : build(n_res, max_ctx_, true);
-    qsa_long_ = qsa_gpu_ = false;
+    qsa_long_ = qsa_gpu_ = stream_on_ = false;
     pin_cpu_layers(worst);
     drop_reuse();
     ggml_backend_sched_reset(sched_);
@@ -4361,6 +4513,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     const bool cacheable = reuse_on && n_tok == 1 && !groups && !any_image && snapshots <= 1 && !hp.dsv4;
     // A check of guesses (an undoable step) has a scheduler of its own, where its graph stays placed (see Plan).
     const bool plan = reuse_on && check_.sched && snapshots > 1 && !groups && !any_image && !hp.dsv4;
+    stream_on_ = !plan && !groups && stream_ready(n_tok);
     const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_, qsa_gpu_};
     const bool reuse = plan ? check_.g.ctx && key == check_.key : cacheable && reuse_.ctx && key == reuse_key_;
     ggml_backend_sched* const sc = plan ? check_.sched : sched_;
@@ -4543,7 +4696,35 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             return true;
         }, &op_state);
     }
-    if (ggml_backend_sched_graph_compute(sc, g.gf) != GGML_STATUS_SUCCESS) {
+    // Streamed: the first two streamed layers' RAM experts are sent now; each time a layer's are done with (its mark),
+    // the layer two on is sent into the slot it frees, and the card waits for the next one's before going on.
+    struct StreamCb { Model* m; std::unordered_map<const ggml_tensor*, int> at; };
+    StreamCb scb{this, {}};
+    const bool streaming = stream_on_ && !g.stream_marks.empty() && !opprof && !trace;
+    if (streaming) {
+        for (auto [t, k] : g.stream_marks) scb.at[t] = k;
+        stream_send(0);
+        stream_send(1);
+        ggml_backend_event_wait(gpus_[0], stream_.ev[0]);
+        ggml_backend_sched_set_eval_callback(sc, [](ggml_tensor* t, bool ask, void* ud) -> bool {
+            auto* sb = (StreamCb*)ud;
+            auto it = sb->at.find(t);
+            if (ask) return it != sb->at.end();
+            if (it == sb->at.end()) return true;
+            const int k = it->second;
+            Model* m = sb->m;
+            m->stream_send(k + 2);
+            if (k + 1 < (int)m->stream_.layers.size()) ggml_backend_event_wait(m->gpus_[0], m->stream_.ev[(k + 1) % 2]);
+            return true;
+        }, &scb);
+    }
+    const bool computed = ggml_backend_sched_graph_compute(sc, g.gf) == GGML_STATUS_SUCCESS;
+    if (streaming) {
+        ggml_backend_sched_set_eval_callback(sc, nullptr, nullptr);
+        ggml_backend_synchronize(stream_.copy);
+    }
+    stream_on_ = false;
+    if (!computed) {
         if (plan) drop_plan(check_); else if (reuse) drop_reuse(); else ggml_free(g.ctx);
         throw std::runtime_error("graph compute failed");
     }

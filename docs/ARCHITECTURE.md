@@ -734,6 +734,27 @@ A short message stays on the CPU: ggml's CUDA engine takes whole RAM layers' wor
 card or more, 128 otherwise) unless it's set. The prompt batch size defaults to "auto": 2,048 with pinned RAM weights,
 256 otherwise.
 
+**Streaming the RAM experts.** With the GPU doing a batch's RAM experts, ggml's scheduler copied each split layer's
+RAM experts over just before the layer and the card waited for the copy. Timed batch by batch, Flash-Next's batches
+took about 0.9 s plus 0.28 ms a token: the copy of 30 GB (about 30 GB/s on this PC) was most of a 2,048-token batch.
+Now, on an NVIDIA card of 24 GB or more, the split layers' RAM experts go into one of two VRAM slots (the biggest
+layer's, about 1 GB each) on a second queue of the card, the next layer's while this one computes. A layer's slot is
+filled again for the layer two on once its RAM experts' result is made (an evaluation callback at that point); the card
+waits on an event for a layer's copy only when it gets there. CUDA pads quantized tensors whose rows aren't a multiple
+of 512 wide and its kernels read the padding expecting zeros; two layers share a slot with different layouts, so each
+copy also zeroes its tensors' padding (without that, the reply came out as "!!!!"). Checked by the same 9.5K-token
+prompt answered at temperature 0 with streaming on and off. With the copies hidden, bigger batches pay: the prompt batch
+size's auto setting is 4,096 when streaming.
+
+| Flash-Next UD-IQ3_XXS, 64K context | 2K prompt | 8K | 16K | 32K | reply, 256 tokens | 2,048 tokens | 256 after 35K |
+|---|---|---|---|---|---|---|---|
+| batch 2,048, copied before each layer | 1,357 | 1,447 | 1,482 | 1,452 | 44.4 | 63.4 | 45.8 |
+| batch 4,096, streamed | 1,744 | 1,985 | 2,129 | 2,041 | 47.4 | 67.2 | 47.8 |
+| auto (4,096, streamed), settings as a user has them | 1,705 | 2,077 | 2,260 | 2,201 | 47.9 | 66.8 | 46.8 |
+
+(Replies vary by about ±15% from run to run with the live VRAM experts; the streamed setup keeps 8,478 experts in VRAM
+against 9,529.) Batches of 8,192 were slower (5.5-8 s each): their working memory (6.4 GB) pushed 2,600 experts out of VRAM.
+
 **MXFP4 on Blackwell.** ggml's CUDA engine already multiplies MXFP4 weights by 4-bit activations with the RTX 50-series'
 FP4 tensor cores (built for `120a`, which ggml's build picks for `120`). It is worth little here: the same gpt-oss-120b
 32K prompt with 8-bit activations instead (`GGML_CUDA_MMQ_PREC=q8`) read at 2,057 tok/s against 2,125, because copying

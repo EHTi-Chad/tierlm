@@ -17,6 +17,7 @@ struct ggml_backend;
 struct ggml_backend_buffer;
 struct ggml_backend_buffer_type;
 struct ggml_backend_sched;
+struct ggml_backend_event;
 
 namespace tierlm {
 
@@ -423,6 +424,7 @@ private:
         ggml_tensor* routing = nullptr;          // all of them joined: [n_used, n_tok * n_layer], one read
         std::vector<std::pair<ggml_tensor*, int>> owner;   // every op tensor of each layer, with its layer
         std::vector<ggml_tensor*> cpu_ops;       // small ops that must run on the CPU (hot-expert bookkeeping)
+        std::vector<std::pair<ggml_tensor*, int>> stream_marks;   // streamed prompt batch: each split layer's RAM experts' result, its turn
         // inputs made with the graph (DeepSeek V4: which ring rows and entries each step reads and writes, masks)
         std::vector<std::pair<ggml_tensor*, std::vector<int32_t>>> in_i32;
         std::vector<std::pair<ggml_tensor*, std::vector<float>>> in_f32;
@@ -504,6 +506,8 @@ private:
         // a bias on the router's choice (0 in VRAM, -1e9 not), so the picks are the best of those in VRAM.
         ggml_tensor *map_hot_g = nullptr, *hot_bias_g = nullptr;
         bool cold_mapped = false;                // the RAM part is the file's whole expert tensor (see load: RAM short)
+        int stream_turn = -1;                    // streamed prompt batches: this layer's turn among those streamed (see Stream)
+        ggml_tensor *gate_xs = nullptr, *up_xs = nullptr, *down_xs = nullptr, *gate_up_xs = nullptr;   // its RAM part's VRAM slot
         ggml_tensor *up_s = nullptr, *gate_s = nullptr, *down_s = nullptr, *gate_inp_s = nullptr;   // shared expert
         ggml_tensor *k_cache = nullptr, *v_cache = nullptr;   // [head_dim, n_head_kv, max_ctx]
         // Hybrid models: Gated DeltaNet layer
@@ -669,6 +673,24 @@ private:
     int kv_t_ = 1;                               // ggml_type of the KV cache (GGML_TYPE_F16)
     int batch_ = 256, n_expert_used_file_ = 0;
     int cold_offload_min_ = 32;                  // (see load: when the GPU takes over the RAM experts' work in a batch)
+    // Streamed prompt batches (see setup_stream): the split layers' RAM experts are copied into two VRAM slots on a
+    // second GPU queue, the next layer's while this one computes, instead of by the scheduler before each layer.
+    struct Stream {
+        ggml_backend* copy = nullptr;            // the second queue (another CUDA engine on the same card)
+        ggml_backend_buffer* buf = nullptr;      // the two slots
+        ggml_context* ctx = nullptr;             // the slot tensors, one set per streamed layer (two layers share a slot)
+        ggml_backend_event* ev[2] = {nullptr, nullptr};
+        std::vector<int> layers;                 // the streamed layers, in order (their turns)
+        size_t bytes = 0;                        // both slots
+        std::vector<std::vector<ggml_tensor*>> pads;   // per turn: the CUDA row padding after each slot tensor (zeroed after each copy)
+        ggml_backend_buffer* zeros = nullptr;    // as many zeros as the biggest padding, pinned (a copy from ordinary memory
+                                                 // waits for the queue: the next layer's work then waited for the copies)
+    };
+    Stream stream_;
+    bool stream_on_ = false;                     // this batch is streamed (built with the slots)
+    void setup_stream();
+    bool stream_ready(int n_tok) const;          // a batch this big is streamed
+    void stream_send(int turn);                  // copy that turn's layer into its slot (on the second queue), then mark it
 };
 using OlmoeModel = Model;
 

@@ -382,7 +382,7 @@ requests from the same computer. Elsewhere it returns HTTP 501.
 | `threads` | CPU threads |
 | `flash_attn` | Flash attention on/off |
 | `kv_type` | KV cache precision: `f16` (default), `q8_0` (8-bit, half the memory), `q5_0` (5-bit, a third; since 0.8.7), `q4_0` (4-bit, a quarter, lower quality) or `f32` (exact). 8-bit and below turn on flash attention |
-| `batch` | Tokens per step when reading a prompt: 0 (the default) for auto, 2,048 when the RAM weights are pinned (an NVIDIA card with part of the model in RAM) and 256 otherwise; up to 8,192. With experts split between VRAM and RAM on a 24 GB card or more, 512 and up let the GPU do the RAM experts' work for the batch too (faster for long prompts, at the cost of some VRAM experts for its working memory) |
+| `batch` | Tokens per step when reading a prompt: 0 (the default) for auto: 4,096 when long prompts stream the RAM experts (an NVIDIA card of 24 GB or more with experts split between VRAM and RAM), 2,048 when the RAM weights are pinned, 256 otherwise; up to 8,192. With experts split between VRAM and RAM on a 24 GB card or more, 512 and up let the GPU do the RAM experts' work for the batch too (faster for long prompts, at the cost of some VRAM experts for its working memory) |
 | `experts_used` | Active experts per token for MoE models; 0 keeps the model's own value |
 | `seed` | -1 for random sampling; any other number makes replies repeatable |
 | `speculative` | `true` loads the model's MTP draft layer and uses speculative decoding (when the file, or an `mtp-*.gguf` next to it, has one: `"mtp": true` in `/api/models`) |
