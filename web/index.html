@@ -188,6 +188,9 @@ window.FIT = (() => {
   .chatitem button.open { flex: 1; text-align: left; border: 0; background: transparent; padding: 7px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chatitem button.del { border: 0; background: transparent; color: var(--faint); padding: 4px 8px; }
   .chatitem small { color: var(--faint); }
+  .chatbar { display: flex; align-items: center; gap: 6px; margin-top: 4px; } .chatbar .grow { flex: 1; }
+  .chatitem input.pick { margin: 0 0 0 8px; accent-color: var(--accent); }
+  #chatdelsel:not(:disabled) { color: var(--danger); border-color: var(--danger); }
   .presets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
   .presets .pchip { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; }
   .presets .pchip button { border: 0; background: transparent; padding: 4px 10px; font-size: 12.5px; }
@@ -1031,7 +1034,11 @@ window.FIT = (() => {
     <div class="sec" data-sec="chats">
       <button class="sechead" aria-expanded="false"><span>Chats</span><small id="chatcount"></small></button>
       <div class="secbody">
-        <button class="tiny" id="newchat2">+ New chat</button>
+        <div class="chatbar"><button class="tiny" id="newchat2">+ New chat</button><span class="grow"></span><button class="tiny ghost" id="chatselect" hidden>Select…</button></div>
+        <div class="chatbar" id="chatselbar" hidden>
+          <label class="small"><input type="checkbox" id="chatall"> All</label><span class="grow"></span>
+          <button class="tiny" id="chatdelsel" disabled>Delete</button><button class="tiny ghost" id="chatselcancel">Cancel</button>
+        </div>
         <div id="chatlist"></div>
         <div class="subhead">System prompt presets</div>
         <div id="presets" class="presets"></div>
@@ -3660,15 +3667,52 @@ function ago(t) {
   const m = Math.round((Date.now() - t) / 60000);
   return m < 1 ? "now" : m < 60 ? m + " min" : m < 1440 ? Math.round(m / 60) + " h" : new Date(t).toLocaleDateString();
 }
+// Selecting several chats to delete at once: "Select…" shows a box on each, "All" ticks them all
+var chatSel = null;                              // the ids ticked, while selecting (null: not selecting)
+function chatSelUpdate() {
+  const n = chatSel ? chatSel.size : 0;
+  $("chatdelsel").disabled = !n;
+  $("chatdelsel").textContent = n ? `Delete ${n} chat${n === 1 ? "" : "s"}` : "Delete";
+  $("chatall").checked = n > 0 && n === chats.length;
+  $("chatall").indeterminate = n > 0 && n < chats.length;
+}
+function chatSelMode(on) {
+  chatSel = on ? new Set() : null;
+  $("chatselbar").hidden = !on;
+  renderChats();
+}
+$("chatselect").onclick = () => chatSelMode(true);
+$("chatselcancel").onclick = () => chatSelMode(false);
+$("chatall").onchange = e => { chatSel = new Set(e.target.checked ? chats.map(c => c.id) : []); renderChats(); };
+$("chatdelsel").onclick = async () => {
+  const gone = chats.filter(c => chatSel.has(c.id));
+  if (!gone.length) return;
+  const what = gone.length === 1 ? `"${gone[0].title}"` : `these ${gone.length} chats`;
+  if (!confirm(`Delete ${what}?` + (chatFiles ? " Their folders, chat files and attached files are deleted, and can't be brought back." : ""))) return;
+  chats = chats.filter(c => !chatSel.has(c.id));
+  if (curChat && chatSel.has(curChat.id)) curChat = null;
+  if (chatFiles) for (const c of gone) await chatApi("/api/chats/" + c.id, { method: "DELETE" }).catch(() => {});
+  else LS.set("tierlm.chats", chats);
+  chatSelMode(false);
+};
 function renderChats() {
   const el = $("chatlist"); el.innerHTML = "";
   $("chatcount").textContent = chats.length ? chats.length + " saved" : "";
+  $("chatselect").hidden = chats.length < 2 || !!chatSel;
   for (const c of chats) {
     const row = document.createElement("div");
     row.className = "chatitem" + (c === curChat ? " cur" : "");
     const o = document.createElement("button"); o.className = "open";
     o.innerHTML = `${esc(c.title)} <small>· ${ago(c.updated || c.created)}</small>`;
     o.onclick = () => openChat(c);
+    if (chatSel) {                               // selecting: a box instead of the ✕, and the title ticks it too
+      const box = document.createElement("input"); box.type = "checkbox"; box.className = "pick"; box.checked = chatSel.has(c.id);
+      box.setAttribute("aria-label", "Select " + c.title);
+      const flip = () => { if (chatSel.has(c.id)) chatSel.delete(c.id); else chatSel.add(c.id); box.checked = chatSel.has(c.id); chatSelUpdate(); };
+      box.onchange = flip; o.onclick = flip;
+      row.append(box, o); el.appendChild(row);
+      continue;
+    }
     const d = document.createElement("button"); d.className = "del"; d.textContent = "✕"; d.setAttribute("aria-label", "Delete chat " + c.title);
     d.onclick = () => {
       if (chatFiles && !confirm(`Delete "${c.title}"? Its folder, chat file and attached files are deleted.`)) return;
@@ -3678,6 +3722,7 @@ function renderChats() {
     };
     row.append(o, d); el.appendChild(row);
   }
+  if (chatSel) chatSelUpdate();
 }
 function renderHistory() {
   const box = $("messages");

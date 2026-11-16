@@ -137,6 +137,7 @@ fold the menu away and give the chat more room.
   (for example `C:\tierlm\chats\2026-11-03 Backup plan (mw0rkoej)`), with `chat.md`, the conversation as a
   readable file you can open in Notepad, VS Code or Obsidian, and the files you attached. **Open the chats folder**
   shows them in Explorer. (Opened from another device, the page keeps its chats in that browser instead.)
+  **Select…** deletes several at once: tick them (or **All**), then **Delete**.
 - **Benchmark**: **Open the full benchmark** opens a page of its own (`/bench`) that tests the loaded model on this
   PC, in under a minute for a model all in VRAM to 10 minutes or more for a big one mostly in RAM: prompt reading
   at 512 to 32K tokens (from scratch, and again with the prompt cached), the time to the first word, writing speed
