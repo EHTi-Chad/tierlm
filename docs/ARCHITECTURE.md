@@ -683,6 +683,42 @@ off by default there). The difference: theirs starts empty and fills from what's
 tierlm learned about the model, adds a fading score with a swap margin, and trades places with the expert leaving
 so nothing is held twice.
 
+## Long prompts with experts in RAM (0.9.1)
+
+Measured with Qwen3.8 Flash-Next UD-IQ3_XXS on the RTX 5090 + Ryzen 9 9950X3D (64 GB DDR5-6000, Windows 11), 64K
+context, 30 GB of experts in RAM, the Benchmark page's prompts. Three things held prompt reading at 460-550 tok/s
+whatever the length:
+
+- **Flash-Next's sparse attention (QSA) was chosen on the CPU.** Past its budget (2,048 tokens) each query scores every
+  4-token block of the conversation with the indexer and keeps the best 512; that ran on the CPU in all 12 indexed
+  layers, for every token of every batch, so each batch was slower than the one before (2K of a 32K prompt took 1.9 s
+  at the start, 5 s at the end). Now the graph does it on the GPU: each indexed layer keeps its raw indexer keys in
+  VRAM (16-bit, 3 KB a token for the 12 layers, counted with the context memory), makes the block keys (mean, norm,
+  rotation), scores them (ReLU, summed over the indexer's heads), picks the best with `top_k`, and turns the pick into
+  the attention mask: the causal mask, seen as [4, blocks, tokens], gets -inf on the blocks left out. One
+  conversation whose cells are its positions, text only; otherwise (several conversations, images) the CPU's way, which
+  `TIERLM_QSA_CPU=1` also forces. Checked against Hugging Face's own Flash-Next past the budget (`tests/tiny_flashnext.py`,
+  qsa cases: the same logits to 2e-5). Replies after a long context gain too: 256 tokens after 35K of context, 36-40 tok/s
+  before, 55 after.
+- **The split experts' bookkeeping looked up the whole ranking.** Which part (VRAM or RAM) holds each pick, and where,
+  was looked up on the CPU for all 512 experts of each token's ranking, then the top 10 used: now only the 10.
+- **RAM weights in ordinary memory.** With a prompt batch of 512 or more, the GPU copies a layer's RAM experts over and
+  does their work for the batch; from ordinary memory that copy runs at about 10 GB/s (3 s a 2,048-token batch). They now
+  go in pinned memory when the GPU is CUDA and RAM has room (`TIERLM_PIN_WEIGHTS`), which also made the model load
+  faster (50 s instead of 114) and the live VRAM experts' moves cheaper.
+
+Prompt reading, tok/s (each run loads the model fresh; the live VRAM experts make runs vary by about 10%):
+
+| Prompt | before, batch 256 | 0.9.1, batch 256 | 0.9.1, batch 2,048 |
+|---|---|---|---|
+| 2K | 548 | 892 | 1,204 |
+| 8K | 523 | 890 | 1,209 |
+| 16K | 507 | 900 | 1,191 |
+| 32K | 460 | 854 | 1,105 |
+
+A batch of 2,048 needs about 1.3 GB more working memory in VRAM (10,226 VRAM experts instead of 10,854). Batches of
+4,096 were no faster per token (3.4 s each): the copy is no longer what limits it.
+
 ## Several conversations at once
 
 With `LoadOptions::parallel` > 1 the model holds several conversations and `eval_seqs` advances any of them in one

@@ -216,6 +216,7 @@ struct EvalStats {
 // Where the tier loader put things.
 struct Placement {
     uint64_t gpu_weights = 0, cpu_weights = 0;   // bytes of weights in VRAM and in system RAM
+    uint64_t pinned_weights = 0;                 // of cpu_weights, in pinned memory (see load)
     bool kv_on_gpu = false;                      // the whole KV cache is in VRAM
     int kv_gpu_layers = 0;                       // layers whose KV cache is in VRAM
     std::string mode;                            // split mode used
@@ -411,6 +412,7 @@ private:
         ggml_tensor *out_idx = nullptr;          // several conversations: the tokens whose logits are wanted
         ggml_tensor *ngram = nullptr;            // Flash-Next: each token's n-gram rows in the PLE table [heads * n_tok]
         std::vector<std::pair<int, ggml_tensor*>> qsa_k;   // QSA: per indexed layer, this batch's indexer keys
+        ggml_tensor *qsa_bpos = nullptr, *qsa_nb = nullptr;   // QSA on the GPU: each block's first position; each token's complete blocks
         int n_tok = 0;
         // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
@@ -484,6 +486,7 @@ private:
         ggml_tensor *ple_norm_conv = nullptr, *ple_conv = nullptr;
         std::vector<ggml_tensor*> ple_states;
         ggml_tensor *idx_q = nullptr, *idx_k = nullptr, *idx_q_norm = nullptr, *idx_k_norm = nullptr;   // QSA indexer
+        ggml_tensor *qsa_kc = nullptr;           // QSA: every position's raw indexer key, by cache cell [qsa_dim, ctx] f16
         int qsa = -1;                            // its entry in qsa_
         bool swa = false;                                                     // sliding-window layer
         ggml_tensor *ffn_norm = nullptr;
@@ -591,6 +594,10 @@ private:
     std::vector<QsaCall> qsa_calls_;            // the mask-making op's userdata, one per indexed layer
     QsaBatch qsa_batch_;
     bool qsa_long_ = false;                      // this step has a query past the budget: build the sparse masks
+    bool qsa_kc_ok_ = true;                      // qsa_kc holds every position's key (false after a restore until qsa_upload)
+    bool qsa_gpu_ = false;                       // ... made by the graph (on the layer's device), not on the CPU (see qsa_mask_gpu)
+    ggml_tensor* qsa_mask_gpu(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* kc, ggml_tensor* qr, ggml_tensor* mask, int n_tok);
+    void qsa_upload();                           // the CPU's copy of conversation 0's indexer keys into qsa_kc (after a restore)
     std::vector<Layer> layers_;
     std::unique_ptr<Layer> mtp_;                 // the MTP draft block, when loaded
     std::vector<bool> layer_kv_gpu_;             // per layer: KV cache in VRAM
@@ -602,10 +609,10 @@ private:
     // a reply's one-token graph, kept to run again (see step)
     struct ReuseKey {
         int n_kv = 0; bool routing = false; int n_logits = 0; bool qsa_long = false; bool hidden = false;
-        int n_tok = 1, snapshots = 1; bool hot_only = false;
+        int n_tok = 1, snapshots = 1; bool hot_only = false, qsa_gpu = false;
         bool operator==(const ReuseKey& o) const {
             return n_kv == o.n_kv && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden &&
-                   n_tok == o.n_tok && snapshots == o.snapshots && hot_only == o.hot_only;
+                   n_tok == o.n_tok && snapshots == o.snapshots && hot_only == o.hot_only && qsa_gpu == o.qsa_gpu;
         }
     };
     Graph reuse_;

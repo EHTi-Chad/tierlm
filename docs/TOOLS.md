@@ -258,6 +258,9 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_LIVE_MB=32` / `TIERLM_LIVE_PER_LAYER=2` | Live hot experts: most MB moved per step (both ways), most swaps per layer per step |
 | `TIERLM_LIVE_PROMPT_MS=250` / `TIERLM_LIVE_PROMPT_HIT=0.62` | Live hot experts: the longest burst of moves after a prompt batch the VRAM experts served poorly (0: never), and the share of the batch's picks served from VRAM under which it starts (full length 17 points lower) |
 | `TIERLM_LIVE_TRACE=1` | Live hot experts: prints, for each prompt batch, the share of its picks the VRAM experts served and what was moved |
+| `TIERLM_PIN_WEIGHTS=0` / `=1` | The weights kept in RAM go in pinned (page-locked) memory when the GPU is NVIDIA (CUDA) and RAM has 8 GB to spare beyond them: the GPU copies them over at full PCIe speed for long prompts and live VRAM experts (Flash-Next on the RTX 5090: about 10 GB/s from ordinary memory). `0`: never; `1`: whenever there's a CUDA GPU |
+| `TIERLM_QSA_CPU=1` | Flash-Next: make the sparse attention's masks on the CPU, as before 0.9.1, instead of on the GPU (to compare; the GPU's are the same choice from 16-bit copies of the indexer's keys) |
+| `TIERLM_PROFILE_PROMPT=1` | One line per prompt batch of more than 64 tokens: its size and position, and the time to build, place, fill and compute it (`prompt batch:` lines) |
 | `TIERLM_COLD_OFFLOAD_MIN=n` | Experts split between VRAM and RAM: the prompt batch size from which the GPU does the RAM experts' work too, copying them over for the batch (default 512 on a 24 GB card or more, 128 otherwise; ggml's rule, and tierlm's before 0.8.7, is 32) |
 | `TIERLM_LIVE_MARGIN=1.3` | Live hot experts: how much more an expert in RAM must be wanted than one in VRAM to replace it (times its score, + 0.5) |
 | `TIERLM_LIVE_SYNC=1` | Live hot experts: wait for each copy instead of queuing them all on the GPU (for comparison) |

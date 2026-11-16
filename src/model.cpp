@@ -127,7 +127,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     std::unique_ptr<Model> m(new Model());
     const std::string& device = opt.device;
     const int max_ctx = opt.max_ctx;
-    m->batch_ = opt.batch > 0 ? std::min(opt.batch, 2048) : 256;
+    m->batch_ = opt.batch > 0 ? std::min(opt.batch, 8192) : 256;
 
     // ---- pick the device ----
     load_backends();
@@ -712,8 +712,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             }
             return b;
         }
-        // keys and values; MLA keeps one compressed vector per token, which is both
-        return (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, (int64_t)hp.head_dim * hp.n_head_kv) * (size_t)m->max_ctx_;
+        // keys and values; MLA keeps one compressed vector per token, which is both. QSA layers: the indexer's keys too
+        const bool qsa = hp.qsa_budget > 0 && il < (int)hp.qsa_ratio.size() && hp.qsa_ratio[il] > 0;
+        return (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, (int64_t)hp.head_dim * hp.n_head_kv) * (size_t)m->max_ctx_ +
+               (qsa ? (size_t)hp.qsa_dim * 2 * (size_t)m->max_ctx_ : 0);
     };
     size_t kv_need = 0;
     for (int il = 0; il < nl_all; ++il) kv_need += layer_mem(il);
@@ -1184,6 +1186,29 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             m->place_.gpus[d].name = ggml_backend_dev_name(ggml_backend_get_device(m->gpus_[d]));
             alloc(bufts[d], on_dev[d], m->place_.gpus[d].weights);
             m->place_.gpu_weights += m->place_.gpus[d].weights;
+        }
+        // The weights in RAM in pinned (page-locked) memory, from the first GPU's engine when that's CUDA: the GPU
+        // copies them over at full PCIe speed for a long prompt (ggml's op offload) and for the live VRAM experts.
+        // From ordinary memory the driver goes through a staging copy: about 10 GB/s on the RTX 5090 (a 2,048-token
+        // batch of Flash-Next spent 3 s copying its 28 GB of RAM experts). Only with room to spare (pinned memory can't
+        // be paged out: Windows needs what's left), and ggml falls back to ordinary memory if pinning fails.
+        // TIERLM_PIN_WEIGHTS=0: never, =1: whenever there's a CUDA GPU.
+        {
+            const char* e = std::getenv("TIERLM_PIN_WEIGHTS");
+            ggml_backend_dev_t gd = G > 0 ? ggml_backend_get_device(m->gpus_[0]) : nullptr;
+            const bool cuda = gd && std::strncmp(ggml_backend_dev_name(gd), "CUDA", 4) == 0;
+            const bool room = m->place_.ram_free >= m->place_.ram_need + ((uint64_t)8 << 30);
+            const bool want = e ? std::strcmp(e, "0") != 0 && cuda : cuda && room && !on_cpu.empty() && !m->integrated_gpu();
+            ggml_backend_buffer_type_t pin = want ? ggml_backend_dev_host_buffer_type(gd) : nullptr;
+            if (pin) {
+                const size_t before = m->place_.cpu_weights;
+                alloc(pin, on_cpu, m->place_.cpu_weights);
+                m->place_.pinned_weights = m->wbufs_.empty() || !ggml_backend_buffer_is_host(m->wbufs_.back()) ||
+                    std::strcmp(ggml_backend_buffer_name(m->wbufs_.back()), ggml_backend_buft_name(pin)) != 0 ? 0 : m->place_.cpu_weights - before;
+                std::fprintf(stderr, "RAM: %.1f GB of weights %s\n", (m->place_.cpu_weights - before) / 1e9,
+                                 m->place_.pinned_weights ? "pinned" : "in ordinary memory (pinning failed)");
+                on_cpu.clear();
+            }
         }
         alloc(cpu_buft, on_cpu, m->place_.cpu_weights);
         if (!on_repack.empty()) alloc(repack_buft, on_repack, m->place_.cpu_weights);
@@ -1856,7 +1881,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
     // of the context), so it is not re-planned on every token.
     const int n_res = std::min(m->batch_, m->max_ctx_);
+    m->qsa_long_ = m->qsa_gpu_ = !m->qsa_.empty() && m->max_ctx_ % m->qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
     Graph worst = m->hp_.dsv4 ? m->build_dsv4(n_res, m->max_ctx_ - n_res, true, 1, false, nullptr) : m->build(n_res, m->max_ctx_, true);
+    m->qsa_long_ = m->qsa_gpu_ = false;
     m->pin_cpu_layers(worst);
     bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
     ggml_free(worst.ctx);
@@ -2207,6 +2234,7 @@ void Model::restore(const Snapshot& s) {
     if (!qsa_.empty()) {
         if (s.qsa.size() != qsa_.size()) throw std::runtime_error("saved conversation doesn't match this model");
         for (size_t i = 0; i < qsa_.size(); ++i) { qsa_[i].keys[0] = s.qsa[i]; qsa_[i].blocks[0].clear(); }   // (made again after the next step)
+        qsa_upload();                                             // and the GPU's copy
     }
     const auto runs = runs_of(seq_cells_[0]);
     const std::vector<std::pair<int, int>> by_pos(s.n_past ? 1 : 0, {0, s.n_past});
@@ -2471,6 +2499,52 @@ void Model::qsa_mask(const QsaLayer& Q, const ggml_tensor* mask, const ggml_tens
     }
 }
 
+// QSA's mask made by the graph, on the layer's device: the same choice as qsa_mask (above), for one conversation whose
+// cells are its positions. Each complete block's key from the cache of raw keys kc (mean of its R tokens' keys, normed,
+// rotated to its first position), every query's score for every block (sum over the indexer's heads of relu(q . key),
+// / sqrt(dim)), the budget / R best of the blocks each query can see kept, the rest of them masked out: the causal
+// mask, seen as [R, blocks, tokens], gets -inf where a block is left out. Blocks a query can't see yet (or not all of
+// them: the last, unfinished one) are left as the causal mask has them. Raw keys are kept as f16 (the CPU keeps f32):
+// near-ties can rank differently. Ties (scores of exactly 0, all heads below zero) are broken differently from the
+// CPU's sort too; both keep budget / R of them.
+ggml_tensor* Model::qsa_mask_gpu(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* kc, ggml_tensor* qr, ggml_tensor* mask, int n_tok) {
+    const Hparams& hp = hp_;
+    const int D = hp.qsa_dim, NH = hp.qsa_heads, R = qsa_[L.qsa].ratio, top = hp.qsa_budget / R;
+    const int64_t nbt = g.qsa_bpos->ne[0];                                // blocks the mask covers: n_kv / R
+    // the blocks' keys [D, 1, nbt]
+    ggml_tensor* raw = ggml_cast(c, ggml_view_2d(c, kc, D, nbt * R, kc->nb[1], 0), GGML_TYPE_F32);
+    raw = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, raw, D, R, nbt), 1, 0, 2, 3));   // [R, D, nbt]
+    ggml_tensor* bk = ggml_reshape_2d(c, ggml_mean(c, raw), D, nbt);
+    bk = ggml_mul(c, ggml_rms_norm(c, bk, hp.rms_eps), L.idx_k_norm);
+    bk = ggml_rope_ext(c, ggml_reshape_3d(c, bk, D, 1, nbt), g.qsa_bpos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, hp.n_ctx,
+                       hp.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    bk = ggml_reshape_2d(c, bk, D, nbt);
+    // the queries' heads [D, NH, n_tok], normed and rotated
+    ggml_tensor* q = ggml_mul(c, ggml_rms_norm(c, ggml_reshape_3d(c, qr, D, NH, n_tok), hp.rms_eps), L.idx_q_norm);
+    q = ggml_rope_ext(c, q, g.pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    // scores [nbt, n_tok], head by head (all heads at once would hold nbt x NH x n_tok numbers)
+    ggml_tensor* sc = nullptr;
+    for (int hh = 0; hh < NH; ++hh) {
+        ggml_tensor* qh = ggml_cont(c, ggml_view_2d(c, q, D, n_tok, q->nb[2], (size_t)hh * q->nb[1]));
+        ggml_tensor* s = ggml_relu(c, ggml_mul_mat(c, bk, qh));
+        sc = sc ? ggml_add(c, sc, s) : s;
+    }
+    sc = ggml_scale(c, sc, 1.0f / std::sqrt((float)D));
+    // which blocks each query can see whole: block b < (pos + 1) / R
+    ggml_tensor* bi  = ggml_reshape_2d(c, ggml_arange(c, 0.0f, (float)nbt, 1.0f), nbt, 1);
+    ggml_tensor* vis = ggml_step(c, ggml_scale_bias(c, ggml_sub(c, ggml_add(c, ggml_scale(c, sc, 0.0f), g.qsa_nb), bi), 1.0f, -0.5f));
+    // the best `top` of those (blocks it can't see score -1e30: never picked while any it can see is left)
+    ggml_tensor* idx = ggml_top_k(c, ggml_add(c, sc, ggml_scale_bias(c, vis, 1e30f, -1e30f)), top);   // [top, n_tok]
+    ggml_tensor* zero = ggml_reshape_3d(c, ggml_scale(c, ggml_cont(c, ggml_view_2d(c, sc, top, n_tok, sc->nb[1], 0)), 0.0f), 1, top, n_tok);
+    ggml_tensor* sel = ggml_reshape_3d(c, ggml_scale_bias(c, sc, 0.0f, -1e9f), 1, nbt, n_tok);
+    sel = ggml_reshape_2d(c, ggml_set_rows(c, sel, zero, idx), nbt, n_tok);   // 0: picked, -1e9: not
+    // -1e9 only where a block it can see whole wasn't picked: min(0, sel + (1 - vis) * 2e9)
+    ggml_tensor* bm = ggml_neg(c, ggml_relu(c, ggml_neg(c, ggml_add(c, sel, ggml_scale_bias(c, vis, -2e9f, 2e9f)))));
+    bm = ggml_cast(c, ggml_reshape_3d(c, bm, 1, nbt, n_tok), GGML_TYPE_F16);   // (-1e9 becomes -inf)
+    ggml_tensor* m3 = ggml_add(c, ggml_reshape_3d(c, mask, R, nbt, n_tok), bm);   // each block's R positions
+    return ggml_reshape_2d(c, m3, mask->ne[0], mask->ne[1]);
+}
+
 ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past) {
     if (hp_.mla) return attn_mla(c, g, L, h, n_tok, n_past);
     const Hparams& hp = hp_;
@@ -2534,10 +2608,16 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
             ggml_set_output(kr);
             ggml_build_forward_expand(g.gf, kr);
             g.qsa_k.push_back({L.qsa, kr});
+            // ... and in the layer's own cache of them, by cell (where the GPU makes the masks from)
+            ggml_tensor* kc = L.qsa_kc ? ggml_set_rows(c, L.qsa_kc, kr, where) : nullptr;
+            if (kc) ggml_build_forward_expand(g.gf, kc);
             if (qsa_long_) {
                 ggml_tensor* qr = ggml_mul_mat(c, L.idx_q, h);               // [qsa_heads * qsa_dim, n_tok]
-                mask = ggml_map_custom3(c, mask, qr, kr, qsa_op, GGML_N_TASKS_MAX, (void*)&qsa_calls_[L.qsa]);
-                g.cpu_ops.push_back(mask);
+                if (g.qsa_bpos && kc) mask = qsa_mask_gpu(c, g, L, kc, qr, mask, n_tok);
+                else {
+                    mask = ggml_map_custom3(c, mask, qr, kr, qsa_op, GGML_N_TASKS_MAX, (void*)&qsa_calls_[L.qsa]);
+                    g.cpu_ops.push_back(mask);
+                }
             }
         }
         if (flash_attn_) {
@@ -2774,10 +2854,13 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             // Hot-expert split: each pick is computed by the part that holds it (VRAM or RAM); in the other part it
             // goes to the all-zero expert with weight 0, so it adds nothing. The sum is the same as unsplit.
             // Looked up for the whole ranking (contiguous), then the top n_used rows are used, like sel.
-            ggml_tensor* order1 = ggml_reshape_1d(c, order, (int64_t)NE * n_tok);
-            auto lookup = [&](ggml_tensor* map) {                            // [n_used, n_tok] view of map[order]
-                ggml_tensor* all = ggml_reshape_2d(c, ggml_get_rows(c, map, order1), NE, n_tok);
-                return ggml_view_2d(c, all, NU, n_tok, all->nb[1], 0);
+            // Only the chosen experts are looked up (until 0.9.1 the whole ranking was, NE rows a token: 512 for
+            // Flash-Next, on the CPU in every layer; at 2,048-token batches that was most of a long prompt's time).
+            ggml_tensor* sel_c = ggml_cont(c, sel);
+            g.cpu_ops.push_back(sel_c);
+            ggml_tensor* sel1 = ggml_reshape_1d(c, sel_c, (int64_t)NU * n_tok);
+            auto lookup = [&](ggml_tensor* map) {                            // [n_used, n_tok]: map[sel]
+                return ggml_reshape_2d(c, ggml_get_rows(c, map, sel1), NU, n_tok);
             };
             // Made contiguous on the CPU before they go anywhere: a strided view copied to the GPU as an input
             // gave CUDA bad ids (an illegal memory access on an RTX 3070).
@@ -2976,6 +3059,11 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     if (ple_embd_) {                                                       // Flash-Next: the n-gram rows of every token
         g.ngram = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t)hp.ngram.heads() * n_tok);
         ggml_set_input(g.ngram);
+    }
+    if (qsa_long_ && qsa_gpu_) {                                           // QSA's masks on the GPU (see qsa_mask_gpu)
+        const int R = qsa_[0].ratio;
+        g.qsa_bpos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_kv / R);       ggml_set_input(g.qsa_bpos);
+        g.qsa_nb   = ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, n_tok);       ggml_set_input(g.qsa_nb);
     }
     const float scale = 1.0f / std::sqrt((float)hd);
 
@@ -3920,6 +4008,10 @@ void Model::make_kv(int ctx, int n_seq) {
         if (hp.mla) { L.v_cache = nullptr; continue; }               // MLA: the values are part of the one cache
         L.v_cache = ggml_new_tensor_3d(kvctx_, kv_type, hd, hp.n_head_kv, ctx);
         dst.push_back(L.v_cache);
+        if (L.idx_k) {                                               // QSA: the indexer's raw keys, for the GPU's masks
+            L.qsa_kc = ggml_new_tensor_2d(kvctx_, GGML_TYPE_F16, hp.qsa_dim, ctx);
+            dst.push_back(L.qsa_kc);
+        }
     }
     kv_bytes_ = 0;
     for (auto& g : place_.gpus) g.kv = 0;
@@ -3945,7 +4037,7 @@ size_t Model::kv_bytes_per_token(size_t* in_vram) const {
             const int r = hp_.d4_ratio_at(i);
             b = (L.d4_ce->nb[1] + (L.d4_ie ? L.d4_ie->nb[1] : 0) + r - 1) / r;
         } else if (L.recurrent || !L.k_cache) continue;
-        else b = L.k_cache->nb[2] + (L.v_cache ? L.v_cache->nb[2] : 0);
+        else b = L.k_cache->nb[2] + (L.v_cache ? L.v_cache->nb[2] : 0) + (L.qsa_kc ? L.qsa_kc->nb[1] : 0);
         all += b;
         if (layer_dev_[i] >= 0) vram += b;
     }
@@ -4037,13 +4129,29 @@ void Model::resize_ctx(int new_ctx) {
     free_lo_ = std::min(free_lo_, max_ctx_);
     // 5. compute memory for the largest graph at the new size
     const int n_res = std::min(batch_, max_ctx_);
+    qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
     Graph worst = hp_.dsv4 ? build_dsv4(n_res, max_ctx_ - n_res, true, 1, false, nullptr) : build(n_res, max_ctx_, true);
+    qsa_long_ = qsa_gpu_ = false;
     pin_cpu_layers(worst);
     drop_reuse();
     ggml_backend_sched_reset(sched_);
     const bool ok = ggml_backend_sched_reserve(sched_, worst.gf);
     ggml_free(worst.ctx);
     if (!ok) throw std::runtime_error("failed to reserve compute memory for the new context");
+    qsa_upload();                                                 // (the new cache starts empty)
+}
+
+void Model::qsa_upload() {
+    qsa_kc_ok_ = true;
+    for (const Layer& L : layers_) {
+        if (!L.qsa_kc || L.qsa < 0) continue;
+        const std::vector<float>& k = qsa_[L.qsa].keys.empty() ? std::vector<float>() : qsa_[L.qsa].keys[0];
+        const int64_t D = L.qsa_kc->ne[0], n = std::min<int64_t>((int64_t)k.size() / D, L.qsa_kc->ne[1]);
+        if (n <= 0) continue;
+        std::vector<ggml_fp16_t> h((size_t)(n * D));
+        ggml_fp32_to_fp16_row(k.data(), h.data(), n * D);
+        ggml_backend_tensor_set(L.qsa_kc, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+    }
 }
 
 void Model::release_pending() {
@@ -4209,6 +4317,26 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             qsa_batch_.at[{tok_seq[t], tok_pos[t]}] = t;
             if ((tok_pos[t] + 1) / rmin > hp.qsa_budget / rmin) qsa_long_ = true;
         }
+        // The masks on the GPU (qsa_mask_gpu) for one conversation whose cells are its positions, when every indexed
+        // layer has the same ratio, the cache span is whole blocks and the GPU's keys are all there (qsa_kc_ok_).
+        // Images (3-part positions) and several conversations: on the CPU. TIERLM_QSA_CPU=1: always on the CPU.
+        static const bool qsa_cpu = std::getenv("TIERLM_QSA_CPU") && std::strcmp(std::getenv("TIERLM_QSA_CPU"), "0") != 0;
+        qsa_gpu_ = false;
+        if (qsa_long_ && !qsa_cpu && qsa_kc_ok_ && !any_image && !groups) {
+            const int R = qsa_[0].ratio;
+            bool ok = n_kv % R == 0;
+            for (const QsaLayer& Q : qsa_) ok = ok && Q.ratio == R;
+            for (const Layer& L : layers_) if (L.idx_k && !L.qsa_kc) ok = false;
+            for (int t = 0; ok && t < n_tok; ++t) ok = tok_seq[t] == 0 && cells[t] == tok_pos[t];
+            if (ok && !seq_cells_.empty()) {
+                const auto& sc = seq_cells_[0];
+                const size_t n = std::min(sc.size(), (size_t)tok_pos[0]);
+                for (size_t q = 0; q < n; ++q) if (sc[q] != (int)q) { ok = false; break; }
+            }
+            qsa_gpu_ = ok;
+            static bool told = false;
+            if (!told) { told = true; std::fprintf(stderr, "QSA: sparse-attention masks made %s\n", ok ? "by the GPU" : "on the CPU"); }
+        }
     }
     // Replies, one token at a time, make the same graph over and over: positions, cache cells and masks are inputs,
     // and the cache span grows in steps of 256. So it is built, placed and allocated once and then run again, until
@@ -4220,7 +4348,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     const bool cacheable = reuse_on && n_tok == 1 && !groups && !any_image && snapshots <= 1 && !hp.dsv4;
     // A check of guesses (an undoable step) has a scheduler of its own, where its graph stays placed (see Plan).
     const bool plan = reuse_on && check_.sched && snapshots > 1 && !groups && !any_image && !hp.dsv4;
-    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_};
+    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_, qsa_gpu_};
     const bool reuse = plan ? check_.g.ctx && key == check_.key : cacheable && reuse_.ctx && key == reuse_key_;
     ggml_backend_sched* const sc = plan ? check_.sched : sched_;
     Graph built;
@@ -4306,6 +4434,21 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         if (g.pos->buffer) ggml_backend_tensor_set(g.pos, pos.data(), 0, sizeof(int32_t) * pos.size());
     }
     if (g.cells->buffer) ggml_backend_tensor_set(g.cells, cells.data(), 0, sizeof(int32_t) * n_tok);
+    if (g.qsa_bpos) {                                             // QSA on the GPU: blocks' first positions, tokens' whole blocks
+        const int R = qsa_[0].ratio, nbt = (int)g.qsa_bpos->ne[0];
+        std::vector<int32_t> bp(nbt, 0);
+        const auto& sr = seq_rope_.empty() ? std::vector<std::array<int, 3>>() : seq_rope_[0];
+        for (int b = 0; b < nbt; ++b) {
+            const int q = b * R;
+            if (q < (int)sr.size() && q < tok_pos[0]) bp[b] = sr[q][0];
+            else if (q >= tok_pos[0] && q - tok_pos[0] < n_tok) bp[b] = rope[q - tok_pos[0]][0];
+            else bp[b] = q;                                         // (not written yet: can't be seen)
+        }
+        std::vector<float> nb(n_tok);
+        for (int t = 0; t < n_tok; ++t) nb[t] = (float)((tok_pos[t] + 1) / R);
+        if (g.qsa_bpos->buffer) ggml_backend_tensor_set(g.qsa_bpos, bp.data(), 0, sizeof(int32_t) * nbt);
+        if (g.qsa_nb->buffer) ggml_backend_tensor_set(g.qsa_nb, nb.data(), 0, sizeof(float) * n_tok);
+    }
     if (g.zero_id && g.zero_id->buffer) { const int32_t z = 0; ggml_backend_tensor_set(g.zero_id, &z, 0, sizeof z); }
     if (g.ngram) {                                                 // Flash-Next: each token's n-gram rows
         const int NH = hp.ngram.heads();
@@ -4483,6 +4626,10 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         }
     n_past_ = seq_past(0);
     if (std::getenv("TIERLM_PROFILE")) profile_step(n_tok, ms(t0, t3), ms(t3, t4), ms(t4, t5), ms(t0, t1), ms(t1, t2));
+    if (n_tok > 64 && std::getenv("TIERLM_PROFILE_PROMPT"))       // a prompt's batches, one line each
+        std::fprintf(stderr, "prompt batch: %d tokens at %d: build %.0f, alloc %.0f, inputs %.0f, compute %.0f, after %.0f ms "
+                     "(%d splits, %d copies)\n", n_tok, n_past_ - n_tok, ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, t5),
+                     stats_.splits, stats_.copies);
     return res;
 }
 
