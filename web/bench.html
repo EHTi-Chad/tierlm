@@ -72,8 +72,8 @@
     <h2>Benchmark this model on this PC</h2>
     <p class="sub">Speed (reading a prompt, writing a reply, with an empty and a filled context, guessing ahead on and off) and a
       short fixed set of 30 questions from public benchmarks, the same every time: maths, knowledge, code and following
-      instructions. Answers are at temperature 0 with thinking off. It uses the loaded model and its settings, and usually
-      takes 5 to 10 minutes. Chats wait while it runs.</p>
+      instructions. Answers are at temperature 0 with thinking off. It uses the loaded model and its settings, and takes
+      from under a minute (a model all in VRAM) to 10 minutes or more (a big model mostly in RAM). Chats wait while it runs.</p>
     <div class="picks" id="picks">
       <label><input type="checkbox" value="speed" checked> Speed <small>2-3 min</small></label>
       <label><input type="checkbox" value="gsm8k" checked> Maths <small>10, GSM8K</small></label>
@@ -375,6 +375,7 @@ function show(R) {
     out.push(stat("Writing, empty context", S.gen_empty ? S.gen_empty.tps.toFixed(1) : "-", "tok/s", S.gen_empty ? `${S.gen_empty.tokens} tokens` : ""));
     out.push(stat("Writing, filled context", S.gen_deep ? S.gen_deep.tps.toFixed(1) : "-", "tok/s", S.gen_deep ? `after ${S.gen_deep.depth.toLocaleString()} tokens` : ""));
     if (S.spec) out.push(stat(`Code, guessing ahead (${S.spec.guesses})`, S.spec.on.tps.toFixed(1), "tok/s", `without: ${S.spec.off.tps.toFixed(1)} tok/s`));
+    else out.push(stat("Guessing ahead", "–", "", "not available as loaded (no draft layer, or every expert in VRAM)"));
   }
   $("rspeed").innerHTML = out.join("") || `<div class="note">Not measured in this run.</div>`;
   const A = R.acc || {}, sc = [];
