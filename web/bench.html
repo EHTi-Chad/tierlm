@@ -315,7 +315,10 @@ async function accuracy(R, which) {
   const ask = async (cat, label, prompt, max, grade, extra = {}) => {
     const d = log(label);
     let r, ans = "", ok = false, got = "";
-    try { r = await chat(prompt, { max_tokens: max }); ans = answerOf(r.text); [ok, got] = await grade(ans); }
+    try {
+      r = await chat(prompt, { max_tokens: max }); ans = answerOf(r.text); [ok, got] = await grade(ans);
+      if (!ok && r.stop === "length") got += `; the answer was cut off at ${max} tokens`;
+    }
     catch (e) { if (stopping) throw e; got = "error: " + e.message; }
     A[cat] = A[cat] || { right: 0, of: 0 }; A[cat].of++; if (ok) A[cat].right++;
     detail.push({ cat, label, prompt, answer: ans, got: String(got), ok, ...extra });
@@ -336,7 +339,7 @@ async function accuracy(R, which) {
       async a => { const res = await runJS(codeOf(a), p.name, p.tests); const passed = res.filter(x => x === true).length;
         return [passed === p.tests.length, typeof res[0] === "string" ? res[0] : `${passed}/${p.tests.length} tests passed`]; });
   if (which.includes("ifeval")) for (const [i, p] of D.ifeval.entries())
-    await ask("instructions", `Instructions ${i + 1}/5 (${p.check.replace("_", " ")})`, p.prompt, 768,
+    await ask("instructions", `Instructions ${i + 1}/5 (${p.check.replace("_", " ")})`, p.prompt, 2048,
       async a => { const ok = !!IF_CHECK[p.check](a, p.kwargs || {}); return [ok, ok ? "followed" : "not followed"]; });
 }
 
