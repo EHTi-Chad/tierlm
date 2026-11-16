@@ -2,7 +2,7 @@
 
 This guide gets you from nothing to chatting with a model in your browser. No programming needed.
 
-tierlm is an early-stage project: it runs the most common model families (Llama, Mistral, Qwen up to Qwen3.8,
+tierlm is an early-stage project: it runs the most common model families (Llama, Mistral, Qwen up to Qwen3.8, Gemma 3 and 4,
 OLMoE) but not yet everything on Hugging Face. See [Supported models](#supported-models) before downloading anything.
 
 ## What you need
@@ -350,7 +350,9 @@ tierlm reads the architecture from the file. The setup screen marks each model a
 | DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash | Early (since 0.9.0). Model math checked against Hugging Face's own code (hyper-connections, sliding-window and compressed attention with its indexer, hash-routed first layers), on the CPU and on CUDA; tested on Unsloth's real UD-IQ3_XXS (about 96 GB) on an RTX 5090 with 64 GB RAM and the SSD tier: 9.6 to 10.8 tok/s in chats. Tool calls in its own format aren't read yet |
 | Qwen3.8 Flash-Next | `qwen4exp` | Qwen3.8-Flash-Next (512 experts, 10 active) | Model math checked against Hugging Face's own code, including its hyper-connections, the n-gram embedding on layer 1 and its sparse attention past 2,048 tokens, and against llama.cpp; tested on the real model (Q4_K_M, 120 GB): 37 tok/s on an RTX 5090 with 64 GB RAM and the SSD tier. Its draft file (Unsloth's `mtp-...-shared-Q8_0.gguf`, in the same folder) is used for speculative decoding since 0.8.5: UD-IQ3_XXS on the same PC at 84 tok/s with 4 guesses (62 without). Text only for now (its vision file isn't used yet). Its 35 GB n-gram table is the first thing the SSD tier moves to the SSD; the rows each step needs are asked for all at once |
 | NVIDIA Nemotron 3.5 (Mamba-2, LatentMoE) | `nemotron_h_moe` | Nemotron-3.5-Bolt-74B-A9B | Tested: Bolt 74B-A9B on an RTX 5090, all in VRAM and with its experts in RAM; images not yet |
-| Gemma, Phi, GLM, ... | various | | Not yet |
+| Gemma 3 (text) | `gemma3` | gemma-3-1b-it ... gemma-3-27b-it | New in 0.9.1. Model math checked against Hugging Face's own code (sliding-window layers with their own RoPE base, scaled full layers, GELU, the norms after attention and after the MLP); real-model test pending. Images not yet (its vision file isn't read) |
+| Gemma 4 (text) | `gemma4` | gemma-4-E2B-it, gemma-4-E4B-it, gemma-4-26B-A4B-it, gemma-4-31B-it | New in 0.9.1. Model math checked against Hugging Face's own code (wider full-attention heads with keys reused as values and proportional RoPE, the later layers reading an earlier layer's cache, per-layer inputs, the 26B's MLP-beside-experts block), and its chat format with thinking on or off; real-model test pending. Images and audio not yet; tool calls go through tierlm's own format, not Gemma 4's |
+| Phi, GLM, MiniMax, ... | various | | Not yet |
 
 A `mmproj-*.gguf` file next to a model is its **vision file**: tierlm loads it with the model so it can read
 images (Qwen3.5 / 3.6; see [Reading images](#reading-images)). Checked against Hugging Face's code; tested with Qwen3.5-9B on an RTX 3070 laptop.

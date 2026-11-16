@@ -22,7 +22,7 @@
 
 namespace tierlm {
 
-static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint", "deepseek2", "qwen4exp", "nemotron_h_moe", "deepseek4" };
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint", "deepseek2", "qwen4exp", "nemotron_h_moe", "deepseek4", "gemma3", "gemma4" };
 bool arch_supported(const std::string& arch) {
     for (const char* a : kArchs) if (arch == a) return true;
     return false;
@@ -373,6 +373,72 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = pattern <= 0 || i % pattern < pattern - 1;
         }
     }
+    if (arch == "gemma3") {
+        // Gemma 3: every sixth layer (5, 11, ...) attends to everything, the others to the last n_swa tokens (unless the
+        // file lists the layers). The sliding ones rotate positions with base 10,000, the full ones with the file's base
+        // and its linear scaling. Attention scale 1/sqrt(query_pre_attn_scalar), which Hugging Face's configs set to
+        // the head size, except the 27B's (n_embd / n_head). The file's norm weights already include Gemma's + 1.
+        hp.gemma = true;
+        hp.rope_neox = true;
+        hp.qk_norm = Hparams::kPerHead;
+        hp.gelu_ffn = true;
+        hp.embd_scale = std::sqrt((float)hp.n_embd);
+        hp.rope_base_swa = f32(arch + ".rope.freq_base_swa", 10000.0f);
+        hp.n_swa = u32(arch + ".attention.sliding_window", false);
+        hp.swa.assign(hp.n_layer, false);
+        const int64_t pid = gguf_find_key(g, (arch + ".attention.sliding_window_pattern").c_str());
+        if (pid >= 0 && gguf_get_kv_type(g, pid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, pid) == GGUF_TYPE_BOOL) {
+            const bool* d = (const bool*)gguf_get_arr_data(g, pid);
+            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, pid); ++i) hp.swa[i] = d[i];
+        } else {
+            const int pattern = pid >= 0 ? (int)u32(arch + ".attention.sliding_window_pattern", false) : 6;
+            for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = pattern > 0 && (i + 1) % pattern != 0;
+        }
+        hp.kq_scale = f32(arch + ".attention.scale", 0.0f);
+        if (hp.kq_scale <= 0) hp.kq_scale = 1.0f / std::sqrt((float)(hp.n_layer == 62 ? hp.n_embd / hp.n_head : hp.head_dim));
+        hp.final_softcap = f32(arch + ".final_logit_softcapping", 0.0f);
+        hp.attn_softcap = f32(arch + ".attn_logit_softcapping", 0.0f);
+    }
+    if (arch == "gemma4") {
+        // Gemma 4 (text): see Hparams::gemma4. Unlike Gemma 3, the file's norm weights are used as they are.
+        hp.gemma = hp.gemma4 = true;
+        hp.rope_neox = true;
+        hp.qk_norm = Hparams::kPerHead;
+        hp.gelu_ffn = true;
+        hp.embd_scale = std::sqrt((float)hp.n_embd);
+        hp.kq_scale = 1.0f;
+        hp.rope_base_swa = f32(arch + ".rope.freq_base_swa", 10000.0f);
+        hp.n_swa = u32(arch + ".attention.sliding_window", false);
+        hp.swa.assign(hp.n_layer, false);
+        {
+            const int64_t pid = gguf_find_key(g, (arch + ".attention.sliding_window_pattern").c_str());
+            if (pid >= 0 && gguf_get_kv_type(g, pid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, pid) == GGUF_TYPE_BOOL) {
+                const bool* d = (const bool*)gguf_get_arr_data(g, pid);
+                for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, pid); ++i) hp.swa[i] = d[i];
+            } else
+                for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = (i + 1) % 6 != 0 && i != hp.n_layer - 1;   // (Hugging Face's default)
+        }
+        const int hd_full = (int)u32(arch + ".attention.key_length", true);
+        const int hd_swa = gguf_find_key(g, (arch + ".attention.key_length_swa").c_str()) >= 0 ? (int)u32(arch + ".attention.key_length_swa", false) : hd_full;
+        const int rot_full = gguf_find_key(g, (arch + ".rope.dimension_count").c_str()) >= 0 ? (int)u32(arch + ".rope.dimension_count", false) : hd_full;
+        const int rot_swa = gguf_find_key(g, (arch + ".rope.dimension_count_swa").c_str()) >= 0 ? (int)u32(arch + ".rope.dimension_count_swa", false) : hd_swa;
+        const std::vector<int> kvh = per_layer(arch + ".attention.head_count_kv", hp.n_layer);
+        hp.hd_l.resize(hp.n_layer); hp.kvh_l.resize(hp.n_layer); hp.rot_l.resize(hp.n_layer);
+        for (int i = 0; i < hp.n_layer; ++i) {
+            hp.hd_l[i] = hp.swa[i] ? hd_swa : hd_full;
+            hp.rot_l[i] = hp.swa[i] ? rot_swa : rot_full;
+            hp.kvh_l[i] = kvh[i] > 0 ? kvh[i] : hp.n_head_kv;
+        }
+        hp.head_dim = std::max(hd_full, hd_swa);
+        const int shared = (int)u32(arch + ".attention.shared_kv_layers", false);
+        if (shared > 0) {
+            hp.kv_from = hp.n_layer - shared;
+            if (hp.kv_from < 2) { gguf_free(g); throw std::runtime_error("Gemma 4: too many layers share an earlier one's cache"); }
+        }
+        hp.g4_ple = (int)u32(arch + ".embedding_length_per_layer_input", false);
+        hp.final_softcap = f32(arch + ".final_logit_softcapping", 0.0f);
+        hp.expert_renorm = true;                                  // (softmax over all, the top ones renormalised)
+    }
     if (arch == "flint") {
         // Flint (Recursive): experts scored by a sigmoid, the top ones' scores renormalised; the first layers dense;
         // sliding-window layers (with attention sinks, as gpt-oss) and full-attention layers, and only the sliding
@@ -719,8 +785,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             return b;
         }
         // keys and values; MLA keeps one compressed vector per token, which is both. QSA layers: the indexer's keys too
+        if (il < hp.n_layer && hp.kv_src(il) >= 0) return 0;          // (Gemma 4: an earlier layer's cache)
         const bool qsa = hp.qsa_budget > 0 && il < (int)hp.qsa_ratio.size() && hp.qsa_ratio[il] > 0;
-        return (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, (int64_t)hp.head_dim * hp.n_head_kv) * (size_t)m->max_ctx_ +
+        const int64_t width = il < hp.n_layer ? (int64_t)hp.hd_at(il) * hp.kvh_at(il) : (int64_t)hp.head_dim * hp.n_head_kv;
+        return (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, width) * (size_t)m->max_ctx_ +
                (qsa ? (size_t)hp.qsa_dim * 2 * (size_t)m->max_ctx_ : 0);
     };
     size_t kv_need = 0;
@@ -1578,7 +1646,13 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         m->d4_out_fn_ = T("output_hc_fn.weight"); m->d4_out_base_ = T("output_hc_base.weight"); m->d4_out_scale_ = T("output_hc_scale.weight");
     }
     m->output_     = T("output.weight", false);
-    m->rope_freqs_ = T("rope_freqs.weight", false);   // Llama 3.1+ long-context frequency factors
+    m->rope_freqs_ = T("rope_freqs.weight", false);   // Llama 3.1+ long-context frequency factors (Gemma 4: proportional RoPE)
+    if (hp.gemma4 && hp.g4_ple > 0) {
+        m->g4_ple_tok_ = T("per_layer_token_embd.weight");
+        m->g4_ple_proj_ = T("per_layer_model_proj.weight");
+        m->g4_ple_norm_ = T("per_layer_proj_norm.weight");
+        if (m->g4_ple_tok_->ne[1] < m->tok_embd_->ne[1]) throw std::runtime_error("Gemma 4: the per-layer embedding covers fewer tokens than the vocabulary");
+    }
     if (!m->output_) m->output_ = m->tok_embd_;      // tied embeddings
     hp.n_vocab = (int)m->tok_embd_->ne[1];
 
@@ -1729,21 +1803,37 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                 L.idx_q_norm = T(b + "indexer.q_norm.weight"); L.idx_k_norm = T(b + "indexer.k_norm.weight");
             }
             L.wq        = T(b + "attn_q.weight");
-            L.wk        = T(b + "attn_k.weight");
-            L.wv        = T(b + "attn_v.weight");
+            L.wk        = T(b + "attn_k.weight", !hp.gemma4);           // (Gemma 4: none where the cache is shared,
+            L.wv        = T(b + "attn_v.weight", !hp.gemma4);           //  no value projection on full layers)
             L.wo        = T(b + "attn_output.weight");
             L.bq        = T(b + "attn_q.bias", hp.qkv_bias);
             L.bk        = T(b + "attn_k.bias", hp.qkv_bias);
             L.bv        = T(b + "attn_v.bias", hp.qkv_bias);
             if (hp.qk_norm != Hparams::kNone) {
                 L.q_norm = T(b + "attn_q_norm.weight");
-                L.k_norm = T(b + "attn_k_norm.weight");
+                L.k_norm = T(b + "attn_k_norm.weight", !hp.gemma4 || L.wk);
             }
+            if (hp.gemma4 && hp.kv_src(i) < 0 && !L.wk) throw std::runtime_error("Gemma 4: layer " + std::to_string(i) + " has no key projection");
             L.bo    = T(b + "attn_output.bias", false);
             L.sinks = T(b + "attn_sinks.weight", false);
             L.swa   = hp.is_swa(i);
         }
         L.ffn_norm  = T(b + "ffn_norm.weight", false);                 // called post_attention_norm in some families
+        if (hp.gemma) {                                                // (Gemma: post_attention_norm is on attention's output)
+            L.attn_post_norm = T(b + "post_attention_norm.weight");
+            L.ffn_post_norm  = T(b + "post_ffw_norm.weight");
+        }
+        if (hp.gemma4) {
+            L.out_scale = T(b + "layer_output_scale.weight", false);
+            if (hp.g4_ple > 0) { L.ple_gate = T(b + "inp_gate.weight"); L.ple_proj = T(b + "proj.weight"); L.ple_post = T(b + "post_norm.weight"); }
+            if (hp.is_moe()) {                                         // the dense MLP beside the experts, and both paths' norms
+                L.gate = T(b + "ffn_gate.weight"); L.up = T(b + "ffn_up.weight"); L.down = T(b + "ffn_down.weight");
+                L.ffn_pre_norm2 = T(b + "pre_ffw_norm_2.weight");
+                L.ffn_post_norm1 = T(b + "post_ffw_norm_1.weight"); L.ffn_post_norm2 = T(b + "post_ffw_norm_2.weight");
+                L.router_scale = T(b + "ffn_gate_inp.scale");
+                L.exp_scale = T(b + "ffn_down_exps.scale", false);
+            }
+        }
         if (!L.ffn_norm) L.ffn_norm = T(b + "post_attention_norm.weight", hp.hc == 0);
         if (i < (int)hp.rope_layer.size()) L.rope = hp.rope_layer[i];
         if (hp.is_moe() && i >= hp.n_dense_lead) {
@@ -2220,7 +2310,7 @@ Model::Snapshot Model::save() const {
     auto layer = [&](const Layer& L, bool mtp) {
         if (L.conv_state) { grab(L.conv_state, ggml_nbytes(L.conv_state)); grab(L.ssm_state_t, ggml_nbytes(L.ssm_state_t)); }
         if (!L.ple_states.empty()) grab(L.ple_states[0], ggml_nbytes(L.ple_states[0]));
-        if (L.k_cache) { grab_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) grab_rows(L.v_cache, mtp ? by_pos : runs); }
+        if (L.k_cache && (mtp || hp_.kv_src(L.index) < 0)) { grab_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) grab_rows(L.v_cache, mtp ? by_pos : runs); }
         if (L.d4_win) {                                           // DeepSeek V4: its rings whole, the entries made so far
             const int m = hp_.d4_ratio_at(L.index);
             grab(L.d4_win, ggml_nbytes(L.d4_win));
@@ -2276,7 +2366,7 @@ void Model::restore(const Snapshot& s) {
     auto layer = [&](const Layer& L, bool mtp) {
         if (L.conv_state) { put(L.conv_state); put(L.ssm_state_t); }
         if (!L.ple_states.empty()) put(L.ple_states[0]);
-        if (L.k_cache) { put_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) put_rows(L.v_cache, mtp ? by_pos : runs); }
+        if (L.k_cache && (mtp || hp_.kv_src(L.index) < 0)) { put_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) put_rows(L.v_cache, mtp ? by_pos : runs); }
         if (L.d4_win) {
             put(L.d4_win);
             for (ggml_tensor* t : {L.d4_c_rkv, L.d4_c_rgate, L.d4_i_rkv, L.d4_i_rgate, L.d4_ce, L.d4_ie}) if (t) put(t);
@@ -2565,11 +2655,58 @@ ggml_tensor* Model::qsa_mask_gpu(ggml_context* c, Graph& g, const Layer& L, ggml
     return ggml_reshape_2d(c, m3, mask->ne[0], mask->ne[1]);
 }
 
+// Gemma 4's attention (see Hparams::gemma4): the layer's own head size and key/value heads; q and k normed per head
+// (weights), v normed without one; a full layer without a value projection uses its key's projection (before the
+// norm); sliding layers rotate with rope_base_swa, full ones with rope_base and the file's frequency factors
+// (rope_freqs: proportional RoPE, rotating only the first part of each head); attention scale 1. A layer past
+// kv_from reads the cache of the last earlier layer of its kind and writes none.
+ggml_tensor* Model::attn_gemma4(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past) {
+    const Hparams& hp = hp_;
+    const int il = L.index, hd = hp.hd_at(il), kvh = hp.kvh_at(il), nrot = hp.rot_at(il), n_kv = kv_span(n_past + n_tok);
+    const bool swa = L.swa;
+    const float base = swa ? hp.rope_base_swa : hp.rope_base, rscale = swa ? 1.0f : hp.rope_scale;
+    ggml_tensor* ff = swa ? nullptr : rope_freqs_;
+    auto rope = [&](ggml_tensor* t) {
+        return ggml_rope_ext(c, t, g.pos, ff, nrot, GGML_ROPE_TYPE_NEOX, hp.n_ctx, base, rscale, 0.0f, 1.0f, 32.0f, 1.0f);
+    };
+    ggml_tensor* q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, hp.n_head, n_tok);
+    q = rope(ggml_mul(c, ggml_rms_norm(c, q, hp.rms_eps), L.q_norm));
+    if (hp.kv_src(il) < 0) {                                              // this layer's keys and values, into its cache
+        ggml_tensor* kr = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, kvh, n_tok);
+        ggml_tensor* v = L.wv ? ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, kvh, n_tok) : kr;
+        ggml_tensor* k = rope(ggml_mul(c, ggml_rms_norm(c, kr, hp.rms_eps), L.k_norm));
+        v = ggml_rms_norm(c, v, hp.rms_eps);
+        ggml_tensor* where = g.cells ? g.cells : g.pos;
+        ggml_build_forward_expand(g.gf, ggml_set_rows(c, ggml_reshape_2d(c, L.k_cache, (int64_t)hd * kvh, L.k_cache->ne[2]),
+                                                      ggml_reshape_2d(c, k, (int64_t)hd * kvh, n_tok), where));
+        ggml_build_forward_expand(g.gf, ggml_set_rows(c, ggml_reshape_2d(c, L.v_cache, (int64_t)hd * kvh, L.v_cache->ne[2]),
+                                                      ggml_reshape_2d(c, v, (int64_t)hd * kvh, n_tok), where));
+    }
+    ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, kvh, n_kv, L.k_cache->nb[1], L.k_cache->nb[2], 0);
+    ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, kvh, n_kv, L.v_cache->nb[1], L.v_cache->nb[2], 0);
+    ggml_tensor* Q = ggml_permute(c, q, 0, 2, 1, 3);                     // [hd, n_tok, n_head]
+    ggml_tensor* K = ggml_permute(c, kall, 0, 2, 1, 3);                  // [hd, n_kv, kvh]
+    ggml_tensor* mask = swa ? g.mask_swa : g.mask;
+    ggml_tensor* o;
+    if (flash_attn_) {
+        o = ggml_flash_attn_ext(c, Q, K, ggml_permute(c, vall, 0, 2, 1, 3), mask, 1.0f, 0.0f, 0.0f);   // [hd, n_head, n_tok]
+    } else {
+        ggml_tensor* kq = ggml_soft_max_ext(c, ggml_mul_mat(c, K, Q), mask, 1.0f, 0.0f);   // [n_kv, n_tok, n_head]
+        o = ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3)), kq);           // [hd, n_tok, n_head]
+        o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));
+    }
+    return ggml_mul_mat(c, L.wo, ggml_reshape_2d(c, o, (int64_t)hd * hp.n_head, n_tok));
+}
+
 ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past) {
     if (hp_.mla) return attn_mla(c, g, L, h, n_tok, n_past);
+    if (hp_.gemma4) return attn_gemma4(c, g, L, h, n_tok, n_past);
     const Hparams& hp = hp_;
     const int hd = hp.head_dim, n_kv = kv_span(n_past + n_tok);     // padded: see kv_span
-    const float scale = 1.0f / std::sqrt((float)hd);
+    const float scale = hp.kq_scale > 0 ? hp.kq_scale : 1.0f / std::sqrt((float)hd);
+    // (Gemma: the sliding-window layers rotate positions with their own base, unscaled)
+    const bool own_base = hp.rope_base_swa > 0 && L.swa;
+    const float rbase = own_base ? hp.rope_base_swa : hp.rope_base, rscale = own_base ? 1.0f : hp.rope_scale;
         // Qwen3.5's attention layers project each head's query together with an output gate: [q | gate]
         ggml_tensor* qg = hp.gated_attn ? ggml_mul_mat(c, L.wq, h) : nullptr;    // [2*hd*n_head, n_tok]
         ggml_tensor* q = qg ? ggml_view_3d(c, qg, hd, hp.n_head, n_tok, 2 * hd * ggml_element_size(qg),
@@ -2597,8 +2734,8 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
                 q = ggml_rope_multi(c, q, g.pos, ff, hp.n_rot, sec, GGML_ROPE_TYPE_IMROPE, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
                 k = ggml_rope_multi(c, k, g.pos, ff, hp.n_rot, sec, GGML_ROPE_TYPE_IMROPE, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
             } else {
-                q = ggml_rope_ext(c, q, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
-                k = ggml_rope_ext(c, k, g.pos, ff, hp.n_rot, mode, hp.n_ctx, hp.rope_base, hp.rope_scale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+                q = ggml_rope_ext(c, q, g.pos, ff, hp.n_rot, mode, hp.n_ctx, rbase, rscale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+                k = ggml_rope_ext(c, k, g.pos, ff, hp.n_rot, mode, hp.n_ctx, rbase, rscale, 0.0f, hp.rope_attn_factor, 32.0f, 1.0f);
             }
         }
 
@@ -2642,15 +2779,20 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
         }
         if (flash_attn_) {
             ggml_tensor* V = ggml_permute(c, vall, 0, 2, 1, 3);              // [hd, n_kv, n_head_kv], no copy
-            o = ggml_flash_attn_ext(c, Q, K, V, mask, scale, 0.0f, 0.0f);    // [hd, n_head, n_tok]
+            o = ggml_flash_attn_ext(c, Q, K, V, mask, scale, 0.0f, hp.attn_softcap);   // [hd, n_head, n_tok]
             if (L.sinks) ggml_flash_attn_ext_add_sinks(o, L.sinks);          // gpt-oss: one more score per head, never attended to
         } else {
             ggml_tensor* kq = ggml_mul_mat(c, K, Q);                         // [n_kv, n_tok, n_head]
+            float sm_scale = scale;
+            if (hp.attn_softcap > 0) {                                       // cap tanh(scale qk / cap), then softmax
+                kq = ggml_scale(c, ggml_tanh(c, ggml_scale(c, kq, scale / hp.attn_softcap)), hp.attn_softcap);
+                sm_scale = 1.0f;
+            }
             if (mask) {
-                kq = ggml_soft_max_ext(c, kq, mask, scale, 0.0f);            // mask: causal (and window)
+                kq = ggml_soft_max_ext(c, kq, mask, sm_scale, 0.0f);         // mask: causal (and window)
                 if (L.sinks) ggml_soft_max_add_sinks(kq, L.sinks);
             } else {
-                kq = ggml_scale(c, kq, scale);
+                kq = ggml_scale(c, kq, sm_scale);
                 kq = ggml_diag_mask_inf(c, kq, n_past);                      // causal: no peeking ahead
                 kq = ggml_soft_max(c, kq);
             }
@@ -2755,18 +2897,20 @@ static void prefetch_experts(ggml_tensor* dst, const ggml_tensor* a, int ith, in
     }
 }
 
-ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing) {
+ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing,
+                              ggml_tensor* router_in) {
     const Hparams& hp = hp_;
         if (!L.router) {
             // ---- dense SwiGLU feed-forward (dense models, and Flint's first layers) ----
             // one SwiGLU step (not silu, then multiply): the GPU then does both multiplies and it in one kernel
-            ggml_tensor* act = ggml_swiglu_split(c, ggml_mul_mat(c, L.gate, h), ggml_mul_mat(c, L.up, h));
+            ggml_tensor* act = hp.gelu_ffn ? ggml_geglu_split(c, ggml_mul_mat(c, L.gate, h), ggml_mul_mat(c, L.up, h))   // (Gemma)
+                                           : ggml_swiglu_split(c, ggml_mul_mat(c, L.gate, h), ggml_mul_mat(c, L.up, h));
             return ggml_mul_mat(c, L.down, act);
         }
         // ---- mixture of experts ----
         // (Nemotron: each block has its own number of experts and of experts per token)
         const int NE = hp.n_expert_at(L.index), NU = hp.n_used_at(L.index);
-        ggml_tensor* scores = ggml_mul_mat(c, L.router, h);                 // [n_expert, n_tok]
+        ggml_tensor* scores = ggml_mul_mat(c, L.router, router_in ? router_in : h);   // [n_expert, n_tok]
         if (L.router_b) scores = ggml_add(c, scores, L.router_b);
         // Most families: softmax over all experts, then the top ones' probabilities. gpt-oss: the top scores, then
         // softmax over just those (same top experts either way: softmax keeps the order).
@@ -2813,6 +2957,9 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             w = ggml_reshape_3d(c, w2, 1, NU, n_tok);
         }
         if (hp.expert_scale != 0.0f && hp.expert_scale != 1.0f) w = ggml_scale(c, w, hp.expert_scale);
+        if (L.exp_scale)                                                     // Gemma 4: each expert's own scale
+            w = ggml_mul(c, w, ggml_reshape_3d(c, ggml_get_rows(c, ggml_reshape_2d(c, L.exp_scale, 1, NE),
+                                                                ggml_reshape_1d(c, ggml_cont(c, sel), (int64_t)NU * n_tok)), 1, NU, n_tok));
         // LatentMoE (Nemotron): the experts read and write a narrower width, between a down and an up projection;
         // the router above and the shared expert below work at the model's.
         ggml_tensor* hx    = L.lat_down ? ggml_mul_mat(c, L.lat_down, h) : h;
@@ -2845,6 +2992,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             ggml_tensor* act  = hp.expert_relu2 ? ggml_sqr(c, ggml_relu(c, up))
                               : hp.swiglu_oai ? ggml_swiglu_oai(c, gate_up_x ? ggml_cont(c, gate) : gate,
                                                                 gate_up_x ? ggml_cont(c, up) : up, 1.702f, 7.0f)
+                              : hp.gelu_ffn ? ggml_geglu_split(c, gate, up)                          // (Gemma 4)
                               : ggml_swiglu_split(c, gate, up);   // one step (gate_up: on the two halves in place)
             ggml_tensor* down = ggml_mul_mat_id(c, down_x, act, ids);        // [n_embd, n_used, n_tok]
             if (down_b) down = ggml_add_id(c, down, down_b, bias_ids);
@@ -3128,6 +3276,17 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     const float scale = 1.0f / std::sqrt((float)hd);
 
     ggml_tensor* x = ggml_get_rows(c, tok_embd_, g.inp);                   // [n_embd, n_tok]
+    if (hp.embd_scale > 0) x = ggml_scale(c, x, hp.embd_scale);           // (Gemma)
+    // Gemma 4 E2B/E4B: per-layer inputs [ple, n_layer, n_tok]: each token's own rows of a table (scaled by sqrt(ple)),
+    // plus a projection of the (scaled) embedding (by 1/sqrt(width), then normed), the two added and scaled by 1/sqrt(2)
+    ggml_tensor* g4_pl = nullptr;
+    if (g4_ple_tok_) {
+        const int P = hp.g4_ple, NL = hp.n_layer;
+        ggml_tensor* pe = ggml_scale(c, ggml_get_rows(c, g4_ple_tok_, g.inp), std::sqrt((float)P));     // [P NL, n]
+        ggml_tensor* pr = ggml_scale(c, ggml_mul_mat(c, g4_ple_proj_, x), 1.0f / std::sqrt((float)hp.n_embd));
+        pr = ggml_mul(c, ggml_rms_norm(c, ggml_reshape_3d(c, pr, P, NL, n_tok), hp.rms_eps), g4_ple_norm_);
+        g4_pl = ggml_scale(c, ggml_add(c, pr, ggml_reshape_3d(c, pe, P, NL, n_tok)), 1.0f / std::sqrt(2.0f));
+    }
     if (g.img) x = ggml_add(c, ggml_mul(c, x, g.keep), g.img);             // images' words in place of their tokens
     // ---- Flash-Next's hyper-connections (Hugging Face's Qwen4ExpTextGatedResidual) ----
     // The residual stream is HC copies of the width, [HC * E, n_tok], starting as HC copies of the embedding. Before
@@ -3460,13 +3619,36 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
             }
             add_back(tr(ggml_mul_mat(c, L.ssm_out, on), "attn_out", li));
         } else {
-            add_back(tr(attn_block(c, g, L, h, n_tok, n_past), "attn_out", li));
+            ggml_tensor* ao = attn_block(c, g, L, h, n_tok, n_past);
+            if (L.attn_post_norm) ao = ggml_mul(c, ggml_rms_norm(c, ao, hp.rms_eps), L.attn_post_norm);   // (Gemma)
+            add_back(tr(ao, "attn_out", li));
         }
         tr(x, "res_attn", li);
 
         h = HC ? hc_mix(x, L.hc_f_norm, L.hc_f_down, L.hc_f_up, L.hc_f_inj, &inj) : ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.ffn_norm);
         tr(h, "mix_ffn", li); tr(inj, "inj_ffn", li);
-        add_back(tr(ffn_block(c, g, L, h, n_tok, want_routing), "ffn_out", li));
+        ggml_tensor* fo;
+        if (hp.gemma4 && L.router) {
+            // Gemma 4's 26B A4B: the dense MLP on the usual input, and beside it the experts, on the residual stream
+            // normed their own way (the router reads it normed without weight, scaled by its own weights and by
+            // 1/sqrt(width)); each path normed, then added
+            ggml_tensor* xn = ggml_rms_norm(c, x, hp.rms_eps);
+            ggml_tensor* mlp = ggml_mul_mat(c, L.down, ggml_geglu_split(c, ggml_mul_mat(c, L.gate, h), ggml_mul_mat(c, L.up, h)));
+            mlp = ggml_mul(c, ggml_rms_norm(c, mlp, hp.rms_eps), L.ffn_post_norm1);
+            ggml_tensor* rin = ggml_scale(c, ggml_mul(c, xn, L.router_scale), 1.0f / std::sqrt((float)hp.n_embd));
+            ggml_tensor* moe = ffn_block(c, g, L, ggml_mul(c, xn, L.ffn_pre_norm2), n_tok, want_routing, rin);
+            moe = ggml_mul(c, ggml_rms_norm(c, moe, hp.rms_eps), L.ffn_post_norm2);
+            fo = ggml_add(c, mlp, moe);
+        } else fo = ffn_block(c, g, L, h, n_tok, want_routing);
+        if (L.ffn_post_norm) fo = ggml_mul(c, ggml_rms_norm(c, fo, hp.rms_eps), L.ffn_post_norm);           // (Gemma)
+        add_back(tr(fo, "ffn_out", li));
+        if (L.ple_gate && g4_pl) {                                          // Gemma 4 E2B/E4B: this layer's per-layer input
+            ggml_tensor* pl = ggml_view_2d(c, g4_pl, hp.g4_ple, n_tok, g4_pl->nb[2], (size_t)li * g4_pl->nb[1]);
+            ggml_tensor* p = ggml_mul(c, ggml_gelu(c, ggml_mul_mat(c, L.ple_gate, x)), pl);
+            p = ggml_mul(c, ggml_rms_norm(c, ggml_mul_mat(c, L.ple_proj, p), hp.rms_eps), L.ple_post);
+            x = ggml_add(c, x, p);
+        }
+        if (L.out_scale) x = ggml_mul(c, x, L.out_scale);                  // Gemma 4: the layer's output scale
         tr(x, "res", li);
     }
     tag((int)layers_.size() - 1);
@@ -3501,6 +3683,8 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
         last = ggml_view_2d(c, x, hp.n_embd, n_logits, x->nb[1], (size_t)(n_tok - n_logits) * x->nb[1]);
     }
     g.logits = ggml_mul_mat(c, output_, last);                             // [n_vocab, n_logits]
+    if (hp.final_softcap > 0)                                               // (Gemma 2/4: cap tanh(logits / cap))
+        g.logits = ggml_scale(c, ggml_tanh(c, ggml_scale(c, g.logits, 1.0f / hp.final_softcap)), hp.final_softcap);
     ggml_set_output(g.logits);
     ggml_build_forward_expand(g.gf, g.logits);
     return g;
@@ -4167,10 +4351,12 @@ void Model::make_kv(int ctx, int n_seq) {
             }
             continue;
         }
-        L.k_cache = ggml_new_tensor_3d(kvctx_, kv_type, hd, hp.n_head_kv, ctx);
+        if (i < hp.n_layer && hp.kv_src(i) >= 0) continue;           // Gemma 4: reads an earlier layer's cache (set below)
+        const int lhd = i < hp.n_layer ? hp.hd_at(i) : hd, lkv = i < hp.n_layer ? hp.kvh_at(i) : hp.n_head_kv;
+        L.k_cache = ggml_new_tensor_3d(kvctx_, kv_type, lhd, lkv, ctx);
         dst.push_back(L.k_cache);
         if (hp.mla) { L.v_cache = nullptr; continue; }               // MLA: the values are part of the one cache
-        L.v_cache = ggml_new_tensor_3d(kvctx_, kv_type, hd, hp.n_head_kv, ctx);
+        L.v_cache = ggml_new_tensor_3d(kvctx_, kv_type, lhd, lkv, ctx);
         dst.push_back(L.v_cache);
         if (L.idx_k) {                                               // QSA: the indexer's raw keys, for the GPU's masks
             L.qsa_kc = ggml_new_tensor_2d(kvctx_, GGML_TYPE_F16, hp.qsa_dim, ctx);
@@ -4189,6 +4375,8 @@ void Model::make_kv(int ctx, int n_seq) {
         if (tier < G) place_.gpus[tier].kv += ggml_backend_buffer_get_size(b);
         kvbufs_.push_back(b);
     }
+    for (int i = 0; i < hp.n_layer; ++i)                              // Gemma 4: the layers sharing an earlier one's cache
+        if (hp.kv_src(i) >= 0) { layers_[i].k_cache = layers_[hp.kv_src(i)].k_cache; layers_[i].v_cache = layers_[hp.kv_src(i)].v_cache; }
 }
 
 size_t Model::kv_bytes_per_token(size_t* in_vram) const {
@@ -4200,7 +4388,7 @@ size_t Model::kv_bytes_per_token(size_t* in_vram) const {
         if (L.d4_ce) {                                             // DeepSeek V4: an entry per 4 or 128 tokens
             const int r = hp_.d4_ratio_at(i);
             b = (L.d4_ce->nb[1] + (L.d4_ie ? L.d4_ie->nb[1] : 0) + r - 1) / r;
-        } else if (L.recurrent || !L.k_cache) continue;
+        } else if (L.recurrent || !L.k_cache || (i < hp_.n_layer && hp_.kv_src(i) >= 0)) continue;
         else b = L.k_cache->nb[2] + (L.v_cache ? L.v_cache->nb[2] : 0) + (L.qsa_kc ? L.qsa_kc->nb[1] : 0);
         all += b;
         if (layer_dev_[i] >= 0) vram += b;

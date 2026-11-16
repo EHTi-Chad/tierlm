@@ -506,6 +506,8 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | gpt-oss (`gpt-oss`: gpt-oss-20b, gpt-oss-120b, HyperNova-60B, ...) | gpt-oss-120b MXFP4 on one RTX 5090 with 34 GB of it in RAM (38.5 tok/s in a chat), gpt-oss-20b on an RTX 5090 (about 270 tok/s); model math verified, including OpenAI's chat format and tools |
 | DeepSeek V3 / R1 / V3.1, Kimi K2.x, Moonlight, DeepSeek V2 (`deepseek2`) | **early**: model math checked against Hugging Face's own code (multi-head latent attention, grouped routing with its choosing bias, YaRN), tokenizers checked against Hugging Face's; tested on the real Moonlight-16B-A3B (about 300 tok/s on an RTX 5090), the 600 GB-class ones not yet. They need the SSD tier |
 | DeepSeek V4 Flash (`deepseek4`) | **early**: model math checked against Hugging Face's own code (hyper-connections, sliding-window and compressed attention with its indexer, hash-routed first layers) on the CPU and CUDA; tested on the real DeepSeek-V4-Flash UD-IQ3_XXS (about 96 GB) on an RTX 5090 with 64 GB RAM and the SSD tier: 9.6 to 10.8 tok/s in chats (since 0.9.0). Tool calls not yet |
+| Gemma 3 (`gemma3`: gemma-3-1b ... 27b-it), text | **new in 0.9.1**: model math checked against Hugging Face's own code; real weights not yet tested |
+| Gemma 4 (`gemma4`: E2B, E4B, 26B-A4B, 31B), text | **new in 0.9.1**: model math checked against Hugging Face's own code (all four layouts: shared caches, per-layer inputs, the 26B's experts), chat format with thinking on or off; real weights not yet tested |
 | Qwen3.8 Flash-Next (`qwen4exp`) | model math checked against Hugging Face's own code (hyper-connections, the n-gram embedding, sparse attention past 2,048 tokens, the MTP draft block), text only for now; the real 120 GB Q4_K_M with Unsloth's MTP file at 80.3 tok/s in a chat (88.8 in Find the fastest settings) on an RTX 5090 with 64 GB RAM, with its n-gram table on the SSD tier; UD-IQ3_XXS (77.9 GiB) at 94.8 tok/s on the same PC (Ryzen 9 9950X3D, 64 GB DDR5-6000, VRAM experts following the conversation, 4 guesses, temperature 0.7; 0.8.7) |
 
 Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-MiniLM, e5) and Nomic
@@ -514,7 +516,7 @@ Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-Min
 Images: Qwen3.5 / 3.6 with their `mmproj` vision file (`qwen3vl_merger`), checked against Hugging Face's code and
 tested with Qwen3.5-9B (RTX 3070 laptop) and Qwen3.6-35B-A3B (RTX 5090).
 
-Not yet: Gemma, Phi and others. Nemotron 3.5 (Mamba-2 and LatentMoE) is in since 0.8.8, checked on a tiny test model and on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s). The setup screen says which
+Not yet: Phi, GLM, MiniMax and others; Gemma's images and audio. Nemotron 3.5 (Mamba-2 and LatentMoE) is in since 0.8.8, checked on a tiny test model and on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s). The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
 
 ## Build from source (Windows)
@@ -594,7 +596,8 @@ Details and options: [docs/TOOLS.md](docs/TOOLS.md).
 - [x] Architecture layer: Llama 2/3, Mistral, Mixtral, Qwen2, Qwen3, Qwen3 MoE, OLMoE; Llama 3 / Qwen / SentencePiece tokenizers
 - [x] Qwen3.5 / 3.6 / 3.8 dense: hybrid Gated DeltaNet + gated attention, verified against a NumPy reference
 - [x] Qwen3.5 / 3.6 MoE: the same hybrid with routed experts and a gated shared expert
-- [ ] Real-model testing of the new families; more families (Gemma 3/4, Phi, DeepSeek, gpt-oss)
+- [ ] Real-model testing of the new families; more families (Phi, GLM, MiniMax, Mistral 3)
+- [x] Gemma 3 and Gemma 4 (text), checked against Hugging Face's own code
 - [x] Qwen3-Next / Qwen3-Coder-Next (both GGUF layouts), verified against a NumPy reference
 - [x] gpt-oss: attention sinks, sliding-window layers, exact YaRN, MXFP4 experts with biases, OpenAI's harmony chat format and tool calls
 - [x] Tier loader, first version: models bigger than VRAM split between VRAM and RAM (whole layers or experts), VRAM limit setting

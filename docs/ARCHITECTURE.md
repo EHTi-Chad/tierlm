@@ -369,6 +369,32 @@ Hugging Face's own code (`tests/tiny_deepseek4.py`, which is checked against the
 - Its tokenizer is DeepSeek V3's; its chat format is V3.1's, with a thinking switch. Tool calls in its own format
   (DSML) aren't read yet.
 
+## Gemma 3 and Gemma 4 (0.9.1)
+
+Text only for now. Both are checked against Hugging Face's own code on tiny random models (`tests/tiny_gemma3.py`,
+`tests/tiny_gemma4.py`): whole prompts, one token at a time, saved and restored, three conversations at once.
+
+- **Shared by both**: the embedding scaled by sqrt(width); norms after attention and after the MLP as well as
+  before; GELU (tanh) instead of SiLU; q/k norms per head; sliding-window layers (5 of every 6) with their own RoPE
+  base (10,000), full-attention layers with the model's; an optional final logit softcap (30 in Gemma 4). Gemma 3's
+  files store norms as 1 + w (the converter adds it); Gemma 4's are used as they are.
+- **Gemma 4's attention**: the full-attention layers have wider heads (512 against 256 in the big models) and fewer
+  key/value heads, and in the 31B and 26B reuse the keys as values (no value projection). They rotate only the first
+  quarter of each head (proportional RoPE: the file's `rope_freqs` leaves the rest still). Values are normed without
+  a weight; the attention scale is 1 (the q/k norms set it). Each layer's cache has its own width.
+- **Shared caches** (E2B, E4B): the last layers keep no cache of their own and read that of the last earlier layer of
+  their kind; their MLPs are twice as wide. Those layers' memory isn't counted or allocated.
+- **Per-layer inputs** (E2B, E4B): a second token table (one small row per layer) plus a projection of the
+  embedding gives each layer an extra input, which a gate, GELU and a projection add to the stream after the MLP.
+- **The 26B A4B's MoE block**: a dense MLP and 128 experts (8 used) side by side, each with its own norms, added. The
+  router reads the residual stream normed without a weight, times its own scale and 1/sqrt(width); weights are a
+  softmax over all experts, the top ones renormalised, times a scale per expert.
+- **Layer output scale**: each layer's output is multiplied by a learned number.
+- **Chat**: Gemma 3's `<start_of_turn>` format (the system message goes at the start of the first user turn), and
+  Gemma 4's `<|turn>` format with a system turn. Gemma 4's thinking switch is `<|think|>` in the system turn; with it
+  off, the reply starts after an empty thought channel, as Google suggests for the 26B and 31B. Its thought channel
+  is shown as tierlm's `<think>` block, and earlier replies go back without their thinking.
+
 ## Speculative decoding
 
 When a model doesn't fit in VRAM, generating a token is limited by how fast its weights in RAM can be read: a dense
@@ -862,6 +888,7 @@ There is no llama.cpp to compare against, so every piece is checked against an i
 | Tokenizers without models | Small tokenizers trained with Hugging Face `tokenizers` and `sentencepiece` (`tests/trained_tokenizers.py`) | Exact token IDs for GPT-2, Llama 3 and Qwen2 splitting and SentencePiece |
 | Splits | Every model split between one or two stand-in GPUs (ggml's RPC backend) and RAM at many VRAM sizes, by layers, by experts and with made-up hot-expert usage | Same results as unsplit (~1e-6 with an f32 cache) |
 | DeepSeek V4 | NumPy version of Hugging Face's DeepseekV4 (itself checked against `transformers` to 5e-7) on a tiny random model (`tests/tiny_deepseek4.py`): whole prompt, one token at a time, saved and restored, guesses undone; also split over RPC, and on CUDA | ~2e-6 relative with an f32 cache (CPU); on an RTX 5090 (f16 cache) about 5e-4 one token at a time, and up to 3.6e-2 for a 120-token prompt read at once (within the test's limit; the cause isn't pinned down yet) |
+| Gemma 3 and 4 | Hugging Face's own Gemma3ForCausalLM / Gemma4ForCausalLM on tiny random models (`tests/tiny_gemma3.py`, `tests/tiny_gemma4.py`), with GELU through the same 16-bit table ggml's CPU uses | Up to 7e-4 relative with an f32 cache (values a hair from a 16-bit rounding step in the GELU table); 5e-3 to 3e-2 with the f16 cache |
 | Real model | "The capital of France is" | " Paris" at 62–64% on CPU and GPU |
 
 ## Design decisions so far

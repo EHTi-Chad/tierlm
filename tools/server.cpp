@@ -174,13 +174,13 @@ std::string gguf_string(const std::string& path, const char* key) {
 
 // Chat formats. Each model family wraps a conversation in its own markers; the GGUF's chat template (and
 // failing that, its vocabulary) says which one. Control tokens are matched when encoding with parse_special.
-enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, DeepSeek, Kimi, Plain };
+enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, DeepSeek, Kimi, Gemma, Gemma4, Plain };
 
 const char* chat_fmt_name(ChatFmt f) {
     switch (f) {
         case ChatFmt::Tulu: return "tulu"; case ChatFmt::ChatML: return "chatml";
         case ChatFmt::Llama3: return "llama3"; case ChatFmt::Mistral: return "mistral"; case ChatFmt::Harmony: return "harmony";
-        case ChatFmt::DeepSeek: return "deepseek"; case ChatFmt::Kimi: return "kimi";
+        case ChatFmt::DeepSeek: return "deepseek"; case ChatFmt::Kimi: return "kimi"; case ChatFmt::Gemma: return "gemma"; case ChatFmt::Gemma4: return "gemma4";
         default: return "plain";
     }
 }
@@ -191,16 +191,46 @@ ChatFmt detect_chat(const Tokenizer& tok) {
     if (has("<|channel|>")) return ChatFmt::Harmony;                 // gpt-oss (OpenAI's harmony format)
     if (has("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") || tok.find("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") >= 0) return ChatFmt::DeepSeek;   // <｜Assistant｜>
     if (has("<|im_middle|>") || tok.find("<|im_middle|>") >= 0) return ChatFmt::Kimi;
+    if (has("<|turn>")) return ChatFmt::Gemma4;
+    if (has("<start_of_turn>")) return ChatFmt::Gemma;
     if (has("<|im_start|>")) return ChatFmt::ChatML;
     if (has("<|start_header_id|>")) return ChatFmt::Llama3;
     if (has("<|user|>")) return ChatFmt::Tulu;
     if (has("[INST]")) return ChatFmt::Mistral;
     if (tok.find("<|channel|>") >= 0 && tok.find("<|return|>") >= 0) return ChatFmt::Harmony;
     if (tok.find("<|im_start|>") >= 0) return ChatFmt::ChatML;
+    if (tok.find("<|turn>") >= 0 && tok.find("<turn|>") >= 0) return ChatFmt::Gemma4;
+    if (tok.find("<start_of_turn>") >= 0) return ChatFmt::Gemma;
     if (tok.find("<|start_header_id|>") >= 0) return ChatFmt::Llama3;
     if (tok.find("<|user|>") >= 0) return ChatFmt::Tulu;
     if (tok.find("[INST]") >= 0 || tok.spm()) return ChatFmt::Mistral;
     return ChatFmt::Plain;
+}
+
+// Gemma 4's reply as tierlm shows it: its thought channel (<|channel>thought ... <channel|>) as <think>...</think>.
+// Grows only at the end as the reply does: a "thought" not yet whole after <|channel> is held back.
+std::string gemma4_display(const std::string& raw) {
+    static const std::string open = "<|channel>", close = "<channel|>", label = "thought\n";
+    std::string s;
+    size_t i = 0;
+    while (i < raw.size()) {
+        const size_t a = raw.find(open, i);
+        if (a == std::string::npos) { s += raw.substr(i); break; }
+        s += raw.substr(i, a - i);
+        size_t k = a + open.size();
+        const size_t have = std::min(label.size(), raw.size() - k);
+        if (raw.compare(k, have, label, 0, have) == 0) {
+            if (have < label.size()) { s += "<think>"; break; }       // (the rest of "thought\n" is still to come)
+            k += label.size();
+        }
+        const size_t b = raw.find(close, k);
+        s += "<think>" + raw.substr(k, b == std::string::npos ? std::string::npos : b - k);
+        if (b == std::string::npos) break;
+        s += "</think>\n\n";
+        i = b + close.size();
+        while (i < raw.size() && raw[i] == '\n') ++i;                 // (the answer's own start)
+    }
+    return s;
 }
 
 // Tool calling in a conversation, made plain for format_chat: the tools go into the system message, an assistant
@@ -317,6 +347,45 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
             else s += "<|im_user|>user<|im_middle|>" + c + "<|im_end|>";
         }
         return s + "<|im_assistant|>assistant<|im_middle|>";
+    }
+    case ChatFmt::Gemma: {                                // Gemma 2 / 3: <start_of_turn>user ... <end_of_turn>; the reply's role is "model"
+        // No system role: as Gemma's template, the system message goes at the start of the first user turn
+        s = tok.bos() >= 0 ? "<bos>" : "";
+        std::string sys;
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", std::string("user")), c = m.value("content", std::string());
+            if (role == "system") { sys += (sys.empty() ? "" : "\n\n") + c; continue; }
+            const bool model = role == "assistant";
+            s += std::string("<start_of_turn>") + (model ? "model" : "user") + "\n" + (!model && !sys.empty() ? sys + "\n\n" : "") + agent::trim(c) + "<end_of_turn>\n";
+            if (!model) sys.clear();
+        }
+        if (!sys.empty()) s += "<start_of_turn>user\n" + sys + "<end_of_turn>\n";
+        return s + "<start_of_turn>model\n";
+    }
+    case ChatFmt::Gemma4: {                               // Gemma 4: <|turn>user ... <turn|>; a system turn of its own
+        // Thinking on: <|think|> opens the system turn. Off: the reply starts after an empty thought, which Google
+        // suggests for the 26B and 31B (they can think on their own otherwise). Earlier replies go back without
+        // their thinking, as Gemma 4's template does.
+        s = tok.bos() >= 0 ? "<bos>" : "";
+        std::string sys;
+        for (const auto& m : messages)
+            if (m.value("role", std::string()) == "system") sys += (sys.empty() ? "" : "\n\n") + m.value("content", std::string());
+        if (think != 0 || !sys.empty()) s += "<|turn>system\n" + std::string(think != 0 ? "<|think|>\n" : "") + sys + "<turn|>\n";
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", std::string("user"));
+            std::string c = m.value("content", std::string());
+            if (role == "system") continue;
+            const bool model = role == "assistant";
+            if (model) {                                      // (no thinking: <think>...</think> as tierlm keeps it)
+                for (size_t a; (a = c.find("<think>")) != std::string::npos;) {
+                    const size_t b = c.find("</think>", a);
+                    c.erase(a, b == std::string::npos ? std::string::npos : b + 8 - a);
+                }
+                c = agent::trim(c);
+            }
+            s += "<|turn>" + std::string(model ? "model" : "user") + "\n" + c + "<turn|>\n";
+        }
+        return s + "<|turn>model\n" + (think == 0 ? "<|channel>thought\n<channel|>" : "");
     }
     case ChatFmt::Llama3:
         s = "<|begin_of_text|>";
@@ -1729,6 +1798,7 @@ int main(int argc, char** argv) {
             // '<|im_start|>assistant\\n<think>\\n' }})
             eng.think_starts = eng.think_switch &&
                 std::regex_search(ct, std::regex(R"(<think>(\\n|\n)'\s*\}\})"));
+            if (eng.chat == ChatFmt::Gemma4) eng.think_switch = true;   // (<|think|> in the system turn)
             if (eng.chat == ChatFmt::DeepSeek) {          // V3.1 has a thinking switch; R1 always starts by thinking
                 eng.think_switch = ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos;
                 eng.think_starts = eng.think_switch || ct.find("<think>\\n") != std::string::npos;
@@ -2829,8 +2899,11 @@ int main(int argc, char** argv) {
         };
         std::string visible, raw;                                 // raw: the reply as the model wrote it (harmony: before display)
         const int32_t h_return = tok.find("<|return|>"), h_call = tok.find("<|call|>"), h_end = tok.find("<|end|>"), h_eot = tok.find("<|endoftext|>");
+        const bool g4 = eng.chat == ChatFmt::Gemma4;
+        const int32_t g4_open = tok.find("<|channel>"), g4_close = tok.find("<channel|>"), g4_think = tok.find("<|think|>");
         auto is_end = [&](int32_t t) {
             if (harm) return t == h_return || t == h_call || t == h_eot || (t == tok.eos() && t != h_end);
+            if (g4 && (t == g4_open || t == g4_close || t == g4_think)) return false;   // (Gemma 4's thinking goes on)
             return t == tok.eos() || t == tok.eot() || tok.is_control(t);
         };
         // "ignore_eos": the reply goes on to max_tokens (to time long replies): the end-of-reply tokens are never
@@ -2861,7 +2934,7 @@ int main(int argc, char** argv) {
             out.push_back(id);
             const std::string text = tok.decode(out);
             raw = pre + text.substr(0, utf8_complete(text));
-            visible = harm ? harmony::display(raw) : raw;
+            visible = harm ? harmony::display(raw) : g4 ? gemma4_display(raw) : raw;
             // A stop string: end the reply just before it.
             size_t cut = std::string::npos;
             for (const auto& st : stops)

@@ -49,6 +49,32 @@ struct Hparams {
     float rope_base = 10000.0f, rope_scale = 1.0f, rms_eps = 1e-5f;
     // Variations
     bool rope_neox = false;           // rotate halves (NeoX) instead of adjacent pairs (original Llama)
+    // Gemma 3 / 4: the embedding scaled by sqrt(n_embd); a norm after attention and after the feed-forward block too
+    // (before each is added back); GELU (tanh) in the feed-forward block; sliding-window layers rotate positions with
+    // their own base (rope_base_swa), the full ones with rope_base and the file's scaling
+    bool gemma = false;
+    float embd_scale = 0.0f;          // 0: none
+    float rope_base_swa = 0.0f;       // 0: as the other layers
+    bool gelu_ffn = false;
+    float final_softcap = 0.0f;       // logits = cap tanh(logits / cap) (0: none)
+    float attn_softcap = 0.0f;        // the same on the attention scores
+    // Gemma 4: per layer, the head size, the key/value heads and the rotated size (sliding and full layers differ;
+    // empty: head_dim, n_head_kv, n_rot everywhere). Full layers without their own value projection use the key's
+    // (before its norm); values are normed (no weight); attention scale 1. The layers from kv_from on keep no cache
+    // of their own: each reads that of the last layer before kv_from of its kind (sliding or full). The 26B A4B's
+    // layers run a dense MLP and the experts side by side (see build). E2B / E4B: per-layer inputs (g4_ple wide).
+    bool gemma4 = false;
+    std::vector<int> hd_l, kvh_l, rot_l;
+    int kv_from = 0;
+    int g4_ple = 0;
+    int hd_at(int il) const { return il >= 0 && il < (int)hd_l.size() && hd_l[il] ? hd_l[il] : head_dim; }
+    int kvh_at(int il) const { return il >= 0 && il < (int)kvh_l.size() && kvh_l[il] ? kvh_l[il] : n_head_kv; }
+    int rot_at(int il) const { return il >= 0 && il < (int)rot_l.size() && rot_l[il] ? rot_l[il] : n_rot; }
+    int kv_src(int il) const {
+        if (kv_from <= 0 || il < kv_from || il >= n_layer) return -1;
+        for (int j = kv_from - 1; j >= 0; --j) if (is_swa(j) == is_swa(il)) return j;
+        return -1;
+    }
     enum QkNorm { kNone, kFull, kPerHead } qk_norm = kNone;
     bool qkv_bias = false;            // biases on Q/K/V projections
     bool expert_renorm = false;       // renormalise the chosen experts' weights to sum to 1
@@ -437,7 +463,9 @@ private:
     struct Layer;
     ggml_tensor* attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
     ggml_tensor* attn_mla(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
-    ggml_tensor* ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing);
+    ggml_tensor* ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing,
+                           ggml_tensor* router_in = nullptr);   // (Gemma 4: the router reads its own input)
+    ggml_tensor* attn_gemma4(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
     void pin_cpu_layers(const Graph& g, ggml_backend_sched* sc = nullptr);        // keep every op of a RAM layer on the CPU
     std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
     void release_pending();
@@ -489,6 +517,11 @@ private:
         std::vector<ggml_tensor*> ple_states;
         ggml_tensor *idx_q = nullptr, *idx_k = nullptr, *idx_q_norm = nullptr, *idx_k_norm = nullptr;   // QSA indexer
         ggml_tensor *qsa_kc = nullptr;           // QSA: every position's raw indexer key, by cache cell [qsa_dim, ctx] f16
+        ggml_tensor *attn_post_norm = nullptr, *ffn_post_norm = nullptr;   // Gemma: norms on the blocks' outputs
+        ggml_tensor *ffn_pre_norm2 = nullptr, *ffn_post_norm1 = nullptr, *ffn_post_norm2 = nullptr;   // Gemma 4 MoE: the two paths' norms
+        ggml_tensor *router_scale = nullptr, *exp_scale = nullptr;   // Gemma 4: the router input's scale, each expert's output scale
+        ggml_tensor *out_scale = nullptr;        // Gemma 4: the layer's output scaled by this
+        ggml_tensor *ple_gate = nullptr, *ple_proj = nullptr, *ple_post = nullptr;   // Gemma 4 E2B/E4B: per-layer input
         int qsa = -1;                            // its entry in qsa_
         bool swa = false;                                                     // sliding-window layer
         ggml_tensor *ffn_norm = nullptr;
@@ -571,6 +604,7 @@ private:
         return v;
     }
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
+    ggml_tensor *g4_ple_tok_ = nullptr, *g4_ple_proj_ = nullptr, *g4_ple_norm_ = nullptr;   // Gemma 4 E2B/E4B: per-layer inputs
     ggml_tensor *ple_embd_ = nullptr;            // Flash-Next: the PLE n-gram table [ple_dim, rows]
     ggml_tensor *out_hc_norm_ = nullptr, *out_hc_down_ = nullptr, *out_hc_up_ = nullptr;   // the last stream mixer
     ggml_tensor *d4_out_fn_ = nullptr, *d4_out_base_ = nullptr, *d4_out_scale_ = nullptr;  // DeepSeek V4: the last stream mixer
