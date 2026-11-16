@@ -363,9 +363,10 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
         return s + "<start_of_turn>model\n";
     }
     case ChatFmt::Gemma4: {                               // Gemma 4: <|turn>user ... <turn|>; a system turn of its own
-        // Thinking on: <|think|> opens the system turn. Off: the reply starts after an empty thought, which Google
-        // suggests for the 26B and 31B (they can think on their own otherwise). Earlier replies go back without
-        // their thinking, as Gemma 4's template does.
+        // Thinking on: <|think|> opens the system turn. Off: the reply starts after an empty thought when the
+        // file's own template does that (the 26B and 31B, which can think on their own otherwise; the E2B and E4B
+        // were trained without it and start thinking aloud after one). Earlier replies go back without their
+        // thinking, as Gemma 4's template does.
         s = tok.bos() >= 0 ? "<bos>" : "";
         std::string sys;
         for (const auto& m : messages)
@@ -385,7 +386,9 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
             }
             s += "<|turn>" + std::string(model ? "model" : "user") + "\n" + c + "<turn|>\n";
         }
-        return s + "<|turn>model\n" + (think == 0 ? "<|channel>thought\n<channel|>" : "");
+        const bool empty_thought = tok.chat_template().empty() ||
+                                   tok.chat_template().find("<|channel>thought\\n<channel|>") != std::string::npos;
+        return s + "<|turn>model\n" + (think == 0 && empty_thought ? "<|channel>thought\n<channel|>" : "");
     }
     case ChatFmt::Llama3:
         s = "<|begin_of_text|>";

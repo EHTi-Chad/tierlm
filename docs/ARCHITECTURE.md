@@ -392,7 +392,8 @@ Text only for now. Both are checked against Hugging Face's own code on tiny rand
 - **Layer output scale**: each layer's output is multiplied by a learned number.
 - **Chat**: Gemma 3's `<start_of_turn>` format (the system message goes at the start of the first user turn), and
   Gemma 4's `<|turn>` format with a system turn. Gemma 4's thinking switch is `<|think|>` in the system turn; with it
-  off, the reply starts after an empty thought channel, as Google suggests for the 26B and 31B. Its thought channel
+  off, the reply starts after an empty thought channel when the file's own template does that (the 26B and 31B;
+  the E2B and E4B weren't trained with one and start thinking aloud after it). Its thought channel
   is shown as tierlm's `<think>` block, and earlier replies go back without their thinking.
 
 ## Speculative decoding
