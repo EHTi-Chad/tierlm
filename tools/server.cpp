@@ -1842,6 +1842,45 @@ int main(int argc, char** argv) {
     });
     // The one script the page loads besides itself (bundled, so maths shows without the internet). A fixed name:
     // nothing else in the folder is served.
+    // The benchmark page (its own tab): speed and a fixed set of questions, with the runs kept on this PC.
+    for (const char* f : {"/bench", "/bench-data.js"}) {
+        const std::string name = f;
+        svr.Get(f, [&, name](const httplib::Request&, httplib::Response& res) {
+            if (a.no_web) { res.set_redirect("/v1"); return; }
+            const bool page = name == "/bench";
+            const std::string body = read_file(a.web + (page ? "/bench.html" : "/bench-data.js"));
+            if (body.empty()) { res.status = 404; res.set_content("not found in the web folder", "text/plain"); return; }
+            res.set_content(body, page ? "text/html; charset=utf-8" : "application/javascript; charset=utf-8");
+        });
+    }
+    // Saved benchmark runs: tierlm-bench.json next to the settings. Any device can read them; only this computer
+    // adds or removes (like the settings).
+    static std::mutex bench_mu;
+    const std::string bench_file = [&] { std::error_code ec; return (fs::absolute(fs::u8path(a.settings), ec).parent_path() / "tierlm-bench.json").u8string(); }();
+    svr.Get("/api/benchruns", [&, bench_file](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lk(bench_mu);
+        json j = json::parse(read_file(bench_file), nullptr, false);
+        res.set_content(dump(j.is_array() ? j : json::array()), "application/json; charset=utf-8");
+    });
+    svr.Post("/api/benchruns", [&, bench_file](const httplib::Request& req, httplib::Response& res) {
+        if (!is_local(req)) { res.status = 403; res.set_content("{\"error\":\"only this computer saves benchmark runs\"}", "application/json; charset=utf-8"); return; }
+        json body = json::parse(req.body, nullptr, false);
+        if (!body.is_object()) { res.status = 400; res.set_content("{\"error\":\"bad request\"}", "application/json; charset=utf-8"); return; }
+        std::lock_guard<std::mutex> lk(bench_mu);
+        json runs = json::parse(read_file(bench_file), nullptr, false);
+        if (!runs.is_array()) runs = json::array();
+        if (body.contains("delete")) {                      // {"delete": id}
+            const std::string id = body.value("delete", std::string());
+            json kept = json::array();
+            for (auto& r : runs) if (r.value("id", std::string()) != id) kept.push_back(r);
+            runs = kept;
+        } else if (body.contains("run") && body["run"].is_object()) {
+            runs.push_back(body["run"]);
+            while (runs.size() > 200) runs.erase(runs.begin());        // the newest 200
+        }
+        write_settings(bench_file, runs);
+        res.set_content(dump({{"ok", true}, {"count", runs.size()}}), "application/json; charset=utf-8");
+    });
     svr.Get("/vendor/katex.min.js", [&](const httplib::Request&, httplib::Response& res) {
         std::string js = read_file(a.web + "/vendor/katex.min.js");
         if (js.empty()) { res.status = 404; return; }

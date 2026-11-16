@@ -137,8 +137,14 @@ fold the menu away and give the chat more room.
   (for example `C:\tierlm\chats\2026-11-03 Backup plan (mw0rkoej)`), with `chat.md`, the conversation as a
   readable file you can open in Notepad, VS Code or Obsidian, and the files you attached. **Open the chats folder**
   shows them in Explorer. (Opened from another device, the page keeps its chats in that browser instead.)
-- **Benchmark**: one click measures prompt reading and generation speed with the current settings, with a line to
-  copy and share.
+- **Benchmark**: **Open the full benchmark** opens a page of its own (`/bench`) that tests the loaded model on this
+  PC in about 5 to 10 minutes: prompt reading (short and long, the first time and again), time to the first word,
+  writing speed with an empty and a filled context, guessing ahead on and off, and 30 fixed questions from public
+  benchmarks: 10 maths (GSM8K), 10 knowledge (MMLU and ARC-Challenge), 5 code (HumanEval, written in JavaScript and
+  run against its tests in the page) and 5 instructions to follow (IFEval). The questions are the same every run, at
+  temperature 0 with thinking off, so runs compare across models, quantizations and PCs; every run is kept on this PC
+  (the newest 200) in a table, with copy buttons (one line, Markdown, JSON). 30 questions are a quick check (a few
+  points either way), not a leaderboard. **Run the quick check** still measures speed alone in about 10 seconds.
 - **Copy specs** (in **Model info**, and next to a benchmark result): copies everything people ask for when you post
   a speed: this PC (CPU, RAM, GPU and VRAM, driver and CUDA versions), the model, its quantization and file size, what
   went in VRAM, RAM and on the SSD, the settings, and the latest benchmark and chat speeds with the prompt and reply

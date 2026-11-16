@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tierlm benchmark</title>
+<script>try { const t = localStorage.getItem("tierlm.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --ink: #1d2230; --muted: #636a7a; --faint: #9aa0ad;
+    --line: #e2e5eb; --accent: #0f7b6c; --accent-ink: #ffffff; --accent-soft: #dff2ee; --danger: #b4472b; --warn: #b8730a;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace; color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b; --panel: #1a1e26; --panel-2: #222733; --ink: #e6e8ee; --muted: #a0a6b4; --faint: #6c7383;
+      --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35; --danger: #e07a5f; --warn: #e0a043; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12151b; --panel: #1a1e26; --panel-2: #222733; --ink: #e6e8ee; --muted: #a0a6b4; --faint: #6c7383;
+    --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35; --danger: #e07a5f; --warn: #e0a043; color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 12px 22px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header .logo { font-weight: 700; font-size: 17px; } header .logo span { color: var(--accent); }
+  header .model { color: var(--muted); }
+  main { max-width: 1080px; margin: 0 auto; padding: 22px; display: grid; gap: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; }
+  h2 { margin: 0 0 4px; font-size: 16px; } .sub { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+  .picks { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 10px 0 14px; }
+  .picks label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  .picks small { color: var(--faint); }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); padding: 6px 14px; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; padding: 8px 20px; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.tiny { padding: 2px 8px; font-size: 12px; } td.acts { white-space: nowrap; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1; }
+  #status { color: var(--muted); }
+  .bar { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin-top: 10px; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  .log { font-family: var(--mono); font-size: 12.5px; max-height: 260px; overflow: auto; margin-top: 12px; color: var(--muted); }
+  .log div.ok::before { content: "✓ "; color: var(--accent); } .log div.no::before { content: "✗ "; color: var(--danger); }
+  .log div.run::before { content: "… "; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .stat { background: var(--panel-2); border-radius: 10px; padding: 10px 12px; }
+  .stat .l { color: var(--muted); font-size: 12px; } .stat .v { font-size: 20px; font-weight: 600; } .stat .v small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .stat .n { color: var(--faint); font-size: 11.5px; }
+  h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 18px 0 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; } td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .spec { color: var(--muted); font-size: 12.5px; }
+  details summary { cursor: pointer; color: var(--muted); }
+  .ans { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; max-height: 160px; overflow: auto; background: var(--panel-2); padding: 6px 8px; border-radius: 6px; }
+  .pass { color: var(--accent); font-weight: 600; } .fail { color: var(--danger); font-weight: 600; }
+  .note { color: var(--faint); font-size: 12px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">tierlm <span>benchmark</span></div>
+  <div class="model" id="hdr">…</div>
+  <span class="grow"></span>
+  <a href="/" class="note">Back to the chat</a>
+</header>
+<main>
+  <section class="card">
+    <h2>Benchmark this model on this PC</h2>
+    <p class="sub">Speed (reading a prompt, writing a reply, with an empty and a filled context, guessing ahead on and off) and a
+      short fixed set of 30 questions from public benchmarks, the same every time: maths, knowledge, code and following
+      instructions. Answers are at temperature 0 with thinking off. It uses the loaded model and its settings, and usually
+      takes 5 to 10 minutes. Chats wait while it runs.</p>
+    <div class="picks" id="picks">
+      <label><input type="checkbox" value="speed" checked> Speed <small>2-3 min</small></label>
+      <label><input type="checkbox" value="gsm8k" checked> Maths <small>10, GSM8K</small></label>
+      <label><input type="checkbox" value="mc" checked> Knowledge <small>10, MMLU and ARC</small></label>
+      <label><input type="checkbox" value="code" checked> Code <small>5, HumanEval in JavaScript</small></label>
+      <label><input type="checkbox" value="ifeval" checked> Instructions <small>5, IFEval</small></label>
+    </div>
+    <div class="row">
+      <button class="primary" id="run">Run benchmark</button>
+      <button id="stop" disabled>Stop</button>
+      <span id="status"></span>
+    </div>
+    <div class="bar"><i id="prog"></i></div>
+    <div class="log" id="log"></div>
+  </section>
+
+  <section class="card" id="result" hidden>
+    <div class="row"><h2 class="grow">Result</h2>
+      <button id="copyline">Copy one line</button><button id="copymd">Copy table (Markdown)</button><button id="copyjson">Copy JSON</button></div>
+    <p class="spec" id="rspec"></p>
+    <h3>Speed</h3><div class="stats" id="rspeed"></div>
+    <h3>Accuracy</h3><div class="stats" id="rscore"></div>
+    <details style="margin-top:14px"><summary>Every question and answer</summary><div id="rdetail"></div></details>
+  </section>
+
+  <section class="card">
+    <div class="row"><h2 class="grow">Runs on this PC</h2><span class="note" id="histnote"></span></div>
+    <p class="sub">Every finished run is kept (the newest 200), so models, quantizations and settings can be compared.
+      Accuracy from 30 questions is a rough guide (a few points either way), not a leaderboard score.</p>
+    <div style="overflow:auto"><table id="hist"></table></div>
+  </section>
+</main>
+<script src="/bench-data.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const D = window.BENCH_DATA;
+let stopping = false, controller = null, info = null, specs = null, last = null;
+
+function storedKey() { try { return localStorage.getItem("tierlm.apikey") || ""; } catch (e) { return ""; } }
+async function api(url, opts = {}) {
+  const o = { ...opts, headers: { ...(opts.headers || {}) } };
+  const k = storedKey(); if (k) o.headers["Authorization"] = "Bearer " + k;
+  return fetch(url, o);
+}
+async function getJSON(url) { const r = await api(url); if (!r.ok) throw new Error(url + ": " + r.status); return r.json(); }
+const post = (url, body) => api(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+// ---------- one request through the chat endpoint, timed ----------
+// Returns the text, the server's own timings (prompt tokens, reused, prompt seconds, generated tokens, generation
+// seconds, guessing stats) and the time to the first token as this page saw it.
+async function chat(content, { max_tokens = 512, temperature = 0, prefix = null } = {}) {
+  if (stopping) throw new Error("stopped");
+  controller = new AbortController();
+  const t0 = performance.now();
+  const messages = [{ role: "user", content: (prefix || "") + content }];
+  const r = await api("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+    body: JSON.stringify({ messages, max_tokens, temperature, top_k: 1, top_p: 1, min_p: 0, repeat_penalty: 1, presence_penalty: 0,
+                           frequency_penalty: 0, seed: 1234, thinking: false }) });
+  if (!r.ok || !r.body) throw new Error("the chat request failed (" + r.status + ")");
+  const rd = r.body.getReader(), dec = new TextDecoder();
+  let buf = "", text = "", first = 0, done = null;
+  for (;;) {
+    const { value, done: end } = await rd.read();
+    if (end) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 2);
+      if (!line.startsWith("data: ")) continue;
+      const ev = JSON.parse(line.slice(6));
+      if (ev.type === "token") { if (!first) first = performance.now(); text += ev.text; }
+      else if (ev.type === "done") done = ev;
+      else if (ev.type === "error") throw new Error(ev.message || "error");
+    }
+  }
+  if (!done) throw new Error("the reply ended early");
+  return { text, ttft: first ? (first - t0) / 1000 : null, total: (performance.now() - t0) / 1000, ...done };
+}
+// The answer without the model's thinking (an unfinished thought: no answer)
+function answerOf(t) {
+  const c = t.lastIndexOf("</think>");
+  if (c >= 0) return t.slice(c + 8).trim();
+  if (t.includes("<think>")) return "";
+  return t.trim();
+}
+
+// ---------- the filler text for prompts of a given length ----------
+const WORDS = ("the river ran past an old mill where a family of millers had worked for many years and every morning the " +
+  "wheel turned slowly while the village woke up around it children walked to school along the bank and the baker opened " +
+  "his shop near the bridge travellers stopped to rest and talk about the weather the roads and the prices at the market " +
+  "in the town further south where the cathedral bells could be heard on a clear day").split(" ");
+let tokPerWord = 1.4;                                   // most tokenizers; measured on the first prompt
+function filler(tokens, seed) {
+  let x = seed >>> 0, out = [];
+  const n = Math.round(tokens / tokPerWord);
+  for (let i = 0; i < n; i++) {
+    x = (x * 1664525 + 1013904223) >>> 0;
+    out.push(WORDS[x % WORDS.length]);
+    if (i % 14 === 13) out.push(".\n");
+  }
+  return out.join(" ");
+}
+
+// ---------- the tests ----------
+const log = (msg, cls = "run") => { const d = document.createElement("div"); d.className = cls; d.textContent = msg; $("log").appendChild(d); $("log").scrollTop = 1e9; return d; };
+const settle = (d, msg, ok) => { d.className = ok ? "ok" : "no"; d.textContent = msg; };
+let stepsDone = 0, stepsAll = 1;
+const tick = () => { stepsDone++; $("prog").style.width = Math.min(100, 100 * stepsDone / stepsAll) + "%"; };
+
+async function speedTests(R) {
+  const S = R.speed = {};
+  const ctx = info.ctx || 4096;
+  let longT = Math.max(1024, Math.min(8192, Math.floor(ctx * 0.5)));
+  const nonce = () => `Reference number ${Math.random().toString(36).slice(2)}.\n\n`;   // a new start: nothing reused
+  let seed = 7;
+  const pf = async (label, tokens, key) => {
+    const d = log(label);
+    const r = await chat(filler(tokens, ++seed) + "\n\nReply with the single word OK.", { max_tokens: 4, prefix: nonce() });
+    const read = r.n_prompt - (r.reused || 0);
+    S[key] = { tps: read / Math.max(r.prompt_s, 1e-9), tokens: read, ttft: r.ttft };
+    settle(d, `${label}: ${read.toLocaleString()} tokens at ${S[key].tps.toFixed(0)} tok/s, first word after ${r.ttft ? r.ttft.toFixed(2) + " s" : "-"}`, true);
+    tick();
+  };
+  // How many tokens this model's tokenizer makes of the filler, so the prompts come out at the sizes asked for
+  {
+    const base = await chat("Reply with the single word OK.", { max_tokens: 2, prefix: nonce() });
+    const words = 300, cal = await chat(filler(300 * tokPerWord, 1) + "\n\nReply with the single word OK.", { max_tokens: 2, prefix: nonce() });
+    tokPerWord = Math.max(0.5, Math.min(6, (cal.n_prompt - base.n_prompt) / (words * 15 / 14)));
+  }
+  await pf("Prompt reading, short, first time", 512, "pf_short_cold");
+  await pf("Prompt reading, short, again", 512, "pf_short_warm");
+  await pf(`Prompt reading, long (about ${longT.toLocaleString()} tokens), first time`, longT, "pf_long_cold");
+  // the long prompt again, kept so the next test can write after it
+  const longText = filler(longT, 99), longPrefix = nonce();
+  let d = log(`Prompt reading, long, again`);
+  let r = await chat(longText + "\n\nReply with the single word OK.", { max_tokens: 4, prefix: longPrefix });
+  S.pf_long_warm = { tps: (r.n_prompt - (r.reused || 0)) / Math.max(r.prompt_s, 1e-9), tokens: r.n_prompt - (r.reused || 0), ttft: r.ttft };
+  settle(d, `Prompt reading, long, again: ${S.pf_long_warm.tokens.toLocaleString()} tokens at ${S.pf_long_warm.tps.toFixed(0)} tok/s, first word after ${r.ttft ? r.ttft.toFixed(2) + " s" : "-"}`, true); tick();
+
+  const story = "Write a story of about 250 words about a lighthouse keeper who finds a message in a bottle.";
+  d = log("Writing, empty context");
+  r = await chat(story, { max_tokens: 320, prefix: nonce() });
+  S.gen_empty = { tps: r.gen_tps, tokens: r.n_gen };
+  settle(d, `Writing, empty context: ${r.n_gen} tokens at ${r.gen_tps.toFixed(1)} tok/s`, true); tick();
+  d = log(`Writing after ${S.pf_long_warm.tokens.toLocaleString()} tokens of context`);
+  r = await chat(longText + "\n\n" + story, { max_tokens: 320, prefix: longPrefix });
+  S.gen_deep = { tps: r.gen_tps, tokens: r.n_gen, depth: r.n_prompt };
+  settle(d, `Writing after ${r.n_prompt.toLocaleString()} tokens of context: ${r.n_gen} tokens at ${r.gen_tps.toFixed(1)} tok/s`, true); tick();
+
+  // Guessing ahead, on and off, on code (easy to guess) if this model can
+  const code = "Write a Python function that parses one line of CSV with quoted fields, and three short tests for it.";
+  const was = { speculative: !!info.speculative, draft_max: info.draft_max || 2 };
+  const runCode = async (label) => { const x = await chat(code, { max_tokens: 320, prefix: nonce() }); return { tps: x.gen_tps, tokens: x.n_gen, spec: x.spec || null, label }; };
+  d = log("Guessing ahead, on and off");
+  const set = async (on, dm) => { const q = await post("/api/spec", on ? { speculative: true, draft_max: dm } : { speculative: false }); return q.ok; };
+  try {
+    if (was.speculative) {
+      const on = await runCode("on"); await set(false); const off = await runCode("off"); await set(true, was.draft_max);
+      S.spec = { on, off, guesses: was.draft_max };
+    } else if (await set(true, 3)) {
+      const on = await runCode("on"); await set(false); const off = await runCode("off");
+      S.spec = { on, off, guesses: 3 };
+    }
+  } catch (e) { if (was.speculative) await set(true, was.draft_max).catch(() => {}); else await set(false).catch(() => {}); throw e; }
+  if (S.spec) settle(d, `Code, guessing ahead (${S.spec.guesses}): ${S.spec.on.tps.toFixed(1)} tok/s; without: ${S.spec.off.tps.toFixed(1)} tok/s`, true);
+  else settle(d, "Guessing ahead: not available for this model as loaded (skipped)", true);
+  tick();
+}
+
+// ---------- accuracy ----------
+function lastNumber(s) {
+  const a = /answer\s*[:=]?\s*\$?\s*(-?[\d,]*\.?\d+)/gi; let m, v = null;
+  while ((m = a.exec(s))) v = m[1];
+  if (v === null) { const all = s.match(/-?\d[\d,]*\.?\d*/g); if (all) v = all[all.length - 1]; }
+  return v === null ? null : parseFloat(v.replace(/,/g, ""));
+}
+function pickLetter(s, n) {
+  const L = "ABCDE".slice(0, n), t = s.trim();
+  let m = t.match(new RegExp(`^\\(?\\**([${L}])\\**\\)?(?:[.):\\s]|$)`));
+  if (m) return m[1];
+  m = t.match(new RegExp(`answer(?:\\s+is)?\\s*[:\\-]?\\s*\\**\\(?([${L}])\\b`, "i"));
+  if (m) return m[1].toUpperCase();
+  m = t.match(new RegExp(`\\b([${L}])\\b`));
+  return m ? m[1] : null;
+}
+function runJS(code, name, tests) {
+  // In a worker of its own, with a time limit: the model's code never touches this page.
+  const src = `"use strict";\nconst same = (a, b) => JSON.stringify(a) === JSON.stringify(b);\n` +
+    `self.onmessage = (m) => { let r = [];\ntry {\nconst f = (0, eval)(m.data + "\\n;${name}");\n` +
+    tests.map(t => `try { r.push(!!(${t})); } catch (e) { r.push(false); }`).join("\n") +
+    `\n} catch (e) { r = ["error: " + (e && e.message)]; }\nself.postMessage(r); };`;
+  return new Promise(res => {
+    let w;
+    try { w = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" }))); }
+    catch (e) { res(["error: " + e.message]); return; }
+    const t = setTimeout(() => { w.terminate(); res(["timed out"]); }, 5000);
+    w.onmessage = e => { clearTimeout(t); w.terminate(); res(e.data); };
+    w.onerror = e => { clearTimeout(t); w.terminate(); res(["error: " + (e.message || "syntax")]); e.preventDefault(); };
+    w.postMessage(code);
+  });
+}
+function codeOf(s) {
+  const m = s.match(/```(?:javascript|js|JavaScript)?\s*\n([\s\S]*?)```/);
+  return m ? m[1] : s;
+}
+const IF_CHECK = {
+  no_comma: s => !s.includes(","),
+  lowercase: s => s === s.toLowerCase(),
+  bullets: (s, k) => (s.match(/^\s*[*-]\s+\S/gm) || []).length === k.num_bullets,
+  end_phrase: (s, k) => s.trim().replace(/[*_`"]+$/g, "").trim().toLowerCase().endsWith(k.end_phrase.trim().toLowerCase()),
+  json: s => { const t = s.trim().replace(/^```(?:json|JSON|Json)?\s*/, "").replace(/```$/, "").trim(); try { JSON.parse(t); return true; } catch (e) { return false; } },
+};
+
+async function accuracy(R, which) {
+  const A = R.acc = R.acc || {}, detail = R.detail = R.detail || [];
+  const ask = async (cat, label, prompt, max, grade, extra = {}) => {
+    const d = log(label);
+    let r, ans = "", ok = false, got = "";
+    try { r = await chat(prompt, { max_tokens: max }); ans = answerOf(r.text); [ok, got] = await grade(ans); }
+    catch (e) { if (stopping) throw e; got = "error: " + e.message; }
+    A[cat] = A[cat] || { right: 0, of: 0 }; A[cat].of++; if (ok) A[cat].right++;
+    detail.push({ cat, label, prompt, answer: ans, got: String(got), ok, ...extra });
+    settle(d, `${label}: ${ok ? "right" : "wrong"}${got !== "" ? " (" + String(got).slice(0, 60) + ")" : ""}`, ok); tick();
+  };
+  if (which.includes("gsm8k")) for (const [i, p] of D.gsm8k.entries())
+    await ask("maths", `Maths ${i + 1}/10`, `Solve this problem. Work it out briefly, then give the final answer on the last line as "Answer: <number>".\n\n${p.q}`, 1024,
+      async a => { const v = lastNumber(a); return [v !== null && Math.abs(v - parseFloat(p.a)) < 1e-6, v === null ? "no number" : v + " (expected " + p.a + ")"]; });
+  if (which.includes("mc")) {
+    const mc = [...D.mmlu.map(x => ({ ...x, src: "MMLU" })), ...D.arc.map(x => ({ ...x, src: "ARC" }))];
+    for (const [i, p] of mc.entries())
+      await ask("knowledge", `Knowledge ${i + 1}/10 (${p.src})`, `${p.q}\n\n${p.choices.map((c, j) => "ABCDE"[j] + ". " + c).join("\n")}\n\nAnswer with the letter of the correct choice only.`, 512,
+        async a => { const l = pickLetter(a, p.choices.length); return [l === p.a, (l || "none") + " (expected " + p.a + ")"]; });
+  }
+  if (which.includes("code")) for (const [i, p] of D.code.entries())
+    await ask("code", `Code ${i + 1}/5 (${p.id})`, `Write this Python function in JavaScript, as a plain function named \`${p.name}\` with the same arguments ` +
+      `(return null for None, and an array for a list or a tuple). Reply with the code only, in one \`\`\`javascript block.\n\n\`\`\`python\n${p.spec}\n\`\`\``, 1024,
+      async a => { const res = await runJS(codeOf(a), p.name, p.tests); const passed = res.filter(x => x === true).length;
+        return [passed === p.tests.length, typeof res[0] === "string" ? res[0] : `${passed}/${p.tests.length} tests passed`]; });
+  if (which.includes("ifeval")) for (const [i, p] of D.ifeval.entries())
+    await ask("instructions", `Instructions ${i + 1}/5 (${p.check.replace("_", " ")})`, p.prompt, 768,
+      async a => { const ok = !!IF_CHECK[p.check](a, p.kwargs || {}); return [ok, ok ? "followed" : "not followed"]; });
+}
+
+// ---------- a run ----------
+async function run() {
+  const which = [...document.querySelectorAll("#picks input:checked")].map(x => x.value);
+  if (!which.length) return;
+  stopping = false; $("run").disabled = true; $("stop").disabled = false; $("log").textContent = ""; $("result").hidden = true;
+  stepsDone = 0;
+  stepsAll = (which.includes("speed") ? 7 : 0) + (which.includes("gsm8k") ? 10 : 0) + (which.includes("mc") ? 10 : 0) +
+             (which.includes("code") ? 5 : 0) + (which.includes("ifeval") ? 5 : 0);
+  const t0 = performance.now();
+  const R = { id: Date.now().toString(36), when: new Date().toISOString(), tests: which, data_version: D.version };
+  try {
+    info = await getJSON("/api/info"); specs = await getJSON("/api/specs").catch(() => null);
+    if (!info.loaded) throw new Error("no model is loaded: load one on the chat page first");
+    R.model = info.name; R.file = specs && specs.model_file; R.quant = specs && specs.quant;
+    R.pc = pcLine(); R.settings = settingsLine(); R.tierlm = info.version;
+    $("status").textContent = "Running…";
+    if (which.includes("speed")) await speedTests(R);
+    await accuracy(R, which);
+    R.minutes = (performance.now() - t0) / 60000;
+    last = R;
+    show(R);
+    await post("/api/benchruns", { run: R }).catch(() => {});
+    $("status").textContent = `Done in ${R.minutes.toFixed(1)} minutes.`;
+    loadHistory();
+  } catch (e) {
+    $("status").textContent = stopping ? "Stopped." : "Stopped: " + e.message;
+  } finally {
+    $("run").disabled = false; $("stop").disabled = true; controller = null;
+  }
+}
+function pcLine() {
+  if (!specs) return "";
+  const g = (specs.gpus || []).map(x => `${x.name} ${Math.round((x.vram || 0) / 2 ** 30)} GB (${x.backend})`).join(" + ");
+  return [g || "no GPU", `${(specs.cpu || "").split(",")[0]}, ${Math.round((specs.ram_total || 0) / 2 ** 30)} GB RAM`, specs.os].filter(Boolean).join(" | ");
+}
+function settingsLine() {
+  const where = info.all_on_gpu ? "all on the GPU" : info.live_experts ? "VRAM experts following the conversation" : info.hot_experts ? "busiest experts in VRAM" : info.on_gpu ? "split between GPU and RAM" : "CPU";
+  return [`${(info.ctx || 0).toLocaleString()} tokens of context`, `KV ${info.kv_type}`, `${info.threads} thread${info.threads === 1 ? "" : "s"}`, where,
+          info.speculative ? `speculative ${info.draft_max}` : "no speculative decoding"].join(", ");
+}
+
+// ---------- showing a run ----------
+const pct = a => a && a.of ? Math.round(100 * a.right / a.of) : null;
+function stat(l, v, unit, note) { return `<div class="stat"><div class="l">${esc(l)}</div><div class="v">${v}${unit ? ` <small>${unit}</small>` : ""}</div>${note ? `<div class="n">${esc(note)}</div>` : ""}</div>`; }
+function show(R) {
+  $("result").hidden = false;
+  $("rspec").textContent = `${R.model}${R.quant ? " " + R.quant : ""} | ${R.pc} | ${R.settings} | tierlm ${R.tierlm}`;
+  const S = R.speed, out = [];
+  if (S) {
+    const f = x => x ? x.tps.toFixed(0) : "-";
+    out.push(stat("Prompt reading, short", f(S.pf_short_warm), "tok/s", `first time ${f(S.pf_short_cold)}; ${S.pf_short_warm ? S.pf_short_warm.tokens : "?"} tokens`));
+    out.push(stat("Prompt reading, long", f(S.pf_long_warm), "tok/s", `first time ${f(S.pf_long_cold)}; ${S.pf_long_warm ? S.pf_long_warm.tokens.toLocaleString() : "?"} tokens`));
+    out.push(stat("First word, short prompt", S.pf_short_warm && S.pf_short_warm.ttft ? S.pf_short_warm.ttft.toFixed(2) : "-", "s", S.pf_long_warm && S.pf_long_warm.ttft ? `long prompt: ${S.pf_long_warm.ttft.toFixed(2)} s` : ""));
+    out.push(stat("Writing, empty context", S.gen_empty ? S.gen_empty.tps.toFixed(1) : "-", "tok/s", S.gen_empty ? `${S.gen_empty.tokens} tokens` : ""));
+    out.push(stat("Writing, filled context", S.gen_deep ? S.gen_deep.tps.toFixed(1) : "-", "tok/s", S.gen_deep ? `after ${S.gen_deep.depth.toLocaleString()} tokens` : ""));
+    if (S.spec) out.push(stat(`Code, guessing ahead (${S.spec.guesses})`, S.spec.on.tps.toFixed(1), "tok/s", `without: ${S.spec.off.tps.toFixed(1)} tok/s`));
+  }
+  $("rspeed").innerHTML = out.join("") || `<div class="note">Not measured in this run.</div>`;
+  const A = R.acc || {}, sc = [];
+  const names = { maths: "Maths (GSM8K)", knowledge: "Knowledge (MMLU, ARC)", code: "Code (HumanEval, JS)", instructions: "Instructions (IFEval)" };
+  let right = 0, of = 0;
+  for (const k of Object.keys(names)) if (A[k]) { right += A[k].right; of += A[k].of; sc.push(stat(names[k], `${A[k].right}/${A[k].of}`, "", `${pct(A[k])}%`)); }
+  if (of) sc.unshift(stat("All questions", `${right}/${of}`, "", `${Math.round(100 * right / of)}%`));
+  $("rscore").innerHTML = sc.join("") || `<div class="note">Not measured in this run.</div>`;
+  $("rdetail").innerHTML = (R.detail || []).map(x => `<div style="margin:10px 0"><div><span class="${x.ok ? "pass" : "fail"}">${x.ok ? "Right" : "Wrong"}</span> ${esc(x.label)} <span class="note">${esc(x.got)}</span></div>` +
+    `<details><summary>Question and answer</summary><div class="ans">${esc(x.prompt)}</div><div class="ans" style="margin-top:4px">${esc(x.answer || "(no answer)")}</div></details></div>`).join("");
+}
+function summary(R) {
+  const S = R.speed || {}, A = R.acc || {};
+  let right = 0, of = 0; for (const k in A) { right += A[k].right; of += A[k].of; }
+  return { S, A, right, of };
+}
+function lineOf(R) {
+  const { S, A, right, of } = summary(R);
+  const parts = [`tierlm ${R.tierlm}`, `${R.model}${R.quant ? " " + R.quant : ""}`, R.pc, R.settings];
+  const sp = [];
+  if (S.pf_long_warm) sp.push(`prompt ${S.pf_long_warm.tps.toFixed(0)} tok/s (${S.pf_long_warm.tokens} tokens)`);
+  if (S.gen_empty) sp.push(`generation ${S.gen_empty.tps.toFixed(1)} tok/s`);
+  if (S.gen_deep) sp.push(`${S.gen_deep.tps.toFixed(1)} tok/s at ${S.gen_deep.depth} tokens of context`);
+  if (of) sp.push(`accuracy ${right}/${of} (` + Object.entries(A).map(([k, v]) => `${k} ${v.right}/${v.of}`).join(", ") + ")");
+  return parts.join(" | ") + " -> " + sp.join(", ");
+}
+function mdOf(R) {
+  const { S, A, right, of } = summary(R), rows = [["", ""]];
+  rows.length = 0;
+  rows.push(["tierlm", R.tierlm], ["Model", `${R.model}${R.quant ? " " + R.quant : ""}`], ["PC", R.pc], ["Settings", R.settings]);
+  const f = x => x ? `${x.tps.toFixed(1)} tok/s (${(x.tokens || 0).toLocaleString()} tokens)` : "";
+  if (S.pf_short_warm) rows.push(["Prompt reading, short (first time)", `${f(S.pf_short_warm)} (${S.pf_short_cold ? S.pf_short_cold.tps.toFixed(1) : "-"})`]);
+  if (S.pf_long_warm) rows.push(["Prompt reading, long (first time)", `${f(S.pf_long_warm)} (${S.pf_long_cold ? S.pf_long_cold.tps.toFixed(1) : "-"})`]);
+  if (S.pf_short_warm && S.pf_short_warm.ttft) rows.push(["First word", `${S.pf_short_warm.ttft.toFixed(2)} s (short prompt)`]);
+  if (S.gen_empty) rows.push(["Writing, empty context", f(S.gen_empty)]);
+  if (S.gen_deep) rows.push(["Writing after " + S.gen_deep.depth.toLocaleString() + " tokens", f(S.gen_deep)]);
+  if (S.spec) rows.push([`Code, guessing ahead (${S.spec.guesses}) / without`, `${S.spec.on.tps.toFixed(1)} / ${S.spec.off.tps.toFixed(1)} tok/s`]);
+  for (const [k, v] of Object.entries(A)) rows.push([`Accuracy: ${k}`, `${v.right}/${v.of}`]);
+  if (of) rows.push(["Accuracy: all", `${right}/${of} (${Math.round(100 * right / of)}%)`]);
+  return "| | |\n|---|---|\n" + rows.map(r => `| ${r[0]} | ${String(r[1]).replace(/\|/g, "/")} |`).join("\n") + "\n\n(tierlm benchmark: temperature 0, thinking off; 30 fixed questions from GSM8K, MMLU, ARC-Challenge, HumanEval and IFEval)";
+}
+async function copy(t, btn) { try { await navigator.clipboard.writeText(t); const o = btn.textContent; btn.textContent = "Copied"; setTimeout(() => btn.textContent = o, 1200); } catch (e) {} }
+$("copyline").onclick = e => last && copy(lineOf(last), e.target);
+$("copymd").onclick = e => last && copy(mdOf(last), e.target);
+$("copyjson").onclick = e => last && copy(JSON.stringify(last, null, 1), e.target);
+
+// ---------- the runs kept ----------
+async function loadHistory() {
+  let runs = [];
+  try { runs = await getJSON("/api/benchruns"); } catch (e) {}
+  $("histnote").textContent = runs.length ? `${runs.length} run${runs.length === 1 ? "" : "s"}` : "";
+  if (!runs.length) { $("hist").innerHTML = `<tr><td class="note">No runs yet.</td></tr>`; return; }
+  const sc = (A, k) => A && A[k] ? `${A[k].right}/${A[k].of}` : "";
+  $("hist").innerHTML = `<tr><th>When</th><th>Model</th><th>Settings</th><th class="num">Prompt tok/s</th><th class="num">Writing tok/s</th><th class="num">Filled ctx</th>` +
+    `<th class="num">Maths</th><th class="num">Knowl.</th><th class="num">Code</th><th class="num">Instr.</th><th class="num">All</th><th></th></tr>` +
+    runs.slice().reverse().map(R => {
+      const { S, A, right, of } = summary(R);
+      return `<tr data-id="${esc(R.id)}"><td>${esc(new Date(R.when).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }))}</td>` +
+        `<td>${esc(R.model)}${R.quant ? `<div class="note">${esc(R.quant)}</div>` : ""}</td><td class="spec">${esc(R.settings || "")}</td>` +
+        `<td class="num">${S.pf_long_warm ? S.pf_long_warm.tps.toFixed(0) : ""}</td><td class="num">${S.gen_empty ? S.gen_empty.tps.toFixed(1) : ""}</td>` +
+        `<td class="num">${S.gen_deep ? S.gen_deep.tps.toFixed(1) : ""}</td><td class="num">${sc(A, "maths")}</td><td class="num">${sc(A, "knowledge")}</td>` +
+        `<td class="num">${sc(A, "code")}</td><td class="num">${sc(A, "instructions")}</td><td class="num">${of ? Math.round(100 * right / of) + "%" : ""}</td>` +
+        `<td class="acts"><button class="tiny" data-show="${esc(R.id)}">Show</button> <button class="tiny" data-del="${esc(R.id)}" title="Remove this run">✕</button></td></tr>`;
+    }).join("");
+  $("hist").onclick = async e => {
+    const id = e.target.dataset.show || e.target.dataset.del; if (!id) return;
+    const R = runs.find(x => x.id === id); if (!R) return;
+    if (e.target.dataset.show) { last = R; show(R); $("result").scrollIntoView({ behavior: "smooth" }); }
+    else if (confirm("Remove this run?")) { await post("/api/benchruns", { delete: id }); loadHistory(); }
+  };
+}
+
+$("run").onclick = run;
+$("stop").onclick = () => { stopping = true; if (controller) controller.abort(); $("status").textContent = "Stopping…"; };
+(async () => {
+  try {
+    info = await getJSON("/api/info");
+    $("hdr").textContent = info.loaded ? `${info.name} · ${info.device || ""}` : "no model loaded: load one on the chat page first";
+    if (!info.loaded) $("run").disabled = true;
+  } catch (e) { $("hdr").textContent = "tierlm isn't answering"; }
+  loadHistory();
+})();
+</script>
+</body>
+</html>

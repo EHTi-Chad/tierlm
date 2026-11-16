@@ -415,11 +415,20 @@ as `/api/chat` would. The optional body sets the sampling to measure with (`temp
 Returns `{"prompt_tps": 143.0, "gen_tps": 22.3, "speculative": true, "draft_max": 2, "threads": 8, "prompt_tokens": 512,
 "gen_tokens": 160, "questions": 3}` (the last three: what the speeds were measured on, up to `gen_tokens` per answer).
 
+### GET /bench, GET /api/benchruns, POST /api/benchruns
+
+`/bench` is the benchmark page (since 0.9.1); it runs everything through `/api/chat`, `/api/spec`, `/api/info` and
+`/api/specs`. Its questions are in `/bench-data.js` (made by `scripts/make-bench-data.py` from GSM8K, MMLU,
+ARC-Challenge, HumanEval and IFEval; sources and licences in the file). `GET /api/benchruns` returns the saved runs (a
+JSON array, oldest first, kept in `tierlm-bench.json` next to the settings); `POST /api/benchruns` with
+`{"run": {...}}` adds one and `{"delete": "<id>"}` removes one, from this computer only (403 from other devices).
+
 ### POST /api/spec
 
 Turns speculative decoding on or off, or changes the guesses per check, without reloading:
 `{"speculative": true, "draft_max": 2}`. Only when the model was loaded with its draft layer (`mtp_loaded` in
-`/api/info`); otherwise it answers 409. `{"lookup": 8}` (or `0`, or `-1` for automatic) changes prompt lookup, for
+`/api/info`), or has none but can guess from its VRAM experts (`self_draft`, with part of its experts in RAM; since
+0.9.0); otherwise it answers 409. `{"lookup": 8}` (or `0`, or `-1` for automatic) changes prompt lookup, for
 any model, and keeps the conversation in the cache.
 
 ### POST /api/usage/reset
