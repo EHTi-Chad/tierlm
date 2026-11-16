@@ -34,6 +34,21 @@ its binaries.
 | [PyTorch](https://pytorch.org) and [Hugging Face transformers](https://github.com/huggingface/transformers) | Reference Qwen3.5 vision and text model for the image test (`tests/tiny_vision.py`) | BSD-3-Clause, Apache 2.0 |
 | [Pillow](https://python-pillow.org) | Test images and the reference resize | MIT-CMU (HPND) |
 
+## Benchmark questions
+
+`web/bench-data.js`, the benchmark page's fixed questions, holds a few items from each of these sets (made by
+`scripts/make-bench-data.py`), under their own licences:
+
+| Set | Items | Licence |
+|---|---|---|
+| [GSM8K](https://github.com/openai/grade-school-math) (OpenAI) | 10 maths word problems | MIT |
+| [MMLU](https://github.com/hendrycks/test) (Hendrycks et al.) | 5 multiple-choice questions | MIT |
+| [ARC-Challenge](https://allenai.org/data/arc) (Allen Institute for AI) | 5 multiple-choice questions | CC BY-SA 4.0 |
+| [HumanEval](https://github.com/openai/human-eval) (OpenAI) | 5 problems; their tests translated to JavaScript | MIT |
+| [IFEval](https://github.com/google-research/google-research/tree/master/instruction_following_eval) (Google) | 5 prompts | Apache 2.0 |
+
+The ARC-Challenge items, as adapted in that file, stay under CC BY-SA 4.0.
+
 ## Models
 
 Model weights are not part of this repository. Each model has its own licence, set by its publisher. For
