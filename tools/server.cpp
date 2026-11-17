@@ -1096,7 +1096,7 @@ fs::path vision_file_for(const std::string& model_path, int n_embd) {
         gguf_init_params gp{ true, nullptr };
         if (gguf_context* g = gguf_init_from_file(f.path().u8string().c_str(), gp)) {
             const int64_t id = gguf_find_key(g, "clip.vision.projection_dim");
-            const int64_t dim = id >= 0 ? (int64_t)gguf_get_val_u32(g, id) : 0;
+            const int64_t dim = id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32 ? (int64_t)gguf_get_val_u32(g, id) : 0;
             gguf_free(g);
             if (n_embd > 0 && dim > 0 && dim != n_embd) continue;          // another model's eyes
         }
@@ -1810,7 +1810,7 @@ int main(int argc, char** argv) {
         if (body.contains("ssd")) o.ssd = body.value("ssd", true) ? -1 : 0;
         // Connections: replies written at once. The context length is per connection, so the cache holds that many.
         o.parallel = std::max(1, std::min(64, body.value("connections", 1)));
-        if (o.parallel > 1 && o.max_ctx > 0) o.max_ctx *= o.parallel;
+        if (o.parallel > 1 && o.max_ctx > 0) o.max_ctx = (int)std::min<long long>((long long)o.max_ctx * o.parallel, INT_MAX);
         return o;
     };
     httplib::Server svr;
@@ -2271,7 +2271,7 @@ int main(int argc, char** argv) {
         const int cur = eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per;
         size_t vram_tok = 0;
         const size_t all_tok = eng.model->kv_bytes_per_token(&vram_tok), ram_tok = all_tok - vram_tok;
-        const long long d = (long long)(want - cur) * conns;          // positions added (or dropped), all connections
+        const long long d = ((long long)want - cur) * conns;          // positions added (or dropped), all connections
         size_t vfree = 0, vtotal = 0, rfree = 0, rtotal = 0;
         eng.model->device_memory(vfree, vtotal);
         if (auto c = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ggml_backend_dev_memory(c, &rfree, &rtotal);
@@ -2287,7 +2287,7 @@ int main(int argc, char** argv) {
         std::string why;
         if (want < 256) why = "the context must be at least 256 tokens";
         else if (trained > 0 && want > trained) why = "longer than this model was trained for (" + std::to_string(trained) + " tokens)";
-        else if (eng.model->ctx_in_use() > want * conns) why = "the conversations in the cache are longer: start a new chat first";
+        else if ((long long)eng.model->ctx_in_use() > (long long)want * conns) why = "the conversations in the cache are longer: start a new chat first";
         j["live"] = why.empty() && fits_v && fits_r;
         j["reload"] = why.empty() && (!fits_v || !fits_r);
         if (!why.empty()) j["why"] = why;

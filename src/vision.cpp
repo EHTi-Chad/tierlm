@@ -37,6 +37,11 @@ struct Keys {
             default: return def;
         }
     }
+    // A count or size: whole, and clamped so a made-up value can't overflow the conversion (the checks below refuse it).
+    int inum(const std::string& k, int def) const {
+        const double v = num(k, def);
+        return std::isfinite(v) ? (int)std::max(-1e9, std::min(1e9, v)) : -1;
+    }
     bool floats(const std::string& k, float* out, int n) const {
         int64_t id = gguf_find_key(g, k.c_str());
         if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(g, id) != GGUF_TYPE_FLOAT32 ||
@@ -158,25 +163,28 @@ std::unique_ptr<Vision> Vision::load(const std::string& path, const std::string&
     const std::string proj = projector_of(k);
     if (proj != "qwen3vl_merger") throw std::runtime_error("vision file of type '" + proj + "' is not supported yet");
     if (k.num("clip.has_vision_encoder", 1) == 0) throw std::runtime_error("the file has no vision encoder");
-    v->n_embd_ = (int)k.num("clip.vision.embedding_length", 0);
-    v->n_head_ = (int)k.num("clip.vision.attention.head_count", 0);
-    v->n_ff_ = (int)k.num("clip.vision.feed_forward_length", 0);
-    v->patch_ = (int)k.num("clip.vision.patch_size", 16);
-    v->merge_ = (int)k.num("clip.vision.spatial_merge_size", 2);
-    v->out_dim_ = (int)k.num("clip.vision.projection_dim", 0);
+    v->n_embd_ = k.inum("clip.vision.embedding_length", 0);
+    v->n_head_ = k.inum("clip.vision.attention.head_count", 0);
+    v->n_ff_ = k.inum("clip.vision.feed_forward_length", 0);
+    v->patch_ = k.inum("clip.vision.patch_size", 16);
+    v->merge_ = k.inum("clip.vision.spatial_merge_size", 2);
+    v->out_dim_ = k.inum("clip.vision.projection_dim", 0);
     v->eps_ = (float)k.num("clip.vision.attention.layer_norm_epsilon", 1e-6);
-    const int n_block = (int)k.num("clip.vision.block_count", 0);
+    const int n_block = k.inum("clip.vision.block_count", 0);
+    if (v->patch_ < 1 || v->patch_ > 1024 || n_block > 1024 || v->n_embd_ > (1 << 16) || v->n_ff_ < 0 || v->n_ff_ > (1 << 20) ||
+        v->out_dim_ > (1 << 20) || !std::isfinite(v->eps_))
+        throw std::runtime_error("vision file with incomplete or unexpected settings");
     k.floats("clip.vision.image_mean", v->mean_, 3);
     k.floats("clip.vision.image_std", v->std_, 3);
     const int unit = v->patch_ * v->merge_;                      // pixels per image word, per side
-    const double minp = k.num("clip.vision.image_min_pixels", 0), maxp = k.num("clip.vision.image_max_pixels", 0);
+    const double minp = std::min(k.num("clip.vision.image_min_pixels", 0), 1e12), maxp = std::min(k.num("clip.vision.image_max_pixels", 0), 1e12);
     if (minp > 0) v->min_tokens_ = std::max(1, (int)(minp / (unit * unit)));
     if (maxp > 0) v->max_tokens_ = std::max(v->min_tokens_, (int)(maxp / (unit * unit)));
     if (v->n_embd_ <= 0 || v->n_head_ <= 0 || n_block <= 0 || v->n_embd_ % v->n_head_ || v->out_dim_ <= 0 || v->merge_ != 2)
         throw std::runtime_error("vision file with incomplete or unexpected settings");
     if (k.num("clip.vision.is_deepstack_layers", 0) != 0) {
         const int64_t id = gguf_find_key(g, "clip.vision.is_deepstack_layers");
-        if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY) {
+        if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, id) == GGUF_TYPE_BOOL) {
             const bool* d = (const bool*)gguf_get_arr_data(g, id);
             for (size_t i = 0; i < gguf_get_arr_n(g, id); ++i)
                 if (d[i]) throw std::runtime_error("Qwen3-VL DeepStack vision files are not supported yet");

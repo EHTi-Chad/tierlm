@@ -46,18 +46,23 @@ std::unique_ptr<Encoder> Encoder::load(const std::string& path, const std::strin
             default: return def;
         }
     };
+    auto inum = [&](const std::string& k, double def) -> int {     // (clamped: a made-up value can't overflow the conversion)
+        const double v = num(k, def);
+        return std::isfinite(v) ? (int)std::max(-1e9, std::min(1e9, v)) : -1;
+    };
     e->arch_ = sval("general.architecture");
     if (!is_encoder_arch(e->arch_)) throw std::runtime_error("'" + e->arch_ + "' is not a supported embedding model");
     const std::string a = e->arch_ + ".";
-    e->n_embd_ = (int)num(a + "embedding_length", 0);
-    e->n_head_ = (int)num(a + "attention.head_count", 0);
-    e->n_layer_ = (int)num(a + "block_count", 0);
-    e->n_ctx_ = (int)num(a + "context_length", 512);
+    e->n_embd_ = inum(a + "embedding_length", 0);
+    e->n_head_ = inum(a + "attention.head_count", 0);
+    e->n_layer_ = inum(a + "block_count", 0);
+    e->n_ctx_ = inum(a + "context_length", 512);
     e->eps_ = (float)num(a + "attention.layer_norm_epsilon", 1e-12);
     e->rope_base_ = (float)num(a + "rope.freq_base", 10000.0);
-    const int pool = (int)num(a + "pooling_type", 1);
+    const int pool = inum(a + "pooling_type", 1);
     e->pooling_ = pool == 2 ? Pooling::Cls : pool == 3 ? Pooling::Last : Pooling::Mean;   // none/rank: mean
-    if (e->n_embd_ <= 0 || e->n_head_ <= 0 || e->n_layer_ <= 0 || e->n_embd_ % e->n_head_)
+    if (e->n_embd_ <= 0 || e->n_head_ <= 0 || e->n_layer_ <= 0 || e->n_embd_ % e->n_head_ ||
+        e->n_embd_ > (1 << 16) || e->n_layer_ > 1024 || e->n_ctx_ < 0 || e->n_ctx_ > (1 << 24))
         throw std::runtime_error("embedding model with incomplete settings");
 
     auto T = [&](const std::string& name, bool need) -> ggml_tensor* {

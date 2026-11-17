@@ -57,7 +57,7 @@ ModelMap load_model_map(const std::string& path) {
     ModelMap m;
     m.path = path;
     int64_t aid = gguf_find_key(g, "general.architecture");
-    if (aid >= 0) m.arch = gguf_get_val_str(g, aid);
+    if (aid >= 0 && gguf_get_kv_type(g, aid) == GGUF_TYPE_STRING) m.arch = gguf_get_val_str(g, aid);
     m.n_layers       = get_u32(g, m.arch + ".block_count");
     m.n_experts      = get_u32(g, m.arch + ".expert_count");
     m.n_experts_used = get_u32(g, m.arch + ".expert_used_count");

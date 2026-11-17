@@ -1,6 +1,8 @@
 #include "tokenizer.h"
 #include "unicode_tables.h"
 #include "gguf.h"
+#include "gguf_read.h"
+#include <memory>
 #include <algorithm>
 #include <iterator>
 #include <climits>
@@ -347,6 +349,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
     gguf_init_params p{ /*no_alloc=*/true, /*ctx=*/nullptr };
     gguf_context* g = gguf_init_from_file(path.c_str(), p);
     if (!g) throw std::runtime_error("failed to read GGUF: " + path);
+    const std::unique_ptr<gguf_context, void (*)(gguf_context*)> g_owner(g, gguf_free);   // (freed however this ends)
 
     auto sval = [&](const char* k) -> std::string {
         int64_t id = gguf_find_key(g, k);
@@ -354,7 +357,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
     };
     auto bval = [&](const char* k, bool def) -> bool {
         int64_t id = gguf_find_key(g, k);
-        return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL ? gguf_get_val_bool(g, id) : def;
+        return id >= 0 && gg::whole_type(gguf_get_kv_type(g, id)) ? gg::bool_val(g, id) : def;
     };
     const std::string model = sval("tokenizer.ggml.model");
     Tokenizer t;
@@ -381,12 +384,12 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         // Face's terms: spaces made "▁", pieces merged in the order of the file's merges list, bytes for the rest.
         t.kind_ = Kind::Spm;
         t.add_space_prefix_ = bval("tokenizer.ggml.add_space_prefix", true);
-    } else {
-        gguf_free(g);
+    } else
         throw std::runtime_error("the '" + model + "' tokenizer is not supported yet");
-    }
     int64_t tk = gguf_find_key(g, "tokenizer.ggml.tokens");
-    if (tk < 0) { gguf_free(g); throw std::runtime_error("GGUF has no tokenizer vocabulary"); }
+    if (tk < 0) throw std::runtime_error("GGUF has no tokenizer vocabulary");
+    if (!gg::str_array(g, tk) || gguf_get_arr_n(g, tk) == 0 || gguf_get_arr_n(g, tk) > (size_t)INT32_MAX)
+        throw std::runtime_error("this file's tokenizer vocabulary isn't a list of words");
     const size_t nt = gguf_get_arr_n(g, tk);
     t.id_to_token_.resize(nt);
     for (size_t i = 0; i < nt; ++i) {
@@ -402,7 +405,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
     }
     int64_t yk = gguf_find_key(g, "tokenizer.ggml.token_type");
     t.token_type_.assign(nt, 1);
-    if (yk >= 0 && gguf_get_arr_type(g, yk) == GGUF_TYPE_INT32 && gguf_get_arr_n(g, yk) == nt) {
+    if (yk >= 0 && gg::is_array(g, yk) && gguf_get_arr_type(g, yk) == GGUF_TYPE_INT32 && gguf_get_arr_n(g, yk) == nt) {
         const int32_t* ty = (const int32_t*)gguf_get_arr_data(g, yk);
         t.token_type_.assign(ty, ty + nt);
     }
@@ -413,22 +416,23 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
                      [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
 
     int64_t sk = gguf_find_key(g, "tokenizer.ggml.scores");
-    if (sk >= 0 && gguf_get_arr_type(g, sk) == GGUF_TYPE_FLOAT32 && gguf_get_arr_n(g, sk) == nt) {
+    if (sk >= 0 && gg::is_array(g, sk) && gguf_get_arr_type(g, sk) == GGUF_TYPE_FLOAT32 && gguf_get_arr_n(g, sk) == nt) {
         const float* sc = (const float*)gguf_get_arr_data(g, sk);
         t.score_.assign(sc, sc + nt);
     }
 
     int64_t rk = gguf_find_key(g, "tokenizer.ggml.merges");          // optional: a byte-only vocab has none
+    if (rk >= 0 && !gg::str_array(g, rk)) throw std::runtime_error("this file's tokenizer merges aren't a list of text");
     const size_t nm = rk < 0 ? 0 : gguf_get_arr_n(g, rk);
     for (size_t i = 0; i < nm; ++i) t.merge_rank_.emplace(gguf_get_arr_str(g, rk, i), (int32_t)i);
-    if (t.kind_ == Kind::Spm && t.score_.empty() && t.merge_rank_.empty()) {
-        gguf_free(g);
+    if (t.kind_ == Kind::Spm && t.score_.empty() && t.merge_rank_.empty())
         throw std::runtime_error("SentencePiece vocabulary has neither scores nor merges");
-    }
 
     auto u32 = [&](const char* k) -> int32_t {
         int64_t id = gguf_find_key(g, k);
-        return id < 0 ? -1 : (int32_t)gguf_get_val_u32(g, id);
+        if (id < 0) return -1;
+        const int64_t v = gg::int_val(g, id);
+        return v >= 0 && v < (int64_t)nt ? (int32_t)v : -1;              // (an id outside the vocabulary: none)
     };
     t.bos_ = u32("tokenizer.ggml.bos_token_id");
     t.eos_ = u32("tokenizer.ggml.eos_token_id");
@@ -450,7 +454,6 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         }
     }
     t.chat_template_ = sval("tokenizer.chat_template");
-    gguf_free(g);
 
     int extra = 0;                                   // GPT-2 bytes_to_unicode()
     for (int b = 0; b < 256; ++b) {

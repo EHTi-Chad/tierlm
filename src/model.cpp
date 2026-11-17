@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "backends.h"
 #include "gguf.h"
+#include "gguf_read.h"
 #include <algorithm>
 #include <atomic>
 #include <set>
@@ -62,7 +63,7 @@ std::string mtp_companion(const std::string& model_path) {
         gguf_context* g = gguf_init_from_file(p.c_str(), ip);
         if (!g) return false;
         auto s = [&](const std::string& k) { int64_t id = gguf_find_key(g, k.c_str()); return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING ? std::string(gguf_get_val_str(g, id)) : std::string(); };
-        auto u = [&](const std::string& k) { int64_t id = gguf_find_key(g, k.c_str()); return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g, id) : 0u; };
+        auto u = [&](const std::string& k) { int64_t id = gguf_find_key(g, k.c_str()); return id >= 0 && gg::whole_type(gguf_get_kv_type(g, id)) ? (uint32_t)std::max<int64_t>(0, std::min<int64_t>(gg::int_val(g, id), UINT32_MAX)) : 0u; };
         arch = s("general.architecture");
         embd = u(arch + ".embedding_length"); nextn = u(arch + ".nextn_predict_layers"); blocks = u(arch + ".block_count");
         has_layer0 = false;                              // any layer-0 tensor (Flash-Next's layers have no attn_norm)
@@ -250,22 +251,18 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         }
         cleanup();
     }
+    // From here the settings file is freed however loading ends (an error anywhere below throws).
+    std::unique_ptr<gguf_context, void (*)(gguf_context*)> g_owner(g, gguf_free);
 
-    auto str = [&](const char* k) -> std::string { int64_t id = gguf_find_key(g, k); return id < 0 ? "" : gguf_get_val_str(g, id); };
+    auto str = [&](const char* k) -> std::string { int64_t id = gguf_find_key(g, k); return id < 0 ? "" : gg::str_val(g, id); };
     // A whole number per layer: the key holds a list (Nemotron), or one number for every layer; missing: zeros.
     auto per_layer = [&](const std::string& k, int n) -> std::vector<int> {
         std::vector<int> v((size_t)n, 0);
         const int64_t id = gguf_find_key(g, k.c_str());
         if (id < 0) return v;
-        if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) { std::fill(v.begin(), v.end(), (int)gguf_get_val_u32(g, id)); return v; }
-        const auto t = gguf_get_arr_type(g, id);
-        const void* d = gguf_get_arr_data(g, id);
-        const int cnt = (int)gguf_get_arr_n(g, id);
-        for (int i = 0; i < n && i < cnt; ++i)
-            v[i] = t == GGUF_TYPE_INT32 || t == GGUF_TYPE_UINT32 ? (int)((const int32_t*)d)[i]
-                 : t == GGUF_TYPE_INT64 || t == GGUF_TYPE_UINT64 ? (int)((const int64_t*)d)[i]
-                 : t == GGUF_TYPE_INT16 || t == GGUF_TYPE_UINT16 ? (int)((const uint16_t*)d)[i]
-                 : t == GGUF_TYPE_INT8 || t == GGUF_TYPE_UINT8 ? (int)((const uint8_t*)d)[i] : 0;
+        if (!gg::is_array(g, id)) { std::fill(v.begin(), v.end(), gg::clamp_int(gg::int_val(g, id))); return v; }
+        const size_t cnt = gguf_get_arr_n(g, id);
+        for (size_t i = 0; i < (size_t)n && i < cnt; ++i) v[i] = gg::clamp_int(gg::arr_int(g, id, i));
         return v;
     };
     // (a key that holds a list gives its largest entry)
@@ -274,23 +271,23 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         if (id < 0) { if (required) throw std::runtime_error("missing key " + k); return 0; }
         if (gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY) {
             int mx = 0;
-            for (int v : per_layer(k, (int)gguf_get_arr_n(g, id))) mx = std::max(mx, v);
+            for (int v : per_layer(k, (int)std::min<size_t>(gguf_get_arr_n(g, id), 1 << 16))) mx = std::max(mx, v);
             return mx;
         }
-        return (int)gguf_get_val_u32(g, id);
+        return gg::clamp_int(gg::int_val(g, id));
     };
     auto f32 = [&](const std::string& k, float def) -> float {
         int64_t id = gguf_find_key(g, k.c_str());
-        return id < 0 ? def : gguf_get_val_f32(g, id);
+        return id < 0 ? def : (float)gg::num_val(g, id);
     };
 
     const std::string arch = str("general.architecture");
-    if (!arch_supported(arch)) { gguf_free(g); throw std::runtime_error("the " + arch + " architecture is not supported yet"); }
+    if (!arch_supported(arch)) throw std::runtime_error("the " + arch + " architecture is not supported yet");
     // PrismML's Bonsai 2: weights stored rotated (a Hadamard transform, declared under prism.hadamard.*). Without the
     // matching transform on the way in, the model loads and writes gibberish, so it is refused until tierlm has it.
     for (int64_t i = 0; i < gguf_get_n_kv(g); ++i)
         if (std::strncmp(gguf_get_key(g, i), "prism.hadamard", 14) == 0) {
-            gguf_free(g);
+           
             throw std::runtime_error("Bonsai 2 (ternary weights stored in a rotated form) is not supported yet");
         }
     Hparams& hp = m->hp_;
@@ -309,11 +306,22 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     hp.rope_base     = f32(arch + ".rope.freq_base", 10000.0f);
     hp.rms_eps       = f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     if (hp.n_head_kv == 0) hp.n_head_kv = hp.n_head;
-    if (hp.head_dim == 0) hp.head_dim = hp.n_embd / hp.n_head;
+    if (hp.head_dim == 0) hp.head_dim = hp.n_head > 0 ? hp.n_embd / hp.n_head : 0;
     if (hp.n_rot == 0) hp.n_rot = hp.head_dim;
     if (hp.n_ctx == 0) hp.n_ctx = 4096;
     if (hp.n_expert > 0 && hp.n_ff_exp == 0) hp.n_ff_exp = hp.n_ff;
-    if (hp.n_expert > 0 && hp.n_expert_used == 0) { gguf_free(g); throw std::runtime_error("missing key " + arch + ".expert_used_count"); }
+    if (hp.n_expert > 0 && hp.n_expert_used == 0) throw std::runtime_error("missing key " + arch + ".expert_used_count");
+    {   // A damaged or made-up file must be refused here, not crash later: sizes are allocated and divided by below.
+        auto bad = [&](const char* what) { throw std::runtime_error(std::string("this file's settings don't make sense: ") + what); };
+        if (hp.n_layer < 1 || hp.n_layer > 4096) bad("layer count");
+        if (hp.n_embd < 1 || hp.n_embd > (1 << 20)) bad("width");
+        if (hp.n_head < 1 || hp.n_head > (1 << 14) || hp.n_head_kv < 1 || hp.n_head_kv > (1 << 14)) bad("head count");
+        if (hp.head_dim < 1 || hp.head_dim > (1 << 14) || hp.n_rot < 0 || hp.n_rot > (1 << 14)) bad("head size");
+        if (hp.n_ff < 0 || hp.n_ff > (1 << 22) || hp.n_ff_exp < 0 || hp.n_ff_exp > (1 << 22)) bad("feed-forward size");
+        if (hp.n_expert < 0 || hp.n_expert > (1 << 16) || hp.n_expert_used < 0 || hp.n_expert_used > std::max(hp.n_expert, 0)) bad("expert count");
+        if (hp.n_ctx < 0 || hp.n_ctx > (1 << 28)) bad("context length");
+        if (!std::isfinite(hp.rope_base) || hp.rope_base <= 0 || !std::isfinite(hp.rms_eps) || hp.rms_eps < 0) bad("rope or norm setting");
+    }
     {   // RoPE scaling: "linear" stretches positions; Llama 3.1-style factors come as a rope_freqs tensor instead
         const std::string type = str((arch + ".rope.scaling.type").c_str());
         const float factor = f32(arch + ".rope.scaling.factor", 1.0f);
@@ -433,7 +441,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         const int shared = (int)u32(arch + ".attention.shared_kv_layers", false);
         if (shared > 0) {
             hp.kv_from = hp.n_layer - shared;
-            if (hp.kv_from < 2) { gguf_free(g); throw std::runtime_error("Gemma 4: too many layers share an earlier one's cache"); }
+            if (hp.kv_from < 2) throw std::runtime_error("Gemma 4: too many layers share an earlier one's cache");
         }
         hp.g4_ple = (int)u32(arch + ".embedding_length_per_layer_input", false);
         hp.final_softcap = f32(arch + ".final_logit_softcapping", 0.0f);
@@ -489,20 +497,20 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             d.v  = ggml_get_tensor(m->wctx_, (b + "attn_v_b.weight").c_str());
             if (d.k && d.v) {
                 const int64_t kn = ggml_nelements(d.k), vn = ggml_nelements(d.v);
-                if (kn % ((int64_t)H * R) || vn % ((int64_t)H * R)) { gguf_free(g); throw std::runtime_error("unexpected attn_k_b/attn_v_b sizes in " + b); }
+                if (kn % ((int64_t)H * R) || vn % ((int64_t)H * R)) throw std::runtime_error("unexpected attn_k_b/attn_v_b sizes in " + b);
                 hp.nope = (int)(kn / ((int64_t)H * R)); hp.v_dim = (int)(vn / ((int64_t)H * R));
                 d.k_t = d.k->ne[0] != hp.nope;                     // stored with kv_lora first: rearrange
                 d.v_t = d.v->ne[0] != R;
                 if (d.kv) skip_load.insert(d.kv);                  // (both kinds in one file: the split ones are used)
                 if (!d.k_t && !d.v_t) continue;                    // used as they are
             } else if (d.kv) {
-                if (d.kv->ne[0] != R || d.kv->ne[1] % H) { gguf_free(g); throw std::runtime_error("unexpected attn_kv_b shape in " + b); }
+                if (d.kv->ne[0] != R || d.kv->ne[1] % H) throw std::runtime_error("unexpected attn_kv_b shape in " + b);
                 if (hp.nope <= 0 || hp.v_dim <= 0 || d.kv->ne[1] / H != hp.nope + hp.v_dim) {   // trust the tensor over the keys
                     const int per = (int)(d.kv->ne[1] / H);
-                    if (hp.v_dim > 0 && per > hp.v_dim) hp.nope = per - hp.v_dim; else { gguf_free(g); throw std::runtime_error("can't tell this model's key and value sizes apart"); }
+                    if (hp.v_dim > 0 && per > hp.v_dim) hp.nope = per - hp.v_dim; else throw std::runtime_error("can't tell this model's key and value sizes apart");
                 }
                 d.k = d.v = nullptr;
-            } else { gguf_free(g); throw std::runtime_error("missing attn_kv_b (or attn_k_b and attn_v_b) in " + b); }
+            } else throw std::runtime_error("missing attn_kv_b (or attn_k_b and attn_v_b) in " + b);
             // rearranged copies, kept in f32 when the file is f32 (the tests) and f16 otherwise
             const ggml_type src_t = (d.kv ? d.kv : d.k)->type, ty = src_t == GGML_TYPE_F32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
             if (d.kv || d.k_t) { d.kb = ggml_new_tensor_3d(m->wctx_, ty, hp.nope, R, H); ggml_set_name(d.kb, (b + "attn_k_b.tierlm").c_str()); }
@@ -571,7 +579,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             hp.expert_renorm = id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL && gguf_get_val_bool(g, id);
         }
         hp.expert_softmax_first = true;                           // (the scores below are what's picked and weighted)
-        if (u32(arch + ".expert_gating_func", false) != 4) { gguf_free(g); throw std::runtime_error("this DeepSeek V4 file's expert scoring isn't known (expected sqrt-softplus)"); }
+        if (u32(arch + ".expert_gating_func", false) != 4) throw std::runtime_error("this DeepSeek V4 file's expert scoring isn't known (expected sqrt-softplus)");
         // the compressed layers' YaRN, as Hugging Face computes it (truncated ramp ends), as frequency factors
         const float factor = f32(arch + ".rope.scaling.factor", 1.0f);
         const double orig = u32(arch + ".rope.scaling.original_context_length", false);
@@ -595,27 +603,24 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.hc = (int)u32(arch + ".hyper_connection.count", true);
         hp.ple_layer.assign(hp.n_layer, false);
         const int64_t pid = gguf_find_key(g, (arch + ".ple.layers").c_str());
-        if (pid >= 0 && gguf_get_kv_type(g, pid) == GGUF_TYPE_ARRAY)
+        if (pid >= 0 && gg::is_array(g, pid))
             for (size_t i = 0; i < gguf_get_arr_n(g, pid); ++i) {
-                const int l = ((const int32_t*)gguf_get_arr_data(g, pid))[i];
+                const int64_t l = gg::arr_int(g, pid, i);
                 if (l >= 0 && l < hp.n_layer) hp.ple_layer[l] = true;
             }
         if (hp.any_ple()) {
             auto u64s = [&](const std::string& k) {
                 std::vector<int64_t> v;
                 const int64_t id = gguf_find_key(g, k.c_str());
-                if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) return v;
-                const auto t = gguf_get_arr_type(g, id);
-                for (size_t i = 0; i < gguf_get_arr_n(g, id); ++i)
-                    v.push_back(t == GGUF_TYPE_UINT64 || t == GGUF_TYPE_INT64 ? ((const int64_t*)gguf_get_arr_data(g, id))[i]
-                                                                              : (int64_t)((const int32_t*)gguf_get_arr_data(g, id))[i]);
+                if (id < 0 || !gg::is_array(g, id)) return v;
+                for (size_t i = 0; i < gguf_get_arr_n(g, id); ++i) v.push_back(gg::arr_int(g, id, i));
                 return v;
             };
             const int ngram = (int)u32(arch + ".ple.ngram_size", true), hpn = (int)u32(arch + ".ple.heads_per_ngram", true);
             const int32_t eos = (int32_t)u32(arch + ".ple.eos_token_id", true);
             auto mult = u64s(arch + ".ple.layer_multipliers"), size = u64s(arch + ".ple.head_vocab_sizes"), off = u64s(arch + ".ple.head_offsets");
             if ((int)mult.size() != ngram || (int)size.size() != (ngram - 1) * hpn || size.size() != off.size()) {
-                gguf_free(g); throw std::runtime_error("this Flash-Next file's n-gram settings are incomplete");
+                throw std::runtime_error("this Flash-Next file's n-gram settings are incomplete");
             }
             hp.ngram.set(ngram, hpn, eos, mult, size, off);
             hp.ple_dim = (int)u32(arch + ".embedding_length_per_layer_input", true);
@@ -626,8 +631,8 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.qsa_heads  = (int)u32(arch + ".attention.indexer.head_count", false);
         hp.qsa_dim    = (int)u32(arch + ".attention.indexer.key_length", false);
         hp.qsa_ratio.assign(hp.n_layer, 0);
-        if (const int64_t rid = gguf_find_key(g, (arch + ".attention.compress_ratios").c_str()); rid >= 0 && gguf_get_kv_type(g, rid) == GGUF_TYPE_ARRAY)
-            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, rid); ++i) hp.qsa_ratio[i] = ((const int32_t*)gguf_get_arr_data(g, rid))[i];
+        if (const int64_t rid = gguf_find_key(g, (arch + ".attention.compress_ratios").c_str()); rid >= 0 && gg::is_array(g, rid))
+            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, rid); ++i) hp.qsa_ratio[i] = gg::clamp_int(gg::arr_int(g, rid, i));
         if (gguf_find_key(g, (arch + ".ple.image_token_id").c_str()) >= 0) hp.ple_image_tok = (int32_t)u32(arch + ".ple.image_token_id", false);
     }
     if (arch == "nemotron_h_moe") {
@@ -641,13 +646,13 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.recurrent.assign(hp.n_layer, false);
         hp.n_expert_l.assign(hp.n_layer, 0);
         for (int i = 0; i < hp.n_layer; ++i) {
-            if (kvh[i] > 0) { hp.block[i] = Hparams::kAttn; if (kvh[i] != hp.n_head_kv) { gguf_free(g); throw std::runtime_error("attention blocks with different head counts are not supported yet"); } }
+            if (kvh[i] > 0) { hp.block[i] = Hparams::kAttn; if (kvh[i] != hp.n_head_kv) throw std::runtime_error("attention blocks with different head counts are not supported yet"); }
             else if (ff[i] == 0) { hp.block[i] = Hparams::kMamba; hp.recurrent[i] = true; }
             else {
                 const ggml_tensor* r = ggml_get_tensor(m->wctx_, ("blk." + std::to_string(i) + ".ffn_gate_inp.weight").c_str());
-                if (!r) { gguf_free(g); throw std::runtime_error("Nemotron blocks without experts are not supported yet"); }
+                if (!r) throw std::runtime_error("Nemotron blocks without experts are not supported yet");
                 hp.n_expert_l[i] = (int)r->ne[1];
-                if (hp.n_expert_used_l[i] <= 0 || hp.n_expert_used_l[i] > hp.n_expert_l[i]) { gguf_free(g); throw std::runtime_error("unexpected experts-per-token count"); }
+                if (hp.n_expert_used_l[i] <= 0 || hp.n_expert_used_l[i] > hp.n_expert_l[i]) throw std::runtime_error("unexpected experts-per-token count");
             }
         }
         hp.ssm_conv = u32(arch + ".ssm.conv_kernel", true);
@@ -656,7 +661,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.m_inner  = u32(arch + ".ssm.inner_size", true);
         hp.m_heads  = u32(arch + ".ssm.time_step_rank", true);
         if (hp.m_heads <= 0 || hp.m_groups <= 0 || hp.m_inner % hp.m_heads || hp.m_heads % hp.m_groups || hp.m_inner % hp.m_groups) {
-            gguf_free(g); throw std::runtime_error("unexpected Mamba sizes");
+            throw std::runtime_error("unexpected Mamba sizes");
         }
         hp.latent = u32(arch + ".moe_latent_size", false);
         hp.rope_layer.assign(hp.n_layer, false);                  // no position encoding: the Mamba blocks carry the order
@@ -686,17 +691,14 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.ssm_v_heads = u32(arch + ".ssm.time_step_rank", true);
         hp.recurrent.assign(hp.n_layer, false);
         const int64_t rid = gguf_find_key(g, (arch + ".attention.recurrent_layers").c_str());
-        if (rid >= 0 && gguf_get_kv_type(g, rid) == GGUF_TYPE_ARRAY) {
-            const auto t = gguf_get_arr_type(g, rid);
-            const void* d = gguf_get_arr_data(g, rid);
-            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, rid); ++i)
-                hp.recurrent[i] = t == GGUF_TYPE_INT32 || t == GGUF_TYPE_UINT32 ? ((const int32_t*)d)[i] != 0 : ((const int8_t*)d)[i] != 0;
+        if (rid >= 0 && gg::is_array(g, rid)) {
+            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, rid); ++i) hp.recurrent[i] = gg::arr_num(g, rid, i) != 0;
         } else {
             int interval = u32(arch + ".full_attention_interval", false);
             if (interval <= 0) interval = 4;
             for (int i = 0; i < hp.n_layer; ++i) hp.recurrent[i] = (i + 1) % interval != 0;
         }
-        if (hp.ssm_v_heads % hp.ssm_k_heads != 0) { gguf_free(g); throw std::runtime_error("unexpected linear attention head counts"); }
+        if (hp.ssm_k_heads <= 0 || hp.ssm_v_heads <= 0 || hp.ssm_v_heads % hp.ssm_k_heads != 0) throw std::runtime_error("unexpected linear attention head counts");
         // Qwen3.5 reads images too (with its vision file): 3-part positions, sections from the file.
         const int64_t sid = gguf_find_key(g, (arch + ".rope.dimension_sections").c_str());
         if (arch != "qwen3next" && sid >= 0 && gguf_get_kv_type(g, sid) == GGUF_TYPE_ARRAY &&
@@ -729,13 +731,22 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                     sources.push_back({(int)paths.size(), data_off + gguf_get_tensor_offset(gc, k), t});
                 }
                 const int64_t id = gguf_find_key(gc, (arch + ".nextn_predict_layers").c_str());
-                if (id >= 0) hp.n_nextn = (int)gguf_get_val_u32(gc, id);
+                if (id >= 0) hp.n_nextn = gg::clamp_int(gg::int_val(gc, id));
                 paths.push_back(comp);
                 gguf_free(gc);
                 if (c) ggml_free(c);
                 std::fprintf(stderr, "speculative decoding: draft block from %s\n", comp.c_str());
             }
         }
+    }
+    {   // (the same for what the architecture-specific settings above added, per layer)
+        auto bad = [&](const char* what) { throw std::runtime_error(std::string("this file's settings don't make sense: ") + what); };
+        if (hp.n_layer < 1 || hp.n_nextn < 0 || hp.n_nextn > 16) bad("layer count");
+        if (hp.head_dim < 1 || hp.head_dim > (1 << 14) || hp.n_rot < 0 || hp.n_rot > (1 << 14)) bad("head size");
+        for (size_t i = 0; i < hp.hd_l.size(); ++i)
+            if (hp.hd_l[i] < 0 || hp.hd_l[i] > (1 << 14) || (i < hp.rot_l.size() && (hp.rot_l[i] < 0 || hp.rot_l[i] > (1 << 14)))) bad("head size");
+        for (int v : hp.kvh_l) if (v < 0 || v > (1 << 14)) bad("head count");
+        if (hp.n_swa < 0) bad("sliding window");
     }
     // Layers to load: the model's, plus the MTP draft block (stored as layer n_layer) when speculating.
     const bool want_mtp = opt.mtp && hp.n_nextn > 0 &&
@@ -1272,7 +1283,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             ggml_backend_buffer_free(probe);
         }
     }
-    try {
+    {
         m->place_.gpus.resize(G);
         for (int d = 0; d < G; ++d) {
             m->place_.gpus[d].name = ggml_backend_dev_name(ggml_backend_get_device(m->gpus_[d]));
@@ -1293,7 +1304,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         }
         alloc(cpu_buft, on_cpu, m->place_.cpu_weights);
         if (!on_repack.empty()) alloc(repack_buft, on_repack, m->place_.cpu_weights);
-    } catch (...) { gguf_free(g); throw; }
+    }
     m->place_.repacked = (int)on_repack.size();
     // The SSD tier's weights: mapped from the model's own file where it is (ssd_dir empty), or from tierlm's copy of
     // just those weights in ssd_dir (written now if it isn't there or doesn't match this model).
@@ -1321,7 +1332,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             m->maps_.push_back(std::move(mf));
             m->place_.ssd_file = file;
         };
-        try {
+        {
             if (in_place) {
                 std::map<int, std::vector<std::pair<ggml_tensor*, size_t>>> by_part;
                 for (ggml_tensor* t : on_ssd) by_part[src_of.at(t)->part].push_back({t, src_of.at(t)->offset});
@@ -1421,7 +1432,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                 if (!layers.empty()) use_copy(layers, false);
                 (void)wrote;
             }
-        } catch (...) { gguf_free(g); throw; }
+        }
         std::fprintf(stderr, "SSD tier: %s%d layers, %.1f GB, read as needed from %s\n", m->place_.ssd_ngram ? "the n-gram table + " : "", m->place_.ssd_layers,
                      m->place_.ssd_weights / 1e9, m->place_.ssd_file.c_str());
     }
@@ -1455,7 +1466,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         for (const Source& s : sources) src_of[s.t] = &s;
         std::map<int, std::vector<std::pair<ggml_tensor*, size_t>>> by_part;
         for (ggml_tensor* t : cold_inplace) by_part[src_of.at(t)->part].push_back({t, src_of.at(t)->offset});
-        try {
+        {
             for (auto& [part, at] : by_part) {
                 auto mf = std::make_unique<MappedFile>();
                 mf->open(paths.at(part));
@@ -1469,13 +1480,13 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                 m->wbufs_.push_back(b);
                 m->maps_.push_back(std::move(mf));
             }
-        } catch (...) { gguf_free(g); throw; }
+        }
     }
     // ---- stream every tensor's data from its file into wherever the tier loader put it ----
     std::vector<std::ifstream> files;
     for (const auto& p : paths) {
         files.emplace_back(std::filesystem::u8path(p), std::ios::binary);   // UTF-8 path, also on Windows
-        if (!files.back()) { gguf_free(g); throw std::runtime_error("cannot open " + p); }
+        if (!files.back()) throw std::runtime_error("cannot open " + p);
     }
     std::vector<char> chunk;
     // The VRAM part and the RAM part of a split expert tensor, put together here, kept from tensor to tensor (not made
@@ -1525,7 +1536,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             auto& f = files[s.part];
             const auto t_read = lclock::now();
             f.seekg((std::streamoff)s.offset);
-            if (!f.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + paths[s.part]); }
+            if (!f.read(chunk.data(), (std::streamsize)n)) throw std::runtime_error("short read on " + paths[s.part]);
             read_s += since(t_read);
             // The VRAM part and the RAM part, each put together in hb and cb (above), then set in one go. The last
             // expert of each part is the zero expert.
@@ -1559,7 +1570,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         auto& f = files[s.part];
         const auto t_read = lclock::now();
         f.seekg((std::streamoff)s.offset);
-        if (!f.read(chunk.data(), (std::streamsize)n)) { gguf_free(g); throw std::runtime_error("short read on " + paths[s.part]); }
+        if (!f.read(chunk.data(), (std::streamsize)n)) throw std::runtime_error("short read on " + paths[s.part]);
         read_s += since(t_read);
         const auto t_set = lclock::now();
         ggml_backend_tensor_set(s.t, chunk.data(), 0, n);
@@ -1597,7 +1608,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             ggml_backend_tensor_set(dst, h.data(), 0, h.size() * 2);
         };
         const int H = hp.n_head, R = hp.kv_lora, N = hp.nope, Vd = hp.v_dim;
-        try {
+        {
             for (const MlaDerive& d : mla_derive) {
                 std::vector<float> kb, vb;
                 if (d.kv) {                                      // rows: per head, N key rows then Vd value rows, each R long
@@ -1625,9 +1636,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                 if (d.kb) store(d.kb, kb);
                 if (d.vb) store(d.vb, vb);
             }
-        } catch (...) { gguf_free(g); throw; }
+        }
     }
-    gguf_free(g);
+    g_owner.reset(); g = nullptr;                                 // (the settings are all read)
 
     auto T = [&](const std::string& name, bool required = true) -> ggml_tensor* {
         ggml_tensor* t = ggml_get_tensor(m->wctx_, name.c_str());
