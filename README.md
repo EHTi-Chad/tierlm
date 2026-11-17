@@ -490,7 +490,7 @@ model is in RAM.
 **Steps**
 
 1. From [Releases](https://github.com/EHTi-Chad/tierlm/releases), download one of the two zips and extract it:
-   - **`tierlm-<version>-windows.zip`** (about 550 MB): everything, including NVIDIA's CUDA engine, the fastest
+   - **`tierlm-<version>-windows.zip`** (about 760 MB): everything, including NVIDIA's CUDA engine, the fastest
      option on NVIDIA GeForce RTX cards. Works on every PC. Get this one if you have an NVIDIA RTX card.
    - **`tierlm-<version>-windows-lite.zip`** (about 20 MB): the same app without CUDA. Runs on Intel Arc, AMD
      Radeon and NVIDIA cards through Vulkan (slower than CUDA on NVIDIA), or on the CPU.

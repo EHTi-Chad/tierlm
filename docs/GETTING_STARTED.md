@@ -25,7 +25,7 @@ On Linux, or to build it yourself, see [BUILD.md](BUILD.md).
 
 1. Go to the [Releases page](https://github.com/EHTi-Chad/tierlm/releases).
 2. Download one of the two zips:
-   - **`tierlm-<version>-windows.zip`** (about 550 MB): everything, including NVIDIA's CUDA engine, the fastest
+   - **`tierlm-<version>-windows.zip`** (about 760 MB): everything, including NVIDIA's CUDA engine, the fastest
      option on NVIDIA GeForce RTX cards. Get this one if you have an NVIDIA RTX card.
    - **`tierlm-<version>-windows-lite.zip`** (about 20 MB): the same app without CUDA, for Intel Arc, AMD Radeon,
      or no graphics card. It also runs on NVIDIA cards, through Vulkan, just slower.

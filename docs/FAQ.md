@@ -261,7 +261,7 @@ with most of the model in RAM; ordinary dense models slow down a lot.
 
 **Which download do I need?**
 Both run on every PC; tierlm picks the fastest engine it has when it starts. `tierlm-<version>-windows.zip`
-(about 550 MB) includes NVIDIA's **CUDA** engine, the fastest option on GeForce RTX 20/30/40/50 cards and the
+(about 760 MB) includes NVIDIA's **CUDA** engine, the fastest option on GeForce RTX 20/30/40/50 cards and the
 Tesla V100 (and other NVIDIA cards from the V100 on): get it if you have one. `tierlm-<version>-windows-lite.zip` (about 20 MB) has only the **Vulkan** engine, which runs on
 Intel Arc, AMD Radeon and NVIDIA cards (slower than CUDA on NVIDIA). Without a GPU, either uses the CPU. With the
 full download on a PC without an NVIDIA card, the black window may say CUDA found no device; that's expected.
