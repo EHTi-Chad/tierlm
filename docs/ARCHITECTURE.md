@@ -913,4 +913,4 @@ There is no llama.cpp to compare against, so every piece is checked against an i
    with the next step.
 4. **Faster CPU expert multiplies.**
 5. **Usage-based precision** (rarely used experts stored at lower precision) and **expert-aware speculation**.
-6. **More families**: Gemma 4, Phi and more real-model tests (DeepSeek V4 Flash is in since 0.9.0).
+6. **More families**: GLM, MiniMax, Phi, Gemma's images and audio, and more real-model tests (DeepSeek V4 Flash is in since 0.9.0, Gemma 3 and 4 since 0.9.1).
