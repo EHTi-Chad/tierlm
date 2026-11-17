@@ -1,7 +1,7 @@
 # tierlm's changes to ggml, and what we learned about it
 
 tierlm runs on [ggml](https://github.com/ggml-org/ggml) (MIT license), the tensor library behind llama.cpp. We change
-very little of it: **about 145 lines in 4 files**, listed here in full so anyone can review them, reuse them, or offer them
+very little of it: **about 145 lines in 5 files**, listed here in full so anyone can review them, reuse them, or offer them
 upstream. This page also records three things about ggml that took us a while to find and that matter to anyone
 building on ggml directly rather than through llama.cpp.
 
@@ -16,14 +16,15 @@ building on ggml directly rather than through llama.cpp.
 | 2 | Optional per-split timing in the scheduler | `src/ggml-backend.cpp`, `include/ggml-backend.h` | +38 | Shows where each token's time goes (GPU work, CPU work, copies between them) |
 | 3 | CPU and GPU at once, and fewer waits between them (opt-in) | `src/ggml-backend.cpp`, `include/ggml-backend.h` | +80 | A layer split between VRAM and RAM used to run its CPU half, then its GPU half; now both run together |
 | 4 | Optional time per op kind on the CPU | `src/ggml-cpu/ggml-cpu.c` | +27 | Shows which CPU ops a token's time goes to (`TIERLM_CPU_OP_TIMES=1`) |
+| 5 | The GGUF reader checks type numbers before treating them as types | `src/gguf.cpp` | +2 −2 | A damaged or hostile GGUF file no longer causes undefined behaviour while it is being refused |
 
 Nothing else in ggml is changed. tierlm also turns on one existing ggml build option (CUDA graphs, see Finding 1).
 
 **Status.** These changes are made for tierlm and are not offered to ggml as they stand. Change 1 is small and
 self-contained, but gives negative ids a meaning only on the CPU; a change for ggml itself would likely need every
 backend to agree. Change 2 keeps one set of totals for the whole program (fine for tierlm, which runs one scheduler)
-and is switched on by a tierlm-named variable; for ggml it would need per-scheduler counters and a neutral name. The
-findings below need no changes to ggml at all.
+and is switched on by a tierlm-named variable; for ggml it would need per-scheduler counters and a neutral name. Change 5
+is a plain fix that could go to ggml as it is. The findings below need no changes to ggml at all.
 
 ---
 
@@ -223,6 +224,27 @@ cpu op times over 4000 graphs (850.9 ms): ... MUL_MAT_ID 825.3ms/5925 CONT 4.6ms
 **What it found.** On a laptop with an RTX 3070, Qwen3.6-35B-A3B with its RAM experts on the CPU: 97% of the CPU's
 time is the expert multiplies, and the dozens of small bookkeeping ops per layer cost under 3%. So merging those
 small ops would gain nothing; the multiply itself is what to speed up.
+
+---
+
+## Change 5: the GGUF reader checks type numbers before treating them as types
+
+**What.** A GGUF file stores each tensor's type and each key's value type as a 32-bit number. ggml's reader cast that
+number straight to `ggml_type` or `gguf_type` and checked the range afterwards. In C++ that cast is undefined
+behaviour when the number is outside the enum's range, so a damaged or hostile file could, in principle, let the
+compiler skip the check that follows. Now a number out of range becomes `GGML_TYPE_COUNT` or `GGUF_TYPE_COUNT`,
+which the existing checks refuse with the same errors as before.
+
+```cpp
+// src/gguf.cpp, gguf_reader::read(enum ggml_type &)   (the same for gguf_type, with GGUF_TYPE_COUNT)
+dst = (tmp >= 0 && tmp < GGML_TYPE_COUNT) ? ggml_type(tmp) : GGML_TYPE_COUNT;
+```
+
+**How it was found.** Fuzzing tierlm-inspect and tierlm-logits with 400 damaged copies of small GGUF files, built with
+AddressSanitizer and UndefinedBehaviorSanitizer: 16 files tripped this, at the tensor type and at the key type. None
+caused a crash or a memory error with the GCC and Clang defaults (which don't rely on enum ranges), and every one was
+refused as invalid; with the change, the sanitizers report nothing for any of them. The one visible difference: the
+error for a bad tensor type now names the type as 43 (`GGML_TYPE_COUNT`) rather than the number in the file.
 
 ---
 
