@@ -747,6 +747,25 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             if (hp.hd_l[i] < 0 || hp.hd_l[i] > (1 << 14) || (i < hp.rot_l.size() && (hp.rot_l[i] < 0 || hp.rot_l[i] > (1 << 14)))) bad("head size");
         for (int v : hp.kvh_l) if (v < 0 || v > (1 << 14)) bad("head count");
         if (hp.n_swa < 0) bad("sliding window");
+        // The settings against the weights' own shapes, where every architecture agrees on them: a mismatch would
+        // otherwise stop the program at an assertion inside ggml while the graph is built.
+        auto tensor = [&](const std::string& n) { return ggml_get_tensor(m->wctx_, n.c_str()); };
+        if (const ggml_tensor* te = tensor("token_embd.weight"); te && te->ne[0] != hp.n_embd) bad("width (against token_embd)");
+        for (int i = 0; i < hp.n_layer; ++i) {
+            const std::string b = "blk." + std::to_string(i) + ".";
+            const int hd = hp.hd_at(i), rot = hp.rot_at(i);
+            if (rot > hd && !hp.mla) bad("rotated size larger than the head");
+            if (rot % 2) bad("rotated size must be even");
+            if (hp.gemma4 && hp.kv_from > 0 && i >= hp.kv_from && hp.kv_src(i) < 0) bad("layers sharing a cache with no earlier layer of their kind");
+            if (const ggml_tensor* q = tensor(b + "attn_q.weight")) {
+                if (q->ne[0] != hp.n_embd) bad("width (against attn_q)");
+                if (!hp.mla && (q->ne[1] % hd || (q->ne[1] / hd != hp.n_head && q->ne[1] / hd != 2 * hp.n_head))) bad("head count or size (against attn_q)");
+            }
+            if (const ggml_tensor* k = tensor(b + "attn_k.weight"); k && !hp.mla && k->ne[1] != (int64_t)hp.kvh_at(i) * hd)
+                bad("key heads or size (against attn_k)");
+            if (const ggml_tensor* r = tensor(b + "ffn_gate_inp.weight"); r && hp.n_expert > 0 && hp.n_expert_l.empty() && r->ne[1] != hp.n_expert)
+                bad("expert count (against ffn_gate_inp)");
+        }
     }
     // Layers to load: the model's, plus the MTP draft block (stored as layer n_layer) when speculating.
     const bool want_mtp = opt.mtp && hp.n_nextn > 0 &&
@@ -2188,8 +2207,9 @@ void Model::fill_masks(Graph& g, int n_kv, const std::vector<int>& tok_seq, cons
         const auto& mine = seq_cells_[s];
         for (int q = 0; q <= p && q < (int)mine.size(); ++q) if (mine[q] < end) row[mine[q]] = zero;
     }
-    if (g.mask) ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
-    if (g.mask_swa) {
+    // (a mask no layer uses, as with a model whose layers are all sliding-window or none are, gets no memory: skipped)
+    if (g.mask && g.mask->buffer) ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+    if (g.mask_swa && g.mask_swa->buffer) {
         for (int t = 0; t < n_tok; ++t) {
             ggml_fp16_t* row = mask.data() + (size_t)t * n_kv;
             const auto& mine = seq_cells_[tok_seq[t]];
