@@ -10,6 +10,7 @@
 // that best match it (by meaning with an embedding model, else by keywords), and those go back to the model.
 #pragma once
 
+#include "download.h"
 #include "json.hpp"
 
 #include <algorithm>
@@ -60,6 +61,7 @@ inline std::string clean_name(const std::string& s, size_t max_len = 60) {
     }
     while (!out.empty() && (out.back() == ' ' || out.back() == '.')) out.pop_back();
     while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    if (download::windows_device_name(out)) out = "_" + out;          // (Windows can't make a file called CON or NUL)
     return out.empty() ? "chat" : out;
 }
 

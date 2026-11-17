@@ -31,6 +31,31 @@ namespace download {
 
 namespace fs = std::filesystem;
 
+// A name Windows keeps for a device (CON, NUL, COM1, ...), with or without an extension: such a file can't be made.
+inline bool windows_device_name(const std::string& name) {
+    std::string b = name.substr(0, name.find('.'));
+    while (!b.empty() && (b.back() == ' ')) b.pop_back();
+    for (auto& c : b) c = (char)std::toupper((unsigned char)c);
+    static const char* fixed[] = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"};
+    for (const char* f : fixed) if (b == f) return true;
+    return b.size() == 4 && (b.compare(0, 3, "COM") == 0 || b.compare(0, 3, "LPT") == 0) && b[3] >= '0' && b[3] <= '9';
+}
+
+// A path from a download's file list (Hugging Face's names), safe to put under the download's own folder: relative,
+// "/" between parts, no "..", no drive or stream (":"), no backslash or control characters, no device names.
+inline bool safe_relative_path(const std::string& p) {
+    if (p.empty() || p.size() > 1024 || p[0] == '/') return false;
+    for (unsigned char c : p) if (c < 32 || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') return false;
+    size_t a = 0;
+    while (a <= p.size()) {
+        const size_t b = std::min(p.find('/', a), p.size());
+        const std::string part = p.substr(a, b - a);
+        if (part.empty() || part == "." || part == ".." || part.back() == '.' || part.back() == ' ' || windows_device_name(part)) return false;
+        a = b + 1;
+    }
+    return true;
+}
+
 // ---- SHA-256 (FIPS 180-4) ----
 class Sha256 {
 public:

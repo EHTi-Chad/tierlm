@@ -28,8 +28,13 @@ int main(int argc, char** argv) {
                 case GGUF_TYPE_FLOAT32: std::printf("%g\n", gguf_get_val_f32(g, k)); break;
                 case GGUF_TYPE_BOOL: std::printf("%s\n", gguf_get_val_bool(g, k) ? "true" : "false"); break;
                 case GGUF_TYPE_UINT64: std::printf("%llu\n", (unsigned long long)gguf_get_val_u64(g, k)); break;
-                case GGUF_TYPE_STRING: { std::string v = gguf_get_val_str(g, k); if (v.size() > 200) v = v.substr(0, 200) + "... (" + std::to_string(v.size()) + " chars)";
-                                         for (char& ch : v) if (ch == '\n') ch = ' '; std::printf("%s\n", v.c_str()); break; }
+                case GGUF_TYPE_STRING: {
+                    std::string v = gguf_get_val_str(g, k);
+                    if (v.size() > 200) v = v.substr(0, 200) + "... (" + std::to_string(v.size()) + " chars)";
+                    for (char& ch : v) if (ch == '\n') ch = ' ';
+                    std::printf("%s\n", v.c_str());
+                    break;
+                }
                 case GGUF_TYPE_ARRAY: {
                     const gguf_type at = gguf_get_arr_type(g, k); const size_t n = gguf_get_arr_n(g, k);
                     std::printf("[%zu x %s]", n, gguf_type_name(at));

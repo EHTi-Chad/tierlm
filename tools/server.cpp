@@ -1921,8 +1921,11 @@ int main(int argc, char** argv) {
             {"kv_on_gpu", eng.model->placement().kv_on_gpu}, {"all_on_gpu", eng.model->placement().all_on_gpu()}, {"attn_gpu", eng.model->placement().attn_gpu},
             {"ffn_gpu", eng.model->placement().ffn_gpu}, {"kv_gpu_layers", eng.model->placement().kv_gpu_layers},
             {"split_mode", eng.model->placement().mode},
-            {"gpus", [&] { json g = json::array(); for (const auto& x : eng.model->placement().gpus)
-                               g.push_back({{"name", x.name}, {"weights", x.weights}, {"kv", x.kv}, {"layers", x.layers}}); return g; }()},
+            {"gpus", [&] {
+                 json g = json::array();
+                 for (const auto& x : eng.model->placement().gpus) g.push_back({{"name", x.name}, {"weights", x.weights}, {"kv", x.kv}, {"layers", x.layers}});
+                 return g;
+             }()},
             {"vision", eng.vision != nullptr}, {"vision_file", eng.vision_file},
             {"think_switch", eng.think_switch}, {"thinking", eng.thinking}, {"reasoning_effort", eng.chat == ChatFmt::Harmony ? eng.effort : std::string()},
             {"vision_device", eng.vision ? eng.vision->device_name() : std::string()}, {"image_tokens", eng.image_tokens_for(0)},
@@ -5118,6 +5121,8 @@ int main(int argc, char** argv) {
         if (!body.is_object() || !body.contains("files") || !body["files"].is_array()) return oai_error(res, 400, "expected {\"id\": \"owner/name\", \"files\": [paths]}");
         const std::string id = body.value("id", std::string());
         if (!valid_repo(id)) return oai_error(res, 400, "not a Hugging Face model name (owner/name)");
+        for (const auto& p : body["files"])                          // (names checked before huggingface.co is asked)
+            if (!p.is_string() || !download::safe_relative_path(p.get<std::string>())) return oai_error(res, 400, "bad file name");
         // (claimed here, before Hugging Face is asked for the file list: two requests at once could both pass a
         // plain check and start two downloads into the same files)
         if (hf.running.exchange(true)) return oai_error(res, 409, "a download is already running; wait for it or cancel it");
@@ -5130,7 +5135,6 @@ int main(int argc, char** argv) {
         for (const auto& p : body["files"]) {
             if (!p.is_string()) continue;
             const std::string path = p.get<std::string>();
-            if (path.find("..") != std::string::npos || path.empty() || path[0] == '/' || path.find('\\') != std::string::npos) return oai_error(res, 400, "bad file name");
             for (const auto& f : j["siblings"])
                 if (f.value("rfilename", std::string()) == path) {
                     HfFile hfile; hfile.path = path;

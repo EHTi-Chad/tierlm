@@ -3273,7 +3273,6 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
         g.qsa_bpos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_kv / R);       ggml_set_input(g.qsa_bpos);
         g.qsa_nb   = ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, n_tok);       ggml_set_input(g.qsa_nb);
     }
-    const float scale = 1.0f / std::sqrt((float)hd);
 
     ggml_tensor* x = ggml_get_rows(c, tok_embd_, g.inp);                   // [n_embd, n_tok]
     if (hp.embd_scale > 0) x = ggml_scale(c, x, hp.embd_scale);           // (Gemma)
@@ -4498,7 +4497,8 @@ void Model::qsa_upload() {
     qsa_kc_ok_ = true;
     for (const Layer& L : layers_) {
         if (!L.qsa_kc || L.qsa < 0) continue;
-        const std::vector<float>& k = qsa_[L.qsa].keys.empty() ? std::vector<float>() : qsa_[L.qsa].keys[0];
+        static const std::vector<float> none;          // (one branch a temporary would make the ?: copy keys[0])
+        const std::vector<float>& k = qsa_[L.qsa].keys.empty() ? none : qsa_[L.qsa].keys[0];
         const int64_t D = L.qsa_kc->ne[0], n = std::min<int64_t>((int64_t)k.size() / D, L.qsa_kc->ne[1]);
         if (n <= 0) continue;
         std::vector<ggml_fp16_t> h((size_t)(n * D));
