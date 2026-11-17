@@ -1601,7 +1601,7 @@ int main(int argc, char** argv) {
         pcache::tidy(eng.pc_dir);                                    // (leftovers of a write that was cut short)
     }
     auto smodels = [&] { std::lock_guard<std::recursive_mutex> sl(settings_mu); return settings.value("models", json::object()); };
-    bool recursive = settings.value("recursive", true);
+    std::atomic<bool> recursive{settings.value("recursive", true)};   // (read by the model list without the lock)
     if (!a.models_given && settings.contains("models_folder") && settings["models_folder"].is_string()) {
         std::error_code ec;
         const std::string saved = settings["models_folder"];
@@ -1893,7 +1893,9 @@ int main(int argc, char** argv) {
         std::unique_lock<std::shared_timed_mutex> lk(mu, std::try_to_lock);
         if (!lk.owns_lock()) {
             json j = info_copy(); j["busy"] = true; j["waiting"] = line.waiting();
-            if (!eng.slots.empty()) j["active"] = (int)eng.slots.size() - eng.free_slots.load();   // replies running now
+            // replies running now: readable while replies hold the lock shared, not while a load or unload holds it
+            std::shared_lock<std::shared_timed_mutex> sl(mu, std::try_to_lock);
+            if (sl.owns_lock() && !eng.slots.empty()) j["active"] = (int)eng.slots.size() - eng.free_slots.load();
             res.set_content(dump(j), "application/json; charset=utf-8"); return;
         }
         if (!eng.model) {
@@ -2090,8 +2092,13 @@ int main(int argc, char** argv) {
             if (!fs::equivalent(fs::u8path(f), base, e2)) suggest.push_back({{"name", "LM Studio models"}, {"folder", f}});
         }
         json per_model = smodels();
-        json j = {{"folder", fs::absolute(base, ec).make_preferred().u8string()}, {"exists", exists}, {"recursive", recursive},
-                  {"models", list}, {"default_ctx", a.ctx}, {"current", eng.path}, {"suggestions", suggest},
+        std::string current;                  // (the model's path; while a load or unload holds the lock, the last snapshot's)
+        {
+            std::shared_lock<std::shared_timed_mutex> sl(mu, std::try_to_lock);
+            current = sl.owns_lock() ? eng.path : info_copy().value("path", std::string());
+        }
+        json j = {{"folder", fs::absolute(base, ec).make_preferred().u8string()}, {"exists", exists}, {"recursive", recursive.load()},
+                  {"models", list}, {"default_ctx", a.ctx}, {"current", current}, {"suggestions", suggest},
                   {"saved", per_model}, {"last_model", sget("last_model")}, {"pc", this_pc()}, {"version", TIERLM_VERSION}, {"bundled", json::array()},
 #ifdef _WIN32
                   {"can_pick", true},
@@ -2123,9 +2130,9 @@ int main(int argc, char** argv) {
             settings["models_folder"] = a.models;
         }
         std::lock_guard<std::recursive_mutex> sl(settings_mu);
-        settings["recursive"] = recursive;
+        settings["recursive"] = recursive.load();
         write_settings(a.settings, settings);
-        res.set_content(dump({{"ok", true}, {"folder", a.models}, {"recursive", recursive}}), "application/json; charset=utf-8");
+        res.set_content(dump({{"ok", true}, {"folder", a.models}, {"recursive", recursive.load()}}), "application/json; charset=utf-8");
     });
 
     // Native folder picker. It opens on the computer running tierlm, so only answer local requests.
