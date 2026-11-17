@@ -10,9 +10,30 @@ in [docs/GGML_CHANGES.md](docs/GGML_CHANGES.md); the tokenizers, model graphs, K
 encoder, server and web page are all tierlm's own. It does not use llama.cpp.
 
 It runs **Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8 dense and MoE, Qwen3-Next,
-gpt-oss, DeepSeek V2/V3/V4 and Kimi K2 (early), NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
+gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
+
+### New in 0.9.1: long prompts up to 9× faster with experts in RAM, Gemma 3 and Gemma 4, a benchmark page
+
+- **Long prompts with experts in RAM** (NVIDIA): the RAM weights now go in pinned memory and stay in a layout the GPU
+  can read, so the GPU reads long prompts instead of the CPU; on a card of 24 GB or more the RAM experts stream into
+  VRAM on a second GPU queue while the layer before computes; Flash-Next's sparse-attention masks are worked out on the
+  GPU; the prompt batch size picks itself (**Auto**). On an RTX 5090 (Ryzen 9 9950X3D, 64 GB DDR5-6000), 64K context,
+  32K-token prompt: **Qwen3.8 Flash-Next UD-IQ3_XXS** (30 GB of experts in RAM) 460 → 2,201 tok/s, 16K 507 → 2,260;
+  **gpt-oss-120b MXFP4** (38 GB of experts in RAM) 235 → 2,149 tok/s. Writing speed is about the same (Flash-Next 47-67
+  tok/s, gpt-oss 39-40 against 41). Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#long-prompts-with-experts-in-ram-091).
+- **Gemma 3 and Gemma 4** (text): checked against Hugging Face's own code on tiny test models (all four Gemma 4 layouts),
+  with Gemma 4's chat format, its thinking switch and its own tool-call format (prompts identical to Gemma 4's chat
+  template, character for character). On the RTX 5090, all in VRAM, 4K context: gemma-3-12b-it Q4_K_M about 125 tok/s,
+  gemma-4-E4B-it Q4_K_M 215-247, gemma-4-26B-A4B-it UD-Q4_K_M 183-193. Images and audio aren't read yet.
+- **Benchmark page** (`/bench`, the Benchmark button): prompt reading at 512 to 32K tokens (from scratch and cached),
+  first word, writing speed by reply length, guessing ahead on and off, and 30 fixed questions (GSM8K, MMLU,
+  ARC-Challenge, HumanEval, IFEval), with charts; runs are kept on the PC.
+- **DeepSeek V4**: its hyper-connections run on the GPU with fused ggml ops, instead of a CPU step twice a layer.
+- **Chats: Select…** deletes several at once. **Fixed**: tool calls an app sent with their arguments as a JSON object
+  (not a string) lost those arguments in the conversation; Copy specs' one-line result gives the prompt and reply
+  lengths.
 
 ### New in 0.9.0: guessing ahead for MoE models with no draft layer, DeepSeek V4 Flash, settings that stay found
 
@@ -507,7 +528,7 @@ Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or th
 | DeepSeek V3 / R1 / V3.1, Kimi K2.x, Moonlight, DeepSeek V2 (`deepseek2`) | **early**: model math checked against Hugging Face's own code (multi-head latent attention, grouped routing with its choosing bias, YaRN), tokenizers checked against Hugging Face's; tested on the real Moonlight-16B-A3B (about 300 tok/s on an RTX 5090), the 600 GB-class ones not yet. They need the SSD tier |
 | DeepSeek V4 Flash (`deepseek4`) | **early**: model math checked against Hugging Face's own code (hyper-connections, sliding-window and compressed attention with its indexer, hash-routed first layers) on the CPU and CUDA; tested on the real DeepSeek-V4-Flash UD-IQ3_XXS (about 96 GB) on an RTX 5090 with 64 GB RAM and the SSD tier: 9.6 to 10.8 tok/s in chats (since 0.9.0). Tool calls not yet |
 | Gemma 3 (`gemma3`: gemma-3-1b ... 27b-it), text | **new in 0.9.1**: model math checked against Hugging Face's own code; gemma-3-12b-it Q4_K_M on an RTX 5090 |
-| Gemma 4 (`gemma4`: E2B, E4B, 26B-A4B, 31B), text | **new in 0.9.1**: model math checked against Hugging Face's own code (all four layouts: shared caches, per-layer inputs, the 26B's experts), chat format with thinking on or off; E4B Q4_K_M (210-250 tok/s) and 26B-A4B UD-Q4_K_M (180-190 tok/s) on an RTX 5090 (Ryzen 9 9950X3D, 64 GB DDR5), all in VRAM; the 31B not yet |
+| Gemma 4 (`gemma4`: E2B, E4B, 26B-A4B, 31B), text | **new in 0.9.1**: model math checked against Hugging Face's own code (all four layouts: shared caches, per-layer inputs, the 26B's experts), chat format with thinking on or off and its own tool calls; E4B Q4_K_M (210-250 tok/s) and 26B-A4B UD-Q4_K_M (180-190 tok/s) on an RTX 5090 (Ryzen 9 9950X3D, 64 GB DDR5), all in VRAM; the 31B not yet |
 | Qwen3.8 Flash-Next (`qwen4exp`) | model math checked against Hugging Face's own code (hyper-connections, the n-gram embedding, sparse attention past 2,048 tokens, the MTP draft block), text only for now; the real 120 GB Q4_K_M with Unsloth's MTP file at 80.3 tok/s in a chat (88.8 in Find the fastest settings) on an RTX 5090 with 64 GB RAM, with its n-gram table on the SSD tier; UD-IQ3_XXS (77.9 GiB) at 94.8 tok/s on the same PC (Ryzen 9 9950X3D, 64 GB DDR5-6000, VRAM experts following the conversation, 4 guesses, temperature 0.7; 0.8.7) |
 
 Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-MiniLM, e5) and Nomic
