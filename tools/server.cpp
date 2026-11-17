@@ -47,6 +47,7 @@
 #include "json.hpp"
 #include "agent.h"
 #include "harmony.h"
+#include "gemma4.h"
 #include "workspace.h"
 #include "chats.h"
 #include "prompt_cache.h"
@@ -207,61 +208,6 @@ ChatFmt detect_chat(const Tokenizer& tok) {
     return ChatFmt::Plain;
 }
 
-// Gemma 4's reply as tierlm shows it: its thought channel (<|channel>thought ... <channel|>) as <think>...</think>.
-// Grows only at the end as the reply does: a "thought" not yet whole after <|channel> is held back.
-std::string gemma4_display(const std::string& raw) {
-    static const std::string open = "<|channel>", close = "<channel|>", label = "thought\n";
-    std::string s;
-    size_t i = 0;
-    while (i < raw.size()) {
-        const size_t a = raw.find(open, i);
-        if (a == std::string::npos) { s += raw.substr(i); break; }
-        s += raw.substr(i, a - i);
-        size_t k = a + open.size();
-        const size_t have = std::min(label.size(), raw.size() - k);
-        if (raw.compare(k, have, label, 0, have) == 0) {
-            if (have < label.size()) { s += "<think>"; break; }       // (the rest of "thought\n" is still to come)
-            k += label.size();
-        }
-        const size_t b = raw.find(close, k);
-        s += "<think>" + raw.substr(k, b == std::string::npos ? std::string::npos : b - k);
-        if (b == std::string::npos) break;
-        s += "</think>\n\n";
-        i = b + close.size();
-        while (i < raw.size() && raw[i] == '\n') ++i;                 // (the answer's own start)
-    }
-    return s;
-}
-
-// Tool calling in a conversation, made plain for format_chat: the tools go into the system message, an assistant
-// message's tool calls are written out the way the model writes them (unless its text already has them, as the
-// page sends it), and tool results become a user turn of <tool_response> blocks, as Qwen's chat templates do.
-json with_tools(const json& messages, const agent::ojson& tools, agent::ToolFmt tf) {
-    json out = json::array();
-    const bool use = tools.is_array() && !tools.empty();
-    size_t i = 0;
-    std::string system;
-    if (!messages.empty() && messages[0].value("role", std::string()) == "system") { system = messages[0].value("content", std::string()); i = 1; }
-    if (use) out.push_back({{"role", "system"}, {"content", agent::system_with_tools(tf, system, tools)}});
-    else if (i == 1) out.push_back(messages[0]);
-    for (; i < messages.size(); ++i) {
-        const json& m = messages[i];
-        const std::string role = m.value("role", std::string("user"));
-        if (role == "tool") {
-            std::string c;
-            for (; i < messages.size() && messages[i].value("role", std::string()) == "tool"; ++i)
-                c += std::string(c.empty() ? "" : "\n") + "<tool_response>\n" + agent::trim(messages[i].value("content", std::string())) + "\n</tool_response>";
-            --i;
-            out.push_back({{"role", "user"}, {"content", c}});
-        } else if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
-            std::string c = m.value("content", std::string());
-            if (c.find(agent::kToolOpen) == std::string::npos) c += agent::render_tool_calls(tf, m["tool_calls"], !agent::trim(c).empty());
-            out.push_back({{"role", "assistant"}, {"content", c}});
-        } else out.push_back({{"role", role}, {"content", m.value("content", std::string())}});
-    }
-    return out;
-}
-
 // think: what the assistant turn starts with in models that can think (Qwen3 and later, as their chat templates
 // do): 1 "<think>\n" (the model reasons first; only for templates that start it), 0 "<think>\n\n</think>\n\n" (thinking
 // off: the answer straight away), -1 nothing (the model decides, or can't think).
@@ -362,33 +308,10 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
         if (!sys.empty()) s += "<start_of_turn>user\n" + sys + "<end_of_turn>\n";
         return s + "<start_of_turn>model\n";
     }
-    case ChatFmt::Gemma4: {                               // Gemma 4: <|turn>user ... <turn|>; a system turn of its own
-        // Thinking on: <|think|> opens the system turn. Off: the reply starts after an empty thought when the
-        // file's own template does that (the 26B and 31B, which can think on their own otherwise; the E2B and E4B
-        // were trained without it and start thinking aloud after one). Earlier replies go back without their
-        // thinking, as Gemma 4's template does.
-        s = tok.bos() >= 0 ? "<bos>" : "";
-        std::string sys;
-        for (const auto& m : messages)
-            if (m.value("role", std::string()) == "system") sys += (sys.empty() ? "" : "\n\n") + m.value("content", std::string());
-        if (think != 0 || !sys.empty()) s += "<|turn>system\n" + std::string(think != 0 ? "<|think|>\n" : "") + sys + "<turn|>\n";
-        for (const auto& m : messages) {
-            const std::string role = m.value("role", std::string("user"));
-            std::string c = m.value("content", std::string());
-            if (role == "system") continue;
-            const bool model = role == "assistant";
-            if (model) {                                      // (no thinking: <think>...</think> as tierlm keeps it)
-                for (size_t a; (a = c.find("<think>")) != std::string::npos;) {
-                    const size_t b = c.find("</think>", a);
-                    c.erase(a, b == std::string::npos ? std::string::npos : b + 8 - a);
-                }
-                c = agent::trim(c);
-            }
-            s += "<|turn>" + std::string(model ? "model" : "user") + "\n" + c + "<turn|>\n";
-        }
+    case ChatFmt::Gemma4: {                               // Gemma 4 (gemma4.h)
         const bool empty_thought = tok.chat_template().empty() ||
                                    tok.chat_template().find("<|channel>thought\\n<channel|>") != std::string::npos;
-        return s + "<|turn>model\n" + (think == 0 && empty_thought ? "<|channel>thought\n<channel|>" : "");
+        return gemma4::prompt(messages, think, empty_thought, tok.bos() >= 0);
     }
     case ChatFmt::Llama3:
         s = "<|begin_of_text|>";
@@ -2604,9 +2527,13 @@ int main(int argc, char** argv) {
         if (!pics.empty() && harm) throw std::runtime_error("this model can't read images");
         const int think = think_mode();
         // (the template opened the <think> block: the reply is shown, split and saved with it, as the model wrote it)
-        const std::string pre = think == 1 ? "<think>\n" : "";
+        std::string pre = think == 1 ? "<think>\n" : "";
         const std::string prompt_text = harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
-                                             : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok, think);
+                                             : format_chat(agent::with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok, think);
+        // (Gemma 4 thinking after its tools' results: its template opened the thought channel, as for <think> above)
+        if (eng.chat == ChatFmt::Gemma4 && prompt_text.size() >= gemma4::kThoughtOpen.size() &&
+            prompt_text.compare(prompt_text.size() - gemma4::kThoughtOpen.size(), std::string::npos, gemma4::kThoughtOpen) == 0)
+            pre = gemma4::kThoughtOpen;
         // (TIERLM_SHOW_PROMPT=1: the prompt as the model reads it, in the window, between two lines of ====)
         static const bool show_prompt = std::getenv("TIERLM_SHOW_PROMPT") != nullptr;
         if (show_prompt) std::fprintf(stderr, "==== prompt\n%s\n==== end of prompt\n", prompt_text.c_str());
@@ -2904,8 +2831,10 @@ int main(int argc, char** argv) {
         const int32_t h_return = tok.find("<|return|>"), h_call = tok.find("<|call|>"), h_end = tok.find("<|end|>"), h_eot = tok.find("<|endoftext|>");
         const bool g4 = eng.chat == ChatFmt::Gemma4;
         const int32_t g4_open = tok.find("<|channel>"), g4_close = tok.find("<channel|>"), g4_think = tok.find("<|think|>");
+        const int32_t g4_tool_resp = g4 ? tok.find("<|tool_response>") : -1;   // (after its tool calls: their results are the app's)
         auto is_end = [&](int32_t t) {
             if (harm) return t == h_return || t == h_call || t == h_eot || (t == tok.eos() && t != h_end);
+            if (g4 && t == g4_tool_resp) return true;
             if (g4 && (t == g4_open || t == g4_close || t == g4_think)) return false;   // (Gemma 4's thinking goes on)
             return t == tok.eos() || t == tok.eot() || tok.is_control(t);
         };
@@ -2937,7 +2866,7 @@ int main(int argc, char** argv) {
             out.push_back(id);
             const std::string text = tok.decode(out);
             raw = pre + text.substr(0, utf8_complete(text));
-            visible = harm ? harmony::display(raw) : g4 ? gemma4_display(raw) : raw;
+            visible = harm ? harmony::display(raw) : g4 ? gemma4::display(raw) : raw;
             // A stop string: end the reply just before it.
             size_t cut = std::string::npos;
             for (const auto& st : stops)
@@ -3080,7 +3009,7 @@ int main(int argc, char** argv) {
         std::vector<std::string> pics;
         try { pics = take_pictures(msgs); } catch (...) {}
         int n = (int)eng.tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
-                                         : format_chat(with_tools(msgs, tools, eng.tool_fmt), eng.chat, eng.tok, think_mode()), true).size();
+                                         : format_chat(agent::with_tools(msgs, tools, eng.tool_fmt), eng.chat, eng.tok, think_mode()), true).size();
         for (const std::string& b : pics) {                        // each image: its words instead of one pad token
             int w = 0, h = 0;
             if (eng.vision && image_size((const uint8_t*)b.data(), b.size(), &w, &h)) n += eng.vision->tokens_for(w, h, eng.image_tokens_for(tl_image_tokens)) - 1;

@@ -2,7 +2,10 @@
 // build or parse.
 //   tierlm-chat-check prompt   [{"messages": [...], "tools": [...]}, ...]  -> each harmony prompt, followed by \x01
 //   tierlm-chat-check reply    ["<raw reply>", ...]                        -> each {"display": ..., "calls": [...]}, one per line
+//   tierlm-chat-check gemma4-prompt  [{"messages", "tools", "think": 0|1, "empty_thought": bool}, ...]  (tests/gemma4_chat_test.py)
+//   tierlm-chat-check gemma4-reply   [{"raw": "...", "tools": [...]}, ...]
 #include "harmony.h"
+#include "gemma4.h"
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -22,6 +25,17 @@ int main(int argc, char** argv) {
             const auto p = harmony::parse(r.get<std::string>(), nlohmann::ordered_json::array());
             std::cout << nlohmann::json({{"display", p.content}, {"calls", p.calls}}).dump() << "\n";
         }
-    } else { std::fprintf(stderr, "usage: tierlm-chat-check prompt|reply < input.json\n"); return 1; }
+    } else if (mode == "gemma4-prompt") {
+        for (const auto& c : in) {
+            const auto tools = c.value("tools", nlohmann::ordered_json::array());
+            std::cout << gemma4::prompt(agent::with_tools(nlohmann::json(c["messages"]), tools, agent::ToolFmt::Gemma4),
+                                        c.value("think", 0), c.value("empty_thought", false), true) << '\x01';
+        }
+    } else if (mode == "gemma4-reply") {
+        for (const auto& r : in) {
+            const auto p = agent::parse_tool_calls(gemma4::display(r.value("raw", std::string())), r.value("tools", nlohmann::ordered_json::array()));
+            std::cout << nlohmann::json({{"display", p.content}, {"calls", p.calls}}).dump() << "\n";
+        }
+    } else { std::fprintf(stderr, "usage: tierlm-chat-check prompt|reply|gemma4-prompt|gemma4-reply < input.json\n"); return 1; }
     return 0;
 }
