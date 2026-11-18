@@ -369,6 +369,7 @@ The best results so far, each measured in a normal chat unless noted (details be
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.8 Flash-Next Q4_K_M (120 GB) with its MTP draft file | GPU + RAM + SSD, VRAM experts following the conversation, 2 guesses | **80.3 tok/s**; 88.8 in Find the fastest settings (0.8.7) |
 | RTX 5090 (32 GB), 64 GB RAM | gpt-oss-120b (59 GB) | GPU + RAM, the busiest experts in VRAM | **83-86 tok/s** at 32K context (0.8.8; 45 with its experts in RAM) |
 | RTX 5090 (32 GB), 64 GB RAM | NVIDIA Nemotron 3.5 Bolt 74B-A9B (22 GB) | GPU | **137-147 tok/s** (0.8.8) |
+| RTX 5090 (32 GB), 64 GB RAM | Qwen3.8-27B Q8_0 (27.0 GiB, dense) | all in VRAM at 32K context, 3 guesses | **101.6 tok/s** over a 9,049-token C++ program; **68.6** at 64K context with 62 of 64 layers in VRAM (0.9.2) |
 | RTX 5080 (16 GB), 32 GB RAM | Qwen3.8-27B UD-Q3_K_XL (12.2 GiB, dense) with its MTP draft file | GPU, 3 guesses | **63.5 tok/s** over a 7,786-token C++ program, 48K context (0.9.1) |
 | RTX 5080 (16 GB), 32 GB RAM | Qwen3.6-35B-A3B Q6_K (27 GB) | GPU + RAM, experts in RAM | **65.2 tok/s** (Find the fastest settings) |
 | RTX 3070 Laptop (8 GB), 32 GB RAM | Qwen3.5-9B | GPU (a sliver in RAM) | **59 tok/s**; a full-screen screenshot read in **2.7 s** |
