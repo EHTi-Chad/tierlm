@@ -418,11 +418,22 @@ Returns `{"prompt_tps": 143.0, "gen_tps": 22.3, "speculative": true, "draft_max"
 ### GET /bench, GET /api/benchruns, POST /api/benchruns
 
 `/bench` is the benchmark page (since 0.9.1); it runs everything through `/api/chat`, `/api/spec`, `/api/info` and
-`/api/specs` (its **Several at once** test sends several `/api/chat` requests together, one per connection). `/api/chat` takes `"ignore_eos": true` with `max_tokens` for that: the reply runs to its length (the
+`/api/specs`, and its **Several at once** test through `/api/bench/conc` (below). `/api/chat` takes `"ignore_eos": true` with `max_tokens`: the reply runs to its length (the
 end-of-reply tokens are never picked), to time replies of a set length. Its questions are in `/bench-data.js` (made by `scripts/make-bench-data.py` from GSM8K, MMLU,
 ARC-Challenge, HumanEval and IFEval; sources and licences in the file). `GET /api/benchruns` returns the saved runs (a
 JSON array, oldest first, kept in `tierlm-bench.json` next to the settings); `POST /api/benchruns` with
 `{"run": {...}}` adds one and `{"delete": "<id>"}` removes one, from this computer only (403 from other devices).
+
+### POST /api/bench/conc
+
+The benchmark page's **Several at once** test (since 0.9.3): `{"prompts": ["...", "..."], "max_tokens": 512}` starts one
+reply per prompt at the same moment, inside tierlm, each with nothing cached, at temperature 0 with thinking off, each
+written to `max_tokens` (16 to 8192). Up to the **Connections** setting (400 with more prompts). Returns
+`{"replies": [{"n_prompt", "n_gen", "prompt_s", "gen_s", "gen_tps", "start_s", "end_s", "ttft"}], "connections": 8}`:
+`start_s` and `end_s` are when each reply started writing and ended, in seconds from the start, and `ttft` (the first
+word) is `start_s`. Total speed: the tokens over the window from the earliest `start_s` to the latest `end_s`. Before
+0.9.3 the page sent one `/api/chat` stream per reply, and a browser opens at most 6 connections to one site, so with 8
+at once the last 2 waited and the total read low. Closing the request stops the replies (no result).
 
 ### POST /api/spec
 

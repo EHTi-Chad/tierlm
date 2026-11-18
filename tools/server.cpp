@@ -3845,6 +3845,87 @@ int main(int argc, char** argv) {
         }
     });
 
+    // ---------------- Several at once (the benchmark page): n replies started together inside tierlm ----------------
+    // The page used to send each reply as its own streaming request, but a browser opens at most 6 connections to one
+    // site, so with 8 at once the last 2 waited for the first 6 and the total read low. Here the replies start on
+    // tierlm's own threads at the same moment, each from its own prompt with nothing cached, and the times are
+    // tierlm's: when each started writing and when it ended (seconds from the start).
+    svr.Post("/api/bench/conc", [&](const httplib::Request& req, httplib::Response& res) {
+        const json bb = json::parse(req.body.empty() ? std::string("{}") : req.body, nullptr, false);
+        if (!bb.is_object() || !bb.contains("prompts") || !bb["prompts"].is_array() || bb["prompts"].empty()) {
+            res.status = 400; res.set_content("{\"error\":\"prompts: a list of prompts, one per reply\"}", "application/json; charset=utf-8"); return;
+        }
+        if (!mu.try_lock_for(std::chrono::seconds(3))) {
+            res.status = 409;
+            res.set_content("{\"error\":\"busy: wait for the current reply or load to finish\"}", "application/json; charset=utf-8");
+            return;
+        }
+        std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
+        if (!eng.model) { res.status = 409; res.set_content("{\"error\":\"no model loaded\"}", "application/json; charset=utf-8"); return; }
+        const int n = (int)bb["prompts"].size();
+        const int conns = std::max(1, (int)eng.slots.size());
+        if (n > conns) {
+            res.status = 400;
+            res.set_content(dump({{"error", "more replies than connections (" + std::to_string(conns) + "): set Connections in Change setup"}}), "application/json; charset=utf-8");
+            return;
+        }
+        std::vector<std::string> prompts;
+        for (const auto& p : bb["prompts"]) {
+            if (!p.is_string() || p.get<std::string>().empty() || p.get<std::string>().size() > 20000) {
+                res.status = 400; res.set_content("{\"error\":\"each prompt: some text (up to 20,000 characters)\"}", "application/json; charset=utf-8"); return;
+            }
+            prompts.push_back(p.get<std::string>());
+        }
+        const int max_tokens = std::max(16, std::min(bb.value("max_tokens", 512), 8192));
+        try {
+            Sampling sp = sampling_of(json{{"temperature", 0.0}, {"top_k", 1}, {"top_p", 1.0}, {"min_p", 0.0}, {"repeat_penalty", 1.0}});
+            // nothing cached: every reply reads its whole prompt
+            if (eng.slots.empty()) { eng.model->reset(); eng.cached.clear(); }
+            else for (int sq = 0; sq < (int)eng.slots.size(); ++sq) { eng.model->seq_reset(sq); eng.slots[sq].cached.clear(); }
+            std::fprintf(stderr, "benchmark: %d %s at once, %d tokens each\n", n, n == 1 ? "reply" : "replies", max_tokens);
+            std::vector<Gen> gs(n);
+            std::vector<double> ends(n, 0.0);
+            std::vector<std::string> errs(n);
+            std::atomic<bool> stop{false};
+            std::atomic<int> done{0};
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+            std::vector<std::thread> th;
+            for (int i = 0; i < n; ++i)
+                th.emplace_back([&, i] {
+                    try {
+                        tl_ignore_eos = true;                       // (the thread's own: generate takes it and clears it)
+                        tl_think = 0; tl_effort = 0;
+                        gs[i] = generate(json::array({json{{"role", "user"}, {"content", prompts[i]}}}), sp, max_tokens, {}, nullptr,
+                                         [&](const std::string&, double, const std::vector<int32_t>&) { return !stop.load(); });
+                    } catch (const std::exception& e) { errs[i] = e.what(); }
+                    ends[i] = secs();
+                    ++done;
+                });
+            // The page's Stop (or the page closed) ends the replies early
+            while (done.load() < n) {
+                if (req.is_connection_closed()) stop = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            for (auto& t : th) t.join();
+            if (eng.slots.empty()) { eng.model->reset(); eng.cached.clear(); }
+            else for (int sq = 0; sq < (int)eng.slots.size(); ++sq) { eng.model->seq_reset(sq); eng.slots[sq].cached.clear(); }
+            for (const auto& e : errs) if (!e.empty()) throw std::runtime_error(e);
+            if (stop) { res.status = 499; res.set_content("{\"error\":\"stopped\"}", "application/json; charset=utf-8"); return; }
+            json out = json::array();
+            for (int i = 0; i < n; ++i) {
+                const double start = std::max(0.0, ends[i] - gs[i].gen_s);   // when it started writing
+                out.push_back({{"n_prompt", gs[i].n_prompt}, {"n_gen", gs[i].n_gen}, {"gen_s", gs[i].gen_s}, {"prompt_s", gs[i].prompt_s},
+                               {"gen_tps", gs[i].n_gen / std::max(gs[i].gen_s, 1e-9)}, {"start_s", start}, {"end_s", ends[i]},
+                               {"ttft", start}});                     // (the first word comes as writing starts)
+            }
+            res.set_content(dump({{"replies", out}, {"connections", conns}}), "application/json; charset=utf-8");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(dump({{"error", e.what()}}), "application/json; charset=utf-8");
+        }
+    });
+
     // ---------------- Speculative decoding on/off without reloading (when the draft layer is loaded) ----------------
     svr.Post("/api/spec", [&](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body, nullptr, false);

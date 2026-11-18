@@ -295,14 +295,25 @@ async function concurrencyTests(R) {
     for (const n of levels) {
       const d = log(`${n} repl${n === 1 ? "y" : "ies"} at once`);
       const nonce = () => `Reference number ${Math.random().toString(36).slice(2)}.\n\n`;
-      const rs = await Promise.all(Array.from({ length: n }, (_, i) =>
-        chat(CONC_PROMPTS[i % CONC_PROMPTS.length], { max_tokens: CONC_LEN, prefix: nonce(), ignore_eos: true })));
+      // started inside tierlm (a browser opens at most 6 connections to one site, so 8 streams from here would
+      // run as 6 and then 2); its times are tierlm's own
+      const controller = new AbortController();
+      controllers.add(controller);
+      let rs;
+      try {
+        if (stopping) throw new Error("stopped");
+        const r = await api("/api/bench/conc", { method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+          body: JSON.stringify({ prompts: Array.from({ length: n }, (_, i) => nonce() + CONC_PROMPTS[i % CONC_PROMPTS.length]), max_tokens: CONC_LEN }) });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || ("the test failed (" + r.status + ")"));
+        rs = j.replies;
+      } finally { controllers.delete(controller); }
       const tokens = rs.reduce((a, r) => a + r.n_gen, 0);
-      // the writing window: from the earliest reply's start of writing (its end less its writing time, as the server
-      // timed it) to the last reply's end; with one reply this is exactly its own writing speed
-      const firstAt = Math.min(...rs.map(r => r.end - 1000 * r.n_gen / Math.max(r.gen_tps, 1e-9))), lastAt = Math.max(...rs.map(r => r.end));
+      // the writing window: from the earliest reply's start of writing to the last reply's end, as tierlm timed
+      // them; with one reply this is exactly its own writing speed
+      const firstAt = Math.min(...rs.map(r => r.start_s)), lastAt = Math.max(...rs.map(r => r.end_s));
       const each = rs.map(r => r.gen_tps), ttfts = rs.map(r => r.ttft || 0);
-      const row = { n, tokens, total_tps: tokens / Math.max((lastAt - firstAt) / 1000, 1e-9),
+      const row = { n, tokens, total_tps: tokens / Math.max(lastAt - firstAt, 1e-9),
                     each_avg: each.reduce((a, b) => a + b, 0) / n, each_min: Math.min(...each),
                     ttft_avg: ttfts.reduce((a, b) => a + b, 0) / n, ttft_max: Math.max(...ttfts) };
       R.conc.levels.push(row);
