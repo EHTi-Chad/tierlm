@@ -25,8 +25,8 @@ serves your other apps, also with no page or browser at all: start it from the c
 - **A code and security review**, with everything found fixed:
   - A damaged or made-up model file is refused with an error instead of stopping tierlm: every setting is read with
     its type checked, the main sizes are range-checked, and the settings are checked against the weights' shapes.
-    Found by fuzzing under AddressSanitizer and UndefinedBehaviorSanitizer (from 55 of 396 bad files stopping the
-    program to none); checked against the headers of 14 real models, which all load as before.
+    Measured by fuzzing under AddressSanitizer and UndefinedBehaviorSanitizer: of 396 deliberately broken files,
+    0.9.1 crashed, hung or tripped a sanitizer on 190, 0.9.2 on none; checked against the headers of 14 real models, which all load as before.
   - Two data races in the server's status answers (found with ThreadSanitizer), a model-file leak on a failed load,
     and three overflows with absurd context sizes.
   - Get models checks file names more strictly (no `..`, no Windows device names such as `CON` or `NUL`).
