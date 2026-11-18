@@ -35,6 +35,10 @@ serves your other apps, also with no page or browser at all: start it from the c
   - A model whose layers are all sliding-window (or none are) no longer stops while it runs.
   - The security checks (82: path escapes, cross-site requests, DNS rebinding, remote settings, the API key) all
     pass; the test suite passes under the sanitizers.
+- **Known issue** (also in 0.9.1): Find the fastest settings can stop tierlm with Gemma 4 26B-A4B at a long context
+  (64K tokens, 16-bit context memory) when it tries the busiest experts in VRAM; use a shorter context or 8-bit context
+  memory with that model for now. Gemma 3 and 4 also keep the whole context for their sliding-window layers (30 GiB at
+  64K for the 26B-A4B); storing just the window is next.
 
 ### New in 0.9.1: long prompts up to 9× faster with experts in RAM, Gemma 3 and Gemma 4, a benchmark page
 
