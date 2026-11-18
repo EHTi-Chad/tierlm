@@ -14,6 +14,28 @@ gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), NVIDIA Nemo
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
 
+### New in 0.9.2: Get models fixed for unsloth's repos, a concurrency test, a code and security review
+
+- **Fixed: Get models did nothing for many unsloth repos.** Repos with an importance-matrix file
+  (`imatrix_unsloth.gguf`, unsloth/Qwen3.8-27B-GGUF among them) were read as "unknown architecture" and every Download
+  button was disabled, without looking disabled. imatrix files are now left out of the list, and a file with no architecture
+  no longer marks a repo as unsupported.
+- **Several at once** on the benchmark page: 1, 2, 4… replies started together, up to the **Connections** setting, with
+  the total writing speed, each reply's speed and the slowest, and the time to the first word; kept with the other runs.
+- **A code and security review**, with everything found fixed:
+  - A damaged or made-up model file is refused with an error instead of stopping tierlm: every setting is read with
+    its type checked, the main sizes are range-checked, and the settings are checked against the weights' shapes.
+    Found by fuzzing under AddressSanitizer and UndefinedBehaviorSanitizer (from 55 of 396 bad files stopping the
+    program to none); checked against the headers of 14 real models, which all load as before.
+  - Two data races in the server's status answers (found with ThreadSanitizer), a model-file leak on a failed load,
+    and three overflows with absurd context sizes.
+  - Get models checks file names more strictly (no `..`, no Windows device names such as `CON` or `NUL`).
+  - ggml's GGUF reader now checks a file's type numbers before using them (change 5 in
+    [docs/GGML_CHANGES.md](docs/GGML_CHANGES.md)).
+  - A model whose layers are all sliding-window (or none are) no longer stops while it runs.
+  - The security checks (82: path escapes, cross-site requests, DNS rebinding, remote settings, the API key) all
+    pass; the test suite passes under the sanitizers.
+
 ### New in 0.9.1: long prompts up to 9× faster with experts in RAM, Gemma 3 and Gemma 4, a benchmark page
 
 - **Long prompts with experts in RAM** (NVIDIA): the RAM weights now go in pinned memory and stay in a layout the GPU
