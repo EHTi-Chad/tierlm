@@ -5042,6 +5042,9 @@ int main(int argc, char** argv) {
             if (path.size() < 5 || path.compare(path.size() - 5, 5, ".gguf") != 0) continue;
             const std::string name = fs::u8path(path).filename().u8string();
             std::string lower = name; for (char& ch : lower) ch = (char)std::tolower((unsigned char)ch);
+            // (an importance matrix, imatrix*.gguf, is calibration data for making quants, not a model: left out; it
+            // was once listed first, as the smallest file, and its header, with no architecture, greyed the repo out)
+            if (lower.rfind("imatrix", 0) == 0) continue;
             const std::string kind = lower.rfind("mmproj", 0) == 0 ? "vision" : lower.rfind("mtp-", 0) == 0 ? "draft" : "model";
             std::smatch m;
             const std::string key = std::regex_match(path, m, part_re) ? m.str(1) : path.substr(0, path.size() - 5);
@@ -5081,6 +5084,8 @@ int main(int argc, char** argv) {
                 if (!g) continue;                                 // the header is longer: read more
                 gguf_free(g);
                 json d = describe_model(tmp.u8string(), true);
+                // a header with no architecture says nothing either way: the repo isn't marked as unsupported for it
+                if (d.value("arch", std::string()).empty()) break;
                 for (const char* k : {"arch", "supported", "reason", "kind", "kv_bytes_per_token", "layers", "experts", "experts_used", "ctx_train", "hybrid", "name"})
                     if (d.contains(k)) out[k] = d[k];
                 break;
