@@ -142,7 +142,10 @@ fold the menu away and give the chat more room.
   PC, in under a minute for a model all in VRAM to 10 minutes or more for a big one mostly in RAM: prompt reading
   at 512 to 32K tokens (from scratch, and again with the prompt cached), the time to the first word, writing speed
   for replies of 256 and 2K tokens (8K and 16K with **Long replies**) and after a long context, guessing ahead on and
-  off, with charts, and 30 fixed questions from public
+  off, with charts; **Several at once** (with **Connections** set above 1 in **Change setup**) starts 1, 2, 4…
+  512-token replies together, up to the Connections setting, and shows the total writing speed, each reply's speed
+  and the time to the first word (guessing ahead is off for that test, as it is whenever several replies run); and
+  30 fixed questions from public
   benchmarks: 10 maths (GSM8K), 10 knowledge (MMLU and ARC-Challenge), 5 code (HumanEval, written in JavaScript and
   run against its tests in the page) and 5 instructions to follow (IFEval). The questions are the same every run, at
   temperature 0 with thinking off, so runs compare across models, quantizations and PCs; every run is kept on this PC

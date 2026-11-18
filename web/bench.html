@@ -81,11 +81,13 @@
     <p class="sub">Speed (reading prompts of 512 to 32K tokens from scratch and again with them cached, the time to the first
       word, writing replies of different lengths, writing after a long context, guessing ahead on and off) and a
       short fixed set of 30 questions from public benchmarks, the same every time: maths, knowledge, code and following
-      instructions. Answers are at temperature 0 with thinking off. It uses the loaded model and its settings, and takes
+      instructions. Several at once (optional) starts 1, 2, 4… replies together, up to the Connections setting, and measures
+      the total and each reply's speed. Answers are at temperature 0 with thinking off. It uses the loaded model and its settings, and takes
       from under a minute (a model all in VRAM) to 10 minutes or more (a big model mostly in RAM). Chats wait while it runs.</p>
     <div class="picks" id="picks">
       <label><input type="checkbox" value="speed" checked> Speed <small>prompts to 32K, replies to 2K</small></label>
       <label><input type="checkbox" value="long"> Long replies <small>8K and 16K tokens: slow models take a while</small></label>
+      <label><input type="checkbox" value="conc"> Several at once <small>1, 2, 4… replies together, up to Connections</small></label>
       <label><input type="checkbox" value="gsm8k" checked> Maths <small>10, GSM8K</small></label>
       <label><input type="checkbox" value="mc" checked> Knowledge <small>10, MMLU and ARC</small></label>
       <label><input type="checkbox" value="code" checked> Code <small>5, HumanEval in JavaScript</small></label>
@@ -123,7 +125,8 @@
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const D = window.BENCH_DATA;
-let stopping = false, controller = null, info = null, specs = null, last = null;
+let stopping = false, info = null, specs = null, last = null;
+const controllers = new Set();                          // every request running (several at once in that test)
 
 function storedKey() { try { return localStorage.getItem("tierlm.apikey") || ""; } catch (e) { return ""; } }
 async function api(url, opts = {}) {
@@ -139,7 +142,9 @@ const post = (url, body) => api(url, { method: "POST", headers: { "Content-Type"
 // seconds, guessing stats) and the time to the first token as this page saw it.
 async function chat(content, { max_tokens = 512, temperature = 0, prefix = null, ignore_eos = false } = {}) {
   if (stopping) throw new Error("stopped");
-  controller = new AbortController();
+  const controller = new AbortController();
+  controllers.add(controller);
+  try {
   const t0 = performance.now();
   const messages = [{ role: "user", content: (prefix || "") + content }];
   const r = await api("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
@@ -163,7 +168,8 @@ async function chat(content, { max_tokens = 512, temperature = 0, prefix = null,
     }
   }
   if (!done) throw new Error("the reply ended early");
-  return { text, ttft: first ? (first - t0) / 1000 : null, total: (performance.now() - t0) / 1000, ...done };
+  return { text, ttft: first ? (first - t0) / 1000 : null, t0, first, end: performance.now(), total: (performance.now() - t0) / 1000, ...done };
+  } finally { controllers.delete(controller); }
 }
 // The answer without the model's thinking (an unfinished thought: no answer)
 function answerOf(t) {
@@ -259,6 +265,54 @@ async function speedTests(R, which) {
   else settle(d, "Guessing ahead: not available for this model as loaded (skipped)", true);
   tick();
 }
+// ---------- several replies at once ----------
+// 1, 2, 4… replies started together (up to the Connections setting), each a different prompt with a fresh start (nothing
+// cached) written to a set length. Total: every token written over the time from the first reply starting to write
+// to the last reply's end; each reply's own writing speed and time to the first word as the server and this page measured them.
+// Guessing ahead is off for the whole test (several replies don't guess, so one alone shouldn't either).
+const CONC_PROMPTS = [
+  "Write a long, detailed story about a lighthouse keeper who finds a message in a bottle, with many chapters.",
+  "Explain in detail how a modern CPU executes instructions, from fetch to retirement, with examples.",
+  "Write a detailed travel guide to a week in Portugal, day by day, with food and history notes.",
+  "Write a long essay on the history of printing, from woodblocks to digital presses.",
+  "Describe step by step how to build a small web server in Go, with code and explanations.",
+  "Write a long, detailed story about two rival bakers in a mountain village, with many chapters.",
+  "Explain in detail how vaccines train the immune system, for a curious adult reader.",
+  "Write a detailed guide to starting a vegetable garden, month by month, for a cold climate.",
+];
+const concLevels = () => { const c = Math.max(1, (info && info.connections) || 1); const l = [1, 2, 4, 8, 16, 32, 64].filter(n => n <= c); if (l[l.length - 1] !== c) l.push(c); return l; };
+const CONC_LEN = 512;
+async function concurrencyTests(R) {
+  const levels = concLevels();
+  R.conc = { len: CONC_LEN, levels: [] };
+  if (levels.length < 2) {
+    log("Several at once: skipped (Connections is 1: set it to 4 or more in Change setup, then run again)", "no");
+    tick(); return;
+  }
+  const was = { speculative: !!info.speculative, draft_max: info.draft_max || 2 };
+  if (was.speculative) await post("/api/spec", { speculative: false }).catch(() => {});
+  try {
+    for (const n of levels) {
+      const d = log(`${n} repl${n === 1 ? "y" : "ies"} at once`);
+      const nonce = () => `Reference number ${Math.random().toString(36).slice(2)}.\n\n`;
+      const rs = await Promise.all(Array.from({ length: n }, (_, i) =>
+        chat(CONC_PROMPTS[i % CONC_PROMPTS.length], { max_tokens: CONC_LEN, prefix: nonce(), ignore_eos: true })));
+      const tokens = rs.reduce((a, r) => a + r.n_gen, 0);
+      // the writing window: from the earliest reply's start of writing (its end less its writing time, as the server
+      // timed it) to the last reply's end; with one reply this is exactly its own writing speed
+      const firstAt = Math.min(...rs.map(r => r.end - 1000 * r.n_gen / Math.max(r.gen_tps, 1e-9))), lastAt = Math.max(...rs.map(r => r.end));
+      const each = rs.map(r => r.gen_tps), ttfts = rs.map(r => r.ttft || 0);
+      const row = { n, tokens, total_tps: tokens / Math.max((lastAt - firstAt) / 1000, 1e-9),
+                    each_avg: each.reduce((a, b) => a + b, 0) / n, each_min: Math.min(...each),
+                    ttft_avg: ttfts.reduce((a, b) => a + b, 0) / n, ttft_max: Math.max(...ttfts) };
+      R.conc.levels.push(row);
+      settle(d, `${n} at once: ${row.total_tps.toFixed(1)} tok/s in all; each ${row.each_avg.toFixed(1)} tok/s (slowest ${row.each_min.toFixed(1)}); first word ${row.ttft_avg.toFixed(2)} s (longest ${row.ttft_max.toFixed(2)} s)`, true);
+      tick();
+    }
+  } finally {
+    if (was.speculative) await post("/api/spec", { speculative: true, draft_max: was.draft_max }).catch(() => {});
+  }
+}
 // The number of speed steps, for the progress bar
 function speedSteps(which) {
   const ctx = (info && info.ctx) || 4096;
@@ -350,7 +404,7 @@ async function run() {
   stopping = false; $("run").disabled = true; $("stop").disabled = false; $("log").textContent = ""; $("result").hidden = true;
   stepsDone = 0;
   info = await getJSON("/api/info").catch(() => info);
-  stepsAll = (which.includes("speed") ? speedSteps(which) : 0) + (which.includes("gsm8k") ? 10 : 0) + (which.includes("mc") ? 10 : 0) +
+  stepsAll = (which.includes("speed") ? speedSteps(which) : 0) + (which.includes("conc") ? Math.max(1, concLevels().length) : 0) + (which.includes("gsm8k") ? 10 : 0) + (which.includes("mc") ? 10 : 0) +
              (which.includes("code") ? 5 : 0) + (which.includes("ifeval") ? 5 : 0);
   const t0 = performance.now();
   const R = { id: Date.now().toString(36), when: new Date().toISOString(), tests: which, data_version: D.version };
@@ -361,6 +415,7 @@ async function run() {
     R.pc = pcLine(); R.settings = settingsLine(); R.tierlm = info.version;
     $("status").textContent = "Running…";
     if (which.includes("speed")) await speedTests(R, which);
+    if (which.includes("conc")) await concurrencyTests(R);
     await accuracy(R, which);
     R.minutes = (performance.now() - t0) / 60000;
     last = R;
@@ -371,7 +426,7 @@ async function run() {
   } catch (e) {
     $("status").textContent = stopping ? "Stopped." : "Stopped: " + e.message;
   } finally {
-    $("run").disabled = false; $("stop").disabled = true; controller = null;
+    $("run").disabled = false; $("stop").disabled = true;
   }
 }
 function pcLine() {
@@ -382,7 +437,8 @@ function pcLine() {
 function settingsLine() {
   const where = info.all_on_gpu ? "all on the GPU" : info.live_experts ? "VRAM experts following the conversation" : info.hot_experts ? "busiest experts in VRAM" : info.on_gpu ? "split between GPU and RAM" : "CPU";
   return [`${(info.ctx || 0).toLocaleString()} tokens of context`, `KV ${info.kv_type}`, `${info.threads} thread${info.threads === 1 ? "" : "s"}`, where,
-          info.speculative ? `speculative ${info.draft_max}` : "no speculative decoding"].join(", ");
+          info.speculative ? `speculative ${info.draft_max}` : "no speculative decoding",
+          ...(info.connections > 1 ? [`${info.connections} connections`] : [])].join(", ");
 }
 
 // ---------- showing a run ----------
@@ -445,6 +501,19 @@ function show(R) {
       Dd.map(p => ({ x: p.len, y: p.tps, label: kTok(p.len) })), (v, axis) => axis ? String(+v.toFixed(1)) : v.toFixed(v >= 100 ? 0 : 1),
       `<tr><th>Reply</th><th class="num">tok/s</th></tr>` + Dd.map(p => `<tr><td>${p.tokens.toLocaleString()} tokens</td><td class="num">${p.tps.toFixed(1)}</td></tr>`).join("")));
   }
+  const C = R.conc && R.conc.levels && R.conc.levels.length ? R.conc.levels : null;
+  if (C) {
+    const best = C.reduce((a, b) => b.total_tps > a.total_tps ? b : a), one = C[0];
+    out.push(stat(best.n === 1 ? "Several at once: no gain" : `${best.n} replies at once`, best.total_tps.toFixed(1), "tok/s in all",
+      `${(best.total_tps / one.total_tps).toFixed(1)}× one reply; each ${best.each_avg.toFixed(1)} tok/s`));
+    const fmt1 = (v, axis) => axis ? String(+v.toFixed(1)) : v.toFixed(v >= 100 ? 0 : 1);
+    charts.push(chartCard("Several at once: total writing speed", `Higher is better. ${R.conc.len}-token replies started together, different prompts, nothing cached; guessing ahead off.`,
+      C.map(p => ({ x: p.n, y: p.total_tps, label: p.n + "×" })), fmt1,
+      `<tr><th>At once</th><th class="num">In all</th><th class="num">Each</th><th class="num">Slowest</th><th class="num">First word</th></tr>` +
+      C.map(p => `<tr><td>${p.n}</td><td class="num">${p.total_tps.toFixed(1)}</td><td class="num">${p.each_avg.toFixed(1)}</td><td class="num">${p.each_min.toFixed(1)}</td><td class="num">${p.ttft_avg.toFixed(2)} s</td></tr>`).join("")));
+    charts.push(chartCard("Several at once: each reply's speed", "What each person sees while the others are writing.",
+      C.map(p => ({ x: p.n, y: p.each_avg, label: p.n + "×" })), fmt1, ""));
+  }
   $("rspeed").innerHTML = out.join("") || `<div class="note">Not measured in this run.</div>`;
   $("rcharts").innerHTML = charts.join("");
   const A = R.acc || {}, sc = [];
@@ -469,6 +538,8 @@ function lineOf(R) {
   if (h.dec) sp.push(`generation ${h.dec.tps.toFixed(1)} tok/s (${(h.dec.len || 0).toLocaleString()}-token reply)`);
   if (h.deep) sp.push(`${h.deep.tps.toFixed(1)} tok/s after ${h.deep.depth.toLocaleString()} tokens of context`);
   if (h.spec) sp.push(`code ${h.spec.on.tps.toFixed(1)} tok/s guessing ahead, ${h.spec.off.tps.toFixed(1)} without`);
+  const C = R.conc && R.conc.levels || [];
+  if (C.length) sp.push("at once: " + C.map(p => `${p.n}× ${p.total_tps.toFixed(1)} tok/s (each ${p.each_avg.toFixed(1)})`).join(", ") + ` (${R.conc.len}-token replies)`);
   if (of) sp.push(`accuracy ${right}/${of} (` + Object.entries(A).map(([k, v]) => `${k} ${v.right}/${v.of}`).join(", ") + ")");
   return parts.join(" | ") + " -> " + sp.join(", ");
 }
@@ -480,6 +551,8 @@ function mdOf(R) {
   for (const p of S.decode || []) rows.push([`Writing a ${p.tokens.toLocaleString()}-token reply`, `${p.tps.toFixed(1)} tok/s`]);
   if (S.gen_deep) rows.push([`Writing after ${S.gen_deep.depth.toLocaleString()} tokens of context`, `${S.gen_deep.tps.toFixed(1)} tok/s`]);
   if (S.spec) rows.push([`Code, guessing ahead (${S.spec.guesses}) / without`, `${S.spec.on.tps.toFixed(1)} / ${S.spec.off.tps.toFixed(1)} tok/s`]);
+  for (const p of (R.conc && R.conc.levels) || []) rows.push([`${p.n} repl${p.n === 1 ? "y" : "ies"} at once (${R.conc.len} tokens each)`,
+    `${p.total_tps.toFixed(1)} tok/s in all, each ${p.each_avg.toFixed(1)} (slowest ${p.each_min.toFixed(1)}), first word ${p.ttft_avg.toFixed(2)} s`]);
   for (const [k, v] of Object.entries(A)) rows.push([`Accuracy: ${k}`, `${v.right}/${v.of}`]);
   if (of) rows.push(["Accuracy: all", `${right}/${of} (${Math.round(100 * right / of)}%)`]);
   return "| | |\n|---|---|\n" + rows.map(r => `| ${r[0]} | ${String(r[1]).replace(/\|/g, "/")} |`).join("\n") +
@@ -491,20 +564,24 @@ $("copymd").onclick = e => last && copy(mdOf(last), e.target);
 $("copyjson").onclick = e => last && copy(JSON.stringify(last, null, 1), e.target);
 
 // ---------- the runs kept ----------
+function concBest(R) {
+  const C = R.conc && R.conc.levels || []; if (!C.length) return "";
+  const b = C.reduce((a, x) => x.total_tps > a.total_tps ? x : a); return `${b.total_tps.toFixed(0)}<div class="note">${b.n}×</div>`;
+}
 async function loadHistory() {
   let runs = [];
   try { runs = await getJSON("/api/benchruns"); } catch (e) {}
   $("histnote").textContent = runs.length ? `${runs.length} run${runs.length === 1 ? "" : "s"}` : "";
   if (!runs.length) { $("hist").innerHTML = `<tr><td class="note">No runs yet.</td></tr>`; return; }
   const sc = (A, k) => A && A[k] ? `${A[k].right}/${A[k].of}` : "";
-  $("hist").innerHTML = `<tr><th>When</th><th>Model</th><th>Settings</th><th class="num">Prompt tok/s<div class="note">8K</div></th><th class="num">Writing tok/s</th><th class="num">Filled ctx</th>` +
+  $("hist").innerHTML = `<tr><th>When</th><th>Model</th><th>Settings</th><th class="num">Prompt tok/s<div class="note">8K</div></th><th class="num">Writing tok/s</th><th class="num">Filled ctx</th><th class="num">At once<div class="note">best, in all</div></th>` +
     `<th class="num">Maths</th><th class="num">Knowl.</th><th class="num">Code</th><th class="num">Instr.</th><th class="num">All</th><th></th></tr>` +
     runs.slice().reverse().map(R => {
       const { h, A, right, of } = summary(R);
       return `<tr data-id="${esc(R.id)}"><td>${esc(new Date(R.when).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }))}</td>` +
         `<td>${esc(R.model)}${R.quant ? `<div class="note">${esc(R.quant)}</div>` : ""}</td><td class="spec">${esc(R.settings || "")}</td>` +
         `<td class="num">${h.pre ? fmtTps(h.pre.tps) : ""}</td><td class="num">${h.dec ? h.dec.tps.toFixed(1) : ""}</td>` +
-        `<td class="num">${h.deep ? h.deep.tps.toFixed(1) : ""}</td><td class="num">${sc(A, "maths")}</td><td class="num">${sc(A, "knowledge")}</td>` +
+        `<td class="num">${h.deep ? h.deep.tps.toFixed(1) : ""}</td><td class="num">${concBest(R)}</td><td class="num">${sc(A, "maths")}</td><td class="num">${sc(A, "knowledge")}</td>` +
         `<td class="num">${sc(A, "code")}</td><td class="num">${sc(A, "instructions")}</td><td class="num">${of ? Math.round(100 * right / of) + "%" : ""}</td>` +
         `<td class="acts"><button class="tiny" data-show="${esc(R.id)}">Show</button> <button class="tiny" data-del="${esc(R.id)}" title="Remove this run">✕</button></td></tr>`;
     }).join("");
@@ -517,7 +594,7 @@ async function loadHistory() {
 }
 
 $("run").onclick = run;
-$("stop").onclick = () => { stopping = true; if (controller) controller.abort(); $("status").textContent = "Stopping…"; };
+$("stop").onclick = () => { stopping = true; for (const c of controllers) c.abort(); $("status").textContent = "Stopping…"; };
 (async () => {
   try {
     info = await getJSON("/api/info");
