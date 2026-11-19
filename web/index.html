@@ -779,7 +779,7 @@ window.FIT = (() => {
             <div class="help">Goes with the setting above: while you chat, experts the conversation keeps using move into VRAM in place of ones it stopped using (a few per word, copied from RAM). Helps when a chat is about something different from what the model learned, such as code after a lot of plain text. Uses more RAM: the experts in VRAM are kept in RAM as well. Works even before tierlm has learned anything about the model.</div>
           </div>
           <div>
-            <label for="vramlim">VRAM limit (GiB)</label>
+            <label for="vramlim">VRAM limit (GB)</label>
             <input id="vramlim" type="number" value="0" min="0" step="0.5">
             <div class="help">0 uses all free VRAM. A lower number keeps VRAM free for other apps, or lets you see how the model would run on a smaller GPU.</div>
           </div>
@@ -939,7 +939,7 @@ window.FIT = (() => {
         <div class="tiers">
           <div class="tier"><div class="name"><span class="sw" style="background:var(--vram)"></span>VRAM</div><div class="val" id="t-vram">–</div><div class="sub" id="t-vram-sub">–</div></div>
           <div class="tier"><div class="name"><span class="sw" style="background:var(--ram)"></span>RAM</div><div class="val" id="t-ram">–</div><div class="sub" id="t-ram-sub">–</div></div>
-          <div class="tier"><div class="name"><span class="sw" style="background:var(--ssd)"></span>SSD</div><div class="val" id="t-ssd">0 GiB</div><div class="sub" id="t-ssd-sub">not needed</div></div>
+          <div class="tier"><div class="name"><span class="sw" style="background:var(--ssd)"></span>SSD</div><div class="val" id="t-ssd">0 GB</div><div class="sub" id="t-ssd-sub">not needed</div></div>
         </div>
         <div class="note" id="devmem">–</div>
         <div class="note" id="hotnote" hidden></div>
@@ -1201,7 +1201,8 @@ const fmtTok = n => {
   const m = n % 1048576 === 0 ? n / 1048576 : n / 1e6;
   return (Number.isInteger(m) ? m : m.toFixed(2)) + "M";
 };
-const fmtGiB = b => !b ? "0 GiB" : b < 1073741824 ? Math.max(0.1, b / 1048576).toFixed(b < 10485760 ? 1 : 0) + " MiB" : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 1 : 2) + " GiB";
+// Sizes in GB and MB (1,000,000,000 and 1,000,000 bytes), as on tierlm.com, Hugging Face and the box a card comes in
+const fmtGB = b => !b ? "0 GB" : b < 1e9 ? Math.max(0.1, b / 1e6).toFixed(b < 1e7 ? 1 : 0) + " MB" : (b / 1e9).toFixed(b >= 1e10 ? 1 : 2) + " GB";
 let info = null, L = 16, E = 64, K = 8;
 let counts = new Float64Array(L * E), flash = new Float64Array(L * E), totalPicks = 0;
 let mapMode = "heat", mapSorted = true, ffnVram = [], hotSets = [], history = [], busy = false, controller = null;
@@ -1366,29 +1367,29 @@ async function loadInfo() {
   if (info.on_gpu) {
     const kvv = kv * (info.kv_gpu_layers || 0) / L, kvr = kv - kvv;
     const layersMode = info.split_mode !== "experts";
-    $("t-vram").textContent = fmtGiB(vw + kvv);
+    $("t-vram").textContent = fmtGB(vw + kvv);
     const hotN = info.hot_experts || 0;
     $("t-vram-sub").textContent = rw <= 0 ? "the whole model + KV cache"
       : hotN > 0 && !layersMode ? "attention " + info.attn_gpu + "/" + L + ", the " + hotN.toLocaleString() + " busiest experts" + (info.kv_on_gpu ? " + KV cache" : "")
       : layersMode ? info.ffn_gpu + " of " + L + " layers + their KV cache"
       : "attention " + info.attn_gpu + "/" + L + ", " + what(info.ffn_gpu) + (info.kv_on_gpu ? " + KV cache" : "");
-    $("t-ram").textContent = fmtGiB(rw + kvr);
+    $("t-ram").textContent = fmtGB(rw + kvr);
     $("t-ram-sub").textContent = rw <= 0 ? "spill-over tier (not needed)"
       : hotN > 0 && !layersMode ? "the other " + (L * E - hotN).toLocaleString() + " experts" + (kvr > 0 ? " + KV cache" : "") + ", computed by the CPU"
       : (layersMode ? (L - info.ffn_gpu) + " of " + L + " layers" + (kvr > 0 ? " + their KV cache" : "") : what(L - info.ffn_gpu) + (kvr > 0 ? " + KV cache" : "")) + ", computed by the CPU";
   } else {
-    $("t-vram").textContent = "0 GiB"; $("t-vram-sub").textContent = "no GPU in use";
-    $("t-ram").textContent = fmtGiB(w + kv); $("t-ram-sub").textContent = (E ? "all experts" : "all layers") + " + KV cache";
+    $("t-vram").textContent = "0 GB"; $("t-vram-sub").textContent = "no GPU in use";
+    $("t-ram").textContent = fmtGB(w + kv); $("t-ram-sub").textContent = (E ? "all experts" : "all layers") + " + KV cache";
   }
   const used = info.device_total - info.device_free;
-  $("devmem").textContent = info.device + ": " + fmtGiB(used) + " used of " + fmtGiB(info.device_total) +
-    " · weights " + fmtGiB(w) + ", KV cache " + fmtGiB(kv) +
+  $("devmem").textContent = info.device + ": " + fmtGB(used) + " used of " + fmtGB(info.device_total) +
+    " · weights " + fmtGB(w) + ", KV cache " + fmtGB(kv) +
     (info.device_type === "igpu" ? " · an integrated GPU shares system RAM, so its 'VRAM' is borrowed memory" : "") +
     " · KV cache " + info.kv_type + ", flash attention " + (info.flash_attn ? "on" : "off") +
     (info.experts_used !== info.experts_default ? " · " + info.experts_used + " active experts (model default " + info.experts_default + ")" : "") +
     (rw > 0 && !info.all_on_gpu ? " · split between VRAM and RAM" : "") + (info.ssd_weights > 0 ? " and SSD" : "");
   const sw = info.ssd_weights || 0;
-  $("t-ssd").textContent = fmtGiB(sw);
+  $("t-ssd").textContent = fmtGB(sw);
   $("t-ssd-sub").textContent = sw <= 0 ? "not needed" : (info.ssd_ngram ? "the n-gram table" + (info.ssd_layers ? " + " : "") : "") +
     (info.ssd_layers ? info.ssd_layers + " of " + L + (E ? " expert layers" : " layers") : "") +
     ", read from the drive as they're used" + (info.ssd_file ? " (" + info.ssd_file + ")" : "");
@@ -2124,7 +2125,7 @@ async function loadDrives() {
   for (const d of drives.drives || []) {
     const o = document.createElement("option");
     o.value = d.path;
-    o.textContent = d.path + (d.label && !d.label.startsWith("/dev/") ? " " + d.label : "") + " · " + fmtGiB(d.free) + " free of " + fmtGiB(d.total);
+    o.textContent = d.path + (d.label && !d.label.startsWith("/dev/") ? " " + d.label : "") + " · " + fmtGB(d.free) + " free of " + fmtGB(d.total);
     sel.appendChild(o);
   }
   let match = "";
@@ -2150,7 +2151,7 @@ function plan() {
   const base = { W, KV, gpu, cpu, held, ramFree };
   if ($("forcecpu").checked || !gpu)
     return withSsd({ ...base, dev: cpu, wv: 0, kvv: 0, wr: W, kvr: KV, why: $("forcecpu").checked ? "forced" : "nogpu" });
-  const lim = +$("vramlim").value > 0 ? +$("vramlim").value * 1073741824 : Infinity;
+  const lim = +$("vramlim").value > 0 ? +$("vramlim").value * 1e9 : Infinity;
   const group = $("allgpus").checked ? gpuGroup(gpu) : [gpu];
   const rooms = group.map((g, i) => Math.max(0, Math.min(g.free + (i === 0 ? held.vram : 0), lim) - WORK));
   const room = rooms.reduce((t, r) => t + r, 0);
@@ -2172,17 +2173,17 @@ function ssdNote(p) {
   if (!(p.ssd > 0)) return "";
   const dr = ssdDrive();
   const room = dr ? dr.free : Infinity;
-  return ` ${fmtGiB(p.ssd)} of it doesn't fit in RAM either, so it stays on the SSD (${dr ? dr.label : "the model's own drive"}) and is read as each word needs it.` +
+  return ` ${fmtGB(p.ssd)} of it doesn't fit in RAM either, so it stays on the SSD (${dr ? dr.label : "the model's own drive"}) and is read as each word needs it.` +
     ` Any size of model runs this way. A mixture-of-experts model stays fast, since each word reads only the few experts it picks;` +
     ` a dense one reads all of itself for every word, so the drive's speed decides.` +
-    (dr && p.ssd > room ? ` Warning: that drive has only ${fmtGiB(room)} free.` : "");
+    (dr && p.ssd > room ? ` Warning: that drive has only ${fmtGB(room)} free.` : "");
 }
 function memBar(title, sub, total, parts) {
   const used = parts.reduce((t, x) => t + x.v, 0);
   const all = [...parts, { v: Math.max(0, total - used), c: "transparent", l: "Free" }];
   const MiB = 1048576;                      // leave out slivers (e.g. "Free 0.1 MiB" when VRAM is full)
-  const segs = all.filter(x => x.v >= MiB).map(x => `<div class="${x.h ? "hatch" : ""}" style="background-color:${x.c};width:${100 * x.v / Math.max(1, total, used)}%" title="${x.l}: ${fmtGiB(x.v)}"></div>`).join("");
-  const leg = all.filter(x => x.v >= MiB || x.always).map(x => `<span><i class="${x.h ? "hatch" : ""}" style="background-color:${x.c === "transparent" ? "var(--panel-2)" : x.c}"></i>${x.l} <b>${fmtGiB(x.v)}</b></span>`).join("");
+  const segs = all.filter(x => x.v >= MiB).map(x => `<div class="${x.h ? "hatch" : ""}" style="background-color:${x.c};width:${100 * x.v / Math.max(1, total, used)}%" title="${x.l}: ${fmtGB(x.v)}"></div>`).join("");
+  const leg = all.filter(x => x.v >= MiB || x.always).map(x => `<span><i class="${x.h ? "hatch" : ""}" style="background-color:${x.c === "transparent" ? "var(--panel-2)" : x.c}"></i>${x.l} <b>${fmtGB(x.v)}</b></span>`).join("");
   return `<div class="membar"><div class="mt">${title}<span>${sub}</span></div><div class="stack">${segs}</div><div class="stackleg">${leg}</div></div>`;
 }
 async function loadSetup() {
@@ -2273,7 +2274,7 @@ function applySaved() {
   if (s.temperature != null) $("temp").value = s.temperature;
   for (const id of ["topk", "topp", "minp", "rpen", "ppen", "temp"]) $(id).oninput();
   $("forcecpu").checked = !!s.force_cpu;
-  $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb / 1024).toFixed(1) : 0;
+  $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb * 1048576 / 1e9).toFixed(1) : 0;   // (kept in MiB, shown in GB)
   // Settings saved before "Automatic" existed (no settings_v) had whole layers as the default: treat as Automatic.
   $("splitsel").value = (s.settings_v >= 2 || s.split_mode === "experts") && s.split_mode ? s.split_mode : "auto";
   $("hotexp").checked = s.hot_experts === true;   // opt-in: Find the fastest settings turns it on where it wins
@@ -2314,7 +2315,7 @@ function buildCtx(want) {
   for (const v of opts) {
     const o = document.createElement("option"); o.value = v;
     const k = v >= 1024 && v % 1024 === 0 ? (v / 1024) + "K" : v.toLocaleString();
-    o.textContent = k + " tokens" + (kvpt ? " · " + fmtGiB(kvpt * v) : "") + (v === max ? " (model max)" : "");
+    o.textContent = k + " tokens" + (kvpt ? " · " + fmtGB(kvpt * v) : "") + (v === max ? " (model max)" : "");
     sel.appendChild(o);
   }
   const oc = document.createElement("option"); oc.value = "custom"; oc.textContent = "Custom…"; sel.appendChild(oc);
@@ -2367,7 +2368,7 @@ function renderSetup() {
     el.innerHTML = `<div class="t"></div><div class="d"></div><div class="tags"></div>`;
     el.querySelector(".t").textContent = d.type === "cpu" ? "CPU · " + d.description : d.description;
     el.querySelector(".d").textContent = (d.type === "cpu" ? "System RAM" : d.type === "igpu" ? d.backend + " · shared memory" : d.backend + " · VRAM") +
-      " · " + fmtGiB(d.free) + " free of " + fmtGiB(d.total);
+      " · " + fmtGB(d.free) + " free of " + fmtGB(d.total);
     const add = tagger(el.querySelector(".tags"));
     add(typeLabel[d.type] || d.type);
     if (p.dev && (d.id === p.dev.id || (p.gpus || []).some(x => x.dev === d))) add("Will be used", "good");
@@ -2389,7 +2390,7 @@ function renderSetup() {
     if (p.dev === p.gpu) {
       const ig = p.gpu.type === "igpu", many = p.gpus.length > 1;
       p.gpus.forEach((x, i) => {
-        html += memBar(ig ? "GPU memory (shared)" : many ? "VRAM, GPU " + (i + 1) : "VRAM", x.dev.description + " · " + fmtGiB(x.dev.total), x.dev.total, [
+        html += memBar(ig ? "GPU memory (shared)" : many ? "VRAM, GPU " + (i + 1) : "VRAM", x.dev.description + " · " + fmtGB(x.dev.total), x.dev.total, [
           { v: x.wv, c: "var(--vram)", l: "Model", always: true },
           { v: x.kvv, c: "var(--kv)", l: "Context (KV cache)", always: true },
           { v: x.wv + x.kvv > 0 ? WORK : 0, c: "var(--work)", l: "Working memory" },
@@ -2397,24 +2398,24 @@ function renderSetup() {
       });
     }
     if (p.wr + p.kvr > 0 && p.cpu) {
-      html += memBar("System RAM", fmtGiB(p.cpu.total), p.cpu.total, [
+      html += memBar("System RAM", fmtGB(p.cpu.total), p.cpu.total, [
         { v: p.wr, c: "var(--ram)", l: "Model", always: true },
         { v: p.kvr, c: "var(--kv)", l: "Context (KV cache)" },
         { v: other(p.cpu), c: "var(--other)", h: true, l: "Windows and other programs" }]);
     }
     if (p.ssd > 0) {
       const dr = ssdDrive();
-      html += memBar("SSD", dr ? dr.label + " · " + fmtGiB(dr.total) : "the model's own drive", dr ? dr.total : p.ssd, [
+      html += memBar("SSD", dr ? dr.label + " · " + fmtGB(dr.total) : "the model's own drive", dr ? dr.total : p.ssd, [
         { v: p.ssd, c: "var(--ssd)", l: "Model (read as needed)", always: true },
         { v: dr ? Math.max(0, dr.total - dr.free) : 0, c: "var(--other)", h: true, l: "Other files" }]);
     }
     const otherG = p.gpu ? other(p.gpu) : 0;
     if (p.why === "split" && otherG > 1.5 * 1073741824)
-      html += `<div class="memnote">Other programs are using <b>${fmtGiB(otherG)}</b> of VRAM (another tierlm window, LM Studio, a game?). Closing them gives tierlm more room; then click <b>Rescan</b>.</div>`;
+      html += `<div class="memnote">Other programs are using <b>${fmtGB(otherG)}</b> of VRAM (another tierlm window, LM Studio, a game?). Closing them gives tierlm more room; then click <b>Rescan</b>.</div>`;
     pl.innerHTML = html;
     const ram = p.wr + p.kvr;
     const onWhat = (p.gpus || []).length > 1 ? `your ${p.gpus.length} GPUs (${p.gpus.map(x => x.dev.description).join(" + ")})` : p.dev.description;
-    const msg = { fits: `The whole model fits on ${onWhat}: ${fmtGiB(p.W)} of model plus ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context.`,
+    const msg = { fits: `The whole model fits on ${onWhat}: ${fmtGB(p.W)} of model plus ${fmtGB(p.KV)} for ${ctx.toLocaleString()} tokens of context.`,
                   split: `It doesn't all fit on ${onWhat}, so tierlm splits it: ` +
                          (splitMode() === "experts" ? "the context and as much of the model as fits go in VRAM, the rest of the model in RAM, computed by the CPU."
                                                             : "as many layers as fit (with their part of the context) go in VRAM, the rest in RAM, computed by the CPU.") +
@@ -2439,7 +2440,7 @@ function renderSetup() {
     lab.innerHTML = `<input type="radio" name="model"><div class="t"></div><div class="d"></div><div class="tags"></div>`;
     const inp = lab.querySelector("input"); inp.checked = selModel && m.id === selModel.id; inp.disabled = !m.supported;
     lab.querySelector(".t").textContent = m.name || m.file.replace(/-00001-of-\d{5}\.gguf$/, "");
-    lab.querySelector(".d").textContent = (m.folder ? m.folder + "/" : "") + m.file + " · " + fmtGiB(m.bytes || 0);
+    lab.querySelector(".d").textContent = (m.folder ? m.folder + "/" : "") + m.file + " · " + fmtGB(m.bytes || 0);
     const add = tagger(lab.querySelector(".tags"));
     if (m.parts > 1) add(m.parts + " files");
     if (m.supported) {
@@ -2469,9 +2470,9 @@ function renderSetup() {
   } else if (p.dev) {
     $("rec").innerHTML = "";
     const b = document.createElement("b"); b.textContent = selModel.name || selModel.file;
-    $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description + (p.wr + p.kvr > 0 ? " and system RAM" : "")}, needing about ${fmtGiB(p.W + p.KV)} ` +
-      `(${fmtGiB(p.W)} model + ${fmtGiB(p.KV)} for ${ctx.toLocaleString()} tokens of context${(+$("connsel").value || 1) > 1 ? ` for each of ${$("connsel").value} connections` : ""}).` +
-      (p.ssd > 0 ? ` ${fmtGiB(p.ssd)} of the model will be read from the SSD as it's needed.` : ""));
+    $("rec").append("Will load ", b, ` on ${p.dev.type === "cpu" ? "the CPU" : p.dev.description + (p.wr + p.kvr > 0 ? " and system RAM" : "")}, needing about ${fmtGB(p.W + p.KV)} ` +
+      `(${fmtGB(p.W)} model + ${fmtGB(p.KV)} for ${ctx.toLocaleString()} tokens of context${(+$("connsel").value || 1) > 1 ? ` for each of ${$("connsel").value} connections` : ""}).` +
+      (p.ssd > 0 ? ` ${fmtGB(p.ssd)} of the model will be read from the SSD as it's needed.` : ""));
   }
   $("ctxhelp").textContent = "How much conversation the model can remember, up to what this model was trained for (" +
     (selModel && selModel.ctx_train ? selModel.ctx_train.toLocaleString() + " tokens" : "unknown") + "). Longer uses more memory, shown next to each size.";
@@ -2553,11 +2554,11 @@ function ctxShow(p) {
     add.style.width = Math.min(100, 100 * Math.abs(ch) / total) + "%";
     add.classList.toggle("less", ch < 0);
   }
-  const mem = (ch, where) => ch === 0 ? "" : (ch > 0 ? "+" : "−") + fmtGiB(Math.abs(ch)) + " " + where;
+  const mem = (ch, where) => ch === 0 ? "" : (ch > 0 ? "+" : "−") + fmtGB(Math.abs(ch)) + " " + where;
   const parts = [mem(p.vram_change, "VRAM"), mem(p.ram_change, "RAM")].filter(Boolean).join(", ");
   let t;
   if (p.ctx === p.current) t = "The current length.";
-  else if (p.live) t = `<b>Applies right away</b>, no reload: ${parts || "no change in memory"}` + (p.vram_change > 0 ? ` (${fmtGiB(p.vram_free)} VRAM free now).` : ".");
+  else if (p.live) t = `<b>Applies right away</b>, no reload: ${parts || "no change in memory"}` + (p.vram_change > 0 ? ` (${fmtGB(p.vram_free)} VRAM free now).` : ".");
   else if (p.reload) t = `<b>Needs a reload</b>: ${esc(p.why)}. Use <b>Change setup</b> to load it with ${kTok(p.ctx)}.`;
   else t = esc(p.why || "Not possible.");
   $("ctxplan").innerHTML = t;
@@ -2654,7 +2655,7 @@ function loadBody(p) {
                  flash_attn: $("fa").checked, kv_type: $("kvsel").value, batch: +$("batchsel").value,
                  speculative: $("specon").checked && !$("specon").disabled, draft_max: +$("specn").value, lookup: +$("llook").value,
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
-                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1024), split_mode: $("splitsel").value, settings_v: 2, multi_gpu: $("allgpus").checked, connections: +$("connsel").value || 1, min_tps: +$("mintps").value || 5, hot_experts: $("hotexp").checked || $("liveexp").checked, live_experts: $("liveexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, presence_penalty: +$("ppen").value, temperature: +$("temp").value };
+                 force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1e9 / 1048576), split_mode: $("splitsel").value, settings_v: 2, multi_gpu: $("allgpus").checked, connections: +$("connsel").value || 1, min_tps: +$("mintps").value || 5, hot_experts: $("hotexp").checked || $("liveexp").checked, live_experts: $("liveexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, presence_penalty: +$("ppen").value, temperature: +$("temp").value };
   if ($("forcecpu").checked) body.device = "cpu";
   return body;
 }
@@ -2788,7 +2789,7 @@ function renderMiniMem() {
   if (!info) { $("minimem").innerHTML = ""; return; }
   const L_ = info.layers || 1, kvG = (info.kv_bytes || 0) * (info.kv_gpu_layers || 0) / L_;
   const vram = (info.vram_weights || 0) + kvG, ram = (info.ram_weights || 0) + (info.kv_bytes || 0) - kvG;
-  const row = (name, used, total, parts) => `<div class="mm"><div class="mmh"><span>${name}</span><b>${fmtGiB(used)}${total ? " / " + fmtGiB(total) : ""}</b></div>` +
+  const row = (name, used, total, parts) => `<div class="mm"><div class="mmh"><span>${name}</span><b>${fmtGB(used)}${total ? " / " + fmtGB(total) : ""}</b></div>` +
     `<div class="stack">${parts.map(([v, c]) => `<div style="width:${total ? Math.min(100, 100 * v / total) : 0}%;background:${c}"></div>`).join("")}</div></div>`;
   let h = "";
   if (info.on_gpu) {
@@ -2922,7 +2923,7 @@ async function pictureData(f) {
 }
 // About how many tokens an image becomes (Qwen: one per 32x32 pixels, at most the server's limit).
 const pictureTokens = a => Math.min(+$("picdetail").value || info?.image_tokens || 2048, Math.ceil(a.w / 32) * Math.ceil(a.h / 32));
-const fmtSize = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB" : (n / 1048576).toFixed(1) + " MB";
+const fmtSize = n => n < 1000 ? n + " B" : n < 1e6 ? (n / 1000).toFixed(n < 10000 ? 1 : 0) + " KB" : (n / 1e6).toFixed(1) + " MB";
 const kMaxFile = 2 * 1048576;
 function withFiles(text, files) {
   files = files.filter(f => !f.image);
@@ -3142,8 +3143,8 @@ function hfFit(size) {
   const vram = g ? Math.max(0, g.free + held.vram - 1.5 * 1073741824) : 0;
   const ram = c ? Math.max(0, c.free + held.ram - Math.max(1.5 * 1073741824, 0.12 * (c.total || 0)) - 1073741824) : 0;
   if (g && size <= vram) return { cls: "good", t: "Fits in VRAM" };
-  if (size <= vram + ram) return { cls: "warn", t: g ? fmtGiB(size - vram) + " in RAM" : "In RAM (no GPU)" };
-  return { cls: "bad", t: "SSD tier: " + fmtGiB(size - vram - ram) + " on the drive" };
+  if (size <= vram + ram) return { cls: "warn", t: g ? fmtGB(size - vram) + " in RAM" : "In RAM (no GPU)" };
+  return { cls: "bad", t: "SSD tier: " + fmtGB(size - vram - ram) + " on the drive" };
 }
 async function hfShowRepo(id) {
   hfCur = id;
@@ -3172,7 +3173,7 @@ async function hfShowRepo(id) {
     quants.forEach((q, i) => {
       const f = hfFit(q.size), parts = q.files.length;
       h += `<tr><td><b>${esc2(q.label)}</b>${parts > 1 ? ` <span class="caption">${parts} files</span>` : ""}<div class="caption">${esc2(q.files[0].path)}</div></td>` +
-        `<td class="sz">${fmtGiB(q.size)}</td><td><span class="tag ${f.cls}">${f.t}</span></td>` +
+        `<td class="sz">${fmtGB(q.size)}</td><td><span class="tag ${f.cls}">${f.t}</span></td>` +
         `<td class="act"><button class="tiny ${i === hfBestIdx(quants) ? "primary" : ""}" data-q="${i}"${ok && !j.gated ? "" : " disabled"}>Download</button></td></tr>`;
     });
     h += `</tbody></table>`;
@@ -3183,7 +3184,7 @@ async function hfShowRepo(id) {
         // vision: one is enough (the F16 one if there is, else the first); draft files: yes
         const vis = j.vision || [], pref = Math.max(0, vis.findIndex(v => /^f16$/i.test(v.label)));
         const pick = x.kind !== "vision" || vis.indexOf(vis.find(v => v.files[0].path === x.files[0].path)) === pref;
-        h += `<label><input type="checkbox" data-x="${k}"${pick ? " checked" : ""}> Also download ${esc2(x.files[0].path)} (${fmtGiB(x.size)}): ${x.why}</label>`;
+        h += `<label><input type="checkbox" data-x="${k}"${pick ? " checked" : ""}> Also download ${esc2(x.files[0].path)} (${fmtGB(x.size)}): ${x.why}</label>`;
       });
       h += `</div>`;
     }
@@ -3249,7 +3250,7 @@ function hfBar(j) {
   if (j.state === "downloading") {
     const left = hfRate > 1 ? Math.round((j.total - j.done) / hfRate) : 0;
     txt = (cur ? (cur.state === "checking" ? "Checking " : "Downloading ") + esc2(cur.path) : "Starting") +
-      ` · ${fmtGiB(j.done)} of ${fmtGiB(j.total)}` + (hfRate > 1 ? ` · ${(hfRate / 1048576).toFixed(1)} MB/s` : "") +
+      ` · ${fmtGB(j.done)} of ${fmtGB(j.total)}` + (hfRate > 1 ? ` · ${(hfRate / 1048576).toFixed(1)} MB/s` : "") +
       (left > 0 ? ` · about ${left >= 3600 ? Math.floor(left / 3600) + " h " + Math.round(left % 3600 / 60) + " min" : left >= 60 ? Math.round(left / 60) + " min" : left + " s"} left` : "");
   } else if (j.state === "done") txt = `Done: ${esc2(j.id)} is in tierlm's models folder, checked. Pick it in <b>GGUF models</b> to load it.`;
   else if (j.state === "cancelled") txt = `Stopped. What was downloaded is kept; download it again to continue where it left off.`;
