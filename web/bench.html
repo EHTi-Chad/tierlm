@@ -252,6 +252,8 @@ async function speedTests(R, which) {
   const runCode = async () => { const x = await chat(code, { max_tokens: 320, prefix: nonce() }); return { tps: x.gen_tps, tokens: x.n_gen, spec: x.spec || null }; };
   const d = log("Guessing ahead, on and off");
   const set = async (on, dm) => { const q = await post("/api/spec", on ? { speculative: true, draft_max: dm } : { speculative: false }); return q.ok; };
+  // with Connections above one tierlm doesn't guess ahead (0.9.2), so "on" would be measured without it
+  if ((info.connections || 1) > 1) { settle(d, `Guessing ahead: off with ${info.connections} connections (skipped)`, true); S.specNote = `off with ${info.connections} connections`; tick(); return; }
   try {
     if (was.speculative) {
       const on = await runCode(); await set(false); const off = await runCode(); await set(true, was.draft_max);
@@ -462,7 +464,7 @@ function headline(S) {
             : S.pf_long_warm ? { tokens: S.pf_long_warm.tokens, tps: S.pf_long_warm.tps, ttft: S.pf_long_warm.ttft } : null;
   const dec = S.decode && S.decode.length ? S.decode[0] : S.gen_empty ? { len: S.gen_empty.tokens, tps: S.gen_empty.tps } : null;
   const first = S.prefill && S.prefill.length ? S.prefill[0] : S.pf_short_warm || null;
-  return { pre, dec, first, deep: S.gen_deep || null, spec: S.spec || null };
+  return { pre, dec, first, deep: S.gen_deep || null, spec: S.spec || null, specNote: S.specNote || null };
 }
 // A line chart: x on a log scale (sizes), the value of each point written above it
 function chartSVG(points, fmt) {
@@ -498,7 +500,7 @@ function show(R) {
     if (h.dec) out.push(stat("Writing", h.dec.tps.toFixed(1), "tok/s", `a ${(h.dec.len || 0).toLocaleString()}-token reply, empty context`));
     if (h.deep) out.push(stat("Writing, filled context", h.deep.tps.toFixed(1), "tok/s", `after ${h.deep.depth.toLocaleString()} tokens`));
     if (h.spec) out.push(stat(`Code, guessing ahead (${h.spec.guesses})`, h.spec.on.tps.toFixed(1), "tok/s", `without: ${h.spec.off.tps.toFixed(1)} tok/s`));
-    else out.push(stat("Guessing ahead", "–", "", "not available as loaded (no draft layer, or every expert in VRAM)"));
+    else out.push(stat("Guessing ahead", "–", "", h.specNote || "not available as loaded (no draft layer, or every expert in VRAM)"));
     const P = S.prefill || [];
     charts.push(chartCard("Prompt reading, from scratch", "Higher is better. Nothing of the prompt cached: every token read.",
       P.map(p => ({ x: p.size, y: p.tps, label: kTok(p.size) })), fmtTps,

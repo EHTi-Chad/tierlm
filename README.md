@@ -365,6 +365,7 @@ The best results so far, each measured in a normal chat unless noted (details be
 | RTX 5090 (32 GB), 64 GB RAM | gpt-oss-20b (MXFP4), 4 replies at once (Connections 4) | all in VRAM, 32K context each | **613.4 tok/s in all**, 154.3 tok/s each (benchmark page, 512-token replies, 0.9.2) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.6-35B-A3B Q4_K_M, 4 replies at once | all in VRAM, 32K context each | **356.7 tok/s in all**, 89.2 tok/s each (as above; 364 in Find the fastest settings) |
 | RTX 5090 (32 GB), 64 GB RAM | Nemotron 3.5 Bolt 74B-A9B (NVIDIA's 24 GB GGUF, IQ2_XXS), 4 replies at once | all in VRAM, 32K context each | **275.4 tok/s in all**, 68.9 tok/s each (as above) |
+| RTX 5090 (32 GB), 64 GB RAM | Qwen3.8-27B Q6_K (dense), 4 replies at once | all in VRAM, 32K context each, KV cache q8_0 | **166.6 tok/s in all**, 41.6 tok/s each, 2.8× one reply (as above) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.6-35B-A3B Q8_0 (37 GB) | GPU + RAM, experts in RAM | **93.7 tok/s** |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3-Coder-Next 80B-A3B Q4_K_M (45 GB) | GPU + RAM, busiest experts in VRAM | **63.8 tok/s** (Find the fastest settings) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.8 Flash-Next UD-IQ3_XXS (77.9 GiB) with its MTP draft file | GPU + RAM + SSD, VRAM experts following the conversation, 4 guesses | **94.8 tok/s** (0.8.7) |
