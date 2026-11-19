@@ -173,6 +173,17 @@ std::string gguf_string(const std::string& path, const char* key) {
     return v;
 }
 
+// The name to show for a model: the file's own name for it, unless that's empty or a packing tool's stand-in
+// (NVIDIA's Nemotron 3.5 Bolt GGUF says "Hf Packed 6226"), then the file name without .gguf or the split part.
+std::string model_display_name(const std::string& name, const std::string& path) {
+    static const std::regex stand_in(R"(^\s*(hf[ _-]*packed\b.*|model|unnamed|untitled)\s*$)", std::regex::icase);
+    if (!name.empty() && !std::regex_match(name, stand_in)) return name;
+    std::string f = std::filesystem::u8path(path).filename().u8string();
+    static const std::regex tail(R"((-\d{5}-of-\d{5})?\.gguf$)", std::regex::icase);
+    f = std::regex_replace(f, tail, "");
+    return f.empty() ? name : f;
+}
+
 // Chat formats. Each model family wraps a conversation in its own markers; the GGUF's chat template (and
 // failing that, its vocabulary) says which one. Control tokens are matched when encoding with parse_special.
 enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, DeepSeek, Kimi, Gemma, Gemma4, Plain };
@@ -993,7 +1004,7 @@ json describe_model(const std::string& path, bool header_only = false) {
     };
     const std::string arch = str("general.architecture");
     j["arch"] = arch;
-    j["name"] = str("general.name");
+    j["name"] = model_display_name(str("general.name"), path);
     const int64_t layers = u32(arch + ".block_count") - u32(arch + ".nextn_predict_layers"), embd = u32(arch + ".embedding_length");
     const int64_t heads = u32(arch + ".attention.head_count"), kv_heads = u32(arch + ".attention.head_count_kv");
     j["layers"] = layers;
@@ -1737,7 +1748,7 @@ int main(int argc, char** argv) {
             eng.effort = saved.value("effort", std::string("medium"));
         }
         eng.path = path;
-        eng.name = gguf_string(path, "general.name");
+        eng.name = model_display_name(gguf_string(path, "general.name"), path);
         {   // which saved openings fit this load: the file (name, size, date), and what changes the numbers kept
             std::error_code ec;
             const fs::path mp = fs::u8path(path);

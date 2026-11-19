@@ -1460,14 +1460,25 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     if (G) {
         std::set<const ggml_tensor*> vram;
         for (const auto& v : on_dev) vram.insert(v.begin(), v.end());
+        // per layer: every one of its weights is in VRAM (for layers without the named part: Nemotron-H's layers each
+        // hold one of Mamba, attention or experts, so most have no attention norm and no experts)
+        std::vector<char> layer_all(hp.n_layer, 1);
+        for (ggml_tensor* t = ggml_get_first_tensor(m->wctx_); t; t = ggml_get_next_tensor(m->wctx_, t)) {
+            int l = -1;
+            if (std::sscanf(ggml_get_name(t), "blk.%d.", &l) == 1 && l >= 0 && l < hp.n_layer && !vram.count(t)) layer_all[l] = 0;
+        }
         for (int i = 0; i < hp.n_layer; ++i) {
             const std::string b = "blk." + std::to_string(i) + ".";
+            auto has = [&](const char* n) { return ggml_get_tensor(m->wctx_, (b + n).c_str()) != nullptr; };
             auto in_vram = [&](const char* n) {
                 ggml_tensor* t = ggml_get_tensor(m->wctx_, (b + n).c_str());
                 return t && vram.count(t) > 0;
             };
-            m->place_.attn_gpu += in_vram("attn_norm.weight") || in_vram("hc_attn_norm.weight");   // (Flash-Next: its mixer's norm)
-            const bool f = hp.n_expert > 0 ? in_vram("ffn_down_exps.weight") : in_vram("ffn_up.weight");
+            m->place_.attn_gpu += (has("attn_norm.weight") || has("hc_attn_norm.weight"))
+                                      ? in_vram("attn_norm.weight") || in_vram("hc_attn_norm.weight")   // (Flash-Next: its mixer's norm)
+                                      : (bool)layer_all[i];
+            const char* fn = hp.n_expert > 0 ? "ffn_down_exps.weight" : "ffn_up.weight";
+            const bool f = has(fn) ? in_vram(fn) : (bool)layer_all[i];
             m->place_.ffn_gpu += f;
             m->place_.ffn_vram.push_back(f);
         }
