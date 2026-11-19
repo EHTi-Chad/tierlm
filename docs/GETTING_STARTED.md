@@ -144,7 +144,7 @@ fold the menu away and give the chat more room.
   for replies of 256 and 2K tokens (8K and 16K with **Long replies**) and after a long context, guessing ahead on and
   off, with charts; **Several at once** (with **Connections** set above 1 in **Change setup**) starts 1, 2, 4…
   512-token replies together, up to the Connections setting, and shows the total writing speed, each reply's speed
-  and the time to the first word (guessing ahead is off for that test, as it is whenever several replies run); and
+  and the time to the first word (guessing ahead is off for that test, as it is whenever several replies are writing); and
   30 fixed questions from public
   benchmarks: 10 maths (GSM8K), 10 knowledge (MMLU and ARC-Challenge), 5 code (HumanEval, written in JavaScript and
   run against its tests in the page) and 5 instructions to follow (IFEval). The questions are the same every run, at
@@ -216,7 +216,7 @@ By default tierlm writes one reply at a time and other requests wait in line. Wi
 **Advanced** on the setup screen) set to more than one, it writes that many at once: each connection gets its own
 context of the length you chose (so the context part of the memory bars grows with each), and every running reply
 advances in the same step, so the total speed goes up while each reply gets a bit slower. Requests beyond that wait
-in line; the top bar shows how many connections are busy. Speculative decoding is off with more than one.
+in line; the top bar shows how many connections are busy. Speculative decoding works while one reply is writing, and turns off while several are (since 0.9.3).
 
 **Find the fastest settings** measures it when Connections is more than one: 1, 2, 4… replies at once, and
 recommends the most that keeps every reply at or above **Slowest speed per reply** (5 tok/s unless you change it).

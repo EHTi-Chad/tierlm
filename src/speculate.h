@@ -94,6 +94,12 @@ public:
     }
 
     const SpecStats& stats() const { return st_; }
+    // The model's conversation was cut back to n tokens and carried on without this speculator (several
+    // connections: conversation 0 written in shared steps): what the draft block holds from n on is someone else's.
+    void forget_after(int n) {
+        mtp_valid_ = std::min(mtp_valid_, std::max(0, n));
+        if (h_pos_ >= n) { h_pos_ = -1; h_last_.clear(); }
+    }
     void reset_stats() { st_ = SpecStats(); }
 
 private:

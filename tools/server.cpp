@@ -616,6 +616,9 @@ struct Batcher {
     struct Req { int seq; std::vector<int32_t> ids; std::vector<float> logits; std::vector<int32_t> routing; bool done = false; std::string err; };
     std::vector<Req*> pending;
     int active = 0;                      // replies running now (each asks for one step at a time)
+    // Held around every model step the batcher runs, and by a reply that has the model to itself and guesses
+    // ahead (its steps call the model directly, on conversation 0, and must not interleave with shared steps)
+    std::mutex run;
     bool stop = false;
     Model* model = nullptr;
     const int* threads = nullptr;        // (the engine's setting, which Find the fastest settings changes)
@@ -687,7 +690,7 @@ struct Batcher {
             std::vector<int32_t> routing;
             const bool one_batch = n_tok <= model->batch();
             const auto c0 = std::chrono::steady_clock::now();
-            try { out = model->eval_seqs(in, *threads, one_batch ? &routing : nullptr); }
+            try { std::lock_guard<std::mutex> rl(run); out = model->eval_seqs(in, *threads, one_batch ? &routing : nullptr); }
             catch (const std::exception& e) { err = e.what(); }
             if (log) {                           // TIERLM_BATCH_LOG=1: how well the steps are shared, every 2 s
                 const auto now = std::chrono::steady_clock::now();
@@ -2586,10 +2589,18 @@ int main(int argc, char** argv) {
                 { std::lock_guard<std::mutex> lk(e.slots_mu); e.slots[s].busy = false; }
             }
         } slot_guard{eng, -1};
+        bool solo = false;                                         // alone with several connections: guess ahead
         if (par) {
             std::lock_guard<std::mutex> lk(eng.slots_mu);
             size_t best_n = 0;
-            for (int s = 0; s < (int)eng.slots.size(); ++s) {
+            // Nobody else writing and guessing ahead available: take conversation 0, the one the speculator works
+            // on, so this reply guesses ahead as with one connection. (Someone else starting meanwhile: shared steps.)
+            {
+                std::lock_guard<std::mutex> lb(eng.batch.m);
+                solo = eng.batch.active == 0 && !has_pics && eng.active_spec() && !eng.slots[0].busy;
+            }
+            if (solo) seq = 0;
+            else for (int s = 0; s < (int)eng.slots.size(); ++s) {
                 if (eng.slots[s].busy) continue;
                 const auto& c = eng.slots[s].cached;
                 size_t n = 0;
@@ -2732,18 +2743,26 @@ int main(int argc, char** argv) {
         if (par) model->seq_truncate(seq, (int)common); else model->truncate((int)common);
         common = (size_t)npast();             // hybrid models start over rather than rewind
         cached.resize(common);
+        // Conversation 0 with several connections is also written in shared steps, without the speculators: what
+        // they hold past the part kept here isn't this conversation's
+        if (par && seq == 0) for (Speculator* s : {eng.spec.get(), eng.look.get()}) if (s) s->forget_after((int)common);
 
         std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;
         auto p0 = Clock::now();
         std::vector<float> lg;
-        // (speculation: one conversation only, and not with images: the draft block reads text only)
-        Speculator* const spx = par || has_pics ? nullptr : eng.active_spec();
+        // (speculation: one conversation at a time, on conversation 0, and not with images: the draft block reads
+        // text only. With several connections, while this reply has the model to itself: `solo`)
+        Speculator* const spx = has_pics || (par && !solo) ? nullptr : eng.active_spec();
+        // its steps call the model directly: never between the batcher's shared steps
+        std::unique_lock<std::mutex> spec_run(eng.batch.run, std::defer_lock);
+        auto run_lock = [&] { if (par) spec_run.lock(); };
+        auto run_unlock = [&] { if (par && spec_run.owns_lock()) spec_run.unlock(); };
         // An opening not on the drive yet: read up to its end, and save what the model holds there (written by another
         // thread; this request goes on reading). `opened`: tokens read here that count as read, not reused, below.
         size_t opened = 0;
         if (save_opening && opening > common && !eng.pc_writing->load()) {
             const std::vector<int32_t> head(toks.begin(), toks.begin() + opening);
-            if (spx) spx->prompt(head, eng.threads, &routing);
+            if (spx) { run_lock(); spx->prompt(head, eng.threads, &routing); run_unlock(); }
             else evalm(std::vector<int32_t>(head.begin() + common, head.end()), &routing);
             opened = opening - common;
             common = opening;
@@ -2813,11 +2832,11 @@ int main(int argc, char** argv) {
                 at = stop;
             }
             if (spx) { lg = spx->prompt(toks, eng.threads, &part); spx->reset_stats(); }
-            else lg = evalm(std::vector<int32_t>(toks.begin() + split, toks.end()), &part);
+            else lg = evalm(std::vector<int32_t>(toks.begin() + split, toks.end()), &part);   // (split: one connection only)
             routing.insert(routing.end(), part.begin(), part.end());
         } else {
             std::vector<int32_t> part;
-            if (spx) { lg = spx->prompt(toks, eng.threads, &part); spx->reset_stats(); }   // also feeds the draft block
+            if (spx) { run_lock(); lg = spx->prompt(toks, eng.threads, &part); run_unlock(); spx->reset_stats(); }   // also feeds the draft block
             else lg = evalm(suffix, &part);
             routing.insert(routing.end(), part.begin(), part.end());
             if (!par && hp.hybrid && common == 0) { model->checkpoint(); if (spx) spx->mark(); }
@@ -2917,7 +2936,7 @@ int main(int argc, char** argv) {
             if (!emit(visible, limit)) { r.stop = "abort"; return false; }
             return true;
         };
-        if (!spx) {
+        auto plain = [&] {                                                // one word per step
             for (;;) {
                 if ((int)out.size() >= max_tokens) { r.stop = "length"; break; }
                 const int32_t id = sample(unend(lg.data(), lg.size()), lg.size(), sp, recent_with({}), rng);
@@ -2928,7 +2947,11 @@ int main(int argc, char** argv) {
                 cached.push_back(id);
                 if (!add(id)) break;
             }
-        } else {
+        };
+        // Several connections: someone else has started writing too
+        auto others = [&] { std::lock_guard<std::mutex> lb(eng.batch.m); return eng.batch.active > 1; };
+        if (!spx) plain();
+        else {
             // Speculative decoding: each check yields one or more tokens, all chosen by the model itself.
             std::vector<int32_t> kept;                                    // experts picked for x and the accepted guesses
             const size_t per_tok = (size_t)L * std::max(K, 0);
@@ -2954,12 +2977,16 @@ int main(int argc, char** argv) {
                     return distribution(row, (size_t)hp.n_vocab, sp, recent_with(ctx));
                 }, &rng);
             int32_t x = pick(lg.data(), {});
+            int32_t handed = -1;                                          // x, when the reply goes on in shared steps
             for (;;) {
                 if ((int)out.size() >= max_tokens) { r.stop = "length"; break; }
                 if (is_end(x)) { r.stop = "end"; break; }
-                if (model->n_past() + 1 >= model->max_ctx()) { r.stop = "context"; break; }
+                if (npast() + 1 >= ctx_lim) { r.stop = "context"; break; }
+                if (par && others()) { handed = x; break; }               // share the steps from here on
                 cur = x;
+                run_lock();
                 const std::vector<int32_t> prod = spx->step(x, eng.threads, pick, is_end, K > 0 ? &kept : nullptr);
+                run_unlock();
                 eng.add_usage(kept, K);
                 cur = -1;
                 cached.push_back(x);                                      // x and the accepted guesses are now cached
@@ -2973,6 +3000,14 @@ int main(int argc, char** argv) {
                 }
                 if (!go) break;
                 x = prod.back();
+            }
+            if (handed >= 0) {                                            // x is chosen, not yet in the cache
+                std::fprintf(stderr, "chat: another reply started: this one goes on in shared steps, without guessing ahead\n");
+                spx->forget_after(npast());
+                lg = evalm({handed}, &routing);
+                eng.add_usage(routing, K);
+                cached.push_back(handed);
+                if (add(handed)) plain();
             }
             const SpecStats& st = spx->stats();
             r.drafted = st.drafted; r.accepted = st.accepted; r.checks = st.steps; r.looked = st.looked; r.look_ok = st.look_ok;

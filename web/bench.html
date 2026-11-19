@@ -252,8 +252,6 @@ async function speedTests(R, which) {
   const runCode = async () => { const x = await chat(code, { max_tokens: 320, prefix: nonce() }); return { tps: x.gen_tps, tokens: x.n_gen, spec: x.spec || null }; };
   const d = log("Guessing ahead, on and off");
   const set = async (on, dm) => { const q = await post("/api/spec", on ? { speculative: true, draft_max: dm } : { speculative: false }); return q.ok; };
-  // with Connections above one tierlm doesn't guess ahead (0.9.2), so "on" would be measured without it
-  if ((info.connections || 1) > 1) { settle(d, `Guessing ahead: off with ${info.connections} connections (skipped)`, true); S.specNote = `off with ${info.connections} connections`; tick(); return; }
   try {
     if (was.speculative) {
       const on = await runCode(); await set(false); const off = await runCode(); await set(true, was.draft_max);
@@ -271,7 +269,7 @@ async function speedTests(R, which) {
 // 1, 2, 4… replies started together (up to the Connections setting), each a different prompt with a fresh start (nothing
 // cached) written to a set length. Total: every token written over the time from the first reply starting to write
 // to the last reply's end; each reply's own writing speed and time to the first word as the server and this page measured them.
-// Guessing ahead is off for the whole test (several replies don't guess, so one alone shouldn't either).
+// Guessing ahead is off for the whole test (replies writing together don't guess, so one alone shouldn't either).
 const CONC_PROMPTS = [
   "Write a long, detailed story about a lighthouse keeper who finds a message in a bottle, with many chapters.",
   "Explain in detail how a modern CPU executes instructions, from fetch to retirement, with examples.",

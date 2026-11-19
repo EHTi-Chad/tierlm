@@ -746,7 +746,7 @@ window.FIT = (() => {
           <div>
             <label for="connsel">Connections (replies written at once)</label>
             <select id="connsel"><option value="1">1: one reply at a time (fastest for one person)</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="6">6</option><option value="8">8</option><option value="12">12</option><option value="16">16</option></select>
-            <div class="help">For several people or apps using one tierlm. Each connection gets its own context of the length chosen above (the purple part of the bars grows with each), and the replies are written together, so the total speed goes up while each reply gets slower. With more than one, speculative decoding is off. <b>Find the fastest settings</b> measures 1, 2, 4… at once and recommends the most that keeps every reply at or above the speed below. More requests than connections wait in line.</div>
+            <div class="help">For several people or apps using one tierlm. Each connection gets its own context of the length chosen above (the purple part of the bars grows with each), and the replies are written together, so the total speed goes up while each reply gets slower. Speculative decoding works while one reply is writing, and is off while several are. <b>Find the fastest settings</b> measures 1, 2, 4… at once and recommends the most that keeps every reply at or above the speed below. More requests than connections wait in line.</div>
             <div id="connrec" class="help" hidden></div>
           </div>
           <div>
