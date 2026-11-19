@@ -379,6 +379,8 @@ The best results so far, each measured in a normal chat unless noted (details be
 | RTX 3070 Laptop (8 GB), 32 GB RAM | Qwen3.5-9B | GPU (a sliver in RAM) | **59 tok/s**; a full-screen screenshot read in **2.7 s** |
 | RTX 3070 Laptop (8 GB), 32 GB RAM | Qwen3.6-35B-A3B UD-Q3_K_XL (17 GB) | GPU + RAM, VRAM experts following the conversation, speculative decoding | **44.0 tok/s** across code, contract law, science and a story (0.8.7) |
 | RTX 4060 Ti (8 GB), Ryzen 7 5800XT, 32 GB RAM (sent in by a tierlm user) | Qwen3.6-35B-A3B UD-Q4_K_M | experts in RAM (VRAM 5.8 GB / RAM 16.5 GB), 64K context, 6 threads | **42.6 tok/s**, prompt read at 129.3 tok/s (the built-in benchmark, 0.9.1) |
+| RTX 4060 Ti (8 GB), Ryzen 7 5800XT, 32 GB RAM (sent in) | Qwen3-Coder-Next UD-IQ3_XXS (80B-A3B) | experts in RAM (VRAM 6.3 GB / RAM 22.3 GB), 16K context, 9 threads | **33.6 tok/s** (the built-in benchmark, 0.9.1); Find the fastest settings 35.8 with the VRAM experts following the conversation, against 23.3 with all experts in RAM |
+| RTX 4060 Ti (8 GB), Ryzen 7 5800XT, 32 GB RAM (sent in) | Nemotron 3.5 Lightning 30B-A3B UD-Q4_K_M | experts in RAM (VRAM 4.8 GB / RAM 20.4 GB), 16K context, 6 threads | **28.0 tok/s**, prompt read at 145.6 tok/s (the built-in benchmark, 0.9.1) |
 
 **gpt-oss-120b on one RTX 5090: a 59 GB model on a 32 GB card.** RTX 5090 (32 GB) + Ryzen 9 9950X3D, 64 GB
 DDR5-6000, Windows 11, tierlm 0.7.0. gpt-oss-120b MXFP4 (2 files, 59.0 GiB), 64K context, CUDA:
