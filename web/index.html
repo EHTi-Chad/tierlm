@@ -12,6 +12,7 @@
 // scrollbars follow), and the Light/Dark switch in the top bar takes over again with the Default look.
 window.FIT = (() => {
   const P = {   // name: [light/dark, background, panels, text, muted text, accent, your messages]
+    "tierlm.com":    ["dark", "#0b0d10", "#10141a", "#e6eaf0", "#aeb8c6", "#7fd4ff", "#164a66"],
     "Midnight Neon": ["dark", "#0b0f1a", "#121829", "#e6ecff", "#8f9bbd", "#00e5ff", "#5b2bd0"],
     "Synthwave":     ["dark", "#1a0f2e", "#241640", "#f7e9ff", "#b79ad6", "#ff3ea5", "#3a1f7a"],
     "Matrix":        ["dark", "#050a05", "#0b140b", "#c8ffc8", "#6fae6f", "#22ff55", "#0f3d1a"],
@@ -83,30 +84,40 @@ window.FIT = (() => {
 </script>
 <style>
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --ink: #1d2230; --muted: #636a7a; --faint: #9aa0ad;
-    --line: #e2e5eb; --accent: #0f7b6c; --accent-ink: #ffffff; --accent-soft: #dff2ee;
-    --vram: #0f7b6c; --ram: #b8730a; --ssd: #b4472b; --kv: #6a55c8; --work: #7d8799; --other: #c3c8d2; --heat-lo: #eef0f3; --flash: #10b39c;
-    --user: #1e3a5f; --user-ink: #ffffff; --danger: #b4472b;
-    --radius: 10px; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    --bg: #f3f5f8; --panel: #ffffff; --panel-2: #edf0f4; --ink: #121821; --muted: #4f5b69; --faint: #8b96a5;
+    --line: #dce1e8; --accent: #0a6e99; --accent-ink: #ffffff; --accent-soft: #dcf0f8;
+    --vram: #0a6e99; --ram: #7fb0cc; --ssd: #6b7686; --kv: #6a55c8; --work: #9aa3b0; --other: #c9d0d9; --heat-lo: #edf0f4; --flash: #2bb2e8;
+    --user: #0f3d57; --user-ink: #ffffff; --danger: #b4472b;
+    --radius: 4px; --mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+    --sans: "Inter Tight", "Segoe UI", system-ui, -apple-system, sans-serif;
     color-scheme: light;   /* the browser's own parts (scrollbars, form controls) follow the theme too */
   }
   /* Theme: Auto follows the system; Light and Dark (the switch in the top bar) override it. */
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #12151b; --panel: #1a1e26; --panel-2: #222733; --ink: #e6e8ee; --muted: #a0a6b4; --faint: #6c7383;
-      --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35;
-      --vram: #2bb39e; --ram: #e0a043; --ssd: #e07a5f; --kv: #a08cf5; --work: #7a8396; --other: #3c4250; --heat-lo: #232834; --flash: #6ff0dc;
-      --user: #2f5d93; --user-ink: #ffffff; --danger: #e07a5f;
+      --bg: #0b0d10; --panel: #10141a; --panel-2: #161c24; --ink: #e6eaf0; --muted: #aeb8c6; --faint: #6f7a89;
+      --line: #222a34; --accent: #7fd4ff; --accent-ink: #0b0d10; --accent-soft: #11303f;
+      --vram: #7fd4ff; --ram: #3b82a8; --ssd: #6b7686; --kv: #a08cf5; --work: #56606e; --other: #2a323d; --heat-lo: #161c24; --flash: #b8e6ff;
+      --user: #164a66; --user-ink: #ffffff; --danger: #e07a5f;
       color-scheme: dark;
     }
   }
   :root[data-theme="dark"] {
-      --bg: #12151b; --panel: #1a1e26; --panel-2: #222733; --ink: #e6e8ee; --muted: #a0a6b4; --faint: #6c7383;
-      --line: #2c3240; --accent: #2bb39e; --accent-ink: #08120f; --accent-soft: #163b35;
-      --vram: #2bb39e; --ram: #e0a043; --ssd: #e07a5f; --kv: #a08cf5; --work: #7a8396; --other: #3c4250; --heat-lo: #232834; --flash: #6ff0dc;
-      --user: #2f5d93; --user-ink: #ffffff; --danger: #e07a5f;
+      --bg: #0b0d10; --panel: #10141a; --panel-2: #161c24; --ink: #e6eaf0; --muted: #aeb8c6; --faint: #6f7a89;
+      --line: #222a34; --accent: #7fd4ff; --accent-ink: #0b0d10; --accent-soft: #11303f;
+      --vram: #7fd4ff; --ram: #3b82a8; --ssd: #6b7686; --kv: #a08cf5; --work: #56606e; --other: #2a323d; --heat-lo: #161c24; --flash: #b8e6ff;
+      --user: #164a66; --user-ink: #ffffff; --danger: #e07a5f;
       color-scheme: dark;
   }
+  /* The default look matches tierlm.com: Inter Tight and JetBrains Mono (bundled in web/fonts, SIL Open Font
+     License), cyan for VRAM, near-square corners. */
+  @font-face { font-family: "Inter Tight"; font-weight: 400; font-display: swap; src: url("/fonts/inter-tight-latin-400-normal.woff2") format("woff2"); }
+  @font-face { font-family: "Inter Tight"; font-weight: 500; font-display: swap; src: url("/fonts/inter-tight-latin-500-normal.woff2") format("woff2"); }
+  @font-face { font-family: "Inter Tight"; font-weight: 600; font-display: swap; src: url("/fonts/inter-tight-latin-600-normal.woff2") format("woff2"); }
+  @font-face { font-family: "Inter Tight"; font-weight: 700; font-display: swap; src: url("/fonts/inter-tight-latin-700-normal.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 400; font-display: swap; src: url("/fonts/jetbrains-mono-latin-400-normal.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 500; font-display: swap; src: url("/fonts/jetbrains-mono-latin-500-normal.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 700; font-display: swap; src: url("/fonts/jetbrains-mono-latin-700-normal.woff2") format("woff2"); }
   /* Scrollbars in the theme's colours: a thin thumb in the line colour on the panel. */
   * { scrollbar-color: var(--line) transparent; }
   ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -115,7 +126,7 @@ window.FIT = (() => {
   ::-webkit-scrollbar-thumb:hover { background: var(--faint); background-clip: padding-box; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
-  body { background: var(--bg); color: var(--ink); font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
   header { display: flex; align-items: center; gap: 14px; padding: 10px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
   .logo { font-weight: 700; font-size: 17px; letter-spacing: -.2px; }
   .logo span { color: var(--accent); }
@@ -287,7 +298,7 @@ window.FIT = (() => {
   .pvbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12.5px; color: var(--muted); position: sticky; top: 0; background: var(--panel); z-index: 1; flex-wrap: wrap; }
   .pvbar .grow { flex: 1; }
   .pvbar b { color: var(--ink); }
-  .code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px; line-height: 1.5; border-collapse: collapse; width: 100%; }
+  .code { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; border-collapse: collapse; width: 100%; }
   .code td { padding: 0 10px; white-space: pre; vertical-align: top; }
   .code td.ln { width: 1%; text-align: right; color: var(--faint); user-select: none; border-right: 1px solid var(--line); }
   .code .k { color: #8250df; } .code .s { color: #0a7d3c; } .code .c { color: var(--faint); font-style: italic; } .code .n { color: #b35900; }
@@ -296,7 +307,7 @@ window.FIT = (() => {
   .pvmd { padding: 14px 18px; }
   .pvimg { padding: 14px; text-align: center; } .pvimg img { max-width: 100%; height: auto; background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 16px 16px; }
   .pvframe { width: 100%; height: calc(100% - 41px); border: 0; background: #fff; }
-  .sbs { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; line-height: 1.5; border-collapse: collapse; width: 100%; table-layout: fixed; }
+  .sbs { font-family: var(--mono); font-size: 12px; line-height: 1.5; border-collapse: collapse; width: 100%; table-layout: fixed; }
   .sbs td { padding: 0 6px; white-space: pre-wrap; word-break: break-all; vertical-align: top; }
   .sbs td.ln { width: 38px; text-align: right; color: var(--faint); user-select: none; }
   .sbs td.del { background: rgba(207, 34, 46, .13); } .sbs td.add { background: rgba(26, 127, 55, .14); }
@@ -337,7 +348,7 @@ window.FIT = (() => {
   .md hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
   .md math { font-size: 1.12em; }
   .md math[display="block"] { margin: .5em 0; overflow-x: auto; overflow-y: hidden; }
-  .md code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .9em; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  .md code { font-family: var(--mono); font-size: .9em; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
   .md .codeblock { position: relative; margin: 0 0 .8em; }
   .md pre { margin: 0; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; line-height: 1.45; }
   .md pre code { background: none; padding: 0; font-size: 12.5px; white-space: pre; }
@@ -573,6 +584,7 @@ window.FIT = (() => {
   :root[data-fit-font] body, :root[data-fit-font] button, :root[data-fit-font] input, :root[data-fit-font] select, :root[data-fit-font] textarea { font-family: var(--fit-font); }
   body { zoom: var(--fit-zoom, 1); }
   :root[data-fit-r] :is(.card, .msg, #composer, textarea, input[type="text"], select, .ricon, button.primary, button.tiny) { border-radius: var(--fit-r) !important; }
+  :root:not([data-fit-r]) :is(.card, .msg, #composer, textarea, input, select, .ricon, button) { border-radius: var(--radius); }
   #messages { background-image: var(--fit-back, none); background-size: var(--fit-back-size, auto); background-attachment: local; }
   #fitbtn { width: 22px; height: 22px; padding: 0; border: 0; background: transparent; color: var(--faint); opacity: .18; font-size: 13px; line-height: 22px;
             cursor: pointer; border-radius: 50%; transition: opacity .25s, transform .4s, color .25s; }
@@ -4162,8 +4174,8 @@ loadWorkspace();
     // Default's preview: the page's own light or dark colours (the Light/Dark switch decides which)
     let base = "auto"; try { base = localStorage.getItem("tierlm.theme") || "auto"; } catch (e) {}
     const dark = base === "dark" || (base === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
-    const defC = dark ? { bg: "#12151b", panel: "#1a1e26", ink: "#e6e8ee", muted: "#a0a6b4", accent: "#2bb39e", user: "#2f5d93" }
-                      : { bg: "#f6f7f9", panel: "#ffffff", ink: "#1d2230", muted: "#636a7a", accent: "#0f7b6c", user: "#1e3a5f" };
+    const defC = dark ? { bg: "#0b0d10", panel: "#10141a", ink: "#e6eaf0", muted: "#aeb8c6", accent: "#7fd4ff", user: "#164a66" }
+                      : { bg: "#f3f5f8", panel: "#ffffff", ink: "#121821", muted: "#4f5b69", accent: "#0a6e99", user: "#0f3d57" };
     const items = [["Default", null], ...Object.keys(F.P).map(n => [n, F.fromPreset(n)])];
     if (fit.look === "Custom") items.push(["Custom", fit.colors]);
     for (const [name, c] of items) {

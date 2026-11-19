@@ -1863,6 +1863,18 @@ int main(int argc, char** argv) {
             res.set_content(body, page ? "text/html; charset=utf-8" : "application/javascript; charset=utf-8");
         });
     }
+    // The page's fonts (Inter Tight and JetBrains Mono, SIL Open Font License, web/fonts): fixed names, nothing else
+    for (const char* f : {"inter-tight-latin-400-normal", "inter-tight-latin-500-normal", "inter-tight-latin-600-normal",
+                          "inter-tight-latin-700-normal", "jetbrains-mono-latin-400-normal", "jetbrains-mono-latin-500-normal",
+                          "jetbrains-mono-latin-700-normal"}) {
+        const std::string name = f;
+        svr.Get("/fonts/" + name + ".woff2", [&, name](const httplib::Request&, httplib::Response& res) {
+            const std::string body = read_file(a.web + "/fonts/" + name + ".woff2");
+            if (body.empty()) { res.status = 404; res.set_content("not found in the web folder", "text/plain"); return; }
+            res.set_header("Cache-Control", "max-age=86400");
+            res.set_content(body, "font/woff2");
+        });
+    }
     // Saved benchmark runs: tierlm-bench.json next to the settings. Any device can read them; only this computer
     // adds or removes (like the settings).
     static std::mutex bench_mu;
