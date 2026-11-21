@@ -1943,6 +1943,19 @@ int main(int argc, char** argv) {
         if (pl.ram_short())
             std::fprintf(stderr, "RAM: this model keeps %.1f GB in RAM but only %.1f GB was free, so the system will move memory to disk and "
                          "replies will be slow. Close other programs (or restart the PC) and load it again.\n", pl.ram_need / 1e9, pl.ram_free / 1e9);
+        // Where each expert is, for the share of each reply's expert work done in VRAM: the hot experts, or whole
+        // expert layers. Nothing (and no share) for a model all in VRAM or all in RAM. Reset at every load, so a
+        // load without hot experts doesn't keep the last one's.
+        eng.in_vram.clear(); eng.hot_share = 0;
+        eng.picks = eng.picks_vram = 0;
+        const bool some_vram = pl.hot_experts > 0 || pl.ffn_gpu > 0;
+        if (uL > 0 && uE > 0 && some_vram && pl.ffn_gpu < pl.layers && eng.usage.size() == (size_t)uL * uE) {
+            eng.in_vram.assign((size_t)uL * uE, 0);
+            for (int l = 0; l < uL; ++l) {
+                if (l < (int)pl.ffn_vram.size() && pl.ffn_vram[l]) for (int e = 0; e < uE; ++e) eng.in_vram[(size_t)l * uE + e] = 1;
+                else if (l < (int)pl.hot.size()) for (int e : pl.hot[l]) if (e >= 0 && e < uE) eng.in_vram[(size_t)l * uE + e] = 1;
+            }
+        }
         if (pl.hot_experts > 0) {
             int split = 0; for (size_t l = 0; l < pl.hot.size(); ++l) split += !pl.hot[l].empty() && !pl.ffn_vram[l];
             // How much of the past expert work the VRAM experts would have done: what the CPU is spared.
@@ -1955,12 +1968,6 @@ int main(int argc, char** argv) {
                     for (int e : pl.hot[l]) in_vram += eng.usage[(size_t)l * uE + e];
             }
             eng.hot_share = all > 0 ? in_vram / all : 0;
-            eng.in_vram.assign((size_t)uL * uE, 0);
-            for (int l = 0; l < uL && (size_t)l < pl.hot.size(); ++l) {
-                if (l < (int)pl.ffn_vram.size() && pl.ffn_vram[l]) for (int e = 0; e < uE; ++e) eng.in_vram[(size_t)l * uE + e] = 1;
-                else for (int e : pl.hot[l]) if (e >= 0 && e < uE) eng.in_vram[(size_t)l * uE + e] = 1;
-            }
-            eng.picks = eng.picks_vram = 0;
             std::fprintf(stderr, "hot experts: %d of %d experts in VRAM, chosen from earlier use (%d layers split between VRAM and RAM); "
                          "they did %.0f%% of the expert work so far\n", pl.hot_experts, uL * uE, split, 100 * eng.hot_share);
         }
