@@ -14,6 +14,7 @@
 //       TIERLM_DRAFT_CORRUPT-th one changed, so that both accepted and rejected guesses are exercised.
 #include "model.h"
 #include "speculate.h"
+#include "gguf.h"
 #include <sstream>
 #include <string>
 #include <stdexcept>
@@ -57,6 +58,23 @@ int main(int argc, char** argv) {
         o.mtp = mtp || mtp_step || (gen_spec && !std::getenv("TIERLM_DRAFT_SCRIPT"));
         o.max_ctx = std::max<int>(o.max_ctx, (int)ids.size() + n_gen + 16);
         if (par) { o.parallel = par + 1; o.max_ctx = std::max<int>(o.max_ctx, (int)ids.size() * par + 64); }
+        // TIERLM_HOT=1 (tests): the busiest experts in VRAM, as the app's "Keep the busiest experts in VRAM", from a
+        // made-up usage (lower-numbered experts busier, a different order in each layer); =live: live hot experts
+        if (const char* hv = std::getenv("TIERLM_HOT")) {
+            gguf_init_params gp{ true, nullptr };
+            if (gguf_context* gc = gguf_init_from_file(argv[1], gp)) {
+                const int64_t ai = gguf_find_key(gc, "general.architecture");
+                const std::string arch = ai >= 0 && gguf_get_kv_type(gc, ai) == GGUF_TYPE_STRING ? gguf_get_val_str(gc, ai) : "";
+                auto u = [&](const std::string& k) { const int64_t i = gguf_find_key(gc, k.c_str()); return i >= 0 && gguf_get_kv_type(gc, i) == GGUF_TYPE_UINT32 ? (int)gguf_get_val_u32(gc, i) : 0; };
+                const int L = u(arch + ".block_count"), E = u(arch + ".expert_count");
+                gguf_free(gc);
+                if (L > 0 && E > 0) {
+                    o.expert_usage.assign((size_t)L * E, 0.0f);
+                    for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) o.expert_usage[(size_t)l * E + e] = 1.0f + (float)((e * 7 + l * 3) % E);
+                    o.live_hot = !std::strcmp(hv, "live");
+                }
+            }
+        }
         auto m = Model::load(argv[1], o);
         if (std::getenv("TIERLM_SHOW_PLACEMENT")) {
             const auto& p = m->placement();
