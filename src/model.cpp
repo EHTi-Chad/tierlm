@@ -807,6 +807,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         const int R = hp.n_swa + m->ring_extra_, nseq = std::max(1, opt.parallel);
         const bool force = e && !std::strcmp(e, "1"), off = e && !std::strcmp(e, "0");
         if (hp.n_swa > 0 && !hp.mla && !hp.dsv4 && !off && (force || (int64_t)R * nseq < m->max_ctx_)) m->swa_R_ = R;
+        if (m->swa_R_) std::fprintf(stderr, "sliding-window layers: a ring of %d tokens per conversation instead of the whole context\n", R);
     }
     auto ring_il = [&](int il) {
         return m->swa_R_ > 0 && il < hp.n_layer && hp.is_swa(il) && !(hp.qsa_budget > 0 && il < (int)hp.qsa_ratio.size() && hp.qsa_ratio[il] > 0);

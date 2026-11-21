@@ -229,6 +229,16 @@ int main(int argc, char** argv) {
             m->eval_ex(ids.data() + np, nb, nt, nb, true, nb);
             m->accept(keep);
             lg = m->eval({ids.back()}, nt);
+        } else if (!step && std::getenv("TIERLM_TRUNCATE")) {
+            // Read the first K ids and a different ending, cut the conversation back to K and finish it with the
+            // real ending: the same as reading it straight through. (Cut back further than a model can rewind, it
+            // starts over: whatever it kept, the rest is read again.)
+            const size_t k = std::min(ids.size() - 1, (size_t)std::max(0, std::atoi(std::getenv("TIERLM_TRUNCATE"))));
+            std::vector<int32_t> other(ids.begin(), ids.begin() + k);
+            other.insert(other.end(), ids.rbegin(), ids.rend() - k);
+            m->eval(other, nt);
+            m->truncate((int)k);
+            lg = m->eval(std::vector<int32_t>(ids.begin() + m->n_past(), ids.end()), nt);
         } else if (!step && std::getenv("TIERLM_SNAPSHOT")) {
             // Save the conversation half way, read a different one, bring the first back and finish it: the result
             // must be the same as reading it straight through.
