@@ -2072,6 +2072,20 @@ const KV_FACTOR = { f16: 1, f32: 2, q8_0: 34 / 64, q5_0: 22 / 64, q4_0: 18 / 64 
 // The split mode tierlm will use: Automatic means experts in RAM for mixture-of-experts models (the CPU then only
 // reads the few experts each token picks), whole layers for the rest.
 function splitMode() { const v = $("splitsel").value; return v !== "auto" ? v : (selModel && selModel.experts ? "experts" : "layers"); }
+// Why a long request failed, in words: when the connection itself broke ("network error", "Failed to fetch"),
+// check whether tierlm is still running. If it isn't, it stopped during the request: its console window says why.
+async function whyFailed(e) {
+  const m = (e && e.message) || String(e);
+  if (!(e instanceof TypeError) && !/network|fetch|load failed/i.test(m)) return m;
+  let alive = false;
+  try {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 2500);
+    alive = (await fetch("/api/info", { signal: ctl.signal })).ok; clearTimeout(t);
+  } catch (x) {}
+  return alive ? "the connection to tierlm was lost part way (tierlm is still running: try again)"
+               : "tierlm stopped while doing this. Its console window (the black window that opened with it) shows why; " +
+                 "please send us its last lines. Then start tierlm again with start-tierlm.bat.";
+}
 function kvFactor() { return KV_FACTOR[$("kvsel").value] || 1; }
 // Context memory for ctx tokens of one connection: sliding-window layers keep only their ring (swa_ring tokens)
 function kvBytes(m, ctx) {
@@ -2644,7 +2658,7 @@ $("loadbtn").onclick = async () => {
     updateHits();
     noteRamShort();
   } catch (e) {
-    msg.className = "err"; msg.textContent = "Could not load: " + e.message;
+    msg.className = "err"; msg.textContent = "Could not load: " + await whyFailed(e);
   }
   watchProgress(false);
   btn.disabled = false;
@@ -2739,7 +2753,7 @@ $("tunebtn").onclick = async () => {
       $("tunebox").hidden = true;
       msg.className = ""; msg.textContent = "Cancelled: nothing was saved, and no model is loaded now. Load and start chatting loads it with your settings.";
       setTimeout(() => { loadInfo().catch(() => {}); }, 2500);   // (tierlm lets go of the model a moment after the request is dropped)
-    } else { msg.className = "err"; msg.textContent = "Could not finish: " + e.message; }
+    } else { msg.className = "err"; msg.textContent = "Could not finish: " + await whyFailed(e); }
   }
   cancel.hidden = true;
   tuning = false;
@@ -3961,7 +3975,7 @@ $("benchbtn").onclick = async () => {
     const sp = await getSpecs();
     $("benchline").textContent = specsLine(sp);
     $("benchcopyrow").hidden = false;
-  } catch (e) { $("benchline").textContent = "Could not run: " + e.message; $("b-prompt").textContent = $("b-gen").textContent = "–"; }
+  } catch (e) { $("benchline").textContent = "Could not run: " + await whyFailed(e); $("b-prompt").textContent = $("b-gen").textContent = "–"; }
   setBusy(false);
   setContext(0);
 };
