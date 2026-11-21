@@ -1030,6 +1030,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                         hl.bias.push_back({t, tv});
                         continue;
                     }
+                    if (nm.size() < 12 || nm.compare(nm.size() - 12, 12, "_exps.weight") != 0 || t->ne[2] != E) {
+                        on_cpu.push_back(t);                                 // not an expert matrix (Gemma 4's per-expert scale):
+                        continue;                                            // whole, read where the router weights are made (CPU)
+                    }
                     ggml_tensor* th = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], H + 1);
                     ggml_tensor* tc = ggml_new_tensor_3d(m->wctx_, t->type, t->ne[0], t->ne[1], E - H + 1);
                     ggml_set_name(th, (nm + ".hot").c_str());
@@ -1718,10 +1722,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         if (it == hot_layers.end()) return;
         for (const HotSplit& sp : it->second.parts) {
             const std::string nm = ggml_get_name(sp.orig);
-            if (nm.find("ffn_gate_up_exps") != std::string::npos) { L.gate_up_xh = sp.hot; L.gate_up_xc = sp.cold; }
-            else if (nm.find("ffn_gate_exps") != std::string::npos) { L.gate_xh = sp.hot; L.gate_xc = sp.cold; }
-            else if (nm.find("ffn_up_exps") != std::string::npos) { L.up_xh = sp.hot; L.up_xc = sp.cold; }
-            else if (nm.find("ffn_down_exps") != std::string::npos) { L.down_xh = sp.hot; L.down_xc = sp.cold; }
+            if (nm.find("ffn_gate_up_exps.weight") != std::string::npos) { L.gate_up_xh = sp.hot; L.gate_up_xc = sp.cold; }
+            else if (nm.find("ffn_gate_exps.weight") != std::string::npos) { L.gate_xh = sp.hot; L.gate_xc = sp.cold; }
+            else if (nm.find("ffn_up_exps.weight") != std::string::npos) { L.up_xh = sp.hot; L.up_xc = sp.cold; }
+            else if (nm.find("ffn_down_exps.weight") != std::string::npos) { L.down_xh = sp.hot; L.down_xc = sp.cold; }
         }
         for (const auto& [orig, vram] : it->second.bias) {
             const std::string nm = ggml_get_name(orig);

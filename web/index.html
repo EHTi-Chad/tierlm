@@ -772,7 +772,6 @@ window.FIT = (() => {
           </div>
           <div>
             <label class="chk"><input type="checkbox" id="hotexp"> Keep the busiest experts in VRAM</label>
-            <div class="help err" id="hotnote" hidden>Not available for Gemma 4 yet: with its experts split between VRAM and RAM this way, tierlm stops while loading. It's being fixed; experts in RAM work as usual.</div>
             <div class="help">Mixture-of-experts models split with experts in RAM: tierlm learns which experts this model uses most as you chat, and the next time it loads, puts those in VRAM instead of whole expert layers. Off by default: whether it beats the plain split depends on the PC. <b>Find the fastest settings</b> learns the experts straight away, measures both and turns this on only if it wins.</div>
           </div>
           <div>
@@ -2087,12 +2086,6 @@ async function whyFailed(e) {
                : "tierlm stopped while doing this. Its console window (the black window that opened with it) shows why; " +
                  "please send us its last lines. Then start tierlm again with start-tierlm.bat.";
 }
-// Busiest experts in VRAM: not yet for Gemma 4 (its split stops tierlm while loading; the server ignores it too)
-function syncHotAllowed() {
-  const no = !!(selModel && selModel.arch === "gemma4");
-  for (const id of ["hotexp", "liveexp"]) { $(id).disabled = no; if (no) $(id).checked = false; }
-  $("hotnote").hidden = !no;
-}
 function kvFactor() { return KV_FACTOR[$("kvsel").value] || 1; }
 // Context memory for ctx tokens of one connection: sliding-window layers keep only their ring (swa_ring tokens)
 function kvBytes(m, ctx) {
@@ -2314,7 +2307,6 @@ function applySaved() {
   if (cr.length) $("connrec").textContent = "Measured: " + cr.map(r => `${r.connections} at once: ${r.tps} tok/s each`).join(" · ") +
     `. Recommended: ${s.connections || 1} (every reply at least ${s.min_tps || 5} tok/s).`;
   $("liveexp").checked = s.live_experts === true;
-  syncHotAllowed();
   const canSpec = !!(selModel && (selModel.mtp || selModel.self_draft));
   const selfSpec = !!(selModel && !selModel.mtp && selModel.self_draft);
   $("specon").disabled = !canSpec; $("specn").disabled = !canSpec;
