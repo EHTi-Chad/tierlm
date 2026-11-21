@@ -432,6 +432,7 @@ private:
         bool mrope = false;                      // pos holds 4 x n_tok 3-part positions
         ggml_tensor *hidden = nullptr;           // final-norm hidden states of every position (for the MTP head)
         ggml_tensor *mask_swa = nullptr;         // causal mask limited to the sliding window (models that use one)
+        ggml_tensor *cells_swa = nullptr;        // with rings (swa_R_): where each token's key and value go in them
         ggml_tensor *rope_ff = nullptr;          // YaRN frequency factors (Hparams::rope_ff), as input
         ggml_tensor *h_in = nullptr;             // MTP head: the target model's hidden states, as input
         ggml_tensor *cells = nullptr;            // where each token's key and value go in the cache
@@ -613,6 +614,17 @@ private:
     // conversation cut back that far; further back it is read again (truncate).
     static constexpr int d4_slack = 64;
     int d4_ring(int need) const { return need + d4_slack; }
+    // Sliding-window layers (Gemma 3 and 4, gpt-oss) keep only a ring of swa_R_ positions per conversation instead
+    // of the whole context: token index q of conversation s goes to slot s * swa_R_ + q % swa_R_. The ring holds the
+    // window, a whole step (kRingStep tokens, the most a step writes: batch_ is capped to it) and kRingSlack more, so
+    // a step never writes over what one of its own tokens reads, and a conversation can be cut back up to kRingSlack
+    // tokens without reading anything again (further: read again from the start, see free_cells_from). 0: off (the
+    // context isn't longer than the rings would be, or TIERLM_SWA_RING=0).
+    static constexpr int kRingStep = 4096, kRingSlack = 1024;
+    int swa_R_ = 0;
+    int ring_extra_ = kRingStep + kRingSlack;   // swa_R_ = n_swa + this
+    int swa_kv_build_ = 0;                       // the ring span the next build covers (0: all of it)
+    bool ringed(const Layer& L) const;
     Graph build_dsv4(int n_tok, int n_past, bool want_routing, int n_logits, bool want_hidden, std::vector<uint8_t>* mem);
     std::vector<std::vector<int32_t>> seq_tok_;  // Flash-Next: each conversation's tokens (for the n-grams)
     // QSA (Flash-Next's sparse attention): each indexed layer's raw indexer keys, per conversation, by position
@@ -647,9 +659,9 @@ private:
     // a reply's one-token graph, kept to run again (see step)
     struct ReuseKey {
         int n_kv = 0; bool routing = false; int n_logits = 0; bool qsa_long = false; bool hidden = false;
-        int n_tok = 1, snapshots = 1; bool hot_only = false, qsa_gpu = false;
+        int n_tok = 1, snapshots = 1; bool hot_only = false, qsa_gpu = false; int n_kv_swa = 0;
         bool operator==(const ReuseKey& o) const {
-            return n_kv == o.n_kv && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden &&
+            return n_kv == o.n_kv && n_kv_swa == o.n_kv_swa && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden &&
                    n_tok == o.n_tok && snapshots == o.snapshots && hot_only == o.hot_only && qsa_gpu == o.qsa_gpu;
         }
     };

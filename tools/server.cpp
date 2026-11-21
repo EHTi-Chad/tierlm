@@ -1047,6 +1047,43 @@ json describe_model(const std::string& path, bool header_only = false) {
         j["hybrid"] = true;
     }
     if (layers && embd && heads) j["kv_bytes_per_token"] = 2 * kv_layers * (kv_heads ? kv_heads : heads) * head_dim * 2;
+    // Sliding-window models (gpt-oss, Gemma 3 and 4, Flint): layer by layer, as the model reads them. Their sliding
+    // layers keep a ring of the window plus 5,120 tokens per connection (see Model::swa_R_), not the whole context:
+    // kv_swa_bytes_per_token for those, kv_bytes_per_token for the rest.
+    if (const int64_t n_swa = u32(arch + ".attention.sliding_window");
+        n_swa > 0 && layers > 0 && layers <= 4096 && (arch == "gpt-oss" || arch == "gemma3" || arch == "gemma4" || arch == "flint")) {
+        auto per_layer = [&](const std::string& k, int64_t dflt) {
+            std::vector<int64_t> v((size_t)layers, dflt);
+            const int64_t id = gguf_find_key(g, k.c_str());
+            if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY &&
+                (gguf_get_arr_type(g, id) == GGUF_TYPE_INT32 || gguf_get_arr_type(g, id) == GGUF_TYPE_UINT32)) {
+                const int32_t* d = (const int32_t*)gguf_get_arr_data(g, id);
+                for (size_t i = 0; i < v.size() && i < gguf_get_arr_n(g, id); ++i) v[i] = d[i] > 0 ? d[i] : dflt;
+            } else if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32) v.assign(v.size(), (int64_t)gguf_get_val_u32(g, id));
+            return v;
+        };
+        std::vector<bool> swa((size_t)layers, false);
+        const int64_t pid = gguf_find_key(g, (arch + ".attention.sliding_window_pattern").c_str());
+        if (pid >= 0 && gguf_get_kv_type(g, pid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, pid) == GGUF_TYPE_BOOL) {
+            const bool* d = (const bool*)gguf_get_arr_data(g, pid);
+            for (size_t i = 0; i < swa.size() && i < gguf_get_arr_n(g, pid); ++i) swa[i] = d[i];
+        } else {
+            const int64_t pat = pid >= 0 ? u32(arch + ".attention.sliding_window_pattern") : (arch == "gpt-oss" ? 2 : 6);
+            for (int64_t i = 0; i < layers; ++i)
+                swa[i] = arch == "flint" ? !(i < 2 || i % 4 == 1 || i == layers - 1)
+                       : arch == "gemma4" ? (i + 1) % 6 != 0 && i != layers - 1
+                       : arch == "gemma3" ? pat > 0 && (i + 1) % pat != 0
+                       : pat <= 0 || i % pat < pat - 1;
+        }
+        const int64_t hd_full = head_dim, hd_swa = u32(arch + ".attention.key_length_swa") ? u32(arch + ".attention.key_length_swa") : hd_full;
+        const std::vector<int64_t> kvh = per_layer(arch + ".attention.head_count_kv", kv_heads ? kv_heads : heads);
+        const int64_t shared = arch == "gemma4" ? u32(arch + ".attention.shared_kv_layers") : 0;
+        int64_t full = 0, slide = 0;
+        for (int64_t i = 0; i < layers - shared; ++i) (swa[i] ? slide : full) += 2 * kvh[i] * (swa[i] ? hd_swa : hd_full) * 2;
+        j["kv_bytes_per_token"] = full;
+        j["kv_swa_bytes_per_token"] = slide;
+        j["swa_ring"] = n_swa + 4096 + 1024;
+    }
     if (arch == "deepseek2" && layers)                    // latent attention: one compressed vector per token per layer
         j["kv_bytes_per_token"] = kv_layers * (u32(arch + ".attention.kv_lora_rank") + u32(arch + ".rope.dimension_count")) * 2;
     if (arch == "deepseek4") {                            // compressed: a 512-wide entry per 4 or 128 tokens per layer
@@ -5225,7 +5262,7 @@ int main(int argc, char** argv) {
                 json d = describe_model(tmp.u8string(), true);
                 // a header with no architecture says nothing either way: the repo isn't marked as unsupported for it
                 if (d.value("arch", std::string()).empty()) break;
-                for (const char* k : {"arch", "supported", "reason", "kind", "kv_bytes_per_token", "layers", "experts", "experts_used", "ctx_train", "hybrid", "name"})
+                for (const char* k : {"arch", "supported", "reason", "kind", "kv_bytes_per_token", "kv_swa_bytes_per_token", "swa_ring", "layers", "experts", "experts_used", "ctx_train", "hybrid", "name"})
                     if (d.contains(k)) out[k] = d[k];
                 break;
             }

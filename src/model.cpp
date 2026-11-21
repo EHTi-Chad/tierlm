@@ -797,6 +797,20 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         }
         m->kv_f32_ = m->kv_t_ == GGML_TYPE_F32;
     }
+    // Sliding-window layers: rings instead of the whole context (see swa_R_), when that's smaller
+    {
+        // TIERLM_SWA_RING=0: off; =1: on even when the context is shorter (tests); TIERLM_SWA_RING_EXTRA: the
+        // room beyond the window (tests: small, so a short conversation goes round the ring)
+        const char* e = std::getenv("TIERLM_SWA_RING");
+        const char* x = std::getenv("TIERLM_SWA_RING_EXTRA");
+        m->ring_extra_ = x && std::atoi(x) >= 10 ? std::atoi(x) : kRingStep + kRingSlack;
+        const int R = hp.n_swa + m->ring_extra_, nseq = std::max(1, opt.parallel);
+        const bool force = e && !std::strcmp(e, "1"), off = e && !std::strcmp(e, "0");
+        if (hp.n_swa > 0 && !hp.mla && !hp.dsv4 && !off && (force || (int64_t)R * nseq < m->max_ctx_)) m->swa_R_ = R;
+    }
+    auto ring_il = [&](int il) {
+        return m->swa_R_ > 0 && il < hp.n_layer && hp.is_swa(il) && !(hp.qsa_budget > 0 && il < (int)hp.qsa_ratio.size() && hp.qsa_ratio[il] > 0);
+    };
     // Conversation memory per layer: a KV cache for attention layers, a small fixed-size state for DeltaNet layers.
     auto layer_mem = [&](int il) -> size_t {
         if (hp.is_recurrent(il))
@@ -818,7 +832,8 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         if (il < hp.n_layer && hp.kv_src(il) >= 0) return 0;          // (Gemma 4: an earlier layer's cache)
         const bool qsa = hp.qsa_budget > 0 && il < (int)hp.qsa_ratio.size() && hp.qsa_ratio[il] > 0;
         const int64_t width = il < hp.n_layer ? (int64_t)hp.hd_at(il) * hp.kvh_at(il) : (int64_t)hp.head_dim * hp.n_head_kv;
-        return (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, width) * (size_t)m->max_ctx_ +
+        const size_t rows = ring_il(il) ? (size_t)m->swa_R_ * std::max(1, opt.parallel) : (size_t)m->max_ctx_;
+        return (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, width) * rows +
                (qsa ? (size_t)hp.qsa_dim * 2 * (size_t)m->max_ctx_ : 0);
     };
     size_t kv_need = 0;
@@ -2028,6 +2043,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // Auto prompt batch size: 4,096 when streamed (see setup_stream: the copies then hide behind the work; 2,048
     // was copy-bound, 8,192's working memory pushed experts out of VRAM)
     if (opt.batch <= 0 && !m->stream_.layers.empty()) m->batch_ = std::min(4096, std::max(256, m->max_ctx_));
+    if (m->swa_R_) m->batch_ = std::min(m->batch_, m->ring_extra_ * 4 / 5);   // (a step never writes more than the rings allow for)
     const int n_res = std::min(m->batch_, m->max_ctx_);
     m->qsa_long_ = m->qsa_gpu_ = !m->qsa_.empty() && m->max_ctx_ % m->qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
     m->stream_on_ = m->stream_ready(n_res);
@@ -2128,6 +2144,8 @@ std::vector<int> Model::alloc_cells(int s, int n) {
 void Model::free_cells_from(int s, int n) {
     auto& mine = seq_cells_[s];
     n = std::max(0, n);
+    // Rings: cut back further than they keep, the window the next token reads has been written over: from the start
+    if (swa_R_ && n > 0 && n < (int)mine.size() && std::max(0, n - hp_.n_swa + 1) + swa_R_ <= (int)mine.size() - 1) n = 0;
     for (int i = n; i < (int)mine.size(); ++i) {
         const int c = mine[i];
         cell_seq_[c] = cell_pos_[c] = -1;
@@ -2220,7 +2238,19 @@ void Model::fill_masks(Graph& g, int n_kv, const std::vector<int>& tok_seq, cons
     }
     // (a mask no layer uses, as with a model whose layers are all sliding-window or none are, gets no memory: skipped)
     if (g.mask && g.mask->buffer) ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
-    if (g.mask_swa && g.mask_swa->buffer) {
+    if (g.mask_swa && g.mask_swa->buffer && swa_R_) {            // rings: each token's window, by slot
+        const int W = (int)g.mask_swa->ne[0];
+        std::vector<ggml_fp16_t> m((size_t)W * n_tok, ninf);
+        for (int t = 0; t < n_tok; ++t) {
+            ggml_fp16_t* row = m.data() + (size_t)t * W;
+            const int s = tok_seq[t], p = tok_pos[t];
+            for (int q = std::max(0, p - hp_.n_swa + 1); q <= p; ++q) {
+                const int slot = s * swa_R_ + q % swa_R_;
+                if (slot < W) row[slot] = zero;
+            }
+        }
+        ggml_backend_tensor_set(g.mask_swa, m.data(), 0, sizeof(ggml_fp16_t) * m.size());
+    } else if (g.mask_swa && g.mask_swa->buffer) {
         for (int t = 0; t < n_tok; ++t) {
             ggml_fp16_t* row = mask.data() + (size_t)t * n_kv;
             const auto& mine = seq_cells_[tok_seq[t]];
@@ -2314,6 +2344,7 @@ void Model::truncate(int n) {
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // (another conversation's step uses the cell tables)
     n_past_ = n < 0 ? 0 : n;
     free_cells_from(0, n_past_);
+    n_past_ = (int)seq_cells_[0].size();                          // (rings: maybe from the start, see free_cells_from)
 }
 
 // Conversation 0's positions, in order, as runs of consecutive cache cells: {first cell, count} (one run when it
@@ -2352,7 +2383,10 @@ Model::Snapshot Model::save() const {
     auto layer = [&](const Layer& L, bool mtp) {
         if (L.conv_state) { grab(L.conv_state, ggml_nbytes(L.conv_state)); grab(L.ssm_state_t, ggml_nbytes(L.ssm_state_t)); }
         if (!L.ple_states.empty()) grab(L.ple_states[0], ggml_nbytes(L.ple_states[0]));
-        if (L.k_cache && (mtp || hp_.kv_src(L.index) < 0)) { grab_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) grab_rows(L.v_cache, mtp ? by_pos : runs); }
+        if (L.k_cache && !mtp && hp_.kv_src(L.index) < 0 && ringed(L)) {   // rings: conversation 0's part whole
+            grab(L.k_cache, (size_t)swa_R_ * L.k_cache->nb[2]);
+            if (L.v_cache) grab(L.v_cache, (size_t)swa_R_ * L.v_cache->nb[2]);
+        } else if (L.k_cache && (mtp || hp_.kv_src(L.index) < 0)) { grab_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) grab_rows(L.v_cache, mtp ? by_pos : runs); }
         if (L.d4_win) {                                           // DeepSeek V4: its rings whole, the entries made so far
             const int m = hp_.d4_ratio_at(L.index);
             grab(L.d4_win, ggml_nbytes(L.d4_win));
@@ -2408,7 +2442,8 @@ void Model::restore(const Snapshot& s) {
     auto layer = [&](const Layer& L, bool mtp) {
         if (L.conv_state) { put(L.conv_state); put(L.ssm_state_t); }
         if (!L.ple_states.empty()) put(L.ple_states[0]);
-        if (L.k_cache && (mtp || hp_.kv_src(L.index) < 0)) { put_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) put_rows(L.v_cache, mtp ? by_pos : runs); }
+        if (L.k_cache && !mtp && hp_.kv_src(L.index) < 0 && ringed(L)) { put(L.k_cache); if (L.v_cache) put(L.v_cache); }
+        else if (L.k_cache && (mtp || hp_.kv_src(L.index) < 0)) { put_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) put_rows(L.v_cache, mtp ? by_pos : runs); }
         if (L.d4_win) {
             put(L.d4_win);
             for (ggml_tensor* t : {L.d4_c_rkv, L.d4_c_rgate, L.d4_i_rkv, L.d4_i_rgate, L.d4_ce, L.d4_ie}) if (t) put(t);
@@ -2718,14 +2753,15 @@ ggml_tensor* Model::attn_gemma4(ggml_context* c, Graph& g, const Layer& L, ggml_
         ggml_tensor* v = L.wv ? ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, kvh, n_tok) : kr;
         ggml_tensor* k = rope(ggml_mul(c, ggml_rms_norm(c, kr, hp.rms_eps), L.k_norm));
         v = ggml_rms_norm(c, v, hp.rms_eps);
-        ggml_tensor* where = g.cells ? g.cells : g.pos;
+        ggml_tensor* where = ringed(L) ? g.cells_swa : g.cells ? g.cells : g.pos;
         ggml_build_forward_expand(g.gf, ggml_set_rows(c, ggml_reshape_2d(c, L.k_cache, (int64_t)hd * kvh, L.k_cache->ne[2]),
                                                       ggml_reshape_2d(c, k, (int64_t)hd * kvh, n_tok), where));
         ggml_build_forward_expand(g.gf, ggml_set_rows(c, ggml_reshape_2d(c, L.v_cache, (int64_t)hd * kvh, L.v_cache->ne[2]),
                                                       ggml_reshape_2d(c, v, (int64_t)hd * kvh, n_tok), where));
     }
-    ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, kvh, n_kv, L.k_cache->nb[1], L.k_cache->nb[2], 0);
-    ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, kvh, n_kv, L.v_cache->nb[1], L.v_cache->nb[2], 0);
+    const int n_at = ringed(L) ? (int)g.mask_swa->ne[0] : n_kv;           // (rings: the slots in use)
+    ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, kvh, n_at, L.k_cache->nb[1], L.k_cache->nb[2], 0);
+    ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, kvh, n_at, L.v_cache->nb[1], L.v_cache->nb[2], 0);
     ggml_tensor* Q = ggml_permute(c, q, 0, 2, 1, 3);                     // [hd, n_tok, n_head]
     ggml_tensor* K = ggml_permute(c, kall, 0, 2, 1, 3);                  // [hd, n_kv, kvh]
     ggml_tensor* mask = swa ? g.mask_swa : g.mask;
@@ -2789,11 +2825,13 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
         const size_t vnb1 = L.v_cache->nb[1], vnb2 = L.v_cache->nb[2];
         ggml_tensor* krows = ggml_reshape_2d(c, L.k_cache, hd * hp.n_head_kv, L.k_cache->ne[2]);
         ggml_tensor* vrows = ggml_reshape_2d(c, L.v_cache, hd * hp.n_head_kv, L.v_cache->ne[2]);
-        ggml_tensor* where = g.cells ? g.cells : g.pos;                      // (the MTP block's cache: by position)
+        ggml_tensor* where = ringed(L) ? g.cells_swa                        // (sliding-window layers with rings: their slots)
+                           : g.cells ? g.cells : g.pos;                      // (the MTP block's cache: by position)
         ggml_build_forward_expand(g.gf, ggml_set_rows(c, krows, ggml_reshape_2d(c, k, hd * hp.n_head_kv, n_tok), where));
         ggml_build_forward_expand(g.gf, ggml_set_rows(c, vrows, ggml_reshape_2d(c, v, hd * hp.n_head_kv, n_tok), where));
-        ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_kv, knb1, knb2, 0);   // all tokens so far, padded
-        ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_kv, vnb1, vnb2, 0);
+        const int n_at = ringed(L) ? (int)g.mask_swa->ne[0] : n_kv;
+        ggml_tensor* kall = ggml_view_3d(c, L.k_cache, hd, hp.n_head_kv, n_at, knb1, knb2, 0);   // all tokens so far, padded
+        ggml_tensor* vall = ggml_view_3d(c, L.v_cache, hd, hp.n_head_kv, n_at, vnb1, vnb2, 0);
 
         ggml_tensor* Q = ggml_permute(c, q, 0, 2, 1, 3);                     // [hd, n_tok, n_head]
         ggml_tensor* K = ggml_permute(c, kall, 0, 2, 1, 3);                  // [hd, n_kv, n_head_kv]
@@ -3299,8 +3337,11 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     g.mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok);
     ggml_set_input(g.mask);
     if (hp.n_swa > 0) {                                                    // the same, limited to the last n_swa tokens
-        g.mask_swa = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok);
+        // (rings: over the rings' slots in use, see swa_R_, with each token's slot as an input)
+        const int n_kv_swa = swa_R_ ? (swa_kv_build_ > 0 ? swa_kv_build_ : swa_R_ * n_seq_max()) : n_kv;
+        g.mask_swa = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv_swa, n_tok);
         ggml_set_input(g.mask_swa);
+        if (swa_R_) { g.cells_swa = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok); ggml_set_input(g.cells_swa); }
     }
     if (!hp.rope_ff.empty()) {
         g.rope_ff = ggml_new_tensor_1d(c, GGML_TYPE_F32, (int64_t)hp.rope_ff.size());
@@ -4394,10 +4435,11 @@ void Model::make_kv(int ctx, int n_seq) {
         }
         if (i < hp.n_layer && hp.kv_src(i) >= 0) continue;           // Gemma 4: reads an earlier layer's cache (set below)
         const int lhd = i < hp.n_layer ? hp.hd_at(i) : hd, lkv = i < hp.n_layer ? hp.kvh_at(i) : hp.n_head_kv;
-        L.k_cache = ggml_new_tensor_3d(kvctx_, kv_type, lhd, lkv, ctx);
+        const int64_t rows = ringed(L) ? (int64_t)swa_R_ * n_seq : ctx;   // (sliding-window layers: their rings)
+        L.k_cache = ggml_new_tensor_3d(kvctx_, kv_type, lhd, lkv, rows);
         dst.push_back(L.k_cache);
         if (hp.mla) { L.v_cache = nullptr; continue; }               // MLA: the values are part of the one cache
-        L.v_cache = ggml_new_tensor_3d(kvctx_, kv_type, lhd, lkv, ctx);
+        L.v_cache = ggml_new_tensor_3d(kvctx_, kv_type, lhd, lkv, rows);
         dst.push_back(L.v_cache);
         if (L.idx_k) {                                               // QSA: the indexer's raw keys, for the GPU's masks
             L.qsa_kc = ggml_new_tensor_2d(kvctx_, GGML_TYPE_F16, hp.qsa_dim, ctx);
@@ -4420,6 +4462,10 @@ void Model::make_kv(int ctx, int n_seq) {
         if (hp.kv_src(i) >= 0) { layers_[i].k_cache = layers_[hp.kv_src(i)].k_cache; layers_[i].v_cache = layers_[hp.kv_src(i)].v_cache; }
 }
 
+bool Model::ringed(const Layer& L) const {
+    return swa_R_ > 0 && L.swa && !L.idx_k && L.index < hp_.n_layer && !hp_.mla;
+}
+
 size_t Model::kv_bytes_per_token(size_t* in_vram) const {
     size_t all = 0, vram = 0;
     const int nl_all = hp_.n_layer + (mtp_ ? 1 : 0);
@@ -4429,7 +4475,7 @@ size_t Model::kv_bytes_per_token(size_t* in_vram) const {
         if (L.d4_ce) {                                             // DeepSeek V4: an entry per 4 or 128 tokens
             const int r = hp_.d4_ratio_at(i);
             b = (L.d4_ce->nb[1] + (L.d4_ie ? L.d4_ie->nb[1] : 0) + r - 1) / r;
-        } else if (L.recurrent || !L.k_cache || (i < hp_.n_layer && hp_.kv_src(i) >= 0)) continue;
+        } else if (L.recurrent || !L.k_cache || (i < hp_.n_layer && hp_.kv_src(i) >= 0) || ringed(L)) continue;   // (rings: a fixed size)
         else b = L.k_cache->nb[2] + (L.v_cache ? L.v_cache->nb[2] : 0) + (L.qsa_kc ? L.qsa_kc->nb[1] : 0);
         all += b;
         if (layer_dev_[i] >= 0) vram += b;
@@ -4476,6 +4522,9 @@ void Model::resize_ctx(int new_ctx) {
                 kept[i].conv.push_back(get(L.conv_states[s], ggml_nbytes(L.conv_states[s])));
                 kept[i].ssm.push_back(get(L.ssm_states[s], ggml_nbytes(L.ssm_states[s])));
             }
+        } else if (L.k_cache && ringed(L)) {                       // rings: whole (their size doesn't change)
+            kept[i].k = get(L.k_cache, ggml_nbytes(L.k_cache));
+            if (L.v_cache) kept[i].v = get(L.v_cache, ggml_nbytes(L.v_cache));
         } else if (L.k_cache) {
             kept[i].k = get(L.k_cache, (size_t)hi_ * L.k_cache->nb[2]);
             if (L.v_cache) kept[i].v = get(L.v_cache, (size_t)hi_ * L.v_cache->nb[2]);
@@ -4699,6 +4748,21 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         }
     }
     const int n_kv_end = cells_end(), n_kv = kv_span(n_kv_end);
+    // Rings (see swa_R_): each token's slot, and the slots attention covers (each conversation's part up to the ring
+    // or its length, in steps of 256 like the cache)
+    std::vector<int32_t> swa_cells;
+    int n_kv_swa = 0;
+    if (swa_R_) {
+        swa_cells.resize(n_tok);
+        std::map<int, int> len;
+        for (int t = 0; t < n_tok; ++t) {
+            swa_cells[t] = tok_seq[t] * swa_R_ + tok_pos[t] % swa_R_;
+            int& l = len[tok_seq[t]];
+            l = std::max(l, tok_pos[t] + 1);
+        }
+        for (auto [sq, l] : len) n_kv_swa = std::max(n_kv_swa, sq * swa_R_ + std::min(swa_R_, l));
+        n_kv_swa = std::min((n_kv_swa + 255) / 256 * 256, swa_R_ * n_seq_max());
+    }
     std::vector<int32_t> live_routing;                            // live hot experts need the picks even if the caller doesn't
     if (!routing && !live_.empty() && !live_frozen_) routing = &live_routing;
     build_images_ = any_image; build_mrope_ = any_image;
@@ -4744,14 +4808,18 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     // A check of guesses (an undoable step) has a scheduler of its own, where its graph stays placed (see Plan).
     const bool plan = reuse_on && check_.sched && snapshots > 1 && !groups && !any_image && !hp.dsv4;
     stream_on_ = !plan && !groups && stream_ready(n_tok);
-    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_, qsa_gpu_};
+    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_, qsa_gpu_, n_kv_swa};
     const bool reuse = plan ? check_.g.ctx && key == check_.key : cacheable && reuse_.ctx && key == reuse_key_;
     ggml_backend_sched* const sc = plan ? check_.sched : sched_;
     Graph built;
     if (!reuse) {
         if (plan) drop_plan(check_);
-        built = hp.dsv4 ? build_dsv4(n_tok, tok_pos[0], routing != nullptr, n_logits, want_hidden, nullptr)
-                        : build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups, plan ? &check_.mem : nullptr);
+        swa_kv_build_ = n_kv_swa;
+        try {
+            built = hp.dsv4 ? build_dsv4(n_tok, tok_pos[0], routing != nullptr, n_logits, want_hidden, nullptr)
+                            : build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups, plan ? &check_.mem : nullptr);
+        } catch (...) { swa_kv_build_ = 0; throw; }
+        swa_kv_build_ = 0;
         if (plan) { built.kept = true; check_.g = built; check_.key = key; }
     }
     Graph& g = plan ? check_.g : reuse ? reuse_ : built;
@@ -4830,6 +4898,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         if (g.pos->buffer) ggml_backend_tensor_set(g.pos, pos.data(), 0, sizeof(int32_t) * pos.size());
     }
     if (g.cells->buffer) ggml_backend_tensor_set(g.cells, cells.data(), 0, sizeof(int32_t) * n_tok);
+    if (g.cells_swa && g.cells_swa->buffer) ggml_backend_tensor_set(g.cells_swa, swa_cells.data(), 0, sizeof(int32_t) * n_tok);
     if (g.qsa_bpos) {                                             // QSA on the GPU: blocks' first positions, tokens' whole blocks
         const int R = qsa_[0].ratio, nbt = (int)g.qsa_bpos->ne[0];
         std::vector<int32_t> bp(nbt, 0);

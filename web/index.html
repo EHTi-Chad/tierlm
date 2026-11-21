@@ -2072,7 +2072,12 @@ const KV_FACTOR = { f16: 1, f32: 2, q8_0: 34 / 64, q5_0: 22 / 64, q4_0: 18 / 64 
 // The split mode tierlm will use: Automatic means experts in RAM for mixture-of-experts models (the CPU then only
 // reads the few experts each token picks), whole layers for the rest.
 function splitMode() { const v = $("splitsel").value; return v !== "auto" ? v : (selModel && selModel.experts ? "experts" : "layers"); }
-function kvFactor() { return KV_FACTOR[$("kvsel").value] || 1; }   // working memory the engine keeps free on the GPU (as the tier loader does)
+function kvFactor() { return KV_FACTOR[$("kvsel").value] || 1; }
+// Context memory for ctx tokens of one connection: sliding-window layers keep only their ring (swa_ring tokens)
+function kvBytes(m, ctx) {
+  if (!m) return 0;
+  return ((m.kv_bytes_per_token || 0) * ctx + (m.kv_swa_bytes_per_token || 0) * Math.min(ctx, m.swa_ring || ctx)) * kvFactor();
+}   // working memory the engine keeps free on the GPU (as the tier loader does)
 // Memory the loaded model holds now. Loading another one frees it first, so it counts as free when planning.
 function heldNow(gpu, other) {                      // (other: an /api/info answer to use in place of the page's)
   const i = other || info;
@@ -2144,7 +2149,7 @@ $("ssdsel").onchange = async () => {
 function plan() {
   const ctx = ctxValue() || defCtx;
   const W = selModel ? selModel.bytes || 0 : 0;
-  const KV = selModel ? (selModel.kv_bytes_per_token || 0) * ctx * kvFactor() * Math.max(1, +$("connsel").value || 1) : 0;
+  const KV = kvBytes(selModel, ctx) * Math.max(1, +$("connsel").value || 1);
   const gpu = bestGpu(), cpu = cpuDev();
   const held = heldNow(gpu);
   const ramFree = cpu ? cpu.free + held.ram : 0;
@@ -2310,12 +2315,12 @@ function buildCtx(want) {
   const opts = [1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 1048576].filter(v => v <= max);
   if (!opts.includes(max)) opts.push(max);
   const custom = +want && !opts.includes(+want) && +want <= max ? +want : 0;
-  const kvpt = (selModel && selModel.kv_bytes_per_token || 0) * kvFactor();
+  const kvAny = !!(selModel && (selModel.kv_bytes_per_token || selModel.kv_swa_bytes_per_token));
   const sel = $("ctxsel"); sel.innerHTML = "";
   for (const v of opts) {
     const o = document.createElement("option"); o.value = v;
     const k = v >= 1024 && v % 1024 === 0 ? (v / 1024) + "K" : v.toLocaleString();
-    o.textContent = k + " tokens" + (kvpt ? " · " + fmtGB(kvpt * v) : "") + (v === max ? " (model max)" : "");
+    o.textContent = k + " tokens" + (kvAny ? " · " + fmtGB(kvBytes(selModel, v)) : "") + (v === max ? " (model max)" : "");
     sel.appendChild(o);
   }
   const oc = document.createElement("option"); oc.value = "custom"; oc.textContent = "Custom…"; sel.appendChild(oc);
