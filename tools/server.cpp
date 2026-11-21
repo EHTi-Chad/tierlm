@@ -1711,6 +1711,10 @@ int main(int argc, char** argv) {
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
         LoadOptions o = opt;
+        if (info.value("arch", std::string()) == "gemma4" && (hot || o.live_hot)) {   // (not yet: see the setup screen's note)
+            std::fprintf(stderr, "note: keeping the busiest experts in VRAM isn't available for Gemma 4 yet; loading with experts in RAM\n");
+            hot = false; o.live_hot = false;
+        }
         const int uL = info.value("layers", 0), uE = info.value("experts", 0);
         eng.usage.clear(); eng.usage_path.clear(); eng.usage_dirty = false; eng.hot_L = uL; eng.hot_E = uE;
         if (uE > 0 && uL > 0) {
@@ -3618,7 +3622,8 @@ int main(int argc, char** argv) {
                     // (hot experts: MoE models)
                     const auto& hp_ = eng.model->hparams();
                     const bool moe = hp_.is_moe();
-                    const bool can_hot = moe && !hp_.mamba;                 // (not yet for Nemotron: uneven expert counts)
+                    // (not yet for Nemotron: uneven expert counts; nor for Gemma 4: its split stops tierlm while loading)
+                    const bool can_hot = moe && !hp_.mamba && !hp_.gemma4;
                     const size_t n_gpus = eng.model->placement().gpus.size();
                     std::string gpu0 = n_gpus ? eng.model->placement().gpus[0].name : std::string();   // "CUDA0"...
                     if (ggml_backend_dev_t d = n_gpus ? ggml_backend_dev_by_name(gpu0.c_str()) : nullptr)
