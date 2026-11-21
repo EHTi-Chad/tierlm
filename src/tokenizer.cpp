@@ -367,7 +367,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
         if (pre == "llama-bpe" || pre == "llama3" || pre == "smaug-bpe" || pre == "dbrx") t.pre_ = Pre::Llama3;
         else if (pre == "qwen2" || pre == "deepseek-r1-qwen" || pre == "megrez") t.pre_ = Pre::Qwen2;
         else if (pre == "qwen35") t.pre_ = Pre::Qwen35;
-        else if (pre == "gpt-4o" || pre == "o200k") t.pre_ = Pre::O200k;
+        else if (pre == "gpt-4o" || pre == "o200k" || pre == "inkling2") t.pre_ = Pre::O200k;   // (Inkling 2: the same split)
         else if (pre == "kimi-k2") t.pre_ = Pre::Kimi;
         else if (pre == "tekken" || pre == "pixtral") t.pre_ = Pre::Tekken;
         else if (pre == "deepseek-v3" || pre == "joyai-llm") t.pre_ = Pre::DeepseekV3;

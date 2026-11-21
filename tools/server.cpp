@@ -47,6 +47,7 @@
 #include "json.hpp"
 #include "agent.h"
 #include "harmony.h"
+#include "inkling.h"
 #include "gemma4.h"
 #include "workspace.h"
 #include "chats.h"
@@ -194,13 +195,13 @@ std::string model_display_name(const std::string& name, const std::string& path)
 
 // Chat formats. Each model family wraps a conversation in its own markers; the GGUF's chat template (and
 // failing that, its vocabulary) says which one. Control tokens are matched when encoding with parse_special.
-enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, DeepSeek, Kimi, Gemma, Gemma4, Plain };
+enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, DeepSeek, Kimi, Gemma, Gemma4, Inkling, Plain };
 
 const char* chat_fmt_name(ChatFmt f) {
     switch (f) {
         case ChatFmt::Tulu: return "tulu"; case ChatFmt::ChatML: return "chatml";
         case ChatFmt::Llama3: return "llama3"; case ChatFmt::Mistral: return "mistral"; case ChatFmt::Harmony: return "harmony";
-        case ChatFmt::DeepSeek: return "deepseek"; case ChatFmt::Kimi: return "kimi"; case ChatFmt::Gemma: return "gemma"; case ChatFmt::Gemma4: return "gemma4";
+        case ChatFmt::DeepSeek: return "deepseek"; case ChatFmt::Kimi: return "kimi"; case ChatFmt::Gemma: return "gemma"; case ChatFmt::Gemma4: return "gemma4"; case ChatFmt::Inkling: return "inkling";
         default: return "plain";
     }
 }
@@ -209,6 +210,7 @@ ChatFmt detect_chat(const Tokenizer& tok) {
     const std::string& t = tok.chat_template();
     auto has = [&](const char* s) { return t.find(s) != std::string::npos; };
     if (has("<|channel|>")) return ChatFmt::Harmony;                 // gpt-oss (OpenAI's harmony format)
+    if (has("<|message_user|>")) return ChatFmt::Inkling;            // Inkling 2 (inkling.h)
     if (has("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") || tok.find("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") >= 0) return ChatFmt::DeepSeek;   // <｜Assistant｜>
     if (has("<|im_middle|>") || tok.find("<|im_middle|>") >= 0) return ChatFmt::Kimi;
     if (has("<|turn>")) return ChatFmt::Gemma4;
@@ -218,6 +220,7 @@ ChatFmt detect_chat(const Tokenizer& tok) {
     if (has("<|user|>")) return ChatFmt::Tulu;
     if (has("[INST]")) return ChatFmt::Mistral;
     if (tok.find("<|channel|>") >= 0 && tok.find("<|return|>") >= 0) return ChatFmt::Harmony;
+    if (tok.find("<|message_user|>") >= 0 && tok.find("<|message_model|>") >= 0) return ChatFmt::Inkling;
     if (tok.find("<|im_start|>") >= 0) return ChatFmt::ChatML;
     if (tok.find("<|turn>") >= 0 && tok.find("<turn|>") >= 0) return ChatFmt::Gemma4;
     if (tok.find("<start_of_turn>") >= 0) return ChatFmt::Gemma;
@@ -1059,7 +1062,8 @@ json describe_model(const std::string& path, bool header_only = false) {
     // layers keep a ring of the window plus 5,120 tokens per connection (see Model::swa_R_), not the whole context:
     // kv_swa_bytes_per_token for those, kv_bytes_per_token for the rest.
     if (const int64_t n_swa = u32(arch + ".attention.sliding_window");
-        n_swa > 0 && layers > 0 && layers <= 4096 && (arch == "gpt-oss" || arch == "gemma3" || arch == "gemma4" || arch == "flint")) {
+        n_swa > 0 && layers > 0 && layers <= 4096 && (arch == "gpt-oss" || arch == "gemma3" || arch == "gemma4" || arch == "flint" ||
+                       arch == "inkling2" || arch == "inkling2_loop")) {
         auto per_layer = [&](const std::string& k, int64_t dflt) {
             std::vector<int64_t> v((size_t)layers, dflt);
             const int64_t id = gguf_find_key(g, k.c_str());
@@ -1087,7 +1091,11 @@ json describe_model(const std::string& path, bool header_only = false) {
         const std::vector<int64_t> kvh = per_layer(arch + ".attention.head_count_kv", kv_heads ? kv_heads : heads);
         const int64_t shared = arch == "gemma4" ? u32(arch + ".attention.shared_kv_layers") : 0;
         int64_t full = 0, slide = 0;
-        for (int64_t i = 0; i < layers - shared; ++i) (swa[i] ? slide : full) += 2 * kvh[i] * (swa[i] ? hd_swa : hd_full) * 2;
+        // (Inkling 2's loop: the loop layers keep a cache for each pass)
+        const int64_t lo = arch == "inkling2_loop" ? u32(arch + ".loop.start") : 0, hi = arch == "inkling2_loop" ? u32(arch + ".loop.end") : 0;
+        const int64_t passes = arch == "inkling2_loop" ? std::max<int64_t>(1, u32(arch + ".loop.count")) : 1;
+        for (int64_t i = 0; i < layers - shared; ++i)
+            (swa[i] ? slide : full) += 2 * kvh[i] * (swa[i] ? hd_swa : hd_full) * 2 * (i >= lo && i < hi ? passes : 1);
         j["kv_bytes_per_token"] = full;
         j["kv_swa_bytes_per_token"] = slide;
         j["swa_ring"] = n_swa + 4096 + 1024;
@@ -1902,7 +1910,7 @@ int main(int argc, char** argv) {
             // '<|im_start|>assistant\\n<think>\\n' }})
             eng.think_starts = eng.think_switch &&
                 std::regex_search(ct, std::regex(R"(<think>(\\n|\n)'\s*\}\})"));
-            if (eng.chat == ChatFmt::Gemma4) eng.think_switch = true;   // (<|think|> in the system turn)
+            if (eng.chat == ChatFmt::Gemma4 || eng.chat == ChatFmt::Inkling) eng.think_switch = true;   // (<|think|> in the system turn; Inkling: its effort)
             if (eng.chat == ChatFmt::DeepSeek) {          // V3.1 has a thinking switch; R1 always starts by thinking
                 eng.think_switch = ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos;
                 eng.think_starts = eng.think_switch || ct.find("<think>\\n") != std::string::npos;
@@ -2672,7 +2680,8 @@ int main(int argc, char** argv) {
                  std::string stop = "length", text, full; };
     // The tool calls in a reply, in the model's own format.
     auto parse_calls = [&](const std::string& full, const agent::ojson& tools) {
-        return eng.chat == ChatFmt::Harmony ? harmony::parse(full, tools) : agent::parse_tool_calls(full, tools);
+        return eng.chat == ChatFmt::Harmony ? harmony::parse(full, tools) : eng.chat == ChatFmt::Inkling ? inkling::parse(full, tools)
+                                            : agent::parse_tool_calls(full, tools);
     };
     // With `tools`, the model is told about them, and a tool call it writes is kept out of the streamed text (it is
     // in `full`, the whole reply as the model wrote it, for agent::parse_tool_calls).
@@ -2725,10 +2734,11 @@ int main(int argc, char** argv) {
         sp.frequency_penalty = within(sp.frequency_penalty, -2.0f, 2.0f);
         // harmony (gpt-oss): a reply is several messages (reasoning, then the answer or a tool call) separated by
         // special tokens; it ends only at <|return|> or <|call|>, and is shown as <think>reasoning</think>answer.
-        const bool harm = eng.chat == ChatFmt::Harmony;
+        const bool harm = eng.chat == ChatFmt::Harmony, ink = eng.chat == ChatFmt::Inkling;
+        const bool native = harm || ink;                            // (the reply's own blocks: shown and parsed by its format)
         const bool use_tools = tools.is_array() && !tools.empty();
         std::vector<std::string> stops = stops_in;
-        if (use_tools && !harm) stops.push_back("<tool_response>");     // the model must not write the tool's answer itself
+        if (use_tools && !native) stops.push_back("<tool_response>");     // the model must not write the tool's answer itself
         if (max_tokens <= 0) max_tokens = INT_MAX;    // no limit: until the model finishes or the context is full
         auto& model = eng.model; auto& tok = eng.tok;
         const auto& hp = model->hparams();
@@ -2740,7 +2750,9 @@ int main(int argc, char** argv) {
         const int think = think_mode();
         // (the template opened the <think> block: the reply is shown, split and saved with it, as the model wrote it)
         std::string pre = think == 1 ? "<think>\n" : "";
+        if (ink) pre.clear();                                        // (Inkling: the model opens its own blocks)
         const std::string prompt_text = harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
+                                      : ink ? inkling::prompt(msgs, tools, think)
                                              : format_chat(agent::with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok, think);
         // (Gemma 4 thinking after its tools' results: its template opened the thought channel, as for <think> above)
         if (eng.chat == ChatFmt::Gemma4 && prompt_text.size() >= gemma4::kThoughtOpen.size() &&
@@ -3060,8 +3072,15 @@ int main(int argc, char** argv) {
         const bool g4 = eng.chat == ChatFmt::Gemma4;
         const int32_t g4_open = tok.find("<|channel>"), g4_close = tok.find("<channel|>"), g4_think = tok.find("<|think|>");
         const int32_t g4_tool_resp = g4 ? tok.find("<|tool_response>") : -1;   // (after its tool calls: their results are the app's)
+        const int32_t ink_stop = ink ? tok.find(inkling::kStop) : -1;
+        auto ink_block_tok = [&](int32_t t) {
+            for (const std::string* k : {&inkling::kModel, &inkling::kEnd, &inkling::kText, &inkling::kThink, &inkling::kTool})
+                if (t == tok.find(*k)) return true;
+            return false;
+        };
         auto is_end = [&](int32_t t) {
             if (harm) return t == h_return || t == h_call || t == h_eot || (t == tok.eos() && t != h_end);
+            if (ink) return t == ink_stop || ((t == tok.eos() || t == tok.eot()) && !ink_block_tok(t));   // (its blocks' tokens go on)
             if (g4 && t == g4_tool_resp) return true;
             if (g4 && (t == g4_open || t == g4_close || t == g4_think)) return false;   // (Gemma 4's thinking goes on)
             return t == tok.eos() || t == tok.eot() || tok.is_control(t);
@@ -3094,14 +3113,14 @@ int main(int argc, char** argv) {
             out.push_back(id);
             const std::string text = tok.decode(out);
             raw = pre + text.substr(0, utf8_complete(text));
-            visible = harm ? harmony::display(raw) : g4 ? gemma4::display(raw) : raw;
+            visible = harm ? harmony::display(raw) : ink ? inkling::display(raw) : g4 ? gemma4::display(raw) : raw;
             // A stop string: end the reply just before it.
             size_t cut = std::string::npos;
             for (const auto& st : stops)
                 if (!st.empty()) { size_t p = visible.find(st, shown > st.size() ? shown - st.size() : 0); if (p < cut) cut = p; }
             if (cut != std::string::npos) {
-                r.full = harm ? raw : visible.substr(0, cut);
-                const size_t tc = use_tools && !harm ? agent::tool_call_pos(r.full) : std::string::npos;
+                r.full = native ? raw : visible.substr(0, cut);
+                const size_t tc = use_tools && !native ? agent::tool_call_pos(r.full) : std::string::npos;
                 emit(visible, std::max(std::min(cut, tc), shown));
                 r.stop = "stop";
                 return false;
@@ -3112,7 +3131,7 @@ int main(int argc, char** argv) {
                 for (size_t k = st.empty() ? 0 : std::min(st.size() - 1, visible.size()); k > hold; --k)
                     if (visible.compare(visible.size() - k, k, st, 0, k) == 0) { hold = k; break; }
             size_t limit = visible.size() - hold;
-            if (use_tools && !harm) {                              // a tool call isn't shown as text
+            if (use_tools && !native) {                            // a tool call isn't shown as text
                 const size_t tc = agent::tool_call_pos(visible);
                 if (tc != std::string::npos) limit = std::min(limit, tc);
                 else if (agent::answer_start(visible) != std::string::npos) {
@@ -3201,9 +3220,9 @@ int main(int argc, char** argv) {
             r.drafted = st.drafted; r.accepted = st.accepted; r.checks = st.steps; r.looked = st.looked; r.look_ok = st.look_ok;
             r.guess_ms = st.guess_s * 1e3; r.check_ms = st.check_s * 1e3; r.catch_ms = st.catch_s * 1e3;
         }
-        if (r.stop != "stop") r.full = harm ? raw : visible;
+        if (r.stop != "stop") r.full = native ? raw : visible;
         if (r.stop != "stop" && r.stop != "abort") {                                  // release held-back text
-            const size_t tc = use_tools && !harm ? agent::tool_call_pos(visible) : std::string::npos;
+            const size_t tc = use_tools && !native ? agent::tool_call_pos(visible) : std::string::npos;
             emit(visible, tc == std::string::npos ? visible.size() : tc);
         }
         r.n_gen = out.size();
@@ -3253,6 +3272,7 @@ int main(int argc, char** argv) {
         std::vector<std::string> pics;
         try { pics = take_pictures(msgs); } catch (...) {}
         int n = (int)eng.tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
+                                    : eng.chat == ChatFmt::Inkling ? inkling::prompt(msgs, tools, think_mode())
                                          : format_chat(agent::with_tools(msgs, tools, eng.tool_fmt), eng.chat, eng.tok, think_mode()), true).size();
         for (const std::string& b : pics) {                        // each image: its words instead of one pad token
             int w = 0, h = 0;

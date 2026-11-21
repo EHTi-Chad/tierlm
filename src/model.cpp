@@ -23,7 +23,7 @@
 
 namespace tierlm {
 
-static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint", "deepseek2", "qwen4exp", "nemotron_h_moe", "deepseek4", "gemma3", "gemma4" };
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint", "deepseek2", "qwen4exp", "nemotron_h_moe", "deepseek4", "gemma3", "gemma4", "inkling2", "inkling2_loop" };
 bool arch_supported(const std::string& arch) {
     for (const char* a : kArchs) if (arch == a) return true;
     return false;
@@ -447,6 +447,71 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.final_softcap = f32(arch + ".final_logit_softcapping", 0.0f);
         hp.expert_renorm = true;                                  // (softmax over all, the top ones renormalised)
     }
+    if (arch == "inkling2" || arch == "inkling2_loop") {
+        // Inkling 2 (text): see Hparams::ink. Values as llama.cpp's converter writes them (convert_hf_to_gguf.py,
+        // conversion/inkling2.py), checked against Hugging Face's Inkling2(Loop)ForCausalLM (tests/tiny_inkling2.py).
+        auto bad = [&](const char* what) { throw std::runtime_error(std::string("this Inkling 2 file's settings don't make sense: ") + what); };
+        hp.ink = true;
+        hp.hybrid = true;                                         // (the convolutions' kept inputs can't be rewound: see truncate)
+        hp.n_swa = u32(arch + ".attention.sliding_window", true);
+        hp.swa.assign(hp.n_layer, false);
+        const int64_t pid = gguf_find_key(g, (arch + ".attention.sliding_window_pattern").c_str());
+        if (pid < 0 || gguf_get_kv_type(g, pid) != GGUF_TYPE_ARRAY || gguf_get_arr_type(g, pid) != GGUF_TYPE_BOOL ||
+            (int)gguf_get_arr_n(g, pid) != hp.n_layer) bad("sliding-window pattern");
+        const bool* sw = (const bool*)gguf_get_arr_data(g, pid);
+        for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = sw[i];
+        const int hd_full = (int)u32(arch + ".attention.key_length", true);
+        const int hd_swa = gguf_find_key(g, (arch + ".attention.key_length_swa").c_str()) >= 0 ? (int)u32(arch + ".attention.key_length_swa", false) : hd_full;
+        const std::vector<int> nh = per_layer(arch + ".attention.head_count", hp.n_layer);
+        const std::vector<int> kvh = per_layer(arch + ".attention.head_count_kv", hp.n_layer);
+        hp.hd_l.resize(hp.n_layer); hp.kvh_l.resize(hp.n_layer); hp.nh_l.resize(hp.n_layer);
+        for (int i = 0; i < hp.n_layer; ++i) {
+            hp.hd_l[i] = hp.swa[i] ? hd_swa : hd_full;
+            hp.nh_l[i] = nh[i];
+            hp.kvh_l[i] = kvh[i];
+            if (nh[i] < 1 || kvh[i] < 1 || nh[i] % kvh[i] || nh[i] > (1 << 12)) bad("head counts");
+        }
+        if (hd_full < 1 || hd_full > 4096 || hd_swa < 1 || hd_swa > 4096) bad("head size");
+        hp.head_dim = std::max(hd_full, hd_swa);
+        hp.n_rot = 0;
+        hp.rope_layer.assign(hp.n_layer, false);                  // no RoPE: the relative bias carries the positions
+        hp.ink_conv = u32(arch + ".shortconv.l_cache", true);
+        hp.ink_rel_dim = u32(arch + ".attention.relative_length", true);
+        hp.ink_rel_extent = u32(arch + ".attention.relative_extent", true);
+        hp.ink_res_block = u32(arch + ".attn_res.block_size", true);
+        hp.ink_log_floor = u32(arch + ".attention.log_scale_floor", true);
+        hp.ink_qk_clip = f32(arch + ".attention.qk_clip", 0.0f);
+        hp.ink_rel_clip = f32(arch + ".attention.relative_clip", 0.0f);
+        hp.ink_log_alpha = f32(arch + ".attention.log_scale_alpha", -1.0f);
+        hp.situ_beta = f32(arch + ".activation.situ_beta", 0.0f);
+        hp.situ_lbeta = f32(arch + ".activation.situ_linear_beta", 0.0f);
+        hp.final_softcap = f32(arch + ".final_logit_softcapping", 0.0f);
+        hp.expert_scale = f32(arch + ".expert_weights_scale", 1.0f);
+        hp.expert_sigmoid = true;                                 // each expert scored on its own, chosen with a bias,
+        hp.expert_softmax_first = true;                           // (no softmax over the chosen ones)
+        hp.expert_renorm = true;                                  // the chosen weights sum to 1, then scaled
+        hp.n_vocab_real = u32(arch + ".vocab_size_unpadded", false);
+        if (arch == "inkling2_loop") {
+            hp.ink_loop_lo = u32(arch + ".loop.start", true);
+            hp.ink_loop_hi = u32(arch + ".loop.end", true);
+            hp.ink_loop_passes = u32(arch + ".loop.count", true);
+            hp.ink_loop_rank = u32(arch + ".loop.gate_rank", true);
+            const int64_t vid = gguf_find_key(g, (arch + ".loop.varying").c_str());
+            if (vid >= 0 && gguf_get_kv_type(g, vid) == GGUF_TYPE_BOOL && gguf_get_val_bool(g, vid))
+                throw std::runtime_error("Inkling 2 with a varying number of loop passes is not supported yet");
+        }
+        if (hp.ink_conv < 2 || hp.ink_conv > 64 || hp.ink_rel_dim < 1 || hp.ink_rel_dim > 4096 || hp.ink_rel_extent < 1 ||
+            hp.ink_rel_extent > (1 << 20) || hp.n_swa < 1 || hp.n_swa > (1 << 20) || hp.ink_res_block < 1 || hp.ink_log_floor < 1)
+            bad("convolution, relative bias or block sizes");
+        for (float v : {hp.ink_qk_clip, hp.ink_rel_clip, hp.situ_beta, hp.situ_lbeta, hp.rms_eps})
+            if (!std::isfinite(v) || v <= 0) bad("clip, softcap or norm settings");
+        if (!std::isfinite(hp.ink_log_alpha) || hp.ink_log_alpha < 0) bad("logarithmic scale");
+        if (hp.ink_loop_passes > 1 || arch == "inkling2_loop") {
+            const int lo = hp.ink_loop_lo, hi = hp.ink_loop_hi, B = hp.ink_res_block;
+            if (lo < 1 || hi <= lo || hi > hp.n_layer || lo % B || hi % B ||
+                hp.ink_loop_passes < 1 || hp.ink_loop_passes > 64 || hp.ink_loop_rank < 1) bad("loop");
+        }
+    }
     if (arch == "flint") {
         // Flint (Recursive): experts scored by a sigmoid, the top ones' scores renormalised; the first layers dense;
         // sliding-window layers (with attention sinks, as gpt-oss) and full-attention layers, and only the sliding
@@ -759,7 +824,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             if (hp.gemma4 && hp.kv_from > 0 && i >= hp.kv_from && hp.kv_src(i) < 0) bad("layers sharing a cache with no earlier layer of their kind");
             if (const ggml_tensor* q = tensor(b + "attn_q.weight")) {
                 if (q->ne[0] != hp.n_embd) bad("width (against attn_q)");
-                if (!hp.mla && (q->ne[1] % hd || (q->ne[1] / hd != hp.n_head && q->ne[1] / hd != 2 * hp.n_head))) bad("head count or size (against attn_q)");
+                if (!hp.mla && (q->ne[1] % hd || (q->ne[1] / hd != hp.nh_at(i) && q->ne[1] / hd != 2 * hp.nh_at(i)))) bad("head count or size (against attn_q)");
             }
             if (const ggml_tensor* k = tensor(b + "attn_k.weight"); k && !hp.mla && k->ne[1] != (int64_t)hp.kvh_at(i) * hd)
                 bad("key heads or size (against attn_k)");
@@ -834,8 +899,13 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         const bool qsa = hp.qsa_budget > 0 && il < (int)hp.qsa_ratio.size() && hp.qsa_ratio[il] > 0;
         const int64_t width = il < hp.n_layer ? (int64_t)hp.hd_at(il) * hp.kvh_at(il) : (int64_t)hp.head_dim * hp.n_head_kv;
         const size_t rows = ring_il(il) ? (size_t)m->swa_R_ * std::max(1, opt.parallel) : (size_t)m->max_ctx_;
-        return (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, width) * rows +
-               (qsa ? (size_t)hp.qsa_dim * 2 * (size_t)m->max_ctx_ : 0);
+        size_t b = (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, width) * rows +
+                   (qsa ? (size_t)hp.qsa_dim * 2 * (size_t)m->max_ctx_ : 0);
+        if (hp.ink && il < hp.n_layer) {                            // Inkling 2: the convolutions' inputs; loop layers once a pass
+            b += (size_t)(hp.ink_conv - 1) * hp.ink_conv_ch(il) * 4 * (size_t)std::max(1, opt.parallel);
+            if (il >= hp.ink_loop_lo && il < hp.ink_loop_hi) b *= (size_t)hp.ink_loop_passes;
+        }
+        return b;
     };
     size_t kv_need = 0;
     for (int il = 0; il < nl_all; ++il) kv_need += layer_mem(il);
@@ -1706,6 +1776,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     if (hp.dsv4) {
         m->d4_out_fn_ = T("output_hc_fn.weight"); m->d4_out_base_ = T("output_hc_base.weight"); m->d4_out_scale_ = T("output_hc_scale.weight");
     }
+    if (hp.ink) {
+        m->tok_norm_ = T("token_embd_norm.weight");
+        m->ink_out_res_ = T("output_res_query.weight");
+    }
     m->output_     = T("output.weight", false);
     m->rope_freqs_ = T("rope_freqs.weight", false);   // Llama 3.1+ long-context frequency factors (Gemma 4: proportional RoPE)
     if (hp.gemma4 && hp.g4_ple > 0) {
@@ -1716,6 +1790,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     }
     if (!m->output_) m->output_ = m->tok_embd_;      // tied embeddings
     hp.n_vocab = (int)m->tok_embd_->ne[1];
+    if (hp.n_vocab_real > 0 && hp.n_vocab_real < hp.n_vocab) {             // Inkling 2: rows past the vocabulary are padding
+        if (m->output_ && m->output_->ne[1] < hp.n_vocab_real) throw std::runtime_error("the output table is smaller than the vocabulary");
+        hp.n_vocab = hp.n_vocab_real;
+    }
 
     auto bind_hot = [&](Layer& L, int i) {                         // a layer whose experts are split into VRAM and RAM parts
         auto it = hot_layers.find(i);
@@ -1761,7 +1839,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         const std::string b = "blk." + std::to_string(i) + ".";
         Layer L;
         L.index = i;
-        L.attn_norm = T(b + "attn_norm.weight", hp.hc == 0);         // (Flash-Next: its stream mixers' norms)
+        L.attn_norm = T(b + "attn_norm.weight", hp.hc == 0 && !hp.ink);   // (Flash-Next: its stream mixers' norms; Inkling 2: below)
         if (hp.hc) {
             L.hc_a_norm = T(b + "hc_attn_norm.weight"); L.hc_a_down = T(b + "hc_attn_down.weight");
             L.hc_a_up   = T(b + "hc_attn_up.weight");   L.hc_a_inj  = T(b + "hc_attn_inject.weight");
@@ -1804,6 +1882,59 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             if (!L.gate_up_x) { L.gate_x = T(b + "ffn_gate_exps.weight"); L.up_x = T(b + "ffn_up_exps.weight"); }
             L.down_x = T(b + "ffn_down_exps.weight");
             L.up_s = T(b + "ffn_up_shexp.weight"); L.gate_s = T(b + "ffn_gate_shexp.weight"); L.down_s = T(b + "ffn_down_shexp.weight");
+            return L;
+        }
+        if (hp.ink) {                                                 // Inkling 2 (see Hparams::ink, Layer::ink_*)
+            L.swa = hp.is_swa(i);
+            L.rope = false;
+            const int H = hp.n_embd, nh = hp.nh_at(i), kvh = hp.kvh_at(i), hd = hp.hd_at(i), K = hp.ink_conv;
+            const int ext = L.swa ? hp.n_swa : hp.ink_rel_extent;
+            auto shaped = [&](const std::string& n, std::initializer_list<int64_t> ne) {
+                ggml_tensor* t = T(n);
+                int d = 0;
+                for (int64_t e : ne) if (t->ne[d++] != e) throw std::runtime_error("unexpected shape of " + n);
+                return t;
+            };
+            L.wq = shaped(b + "attn_q.weight", {H, (int64_t)hd * nh});
+            L.wk = shaped(b + "attn_k.weight", {H, (int64_t)hd * kvh});
+            L.wv = shaped(b + "attn_v.weight", {H, (int64_t)hd * kvh});
+            L.wo = shaped(b + "attn_output.weight", {(int64_t)hd * nh, H});
+            L.ink_gate = shaped(b + "attn_gate.weight", {H, (int64_t)hd * nh});
+            L.ink_qclip = shaped(b + "attn_q_clip.weight", {hd, nh});
+            L.ink_sink = shaped(b + "attn_sink_proj.weight", {H, nh});
+            L.ink_rel = shaped(b + "attn_rel.weight", {H, (int64_t)hp.ink_rel_dim * nh});
+            L.ink_relb = shaped(b + "attn_rel_bias.weight", {hp.ink_rel_dim, ext});
+            L.ink_relclip = shaped(b + "attn_rel_clip.weight", {hp.ink_rel_dim, nh});
+            L.ink_kconv = shaped(b + "attn_k_conv.weight", {K, (int64_t)hd * kvh});
+            L.ink_vconv = shaped(b + "attn_v_conv.weight", {K, (int64_t)hd * kvh});
+            L.ink_aconv = shaped(b + "attn_post_conv.weight", {K, H});
+            L.ink_fconv = shaped(b + "ffn_post_conv.weight", {K, H});
+            if (L.swa) L.attn_norm = shaped(b + "attn_norm.weight", {H});
+            else {
+                L.ink_qn = shaped(b + "attn_q_inp_norm.weight", {H});
+                L.ink_kn = shaped(b + "attn_k_inp_norm.weight", {H});
+                L.ink_vn = shaped(b + "attn_v_inp_norm.weight", {H});
+                L.ink_kconvp = shaped(b + "attn_k_conv_proj.weight", {H, (int64_t)K * kvh});
+                L.ink_vconvp = shaped(b + "attn_v_conv_proj.weight", {H, (int64_t)K * kvh});
+            }
+            if (i > 0) L.ink_ares = shaped(b + "attn_res_query.weight", {H, L.swa ? 1 : 3});
+            L.ink_fres = shaped(b + "ffn_res_query.weight", {H});
+            L.ffn_norm = shaped(b + "ffn_norm.weight", {H});
+            L.router = shaped(b + "ffn_gate_inp.weight", {H, hp.n_expert});
+            L.exp_probs_b = T(b + "exp_probs_b.bias", false);
+            L.gate_up_x = T(b + "ffn_gate_up_exps.weight", false);
+            if (!L.gate_up_x) { L.gate_x = T(b + "ffn_gate_exps.weight"); L.up_x = T(b + "ffn_up_exps.weight"); }
+            L.down_x = T(b + "ffn_down_exps.weight");
+            if (hp.ink_loop_passes > 1 && i >= hp.ink_loop_lo && i < hp.ink_loop_hi) {
+                L.ink_msgq = shaped(b + "loop_msg_query.weight", {H, 4});
+                const char* site[4] = {"q", "k", "v", "ffn"};
+                for (int k = 0; k < 4; ++k) {
+                    const std::string p = b + "loop_" + site[k] + "_ctrl_";
+                    L.ink_down[k] = shaped(p + "down.weight", {2 * H, hp.ink_loop_rank});
+                    L.ink_gain[k] = shaped(p + "gain.weight", {hp.ink_loop_rank, H});
+                    L.ink_forget[k] = shaped(p + "forget.weight", {hp.ink_loop_rank, H});
+                }
+            }
             return L;
         }
         if (hp.mamba) {                                               // Nemotron: one of three kinds of block
@@ -1974,6 +2105,16 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         }
         m->mtp_ = std::make_unique<Layer>(L);
     }
+    if (hp.ink && hp.ink_loop_passes > 1) {
+        // Inkling 2's loop: the later passes' caches (see Model::ink_slots_). Each slot repeats a loop layer: the same
+        // kind (sliding or full) and device; only its cache and convolution inputs are its own.
+        for (int p = 1; p < hp.ink_loop_passes; ++p)
+            for (int i = hp.ink_loop_lo; i < hp.ink_loop_hi; ++i) {
+                Layer S;
+                S.index = i; S.swa = m->layers_[i].swa; S.rope = false;
+                m->ink_slots_.push_back(S);
+            }
+    }
 
     // ---- KV cache on the same device, in f16: half the size and memory traffic of f32 ----
     const int n_seq = std::max(1, opt.parallel);
@@ -1990,6 +2131,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     m->n_free_ = m->max_ctx_;
     // Several conversations in one step: a DeltaNet layer runs once per conversation, so the graph has more nodes.
     if (hp.hybrid && n_seq > 1) m->graph_size_ = 16384 + n_seq * hp.n_layer * 48;
+    if (hp.ink) m->graph_size_ = 32768 + (hp.n_layer + (int)m->ink_slots_.size()) * (256 + n_seq * 64);   // (Inkling 2: many small ops a layer)
 
     // Fused flash attention reads the cache once, with no copies. TIERLM_NO_FA=1 uses the plain version.
     m->flash_attn_ = opt.flash_attn >= 0 ? opt.flash_attn == 1 : std::getenv("TIERLM_NO_FA") == nullptr;
@@ -2225,6 +2367,17 @@ void Model::clear_state(int s) {
                 zeros.assign(ggml_nbytes(t), 0);
                 ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
             }
+    for (ggml_tensor* t : ink_states_of(s)) {                     // Inkling 2: the convolutions' last inputs
+        zeros.assign(ggml_nbytes(t), 0);
+        ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
+    }
+}
+
+std::vector<ggml_tensor*> Model::ink_states_of(int s) const {
+    std::vector<ggml_tensor*> v;
+    for (const Layer& L : layers_) if (s < (int)L.ink_states.size()) v.push_back(L.ink_states[s]);
+    for (const Layer& L : ink_slots_) if (s < (int)L.ink_states.size()) v.push_back(L.ink_states[s]);
+    return v;
 }
 
 // Each token sees the cells of its own conversation up to its own position (sliding-window layers: only the last
@@ -2262,6 +2415,50 @@ void Model::fill_masks(Graph& g, int n_kv, const std::vector<int>& tok_seq, cons
             for (int q = 0; q <= tok_pos[t] - hp_.n_swa && q < (int)mine.size(); ++q) if (mine[q] < end) row[mine[q]] = ninf;
         }
         ggml_backend_tensor_set(g.mask_swa, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+    }
+    if (hp_.ink) fill_ink_inputs(g, n_kv, tok_seq, tok_pos);
+}
+
+// Inkling 2's inputs: each token's log scale (full-attention layers), and per token and cache cell, the row of the
+// relative-bias table to add: the distance back to that cell's position when it is within the table, else the last
+// row (zero bias; cells the mask hides get it too). Sliding layers' tables cover their window.
+void Model::fill_ink_inputs(Graph& g, int n_kv, const std::vector<int>& tok_seq, const std::vector<int>& tok_pos) {
+    const int n_tok = (int)tok_seq.size();
+    if (g.ink_tau && g.ink_tau->buffer) {
+        std::vector<float> tau(n_tok);
+        for (int t = 0; t < n_tok; ++t)
+            tau[t] = 1.0f + hp_.ink_log_alpha * std::log(std::max(1.0f, (float)(tok_pos[t] + 1) / (float)hp_.ink_log_floor));
+        ggml_backend_tensor_set(g.ink_tau, tau.data(), 0, sizeof(float) * tau.size());
+    }
+    const int end = std::min(n_kv, hi_);
+    auto by_cells = [&](ggml_tensor* dst, int ext) {              // by cache cell (each conversation's own list)
+        const int W = (int)dst->ne[0];
+        std::vector<int32_t> idx((size_t)W * n_tok, ext);
+        for (int t = 0; t < n_tok; ++t) {
+            int32_t* row = idx.data() + (size_t)t * W;
+            const auto& mine = seq_cells_[tok_seq[t]];
+            const int p = tok_pos[t];
+            for (int q = std::max(0, p - ext + 1); q <= p && q < (int)mine.size(); ++q)
+                if (mine[q] < end && mine[q] < W) row[mine[q]] = p - q;
+        }
+        ggml_backend_tensor_set(dst, idx.data(), 0, sizeof(int32_t) * idx.size());
+    };
+    if (g.ink_rel && g.ink_rel->buffer) by_cells(g.ink_rel, hp_.ink_rel_extent);
+    if (g.ink_rel_swa && g.ink_rel_swa->buffer) {
+        if (!swa_R_) by_cells(g.ink_rel_swa, hp_.n_swa);
+        else {                                                    // rings: by slot
+            const int W = (int)g.ink_rel_swa->ne[0], ext = hp_.n_swa;
+            std::vector<int32_t> idx((size_t)W * n_tok, ext);
+            for (int t = 0; t < n_tok; ++t) {
+                int32_t* row = idx.data() + (size_t)t * W;
+                const int s = tok_seq[t], p = tok_pos[t];
+                for (int q = std::max(0, p - ext + 1); q <= p; ++q) {
+                    const int slot = s * swa_R_ + q % swa_R_;
+                    if (slot < W) row[slot] = p - q;
+                }
+            }
+            ggml_backend_tensor_set(g.ink_rel_swa, idx.data(), 0, sizeof(int32_t) * idx.size());
+        }
     }
 }
 
@@ -2306,6 +2503,7 @@ void Model::checkpoint() {
         if (!L.ple_states.empty()) grab(L.ple_states[0]);
     }
     if (mtp_ && mtp_->conv_state) { grab(mtp_->conv_state); grab(mtp_->ssm_state_t); }
+    for (ggml_tensor* t : ink_states_of(0)) grab(t);
     ckpts_.push_back(std::move(ck));
     // Too many, or too much RAM: the one whose neighbours are closest together goes (never the first or the last),
     // so the ones kept stay spread over the conversation.
@@ -2344,6 +2542,8 @@ void Model::truncate(int n) {
             if (!L.ple_states.empty()) put(L.ple_states[0]);
         }
         if (mtp_ && mtp_->conv_state) { put(mtp_->conv_state); put(mtp_->ssm_state_t); }
+        for (ggml_tensor* t : ink_states_of(0)) put(t);
+        if ((int)seq_cells_[0].size() != n_past_) reset();          // (rings: further back than they hold, start again)
         return;
     }
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());   // (another conversation's step uses the cell tables)
@@ -2388,6 +2588,7 @@ Model::Snapshot Model::save() const {
     auto layer = [&](const Layer& L, bool mtp) {
         if (L.conv_state) { grab(L.conv_state, ggml_nbytes(L.conv_state)); grab(L.ssm_state_t, ggml_nbytes(L.ssm_state_t)); }
         if (!L.ple_states.empty()) grab(L.ple_states[0], ggml_nbytes(L.ple_states[0]));
+        if (!L.ink_states.empty()) grab(L.ink_states[0], ggml_nbytes(L.ink_states[0]));
         if (L.k_cache && !mtp && hp_.kv_src(L.index) < 0 && ringed(L)) {   // rings: conversation 0's part whole
             grab(L.k_cache, (size_t)swa_R_ * L.k_cache->nb[2]);
             if (L.v_cache) grab(L.v_cache, (size_t)swa_R_ * L.v_cache->nb[2]);
@@ -2401,6 +2602,7 @@ Model::Snapshot Model::save() const {
     };
     for (const auto& L : layers_) layer(L, false);
     if (mtp_) layer(*mtp_, true);
+    for (const auto& L : ink_slots_) layer(L, false);
     return s;
 }
 
@@ -2447,6 +2649,7 @@ void Model::restore(const Snapshot& s) {
     auto layer = [&](const Layer& L, bool mtp) {
         if (L.conv_state) { put(L.conv_state); put(L.ssm_state_t); }
         if (!L.ple_states.empty()) put(L.ple_states[0]);
+        if (!L.ink_states.empty()) put(L.ink_states[0]);
         if (L.k_cache && !mtp && hp_.kv_src(L.index) < 0 && ringed(L)) { put(L.k_cache); if (L.v_cache) put(L.v_cache); }
         else if (L.k_cache && (mtp || hp_.kv_src(L.index) < 0)) { put_rows(L.k_cache, mtp ? by_pos : runs); if (L.v_cache) put_rows(L.v_cache, mtp ? by_pos : runs); }
         if (L.d4_win) {
@@ -2456,6 +2659,7 @@ void Model::restore(const Snapshot& s) {
     };
     for (const auto& L : layers_) layer(L, false);
     if (mtp_) layer(*mtp_, true);
+    for (const auto& L : ink_slots_) layer(L, false);
     if (i != s.parts.size()) throw std::runtime_error("saved conversation doesn't match this model");
 }
 
@@ -2463,7 +2667,7 @@ const char* Model::kv_type() const { return ggml_type_name((ggml_type)kv_t_); }
 
 bool Model::draft_ok() const {
     if (!qsa_.empty() || hp_.mamba) return false;                  // (Flash-Next's indexer keys, Mamba: not yet)
-    for (const Layer& L : layers_) if (!L.ple_states.empty()) return false;
+    for (const Layer& L : layers_) if (!L.ple_states.empty() || !L.ink_states.empty()) return false;
     return true;
 }
 
@@ -3074,7 +3278,14 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                 gate = ggml_clamp(c, ggml_cont(c, gate), -INFINITY, lim);
                 up = ggml_clamp(c, ggml_cont(c, up), -lim, lim);
             }
-            ggml_tensor* act  = hp.expert_relu2 ? ggml_sqr(c, ggml_relu(c, up))
+            if (hp.situ_beta > 0) {                                         // Inkling 2: capped gate and up
+                gate = ggml_cont(c, gate); up = ggml_cont(c, up);
+                auto cap = [&](ggml_tensor* t, float b) { return ggml_scale(c, ggml_tanh(c, ggml_scale(c, t, 1.0f / b)), b); };
+                up = ggml_mul(c, cap(up, hp.situ_lbeta), ggml_sigmoid(c, gate));
+                gate = cap(gate, hp.situ_beta);
+            }
+            ggml_tensor* act  = hp.situ_beta > 0 ? ggml_mul(c, gate, up)
+                              : hp.expert_relu2 ? ggml_sqr(c, ggml_relu(c, up))
                               : hp.swiglu_oai ? ggml_swiglu_oai(c, gate_up_x ? ggml_cont(c, gate) : gate,
                                                                 gate_up_x ? ggml_cont(c, up) : up, 1.702f, 7.0f)
                               : hp.gelu_ffn ? ggml_geglu_split(c, gate, up)                          // (Gemma 4)
@@ -3352,6 +3563,11 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
         g.rope_ff = ggml_new_tensor_1d(c, GGML_TYPE_F32, (int64_t)hp.rope_ff.size());
         ggml_set_input(g.rope_ff);
     }
+    if (hp.ink) {                                                          // Inkling 2: see fill_ink_inputs
+        g.ink_tau = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, 1, n_tok);       ggml_set_input(g.ink_tau);
+        g.ink_rel = ggml_new_tensor_2d(c, GGML_TYPE_I32, n_kv, n_tok);       ggml_set_input(g.ink_rel);
+        g.ink_rel_swa = ggml_new_tensor_2d(c, GGML_TYPE_I32, g.mask_swa->ne[0], n_tok);   ggml_set_input(g.ink_rel_swa);
+    }
     if (ple_embd_) {                                                       // Flash-Next: the n-gram rows of every token
         g.ngram = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t)hp.ngram.heads() * n_tok);
         ggml_set_input(g.ngram);
@@ -3364,6 +3580,7 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
 
     ggml_tensor* x = ggml_get_rows(c, tok_embd_, g.inp);                   // [n_embd, n_tok]
     if (hp.embd_scale > 0) x = ggml_scale(c, x, hp.embd_scale);           // (Gemma)
+    if (tok_norm_) x = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), tok_norm_);   // (Inkling 2: the embedding normed)
     // Gemma 4 E2B/E4B: per-layer inputs [ple, n_layer, n_tok]: each token's own rows of a table (scaled by sqrt(ple)),
     // plus a projection of the (scaled) embedding (by 1/sqrt(width), then normed), the two added and scaled by 1/sqrt(2)
     ggml_tensor* g4_pl = nullptr;
@@ -3470,7 +3687,8 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
             mark = t;
         }
     };
-    for (int li = 0; li < (int)layers_.size(); ++li) {
+    if (hp.ink) x = ink_layers(c, g, x, n_tok, n_kv, grp, snapshots, want_routing, tag);
+    for (int li = 0; li < (hp.ink ? 0 : (int)layers_.size()); ++li) {
         tag(li - 1);
         const Layer& L = layers_[li];
         // ---- attention ----
@@ -3772,6 +3990,8 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     g.logits = ggml_mul_mat(c, output_, last);                             // [n_vocab, n_logits]
     if (hp.final_softcap > 0)                                               // (Gemma 2/4: cap tanh(logits / cap))
         g.logits = ggml_scale(c, ggml_tanh(c, ggml_scale(c, g.logits, 1.0f / hp.final_softcap)), hp.final_softcap);
+    if (g.logits->ne[0] > hp.n_vocab)                                       // (Inkling 2: the table's padding dropped)
+        g.logits = ggml_cont(c, ggml_view_2d(c, g.logits, hp.n_vocab, g.logits->ne[1], g.logits->nb[1], 0));
     ggml_set_output(g.logits);
     ggml_build_forward_expand(g.gf, g.logits);
     return g;
@@ -3815,6 +4035,195 @@ static void d4_hc_weights(ggml_tensor* dst, const ggml_tensor* a, const ggml_ten
         for (int it = 1; it < P.iters; ++it) { rows(); cols(); }
         (void)W;
     }
+}
+
+// ---- Inkling 2 (see Hparams::ink), as Hugging Face's Inkling2(Loop)TextModel computes it ----
+// x: the normed embedding [n_embd, n_tok]. Returns the last depth mixer's output (before the final norm).
+ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_tok, int n_kv, const std::vector<SeqGroup>& grp,
+                               int snapshots, bool want_routing, const std::function<void(int)>& tag) {
+    const Hparams& hp = hp_;
+    const int E = hp.n_embd, K = hp.ink_conv;
+    const bool one = grp.size() == 1;
+    tag(-1);
+    // Attention over the depth: the earlier blocks' outputs and cur, each normed (no weight), mixed by attention with
+    // nq learned queries (the same at every position). Returns [E, nq, n_tok].
+    auto mix = [&](const std::vector<ggml_tensor*>& blocks, ggml_tensor* cur, ggml_tensor* query, int nq) -> ggml_tensor* {
+        ggml_tensor* S = ggml_reshape_3d(c, cur, E, 1, n_tok);
+        for (ggml_tensor* b : blocks) S = ggml_concat(c, ggml_reshape_3d(c, b, E, 1, n_tok), S, 1);
+        S = ggml_rms_norm(c, S, 1e-6f);                                       // [E, nb, n_tok]
+        const int64_t nb = S->ne[1];
+        ggml_tensor* sc = ggml_mul_mat(c, ggml_reshape_2d(c, query, E, nq), ggml_reshape_2d(c, S, E, nb * n_tok));   // [nq, nb n_tok]
+        sc = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, sc, nq, nb, n_tok), 1, 0, 2, 3));          // [nb, nq, n_tok]
+        sc = ggml_soft_max_ext(c, sc, nullptr, 1.0f / std::sqrt((float)E), 0.0f);
+        return ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, S, 1, 0, 2, 3)), sc);                     // [E, nq, n_tok]
+    };
+    auto pick = [&](ggml_tensor* m, int j) {                                  // query j's output of mix: [E, n_tok]
+        return ggml_cont(c, ggml_view_2d(c, m, E, n_tok, m->nb[2], (size_t)j * m->nb[1]));
+    };
+    // Each vector (over ne0) times scale, then scaled down to a length of at most thr
+    auto clip = [&](ggml_tensor* t, ggml_tensor* scale, float thr) {
+        if (scale) t = ggml_mul(c, t, scale);
+        ggml_tensor* d = ggml_scale_bias(c, ggml_sqrt(c, ggml_sum_rows(c, ggml_sqr(c, t))), 1.0f, 1e-6f);
+        ggml_tensor* f = ggml_clamp(c, ggml_div(c, ggml_fill(c, d, thr), d), -INFINITY, 1.0f);
+        return ggml_mul(c, t, f);
+    };
+    // A loop layer's message gate: (1 - forget) cur + gain msg, both from the normed pair through a low-rank projection
+    auto gate = [&](const Layer& L, int k, ggml_tensor* cur, ggml_tensor* msg) {
+        ggml_tensor* in = ggml_concat(c, ggml_rms_norm(c, cur, hp.rms_eps), ggml_rms_norm(c, msg, hp.rms_eps), 0);   // [2E, n_tok]
+        ggml_tensor* lo = ggml_mul_mat(c, L.ink_down[k], in);
+        ggml_tensor* gain = ggml_tanh(c, ggml_mul_mat(c, L.ink_gain[k], lo));
+        ggml_tensor* forget = ggml_tanh(c, ggml_mul_mat(c, L.ink_forget[k], lo));
+        return ggml_add(c, ggml_sub(c, cur, ggml_mul(c, forget, cur)), ggml_mul(c, gain, msg));
+    };
+    std::map<int, ggml_tensor*> zero_sinks;                                    // one zero score per head (the sink's value)
+    auto sinks0 = [&](int nh) {
+        auto it = zero_sinks.find(nh);
+        if (it != zero_sinks.end()) return it->second;
+        ggml_tensor* t = ggml_new_tensor_1d(c, GGML_TYPE_F32, nh);
+        ggml_set_input(t);
+        g.in_f32.push_back({t, std::vector<float>(nh, 0.0f)});
+        return zero_sinks[nh] = t;
+    };
+    // One layer (physical li) in the pass whose cache is S; msgs: [E, 4, n_tok] from the previous pass, or null.
+    std::vector<ggml_tensor*> blocks;
+    auto layer = [&](int li, Layer& S, ggml_tensor* msgs) {
+        const Layer& L = layers_[li];
+        const bool swa = L.swa;
+        const int nh = hp.nh_at(li), kvh = hp.kvh_at(li), hd = hp.hd_at(li), kvd = hd * kvh, D = hp.ink_rel_dim;
+        const int ext = swa ? hp.n_swa : hp.ink_rel_extent;
+        // Short causal convolutions, conversation by conversation, each with its last K - 1 inputs kept in the
+        // state at channel offset off ([K - 1, channels], time first): out = (x + conv(x) [+ per-token taps]) / sqrt(...)
+        std::vector<std::pair<int64_t, ggml_tensor*>> conv_in;               // (one conversation: its inputs, for undo)
+        auto conv = [&](ggml_tensor* xin, ggml_tensor* w, ggml_tensor* dyn, int64_t off) -> ggml_tensor* {
+            const int64_t C = xin->ne[0];
+            ggml_tensor* out = nullptr;
+            for (int gi = 0, t0 = 0; gi < (int)grp.size(); t0 += grp[gi].n, ++gi) {
+                const int n = grp[gi].n;
+                ggml_tensor* st = S.ink_states[grp[gi].seq];
+                ggml_tensor* sv = ggml_view_3d(c, st, K - 1, C, 1, st->nb[1], st->nb[1] * C, (size_t)off * st->nb[1]);
+                ggml_tensor* xs = one ? xin : ggml_cont(c, ggml_view_2d(c, xin, C, n, xin->nb[1], (size_t)t0 * xin->nb[1]));
+                ggml_tensor* cin = ggml_concat(c, sv, ggml_transpose(c, ggml_reshape_3d(c, xs, C, n, 1)), 0);   // [K-1+n, C, 1]
+                ggml_build_forward_expand(g.gf, ggml_cpy(c, ggml_view_3d(c, cin, K - 1, C, 1, cin->nb[1], cin->nb[2],
+                                                                         (size_t)n * ggml_element_size(cin)), sv));
+                if (one) conv_in.push_back({off, cin});
+                ggml_tensor* co = ggml_reshape_2d(c, ggml_ssm_conv(c, cin, w), C, n);                  // [C, n]
+                if (dyn) {                                                    // per-token taps, one per key/value head
+                    const int64_t nhd = dyn->ne[0] / K;
+                    ggml_tensor* dg = one ? dyn : ggml_cont(c, ggml_view_2d(c, dyn, dyn->ne[0], n, dyn->nb[1], (size_t)t0 * dyn->nb[1]));
+                    dg = ggml_reshape_3d(c, dg, K, nhd, n);
+                    for (int lag = 0; lag < K; ++lag) {
+                        ggml_tensor* tap = ggml_cont(c, ggml_view_3d(c, dg, 1, nhd, n, dg->nb[1], dg->nb[2], (size_t)lag * dg->nb[0]));
+                        ggml_tensor* win = ggml_view_2d(c, cin, n, C, cin->nb[1], (size_t)(K - 1 - lag) * ggml_element_size(cin));
+                        win = ggml_reshape_3d(c, ggml_cont(c, ggml_transpose(c, win)), C / nhd, nhd, n);
+                        co = ggml_add(c, co, ggml_reshape_2d(c, ggml_mul(c, win, tap), C, n));
+                    }
+                }
+                ggml_tensor* r = ggml_scale(c, ggml_add(c, xs, co), 1.0f / std::sqrt((float)((dyn ? 2 : 1) * K + 1)));
+                out = out ? ggml_concat(c, out, r, 1) : r;
+            }
+            return out;
+        };
+        ggml_tensor* inp = x;
+        // ---- attention ----
+        ggml_tensor* in[3] = {x, x, x};                                       // the query's, key's and value's inputs
+        if (L.ink_ares) {
+            ggml_tensor* m = mix(blocks, x, L.ink_ares, swa ? 1 : 3);
+            for (int j = 0; j < 3; ++j) in[j] = pick(m, swa ? 0 : j);
+        }
+        if (msgs) for (int j = 0; j < 3; ++j) in[j] = gate(L, j, in[j], pick(msgs, j));
+        if (swa && msgs) for (int j = 0; j < 3; ++j) in[j] = ggml_mul(c, ggml_rms_norm(c, in[j], hp.rms_eps), L.attn_norm);
+        else if (swa) { in[0] = ggml_mul(c, ggml_rms_norm(c, in[0], hp.rms_eps), L.attn_norm); in[1] = in[2] = in[0]; }
+        else {
+            in[0] = ggml_mul(c, ggml_rms_norm(c, in[0], hp.rms_eps), L.ink_qn);
+            in[1] = ggml_mul(c, ggml_rms_norm(c, in[1], hp.rms_eps), L.ink_kn);
+            in[2] = ggml_mul(c, ggml_rms_norm(c, in[2], hp.rms_eps), L.ink_vn);
+        }
+        ggml_tensor* q = clip(ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, in[0]), hd, nh, n_tok), L.ink_qclip, hp.ink_qk_clip);
+        ggml_tensor* k = conv(ggml_mul_mat(c, L.wk, in[1]), L.ink_kconv, swa ? nullptr : ggml_mul_mat(c, L.ink_kconvp, in[1]), 0);
+        ggml_tensor* v = conv(ggml_mul_mat(c, L.wv, in[2]), L.ink_vconv, swa ? nullptr : ggml_mul_mat(c, L.ink_vconvp, in[2]), kvd);
+        k = clip(ggml_reshape_3d(c, k, hd, kvh, n_tok), nullptr, hp.ink_qk_clip);
+        v = ggml_rms_norm(c, ggml_reshape_3d(c, v, hd, kvh, n_tok), hp.rms_eps);
+        ggml_tensor* r = clip(ggml_reshape_3d(c, ggml_mul_mat(c, L.ink_rel, in[0]), D, nh, n_tok), L.ink_relclip, hp.ink_rel_clip);
+        if (!swa) { q = ggml_mul(c, q, g.ink_tau); r = ggml_mul(c, r, g.ink_tau); }
+        // The bias by distance, less the token's sink score (so a zero sink after the softmax stands for it):
+        // [ext + 1 rows (the last: beyond the table, zero), nh, n_tok], then each cell's row
+        ggml_tensor* sink = ggml_mul_mat(c, L.ink_sink, in[0]);                                    // [nh, n_tok]
+        ggml_tensor* tab = ggml_mul_mat(c, ggml_pad(c, L.ink_relb, 0, 1, 0, 0), r);                 // [ext+1, nh, n_tok]
+        tab = ggml_sub(c, tab, ggml_reshape_3d(c, sink, 1, nh, n_tok));
+        tab = ggml_cont(c, ggml_permute(c, tab, 1, 0, 2, 3));                                        // [nh, ext+1, n_tok]
+        ggml_tensor* idx = swa ? g.ink_rel_swa : g.ink_rel;
+        ggml_tensor* bias = ggml_get_rows(c, tab, idx);                                              // [nh, n_at, n_tok]
+        bias = ggml_cont(c, ggml_permute(c, bias, 2, 0, 1, 3));                                      // [n_at, n_tok, nh]
+        (void)ext;
+        // keys and values into this pass's cache, then attention over it
+        ggml_tensor* krows = ggml_reshape_2d(c, S.k_cache, kvd, S.k_cache->ne[2]);
+        ggml_tensor* vrows = ggml_reshape_2d(c, S.v_cache, kvd, S.v_cache->ne[2]);
+        ggml_tensor* where = ringed(S) ? g.cells_swa : g.cells;
+        ggml_build_forward_expand(g.gf, ggml_set_rows(c, krows, ggml_reshape_2d(c, k, kvd, n_tok), where));
+        ggml_build_forward_expand(g.gf, ggml_set_rows(c, vrows, ggml_reshape_2d(c, v, kvd, n_tok), where));
+        const int n_at = (int)idx->ne[0];
+        ggml_tensor* kall = ggml_view_3d(c, S.k_cache, hd, kvh, n_at, S.k_cache->nb[1], S.k_cache->nb[2], 0);
+        ggml_tensor* vall = ggml_view_3d(c, S.v_cache, hd, kvh, n_at, S.v_cache->nb[1], S.v_cache->nb[2], 0);
+        ggml_tensor* kq = ggml_mul_mat(c, ggml_permute(c, kall, 0, 2, 1, 3), ggml_permute(c, q, 0, 2, 1, 3));   // [n_at, n_tok, nh]
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        kq = ggml_add(c, ggml_scale(c, kq, 1.0f / std::sqrt((float)hd)), bias);
+        kq = ggml_soft_max_ext(c, kq, swa ? g.mask_swa : g.mask, 1.0f, 0.0f);
+        ggml_soft_max_add_sinks(kq, sinks0(nh));
+        ggml_tensor* o = ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3)), kq);      // [hd, n_tok, nh]
+        o = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3)), (int64_t)hd * nh, n_tok);
+        o = ggml_mul(c, o, ggml_sigmoid(c, ggml_mul_mat(c, L.ink_gate, in[0])));
+        o = conv(ggml_mul_mat(c, L.wo, o), L.ink_aconv, nullptr, 2 * kvd);
+        // ---- the residual: a block's first layer starts a new one (its input joins the blocks) ----
+        ggml_tensor* res;
+        if (li % hp.ink_res_block == 0) { blocks.push_back(inp); res = o; }
+        else res = ggml_add(c, inp, o);
+        // ---- experts ----
+        ggml_tensor* f = pick(mix(blocks, res, L.ink_fres, 1), 0);
+        if (msgs) f = gate(L, 3, f, pick(msgs, 3));
+        f = ffn_block(c, g, L, ggml_mul(c, ggml_rms_norm(c, f, hp.rms_eps), L.ffn_norm), n_tok, want_routing);
+        f = conv(f, L.ink_fconv, nullptr, 2 * kvd + E);
+        x = ggml_add(c, res, f);
+        if (one && snapshots > 1) {
+            // For dropping the last d tokens: the state as it was d tokens back (each convolution's inputs before them)
+            auto& rb = g.ink_rollback[S.ink_states[0]];
+            const int n = n_tok;
+            rb.assign(std::min(snapshots, n), nullptr);
+            std::sort(conv_in.begin(), conv_in.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (int d = 1; d < (int)rb.size(); ++d) {
+                ggml_tensor* st = nullptr;
+                for (auto& [off, cin] : conv_in) {
+                    ggml_tensor* part = ggml_view_3d(c, cin, K - 1, cin->ne[1], 1, cin->nb[1], cin->nb[2], (size_t)(n - d) * ggml_element_size(cin));
+                    st = st ? ggml_concat(c, st, part, 1) : ggml_cont(c, part);
+                }
+                rb[d] = ggml_cont(c, ggml_reshape_2d(c, st, K - 1, st->ne[1]));
+                ggml_set_output(rb[d]);
+                ggml_build_forward_expand(g.gf, rb[d]);
+            }
+        }
+        tag(li);
+    };
+    const bool loop = hp.ink_loop_passes > 1;
+    const int lo = loop ? hp.ink_loop_lo : hp.n_layer, hi = loop ? hp.ink_loop_hi : hp.n_layer;
+    for (int li = 0; li < lo; ++li) layer(li, layers_[li], nullptr);
+    if (loop) {
+        ggml_tensor* pre = x;
+        const std::vector<ggml_tensor*> pre_blocks = blocks;
+        for (int p = 0; p < hp.ink_loop_passes; ++p) {
+            std::vector<ggml_tensor*> bank;                                   // the previous pass: its later blocks...
+            ggml_tensor* bank_out = nullptr;                                  // ...and its output
+            if (p > 0) {
+                bank.assign(blocks.begin() + (std::ptrdiff_t)pre_blocks.size() + 1, blocks.end());
+                bank_out = x;
+                x = pre;
+                blocks = pre_blocks;
+            }
+            for (int li = lo; li < hi; ++li)
+                layer(li, ink_slot(li, p), p > 0 ? mix(bank, bank_out, layers_[li].ink_msgq, 4) : nullptr);
+        }
+    }
+    for (int li = hi; li < hp.n_layer; ++li) layer(li, layers_[li], nullptr);
+    (void)n_kv;
+    return pick(mix(blocks, x, ink_out_res_, 1), 0);
 }
 
 Model::Graph Model::build_dsv4(int n_tok, int n_past, bool want_routing, int n_logits, bool want_hidden, std::vector<uint8_t>* mem) {
@@ -4391,7 +4800,7 @@ void Model::make_kv(int ctx, int n_seq) {
     const Hparams& hp = hp_;
     const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), G = (int)gpus_.size(), hd = hp.head_dim;
     const ggml_type kv_type = (ggml_type)kv_t_;
-    ggml_init_params kp{ (size_t)(hp.dsv4 ? 8 : 3) * nl_all * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
+    ggml_init_params kp{ (size_t)(hp.dsv4 ? 8 : 3) * (nl_all + ink_slots_.size()) * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     kvctx_ = ggml_init(kp);
     std::vector<std::vector<ggml_tensor*>> kv_t(G + 1);              // per GPU, then RAM
     for (int i = 0; i < nl_all; ++i) {
@@ -4402,6 +4811,13 @@ void Model::make_kv(int ctx, int n_seq) {
             for (int s = 0; s < n_seq; ++s) {
                 L.ple_states.push_back(ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, (int64_t)hp.hc * hp.n_embd, hp.ple_state_len()));
                 dst.push_back(L.ple_states.back());
+            }
+        }
+        if (hp.ink) {                                                 // Inkling 2: the convolutions' last inputs
+            L.ink_states.clear();
+            for (int s = 0; s < n_seq; ++s) {
+                L.ink_states.push_back(ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, hp.ink_conv - 1, hp.ink_conv_ch(i)));
+                dst.push_back(L.ink_states.back());
             }
         }
         if (L.recurrent) {                                            // DeltaNet: fixed-size state, always f32
@@ -4451,6 +4867,20 @@ void Model::make_kv(int ctx, int n_seq) {
             dst.push_back(L.qsa_kc);
         }
     }
+    for (Layer& S : ink_slots_) {                                     // Inkling 2: the loop layers' later passes
+        const int i = S.index;
+        auto& dst = kv_t[layer_dev_[i] >= 0 ? layer_dev_[i] : G];
+        S.ink_states.clear();
+        for (int s = 0; s < n_seq; ++s) {
+            S.ink_states.push_back(ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, hp.ink_conv - 1, hp.ink_conv_ch(i)));
+            dst.push_back(S.ink_states.back());
+        }
+        const int64_t rows = ringed(S) ? (int64_t)swa_R_ * n_seq : ctx;
+        S.k_cache = ggml_new_tensor_3d(kvctx_, kv_type, hp.hd_at(i), hp.kvh_at(i), rows);
+        S.v_cache = ggml_new_tensor_3d(kvctx_, kv_type, hp.hd_at(i), hp.kvh_at(i), rows);
+        dst.push_back(S.k_cache);
+        dst.push_back(S.v_cache);
+    }
     kv_bytes_ = 0;
     for (auto& g : place_.gpus) g.kv = 0;
     for (int tier = 0; tier <= G; ++tier) {
@@ -4485,6 +4915,12 @@ size_t Model::kv_bytes_per_token(size_t* in_vram) const {
         all += b;
         if (layer_dev_[i] >= 0) vram += b;
     }
+    for (const Layer& S : ink_slots_) {                            // Inkling 2: the loop's later passes
+        if (!S.k_cache || ringed(S)) continue;
+        const size_t b = S.k_cache->nb[2] + S.v_cache->nb[2];
+        all += b;
+        if (layer_dev_[S.index] >= 0) vram += b;
+    }
     if (in_vram) *in_vram = vram;
     return all;
 }
@@ -4512,12 +4948,14 @@ void Model::resize_ctx(int new_ctx) {
     const Hparams& hp = hp_;
     const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), n_seq = n_seq_max();
     // 1. what to keep, in RAM
-    struct Kept { std::vector<uint8_t> k, v; std::vector<std::vector<uint8_t>> conv, ssm, ple; };
-    std::vector<Kept> kept(nl_all);
+    struct Kept { std::vector<uint8_t> k, v; std::vector<std::vector<uint8_t>> conv, ssm, ple, ink; };
+    const int n_all = nl_all + (int)ink_slots_.size();          // (Inkling 2: the loop's later passes after the rest)
+    std::vector<Kept> kept(n_all);
     auto get = [](ggml_tensor* t, size_t bytes) { std::vector<uint8_t> d(bytes); if (bytes) ggml_backend_tensor_get(t, d.data(), 0, bytes); return d; };
-    for (int i = 0; i < nl_all; ++i) {
-        auto& L = i < hp.n_layer ? layers_[i] : *mtp_;
+    for (int i = 0; i < n_all; ++i) {
+        auto& L = i < hp.n_layer ? layers_[i] : i < nl_all ? *mtp_ : ink_slots_[i - nl_all];
         for (ggml_tensor* t : L.ple_states) kept[i].ple.push_back(get(t, ggml_nbytes(t)));
+        for (ggml_tensor* t : L.ink_states) kept[i].ink.push_back(get(t, ggml_nbytes(t)));
         if (L.d4_win) {                                           // DeepSeek V4: rings whole, entries up to hi_
             for (ggml_tensor* t : {L.d4_win, L.d4_c_rkv, L.d4_c_rgate, L.d4_i_rkv, L.d4_i_rgate, L.d4_ce, L.d4_ie})
                 kept[i].conv.push_back(t ? get(t, std::min(ggml_nbytes(t), t == L.d4_ce || t == L.d4_ie ?
@@ -4547,10 +4985,12 @@ void Model::resize_ctx(int new_ctx) {
         new_ctx = old_ctx;
     }
     // 3. back in
-    for (int i = 0; i < nl_all; ++i) {
-        auto& L = i < hp.n_layer ? layers_[i] : *mtp_;
+    for (int i = 0; i < n_all; ++i) {
+        auto& L = i < hp.n_layer ? layers_[i] : i < nl_all ? *mtp_ : ink_slots_[i - nl_all];
         for (size_t s = 0; s < L.ple_states.size() && s < kept[i].ple.size(); ++s)
             ggml_backend_tensor_set(L.ple_states[s], kept[i].ple[s].data(), 0, kept[i].ple[s].size());
+        for (size_t s = 0; s < L.ink_states.size() && s < kept[i].ink.size(); ++s)
+            ggml_backend_tensor_set(L.ink_states[s], kept[i].ink[s].data(), 0, kept[i].ink[s].size());
         if (L.d4_win) {
             size_t j = 0;
             for (ggml_tensor* t : {L.d4_win, L.d4_c_rkv, L.d4_c_rgate, L.d4_i_rkv, L.d4_i_rgate, L.d4_ce, L.d4_ie}) {
@@ -4616,6 +5056,7 @@ void Model::accept(int n_keep) {
         // (checked before anything is rewound, so a refusal leaves the state whole)
         for (auto& [li, rb] : g.rollback) if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
         for (auto& [li, rb] : g.ple_rollback) if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
+        for (auto& [st, rb] : g.ink_rollback) if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
         n_past_ -= d;                                             // attention layers: just forget their keys/values
         free_cells_from(0, n_past_);
         for (auto& [li, rb] : g.rollback) {                       // DeltaNet layers: restore the memory d tokens back
@@ -4628,6 +5069,7 @@ void Model::accept(int n_keep) {
             if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
             ggml_backend_tensor_copy(rb[d], layers_[li].ple_states[0]);
         }
+        for (auto& [st, rb] : g.ink_rollback) ggml_backend_tensor_copy(rb[d], st);   // Inkling 2's convolutions: likewise
     }
     release_pending();
 }

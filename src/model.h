@@ -67,6 +67,30 @@ struct Hparams {
     std::vector<int> hd_l, kvh_l, rot_l;
     int kv_from = 0;
     int g4_ple = 0;
+    std::vector<int> nh_l;            // per layer: the query heads (empty: n_head everywhere; Inkling 2's sliding layers)
+    int nh_at(int il) const { return il >= 0 && il < (int)nh_l.size() && nh_l[il] ? nh_l[il] : n_head; }
+    // Inkling 2 (Thinking Machines; "inkling2", "inkling2_loop"): no RoPE. Each attention layer's queries are scaled
+    // per head and clipped to a length (qk_clip), keys clipped too, values normed; a bias by distance is read from each
+    // token's own relative states (rel_dim per head, scaled and clipped to rel_clip, projected on a table of
+    // rel_extent distances: the window's size in the sliding layers); one more score per token and head (a sink, zero
+    // value); the output gated by sigmoid of the input. The full-attention layers scale queries and relative states by
+    // 1 + log_alpha log(max(1, (pos + 1) / log_floor)). Short causal convolutions (conv taps) on the keys and values
+    // (full layers: plus taps that depend on the token, per key/value head) and on both blocks' outputs, each with its
+    // input added back and scaled. Instead of a plain residual, each layer reads the earlier blocks' outputs (a block
+    // is res_block layers) mixed by attention with learned queries. Experts: sigmoid scores (a bias for choosing),
+    // weights renormalised and scaled; softcapped SwiGLU, gate capped at situ_beta, up at situ_lbeta. Logits capped,
+    // the padded vocabulary (output rows past n_vocab_real) dropped. The loop: layers [loop_lo, loop_hi) run
+    // loop_passes times, each later pass from the same input, with messages from the previous pass (its last blocks
+    // and output, mixed by 4 learned queries per layer) mixed into the queries', keys', values' and experts' inputs
+    // through low-rank gates; each pass keeps its own cache (see Model::ink_slots_).
+    bool ink = false;
+    int ink_conv = 0, ink_rel_dim = 0, ink_rel_extent = 0, ink_res_block = 0, ink_log_floor = 0;
+    float ink_qk_clip = 0, ink_rel_clip = 0, ink_log_alpha = 0, situ_beta = 0, situ_lbeta = 0;
+    int ink_loop_lo = 0, ink_loop_hi = 0, ink_loop_passes = 1, ink_loop_rank = 0;
+    int n_vocab_real = 0;             // logits kept (0: all the output rows); Inkling 2 pads its tables past it
+    int ink_loop_n() const { return ink_loop_hi - ink_loop_lo; }
+    // The convolutions' saved inputs per layer: keys, values (head width x key/value heads each), both outputs
+    int ink_conv_ch(int il) const { return 2 * hd_at(il) * kvh_at(il) + 2 * n_embd; }
     int hd_at(int il) const { return il >= 0 && il < (int)hd_l.size() && hd_l[il] ? hd_l[il] : head_dim; }
     int kvh_at(int il) const { return il >= 0 && il < (int)kvh_l.size() && kvh_l[il] ? kvh_l[il] : n_head_kv; }
     int rot_at(int il) const { return il >= 0 && il < (int)rot_l.size() && rot_l[il] ? rot_l[il] : n_rot; }
@@ -446,6 +470,11 @@ private:
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
         // Per PLE layer (Flash-Next): the convolution's kept inputs as they were d tokens back, ple_rollback[layer][d]
         std::map<int, std::vector<ggml_tensor*>> ple_rollback;
+        // Inkling 2: each token's log scale [1, 1, n_tok]; the relative-bias row per cache cell and token [n_kv, n_tok]
+        // (full-attention layers; sliding layers: their cells or ring slots); per layer and pass (key: the state
+        // tensor) the convolutions' inputs as they were d tokens back, ink_rollback[state][d]
+        ggml_tensor *ink_tau = nullptr, *ink_rel = nullptr, *ink_rel_swa = nullptr;
+        std::map<ggml_tensor*, std::vector<ggml_tensor*>> ink_rollback;
         std::vector<ggml_tensor*> orders;        // each layer's chosen experts (when routing is wanted)
         std::vector<int> order_layers;           // the layer each of orders belongs to
         ggml_tensor* routing = nullptr;          // all of them joined: [n_used, n_tok * n_layer], one read
@@ -467,6 +496,9 @@ private:
     ggml_tensor* ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, bool want_routing,
                            ggml_tensor* router_in = nullptr);   // (Gemma 4: the router reads its own input)
     ggml_tensor* attn_gemma4(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* h, int n_tok, int n_past);
+    // Inkling 2: every layer (and loop pass) from the normed embedding to the last depth mixer's output
+    ggml_tensor* ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_tok, int n_kv, const std::vector<SeqGroup>& grp,
+                            int snapshots, bool want_routing, const std::function<void(int)>& tag);
     void pin_cpu_layers(const Graph& g, ggml_backend_sched* sc = nullptr);        // keep every op of a RAM layer on the CPU
     std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
     void release_pending();
@@ -558,6 +590,17 @@ private:
         // MTP draft block only
         ggml_tensor *eh_proj = nullptr, *enorm = nullptr, *hnorm = nullptr, *mtp_embd = nullptr, *head_norm = nullptr, *head = nullptr;
         ggml_tensor *hc_head_norm = nullptr, *hc_head_down = nullptr, *hc_head_up = nullptr;   // (Flash-Next's draft block: its own last mixer)
+        // Inkling 2 (see Hparams::ink): the output gate, query scale, sink scores, relative states (projection, scale)
+        // and their bias table [rel_dim, extent]; the convolutions' taps [conv, channels] (keys, values, attention
+        // output, experts' output) and, in full-attention layers, the per-token taps' projections and the separate
+        // query/key/value input norms; the depth mixers' queries (attention input: 1 or 3, experts' input: 1); in loop
+        // layers the 4 message queries and the q/k/v/ffn gates' down, gain and forget projections.
+        ggml_tensor *ink_gate = nullptr, *ink_qclip = nullptr, *ink_sink = nullptr, *ink_rel = nullptr, *ink_relb = nullptr;
+        ggml_tensor *ink_relclip = nullptr, *ink_kconv = nullptr, *ink_vconv = nullptr, *ink_aconv = nullptr, *ink_fconv = nullptr;
+        ggml_tensor *ink_kconvp = nullptr, *ink_vconvp = nullptr, *ink_qn = nullptr, *ink_kn = nullptr, *ink_vn = nullptr;
+        ggml_tensor *ink_ares = nullptr, *ink_fres = nullptr, *ink_msgq = nullptr;
+        ggml_tensor *ink_down[4] = {}, *ink_gain[4] = {}, *ink_forget[4] = {};
+        std::vector<ggml_tensor*> ink_states;    // per conversation: the convolutions' last inputs [conv - 1, channels]
         ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
         std::vector<ggml_tensor*> conv_states, ssm_states;   // per conversation ([0]: conv_state, ssm_state_t)
         // DeepSeek V4: the stream mixers (fn, base, scale; [0] before attention, [1] before the experts), attention
@@ -606,6 +649,11 @@ private:
     }
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
     ggml_tensor *g4_ple_tok_ = nullptr, *g4_ple_proj_ = nullptr, *g4_ple_norm_ = nullptr;   // Gemma 4 E2B/E4B: per-layer inputs
+    ggml_tensor *tok_norm_ = nullptr, *ink_out_res_ = nullptr;   // Inkling 2: the embedding's norm, the last depth mixer's query
+    // Inkling 2's loop: the caches of the loop layers' later passes, pass p >= 1 of layer i at
+    // (p - 1) * (loop_hi - loop_lo) + i - loop_lo. Each holds only its own cache (index: the layer it repeats).
+    std::vector<Layer> ink_slots_;
+    Layer& ink_slot(int li, int pass) { return pass == 0 ? layers_[li] : ink_slots_[(size_t)(pass - 1) * hp_.ink_loop_n() + li - hp_.ink_loop_lo]; }
     ggml_tensor *ple_embd_ = nullptr;            // Flash-Next: the PLE n-gram table [ple_dim, rows]
     ggml_tensor *out_hc_norm_ = nullptr, *out_hc_down_ = nullptr, *out_hc_up_ = nullptr;   // the last stream mixer
     ggml_tensor *d4_out_fn_ = nullptr, *d4_out_base_ = nullptr, *d4_out_scale_ = nullptr;  // DeepSeek V4: the last stream mixer
@@ -712,7 +760,9 @@ private:
     void free_cells_from(int s, int n);          // conversation s keeps its first n positions
     int cells_end() const;                       // one past the highest cell in use
     void fill_masks(Graph& g, int n_kv, const std::vector<int>& tok_seq, const std::vector<int>& tok_pos);
-    void clear_state(int s);                     // DeltaNet memories of conversation s back to zero
+    std::vector<ggml_tensor*> ink_states_of(int s) const;   // Inkling 2: conversation s's convolution inputs, every layer and pass
+    void clear_state(int s);
+    void fill_ink_inputs(Graph& g, int n_kv, const std::vector<int>& tok_seq, const std::vector<int>& tok_pos);                     // DeltaNet memories of conversation s back to zero
     uint64_t weights_bytes_ = 0, kv_bytes_ = 0;
     void* dev_ = nullptr;                        // ggml_backend_dev_t of the main device
     bool flash_attn_ = true, kv_f32_ = false;
