@@ -14,6 +14,10 @@ namespace tierlm {
 // Sets an environment variable for the whole process (the GPU engines' DLLs read it too).
 void set_process_env(const char* k, const std::string& v);
 
+// A detailed log (for tracking down a problem): ggml's debug lines too, and more of tierlm's own.
+void set_detailed_log(bool on);
+bool detailed_log();
+
 // Loads the engine files next to the program (once; does nothing when the engines are built in).
 void load_backends();
 

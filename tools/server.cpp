@@ -77,6 +77,8 @@
 
 #include "backends.h"
 #include <deque>
+#include <csignal>
+#include <exception>
 #include <condition_variable>
 #include <shared_mutex>
 #ifdef _WIN32
@@ -110,6 +112,7 @@ struct Args {
     nlohmann::json load = nlohmann::json::object();
     bool saved = false, no_web = false, threads_given = false, ctx_given = false, device_given = false;
     int idle_eject = 0; bool idle_given = false;            // --idle-eject: minutes (0: never)
+    bool detailed = false; std::string log_file;            // --detailed-log, --log-file
 };
 
 const char* kUsage =
@@ -128,6 +131,11 @@ const char* kUsage =
     "  --web DIR             the folder with index.html\n"
     "  --idle-eject MIN      put the model away after MIN minutes with nothing to do, freeing its memory; the next\n"
     "                        request loads it again with the same settings (0: never, the default)\n"
+    "\n"
+    "Tracking down a problem\n"
+    "  --detailed-log        more detail in the window: the engines' own lines, each request to tierlm, this PC\n"
+    "  --log-file FILE       also save the window's text to FILE, as it comes (auto: a new file in the logs\n"
+    "                        folder, named for the date and time)\n"
     "\n"
     "Model (with a model given)\n"
     "  --saved               start from the settings saved for this model (what the page last used, or what Find\n"
@@ -1407,6 +1415,60 @@ struct LogRing {
 };
 LogRing g_log;
 
+// The log file (start-tierlm-with-log.bat, --log-file): everything the black window shows, with the times, written
+// as it comes so it holds the last lines even when tierlm stops suddenly. g_err is the real stderr (the window).
+std::mutex g_logf_mu;
+FILE* g_logf = nullptr;
+std::string g_logf_path;
+int g_err = 2;
+void log_file_write(const char* b, size_t n) {
+    std::lock_guard<std::mutex> lk(g_logf_mu);
+    if (!g_logf) return;
+    std::fwrite(b, 1, n, g_logf);
+    std::fflush(g_logf);
+}
+// "auto": logs\tierlm-<date>-<time>.txt next to the program's folder (the one start-tierlm.bat runs in)
+bool open_log_file(std::string path) {
+    if (path == "auto") {
+        const std::time_t t = std::time(nullptr);
+        std::tm tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
+        char b[64];
+        std::strftime(b, sizeof b, "tierlm-%Y-%m-%d-%H%M%S.txt", &tm);
+        std::error_code ec;
+        std::filesystem::create_directories("logs", ec);
+        path = (std::filesystem::path("logs") / b).u8string();
+    }
+#ifdef _WIN32
+    FILE* f = _wfopen(std::filesystem::u8path(path).wstring().c_str(), L"ab");
+#else
+    FILE* f = std::fopen(path.c_str(), "ab");
+#endif
+    if (!f) return false;
+    std::error_code ec;
+    const auto abs = std::filesystem::absolute(std::filesystem::u8path(path), ec);
+    g_logf_path = ec ? path : abs.u8string();
+    g_logf = f;
+    return true;
+}
+// A last line when tierlm stops on an error, in the window and the log file, after what was still on its way
+// to them (the copying thread gets a moment to catch up first).
+void last_words(const std::string& why) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::string t = "\n" + clock_now() + "  tierlm stopped: " + why + "\n";
+    if (!g_logf_path.empty()) t += clock_now() + "  The log is saved in " + g_logf_path + "\n";
+#ifdef _WIN32
+    _write(g_err, t.data(), (unsigned)t.size());
+#else
+    (void)!write(g_err, t.data(), t.size());
+#endif
+    log_file_write(t.data(), t.size());
+}
+
 void capture_stderr() {
     int fds[2];
     std::fflush(stderr);
@@ -1426,6 +1488,7 @@ void capture_stderr() {
     auto wr = [](int fd, const char* b, unsigned n) { return (int)write(fd, b, n); };
 #endif
     std::setvbuf(stderr, nullptr, _IONBF, 0);
+    g_err = orig;
     // (TIERLM_NO_TIMES=1: the black window without the times, as before 0.8.5)
     const bool times = !std::getenv("TIERLM_NO_TIMES");
     std::thread([fd = fds[0], orig, rd, wr, times] {
@@ -1436,6 +1499,17 @@ void capture_stderr() {
             const int n = rd(fd, buf, sizeof buf);
             if (n <= 0) break;
             const std::string now = clock_now();
+            if (g_logf) {                                // (the file always has the times)
+                std::string out;
+                bool ls = line_start;
+                for (int i = 0; i < n; ++i) {
+                    if (ls && buf[i] != '\r' && buf[i] != '\n') { out += now; out += "  "; ls = false; }
+                    out += buf[i];
+                    if (buf[i] == '\n') ls = true;
+                }
+                log_file_write(out.data(), out.size());
+                if (!times) line_start = ls;
+            }
             if (times) {
                 // the time in front of each line, written as the line starts (text without a newline yet, such
                 // as a progress line, still shows at once)
@@ -1505,6 +1579,8 @@ int main(int argc, char** argv) {
         else if (k == "--models") { a.models = next(); a.models_given = true; }
         else if (k == "--settings") a.settings = next();
         else if (k == "--no-web") a.no_web = true;
+        else if (k == "--detailed-log" || k == "--verbose") a.detailed = true;
+        else if (k == "--log-file") { a.log_file = next(); if (a.log_file.empty()) a.log_file = "auto"; }
         else if (k == "--saved") a.saved = true;
         else if (k == "--idle-eject") {
             const std::string v = next();
@@ -1549,7 +1625,46 @@ int main(int argc, char** argv) {
     if (a.model.empty() && (!a.load.empty() || a.saved))
         std::fprintf(stderr, "note: the model options are only used with a model on the command line; choose one on the page\n");
 
+    if (!a.log_file.empty() && !open_log_file(a.log_file))
+        std::fprintf(stderr, "note: could not create the log file %s; going on without it\n", a.log_file.c_str());
+    set_detailed_log(a.detailed);
     capture_stderr();
+    if (g_logf) {
+        std::string cmd;
+        for (int i = 1; i < argc; ++i) {                     // (never the API key)
+            const bool key = i > 1 && !std::strcmp(argv[i - 1], "--api-key");
+            cmd += std::string(" ") + (key ? "(key)" : argv[i]);
+        }
+        std::fprintf(stderr, "saving this window's text to %s\nstarted as: tierlm-server%s\n", g_logf_path.c_str(), cmd.c_str());
+    }
+    // When tierlm stops on an error, say so last, in the window and the log file (the engines' checks, a C++
+    // error nobody caught, a crash).
+    ggml_set_abort_callback([](const char* msg) {
+        std::fprintf(stderr, "%s\n", msg);
+        last_words("an engine check failed (the line above). Please send us this window's last lines" +
+                   std::string(g_logf_path.empty() ? "" : ", or the log file") + ".");
+    });
+    std::set_terminate([] {
+        std::string why = "an error nobody caught";
+        if (auto ep = std::current_exception()) {
+            try { std::rethrow_exception(ep); } catch (const std::exception& e) { why += ": " + std::string(e.what()); } catch (...) {}
+        }
+        last_words(why);
+        std::abort();
+    });
+#ifdef _WIN32
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        char b[96];
+        std::snprintf(b, sizeof b, "a crash (Windows exception 0x%08lX at %p)",
+                      ep && ep->ExceptionRecord ? (unsigned long)ep->ExceptionRecord->ExceptionCode : 0ul,
+                      ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr);
+        last_words(b);
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
+#else
+    for (int sig : {SIGSEGV, SIGBUS, SIGFPE, SIGILL})
+        std::signal(sig, [](int sg) { last_words("a crash (signal " + std::to_string(sg) + ")"); std::signal(sg, SIG_DFL); std::raise(sg); });
+#endif
     load_backends();                     // in release builds: the best CPU engine for this PC, and the GPU engines
     // Testing hook: TIERLM_RPC=host:port adds a tierlm-rpc-server as a stand-in GPU.
     if (const char* ep = std::getenv("TIERLM_RPC")) add_rpc_server(ep);
@@ -1659,6 +1774,18 @@ int main(int argc, char** argv) {
         if (fs::is_directory(fs::u8path(saved), ec)) a.models = saved;
     }
     std::fprintf(stderr, "tierlm %s\nmodels folder: %s\n", TIERLM_VERSION, a.models.c_str());
+    if (a.detailed || g_logf) {                                     // this PC, for whoever reads the log
+        const SystemSpecs sp = system_specs();
+        std::fprintf(stderr, "this PC: %s | %s | CPU engine: %s | NVIDIA driver %s, CUDA %s (tierlm's: %s)\n",
+                     sp.os.c_str(), sp.cpu.c_str(), cpu_features().c_str(), sp.nvidia_driver.empty() ? "-" : sp.nvidia_driver.c_str(),
+                     sp.cuda_driver.empty() ? "-" : sp.cuda_driver.c_str(), sp.cuda_runtime.empty() ? "-" : sp.cuda_runtime.c_str());
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            size_t fr = 0, tot = 0;
+            ggml_backend_dev_memory(d, &fr, &tot);
+            std::fprintf(stderr, "  device %s (%s): %.1f GB, %.1f GB free\n", ggml_backend_dev_name(d), ggml_backend_dev_description(d), tot / 1e9, fr / 1e9);
+        }
+    }
     // A model file's id: its path inside the chosen folder, or "@tierlm/" + its path inside tierlm's own folder.
     auto model_key = [&](const std::string& p) -> std::string {
         std::error_code ec;
@@ -1865,6 +1992,11 @@ int main(int argc, char** argv) {
         return o;
     };
     httplib::Server svr;
+    if (a.detailed)                                                 // each request (not the page's own polling)
+        svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+            if (req.method == "GET" && (req.path.rfind("/api/", 0) != 0 || req.path == "/api/progress" || req.path == "/api/log" || req.path == "/api/info")) return;
+            std::fprintf(stderr, "request: %s %s -> %d\n", req.method.c_str(), req.path.c_str(), res.status);
+        });
     // (files are never taken for scripts or styles by a browser, and another site's page can't embed tierlm's replies)
     svr.set_default_headers({{"X-Content-Type-Options", "nosniff"}, {"Cross-Origin-Resource-Policy", "same-origin"}});
     // Requests waiting in line each hold a thread, so the pool is bigger than httplib's default (the CPU count):

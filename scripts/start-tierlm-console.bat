@@ -23,6 +23,8 @@ rem  KEY      an API key other devices must send; empty: none. Set one when HOST
 rem           yours alone
 rem  IDLE     minutes with nothing to do before the model is put away to free its memory; the next request loads it
 rem           again (it waits for the load). 0: never. Empty: the page's setting (Never unless changed there)
+rem  DETAILED yes: more detail in this window, for tracking down a problem (the engines' own lines, each request)
+rem  SAVE_LOG yes: also save this window's text to a new file in the logs folder, to send in with a problem report
 
 set "MODEL=C:\path\to\your-model.gguf"
 set "SAVED=no"
@@ -33,6 +35,8 @@ set "PORT=8040"
 set "PAGE=yes"
 set "KEY="
 set "IDLE="
+set "DETAILED=no"
+set "SAVE_LOG=no"
 
 rem ---------------------------------------------- EXAMPLES --------------------------------------------------------
 rem  Copy the lines of the one you want over the settings above (MODEL stays yours).
@@ -76,6 +80,8 @@ if /i "%SAVED%"=="yes" set "ARGS=%ARGS% --saved"
 if not "%CTX%"=="" set "ARGS=%ARGS% --ctx %CTX%"
 if not "%KEY%"=="" set "ARGS=%ARGS% --api-key %KEY%"
 if not "%IDLE%"=="" set "ARGS=%ARGS% --idle-eject %IDLE%"
+if /i "%DETAILED%"=="yes" set "ARGS=%ARGS% --detailed-log"
+if /i "%SAVE_LOG%"=="yes" set "ARGS=%ARGS% --log-file auto"
 echo.
 echo  Starting tierlm with %MODEL%
 echo  When it says it's ready, point your app at http://127.0.0.1:%PORT%/v1
@@ -84,4 +90,5 @@ echo.
 tierlm-server.exe "%MODEL%" %ARGS% %OPTIONS%
 echo.
 echo  tierlm has stopped. If it stopped straight away, the message above says why.
+if /i "%SAVE_LOG%"=="yes" echo  This window's text is saved in the logs folder ^(the newest file^).
 pause

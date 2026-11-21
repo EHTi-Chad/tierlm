@@ -2084,7 +2084,8 @@ async function whyFailed(e) {
   } catch (x) {}
   return alive ? "the connection to tierlm was lost part way (tierlm is still running: try again)"
                : "tierlm stopped while doing this. Its console window (the black window that opened with it) shows why; " +
-                 "please send us its last lines. Then start tierlm again with start-tierlm.bat.";
+                 "please send us its last lines. Then start tierlm again with start-tierlm.bat " +
+                 "(or start-tierlm-with-log.bat, which saves everything to a file in the logs folder to send us).";
 }
 function kvFactor() { return KV_FACTOR[$("kvsel").value] || 1; }
 // Context memory for ctx tokens of one connection: sliding-window layers keep only their ring (swa_ring tokens)

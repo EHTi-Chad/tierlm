@@ -317,6 +317,14 @@ threads wait for the slowest one. tierlm uses half your threads by default; try 
 Close other programs, or pick a shorter context length on the setup screen. On laptops with integrated
 graphics, the GPU shares system memory, so other apps compete for it.
 
+**Sending in a problem (a crash, an error, something slow)**
+Start tierlm with **start-tierlm-with-log.bat** instead of start-tierlm.bat and do what went wrong again. The window
+shows more detail, and everything it shows is saved as it comes to a new file in the **logs** folder (named for the
+date and time), so the file has the last lines even when tierlm stops suddenly. When tierlm stops, the logs folder
+opens: send the newest file with your report. It lists your PC's parts and drivers, the settings and the models you
+load, not what you write in chats. With the console launcher, set `DETAILED=yes` and `SAVE_LOG=yes` in
+start-tierlm-console.bat. From a command line: `tierlm-server --detailed-log --log-file auto`.
+
 **The black window closes immediately**
 Open a command prompt in the tierlm folder and run `start-tierlm.bat` from there, so you can read the error
 message.

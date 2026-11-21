@@ -223,6 +223,8 @@ optional on a network that's yours alone, but anyone on the network can use the 
 | `--api-key KEY` | other devices must send this key (apps on this computer don't) |
 | `--no-web` | no chat page: opening the address shows the "tierlm is running" page (as `/v1` does), and the API is all there is |
 | `--idle-eject MIN` | put the model away after MIN minutes with nothing to do (off unless given here or set in the page's Settings; `0`: never). Its VRAM and RAM are free for other programs until the next request, from the page or an app, which loads it again with the same settings first (that request waits for the load) |
+| `--detailed-log` | more detail in the window, for tracking down a problem: the engines' own lines, each request to tierlm (not the page's polling), this PC's parts and drivers (`DETAILED=yes` in the launcher) |
+| `--log-file FILE` | also save the window's text to FILE as it comes, with the times; `auto`: a new file in the **logs** folder named for the date and time (`SAVE_LOG=yes` in the launcher). When tierlm stops on an error, its last line says why and where the file is |
 | `--models DIR` | the models folder |
 | `--settings FILE` | the settings file (default `tierlm-settings.json` in the folder tierlm is started from: start it from its own folder, or give this, so `--saved` finds what the page saved) |
 

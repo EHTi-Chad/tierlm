@@ -1,3 +1,4 @@
+#include <atomic>
 #include "backends.h"
 #include "ggml-backend.h"
 #include <cstdio>
@@ -39,10 +40,15 @@ namespace tierlm {
 
 namespace { bool g_cuda_none = false; }   // NVIDIA cards found, none the CUDA engine can run (see hide_unsupported_cuda)
 
-// ggml's log, minus one line per weight tensor when repacking (hundreds for a big model).
+namespace { std::atomic<bool> g_detailed{false}; }
+void set_detailed_log(bool on) { g_detailed = on; }
+bool detailed_log() { return g_detailed; }
+
+// ggml's log, minus one line per weight tensor when repacking (hundreds for a big model) and its debug lines,
+// unless a detailed log was asked for (start-tierlm-with-log.bat, --detailed-log).
 static void log_filter(ggml_log_level level, const char* text, void*) {
-    if (std::strncmp(text, "repack: repack tensor", 21) == 0) return;
-    if (level == GGML_LOG_LEVEL_DEBUG) return;
+    if (!g_detailed && std::strncmp(text, "repack: repack tensor", 21) == 0) return;
+    if (!g_detailed && level == GGML_LOG_LEVEL_DEBUG) return;
     std::fputs(text, stderr);
 }
 
