@@ -14,6 +14,38 @@ gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), NVIDIA Nemo
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
 
+### New in 0.9.3: much less context memory for Gemma and gpt-oss, guessing ahead with several connections, a log for problem reports
+
+- **Sliding-window layers keep only their window.** Gemma 3 and 4, gpt-oss and Flint have layers that only ever read
+  their last few hundred or thousand tokens, but kept the whole context for them. Each such layer now keeps a ring of
+  the window plus 5,120 tokens per conversation. **Gemma 4 26B-A4B at 64K context: 2.60 GB of context memory**, where
+  0.9.2 needed 14.8 GB, so it fits all in VRAM with plenty to spare: **177.8 tok/s** over a 2,902-token C++ program on an
+  RTX 5090. **gpt-oss-20b, 16 replies at once at 32K each, now all in VRAM: 1,015.3 tok/s in all** (64.9 tok/s each);
+  in 0.9.2, 12 at once didn't fit in VRAM and the model was split with RAM (296.9 tok/s in all). Checked against the
+  whole-context cache with rings cut down to 48 tokens, including conversations cut back.
+- **Guessing ahead with Connections above 1.** Speculative decoding was off whenever Connections was more than 1,
+  so one person chatting alone lost it. Now a reply that starts with nobody else writing guesses ahead as with one
+  connection, and hands over to shared steps when another reply starts. Qwen3.8-27B Q6_K on an RTX 5090, Connections 4,
+  4 guesses: **97.4 tok/s** over a 5,860-token reply (about 60 in 0.9.2, with guessing ahead off).
+- **Fixed: Gemma 4 with "Keep the busiest experts in VRAM"** stopped tierlm while loading (the 0.9.1 and 0.9.2 known
+  issue): its per-expert scale was split like an expert's weights. Gemma 4 26B-A4B at 64K with a 12 GB VRAM limit:
+  **84.8 tok/s** with the busiest experts in VRAM (1,584 of 3,840, 11.2 GB of VRAM), against 68.8 with 12 of 30 whole
+  expert layers in VRAM.
+- **A log for problem reports**: **start-tierlm-with-log.bat** starts tierlm with more detail in the window (the
+  engines' own lines, each request, this PC's parts and drivers) and saves everything it shows to a file in the
+  **logs** folder, written as it comes, so it keeps the last lines if tierlm stops suddenly. When tierlm stops on an
+  error, its last line says why and where the log is. Both launchers have `DETAILED` and `SAVE_LOG` settings; on the
+  command line `--detailed-log` and `--log-file auto`.
+- **Clearer messages**: when tierlm stops during a load, Find the fastest settings or a benchmark, the page says so
+  and what to do, instead of "network error".
+- **Several at once** on the benchmark page runs inside tierlm, so 8 and more replies at once are measured (a browser
+  opens at most 6 streams to one address).
+- **The new look**: the app's default look matches [tierlm.com](https://tierlm.com), and sizes are in GB and MB
+  everywhere, as on the site.
+- **Fixed**: a reply's "VRAM experts did N% of the expert work" kept the previous load's number after a load
+  without the busiest experts in VRAM; Nemotron 3.5 all in VRAM showed as split; models whose file names its packing
+  tool's stand-in ("Hf Packed 6226") show their file name instead.
+
 ### New in 0.9.2: Get models fixed for unsloth's repos, a concurrency test, a code and security review
 
 - **Fixed: Get models did nothing for many unsloth repos.** Repos with an importance-matrix file
@@ -35,10 +67,9 @@ serves your other apps, also with no page or browser at all: start it from the c
   - A model whose layers are all sliding-window (or none are) no longer stops while it runs.
   - The security checks (82: path escapes, cross-site requests, DNS rebinding, remote settings, the API key) all
     pass; the test suite passes under the sanitizers.
-- **Known issue** (also in 0.9.1): Find the fastest settings can stop tierlm with Gemma 4 26B-A4B at a long context
-  (64K tokens, 16-bit context memory) when it tries the busiest experts in VRAM; use a shorter context or 8-bit context
-  memory with that model for now. Gemma 3 and 4 also keep the whole context for their sliding-window layers (30 GiB at
-  64K for the 26B-A4B); storing just the window is next.
+- **Known issue** (also in 0.9.1, fixed in 0.9.3): Find the fastest settings can stop tierlm with Gemma 4 26B-A4B at a
+  long context when it tries the busiest experts in VRAM. Gemma 3 and 4 also keep the whole context for their
+  sliding-window layers (14.8 GB at 64K for the 26B-A4B; 2.60 GB in 0.9.3).
 
 ### New in 0.9.1: long prompts up to 9× faster with experts in RAM, Gemma 3 and Gemma 4, a benchmark page
 
@@ -362,6 +393,7 @@ The best results so far, each measured in a normal chat unless noted (details be
 |---|---|---|---|
 | RTX 5090 (32 GB), 64 GB RAM | gpt-oss-20b (MXFP4) | all in VRAM | **270 tok/s** |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.6-35B-A3B Q4_K_M (21 GB), reading images | all in VRAM | **170 tok/s**; a 4K screenshot (3837 x 2150) read in **0.65 s**, prompt read at 4,447 tok/s |
+| RTX 5090 (32 GB), 64 GB RAM | gpt-oss-20b (MXFP4), 16 replies at once (Connections 16) | all in VRAM, 32K context each | **1,015.3 tok/s in all**, 64.9 tok/s each (benchmark page, 512-token replies, 0.9.3) |
 | RTX 5090 (32 GB), 64 GB RAM | gpt-oss-20b (MXFP4), 4 replies at once (Connections 4) | all in VRAM, 32K context each | **613.4 tok/s in all**, 154.3 tok/s each (benchmark page, 512-token replies, 0.9.2) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.6-35B-A3B Q4_K_M, 4 replies at once | all in VRAM, 32K context each | **356.7 tok/s in all**, 89.2 tok/s each (as above; 364 in Find the fastest settings) |
 | RTX 5090 (32 GB), 64 GB RAM | Nemotron 3.5 Bolt 74B-A9B (NVIDIA's 24 GB GGUF, IQ2_XXS), 4 replies at once | all in VRAM, 32K context each | **275.4 tok/s in all**, 68.9 tok/s each (as above) |
@@ -372,6 +404,9 @@ The best results so far, each measured in a normal chat unless noted (details be
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.8 Flash-Next Q4_K_M (120 GB) with its MTP draft file | GPU + RAM + SSD, VRAM experts following the conversation, 2 guesses | **80.3 tok/s**; 88.8 in Find the fastest settings (0.8.7) |
 | RTX 5090 (32 GB), 64 GB RAM | gpt-oss-120b (59 GB) | GPU + RAM, the busiest experts in VRAM | **83-86 tok/s** at 32K context (0.8.8; 45 with its experts in RAM) |
 | RTX 5090 (32 GB), 64 GB RAM | NVIDIA Nemotron 3.5 Bolt 74B-A9B (22 GB) | GPU | **137-147 tok/s** (0.8.8) |
+| RTX 5090 (32 GB), 64 GB RAM | Gemma 4 26B-A4B UD-Q4_K_M | all in VRAM at 64K context (2.60 GB of context memory) | **177.8 tok/s** over a 2,902-token C++ program (0.9.3) |
+| RTX 5090 (32 GB), 64 GB RAM | Gemma 4 26B-A4B UD-Q4_K_M, VRAM limit 12 GB | GPU + RAM, busiest experts in VRAM, 64K context | **84.8 tok/s** over a 2,772-token C++ program; 68.8 with whole expert layers in VRAM (0.9.3) |
+| RTX 5090 (32 GB), 64 GB RAM | Qwen3.8-27B Q6_K (dense), Connections 4, one reply writing | all in VRAM at 32K context each, KV cache q8_0, 4 guesses | **97.4 tok/s** over a 5,860-token C++ program (0.9.3; about 60 in 0.9.2, guessing ahead off) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.8-27B Q6_K (20.9 GiB, dense, bartowski) | all in VRAM at 64K context (KV cache f16), 4 guesses | **101.4 tok/s** over a 9,163-token C++ program (0.9.2) |
 | RTX 5090 (32 GB), 64 GB RAM | Qwen3.8-27B Q8_0 (27.0 GiB, dense) | all in VRAM at 32K context, 3 guesses | **101.6 tok/s** over a 9,049-token C++ program; **68.6** at 64K context with 62 of 64 layers in VRAM (0.9.2) |
 | RTX 5080 (16 GB), 32 GB RAM | Qwen3.8-27B UD-Q3_K_XL (12.2 GiB, dense) with its MTP draft file | GPU, 3 guesses | **63.5 tok/s** over a 7,786-token C++ program, 48K context (0.9.1) |
@@ -546,7 +581,8 @@ model is in RAM.
 3. Double-click `start-tierlm.bat`. Your browser opens at http://127.0.0.1:8040, where tierlm shows the
    hardware it found and the models in your folder (the **⋯** menu changes the folder). Pick a model and chat.
 
-Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or the [PDF guide](docs/tierlm-0.5.0-guide.pdf) · Problems: [docs/FAQ.md](docs/FAQ.md)
+Step-by-step guide: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** or the [PDF guide](docs/tierlm-0.5.0-guide.pdf) · Problems: [docs/FAQ.md](docs/FAQ.md);
+to send one in, start tierlm with `start-tierlm-with-log.bat` and attach the newest file from the `logs` folder
 
 ### Supported models
 

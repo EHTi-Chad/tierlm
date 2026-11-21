@@ -143,7 +143,16 @@ places, each checked against a NumPy reference written from Hugging Face's `mode
   following the conversation, against 45 with its experts in RAM. Loading it this way takes 79 s (74 s with its
   experts in RAM; up to 0.8.7 it took 3 minutes, its split layers put together in buffers made and zeroed afresh).
 
-Not yet for gpt-oss: a shorter KV cache for the sliding-window layers.
+### Sliding-window layers: a ring instead of the whole context (0.9.3)
+
+A sliding-window layer (Gemma 3 and 4, gpt-oss, Flint) only reads its last `n_swa` tokens, so since 0.9.3 it keeps a
+ring per conversation instead of the whole context: `n_swa` + 4,096 (the most one step writes; the prompt batch is
+capped to it) + 1,024 slack, so a step never overwrites what its own tokens still read, and a conversation can be cut
+back by up to the slack without losing what the window needs (further back, it is read again from the start). Token
+`p` of conversation `s` lives in cell `s*R + p % R`; the mask is worked out from positions (`p - n_swa < q <= p`)
+rather than from cells. Saving, restoring and resizing a conversation copy the rings whole. Gemma 4 26B-A4B at 64K:
+2.60 GB of context memory against 14.8 GB; gpt-oss-20b at 32K: 16 conversations fit in VRAM on a 32 GB card.
+`TIERLM_SWA_RING=0` turns it off and `TIERLM_SWA_RING_EXTRA=N` sets the ring's extra length (tests use 48 tokens).
 
 ## Several conversations in the cache
 

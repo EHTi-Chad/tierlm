@@ -367,6 +367,10 @@ The OLMoE file used in this guide is the safe choice to start with.
 `start-tierlm.bat` uses port 8040. To use another port, run it from a command prompt as
 `start-tierlm.bat 8050`.
 
+`start-tierlm-with-log.bat` starts tierlm the same way, with more detail in its window and everything the window
+shows saved to a file in the `logs` folder: use it when something goes wrong and send that file with your report
+([docs/FAQ.md](docs/FAQ.md)).
+
 You can also run the server directly from a command prompt in the tierlm folder. Give it a model to skip the
 setup screen:
 
