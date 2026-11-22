@@ -5,7 +5,9 @@
 // unfinished block; tierlm gives the attention op that bound (ggml_flash_attn_ext_set_n_kv_max) and the GPU then
 // gathers just those keys and values. This makes a cache of the model's shape (head size 256, 2 key/value heads, 24
 // heads, blocks of 4, budget 2,048) full of random numbers, with masks like QSA's, and for steps of several sizes
-// prints the largest difference between the two results and what each takes.
+// prints what each takes and how far each result is from the exact one (worked out here in double precision from
+// the cache as stored). The GPU's attention works in half precision, so neither is exact; the check is that being
+// told the bound doesn't make it worse.
 //
 //   tierlm-attn-check [positions in the cache = 73728] [cache type: q8_0 or f16] [steps' sizes, e.g. 1,4,9,256]
 // TIERLM_DEVICE: the device (default: the first GPU).
@@ -23,6 +25,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace tierlm;
@@ -67,20 +70,24 @@ int main(int argc, char** argv) {
         step("cache allocated");
         std::mt19937 rng(1234);
         std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> kf, vf;                                // the cache's values as stored (for the exact result)
         {
             const size_t n = (size_t)HD * HKV * n_kv;
-            std::vector<float> f(n);
             for (ggml_tensor* t : {kc, vc}) {
+                std::vector<float>& f = t == kc ? kf : vf;
+                f.resize(n);
                 for (float& x : f) x = nd(rng);
                 if (kvt == GGML_TYPE_F32) ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
                 else if (kvt == GGML_TYPE_F16) {
                     std::vector<ggml_fp16_t> h(n);
                     ggml_fp32_to_fp16_row(f.data(), h.data(), (int64_t)n);
                     ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+                    ggml_fp16_to_fp32_row(h.data(), f.data(), (int64_t)n);
                 } else {
                     std::vector<uint8_t> q(ggml_nbytes(t));
                     ggml_quantize_chunk(kvt, f.data(), q.data(), 0, (int64_t)HKV * n_kv, HD, nullptr);
                     ggml_backend_tensor_set(t, q.data(), 0, ggml_nbytes(t));
+                    ggml_get_type_traits(kvt)->to_float(q.data(), f.data(), (int64_t)n);
                 }
             }
         }
@@ -155,18 +162,60 @@ int main(int argc, char** argv) {
             };
             std::vector<float> a, b;
             const double td = run(false, a), ts = run(true, b);
-            double worst = 0.0, big = 0.0;
+            // the exact result [head size, heads, queries]: each query over the positions it sees, in double
+            std::vector<float> x((size_t)HD * NH * n_tok);
+            {
+                const int n_thr = std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+                std::vector<std::thread> pool;
+                for (int w = 0; w < n_thr; ++w) pool.emplace_back([&, w] {
+                    std::vector<int> see;
+                    std::vector<double> sc, acc(HD);
+                    for (int t = w; t < n_tok; t += n_thr) {
+                        const ggml_fp16_t* row = mask.data() + (size_t)t * n_kv;
+                        see.clear();
+                        for (int p = 0; p < n_kv; ++p) if (std::isfinite(ggml_fp16_to_fp32(row[p]))) see.push_back(p);
+                        for (int h = 0; h < NH; ++h) {
+                            const int kh = h / (NH / HKV);
+                            const float* q = qv.data() + ((size_t)t * NH + h) * HD;
+                            sc.resize(see.size());
+                            double top = -1e300;
+                            for (size_t i = 0; i < see.size(); ++i) {
+                                const float* k = kf.data() + ((size_t)see[i] * HKV + kh) * HD;
+                                double d = 0.0;
+                                for (int j = 0; j < HD; ++j) d += (double)q[j] * k[j];
+                                sc[i] = d / std::sqrt((double)HD);
+                                top = std::max(top, sc[i]);
+                            }
+                            std::fill(acc.begin(), acc.end(), 0.0);
+                            double sum = 0.0;
+                            for (size_t i = 0; i < see.size(); ++i) {
+                                const double wt = std::exp(sc[i] - top);
+                                const float* v = vf.data() + ((size_t)see[i] * HKV + kh) * HD;
+                                sum += wt;
+                                for (int j = 0; j < HD; ++j) acc[j] += wt * v[j];
+                            }
+                            float* o = x.data() + ((size_t)t * NH + h) * HD;
+                            for (int j = 0; j < HD; ++j) o[j] = (float)(acc[j] / sum);
+                        }
+                    }
+                });
+                for (std::thread& th : pool) th.join();
+            }
+            double off_d = 0.0, off_s = 0.0, big = 0.0;
             bool finite = true;
             for (size_t i = 0; i < a.size(); ++i) {
                 if (!std::isfinite(a[i]) || !std::isfinite(b[i])) finite = false;
-                worst = std::max(worst, (double)std::fabs(a[i] - b[i]));
-                big = std::max(big, (double)std::fabs(a[i]));
+                off_d = std::max(off_d, (double)std::fabs(a[i] - x[i]));
+                off_s = std::max(off_s, (double)std::fabs(b[i] - x[i]));
+                big = std::max(big, (double)std::fabs(x[i]));
             }
-            const bool ok = finite && big > 0 && worst <= 2e-3 * big;
+            // (half precision: a few parts in a thousand of the largest value; told the bound, no further off than behind the mask)
+            const bool ok = finite && big > 0 && off_s <= std::max(2e-3 * big, 1.25 * off_d) && off_s <= 3e-2 * big;
             all_ok = all_ok && ok;
-            std::printf("a step of %4d: each query sees up to %d positions; told so %.2f ms, behind the mask %.2f ms%s; "
-                        "largest difference %.1e of the largest value  ->  %s\n", n_tok, most, std::fabs(ts), std::fabs(td),
-                        td < 0 || ts < 0 ? " (not on the GPU)" : "", big > 0 ? worst / big : 0.0, ok ? "ok" : "DIFFERENT");
+            std::printf("a step of %4d: each query sees up to %d positions; told so %.2f ms, behind the mask %.2f ms%s; off the exact "
+                        "result by %.1e and %.1e of its largest value  ->  %s\n", n_tok, most, std::fabs(ts), std::fabs(td),
+                        td < 0 || ts < 0 ? " (not on the GPU)" : "", big > 0 ? off_s / big : 0.0, big > 0 ? off_d / big : 0.0,
+                        ok ? "ok" : "DIFFERENT");
             std::fflush(stdout);
         }
         ggml_backend_buffer_free(wbuf);
