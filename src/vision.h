@@ -20,6 +20,7 @@
 struct ggml_backend;
 struct ggml_backend_sched;
 struct ggml_backend_buffer;
+struct ggml_backend_device;
 struct ggml_context;
 struct ggml_tensor;
 struct gguf_context;
@@ -69,7 +70,7 @@ public:
     const std::string& device_name() const { return device_name_; }
     size_t weight_bytes() const { return weight_bytes_; }
     bool on_gpu() const { return main_ != cpu_; }
-    bool gpu_helps() const { return help_ != nullptr; }   // weights in RAM, a GPU doing the heavy work
+    bool gpu_helps() const { return help_dev_ != nullptr; }   // weights in RAM, a GPU doing the heavy work
     bool last_helped() const { return last_helped_; }      // the last image: did it (or was there no room)
 
 private:
@@ -94,7 +95,8 @@ private:
     ggml_backend_buffer* wbuf_ = nullptr;
     ggml_backend_buffer* xbuf_ = nullptr;
     ggml_backend_sched* sched_ = nullptr;
-    ggml_backend* help_ = nullptr;               // weights in RAM: a GPU that still does the heavy work
+    ggml_backend_device* help_dev_ = nullptr;     // weights in RAM: a GPU that still does the heavy work
+    ggml_backend* help_ = nullptr;               // (its backend and scheduler only while an image is read)
     ggml_backend_sched* sched_help_ = nullptr;
     bool last_helped_ = false;
     size_t weight_bytes_ = 0;

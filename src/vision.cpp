@@ -270,8 +270,12 @@ std::unique_ptr<Vision> Vision::load(const std::string& path, const std::string&
     // that, the CPU does it all (encode() falls back by itself).
     if (!dev && mode == "auto" && !std::getenv("TIERLM_VISION_NO_HELP")) {
         ggml_backend_dev_t h = pref ? pref : best_gpu(false);
-        if (h && (v->help_ = ggml_backend_dev_init(h, nullptr)))
+        ggml_backend_t probe = h ? ggml_backend_dev_init(h, nullptr) : nullptr;
+        if (probe) {
+            ggml_backend_free(probe);
+            v->help_dev_ = h;
             v->device_name_ = std::string("CPU + ") + ggml_backend_dev_name(h) + " (" + ggml_backend_dev_description(h) + ")";
+        }
     }
 
     // ---- the weights. The patch layer is a 3D convolution over two copies of the image (Qwen treats a
@@ -318,10 +322,6 @@ std::unique_ptr<Vision> Vision::load(const std::string& path, const std::string&
     backends.push_back(v->cpu_);
     v->sched_ = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(), 16384, false, true);
     if (!v->sched_) throw std::runtime_error("failed to create the scheduler");
-    if (v->help_) {
-        ggml_backend_t hb[2] = { v->help_, v->cpu_ };
-        v->sched_help_ = ggml_backend_sched_new(hb, nullptr, 2, 16384, false, true);   // op_offload: big ops to the GPU
-    }
     return v;
 }
 
@@ -491,6 +491,28 @@ std::vector<float> Vision::encode(const Prepared& p, int n_threads) {
         std::lock_guard<std::recursive_mutex> lk(device_mutex());
         // With a helping GPU: its working memory may not fit next to the chat model; then the CPU alone.
         ggml_backend_sched_t sched = nullptr;
+        // The GPU's working memory is given back once the image is read (the helper's backend and scheduler, and
+        // the scheduler's buffers when the reader is on the GPU): kept, they hold GBs next to a chat model that
+        // was planned to fill the GPU, and Windows then moves GPU memory out to RAM and everything slows down.
+        struct Release {
+            Vision& v;
+            ~Release() {
+                if (v.sched_help_) { ggml_backend_sched_free(v.sched_help_); v.sched_help_ = nullptr; }
+                if (v.help_) { ggml_backend_free(v.help_); v.help_ = nullptr; }
+                if (v.main_ != v.cpu_ && v.sched_) { ggml_backend_sched_free(v.sched_); v.sched_ = nullptr; }
+            }
+        } release{*this};
+        if (help_dev_ && (help_ = ggml_backend_dev_init(help_dev_, nullptr))) {
+            ggml_backend_t hb[2] = { help_, cpu_ };
+            sched_help_ = ggml_backend_sched_new(hb, nullptr, 2, 16384, false, true);   // op_offload: big ops to the GPU
+        }
+        if (!sched_) {
+            std::vector<ggml_backend_t> backends;
+            if (main_ != cpu_) backends.push_back(main_);
+            backends.push_back(cpu_);
+            sched_ = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(), 16384, false, true);
+            if (!sched_) { ggml_free(c); throw std::runtime_error("failed to create the scheduler"); }
+        }
         if (sched_help_) {
             ggml_backend_sched_reset(sched_help_);
             if (ggml_backend_sched_alloc_graph(sched_help_, gf)) sched = sched_help_;
