@@ -28,8 +28,12 @@
 using namespace tierlm;
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);                     // (each line out at once: it is read from a file while this runs)
+    const bool say = std::getenv("TIERLM_ATTN_CHECK_STEPS") != nullptr;
+    auto step = [&](const char* what) { if (say) std::fprintf(stderr, "step: %s\n", what); };
     try {
         load_backends();
+        step("engines loaded");
         const int n_kv = argc > 1 ? std::max(4096, std::atoi(argv[1]) / 256 * 256) : 73728;
         const std::string tname = argc > 2 ? argv[2] : "q8_0";
         const ggml_type kvt = tname == "f16" ? GGML_TYPE_F16 : tname == "f32" ? GGML_TYPE_F32 : GGML_TYPE_Q8_0;
@@ -47,7 +51,8 @@ int main(int argc, char** argv) {
             if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) dev = ggml_backend_dev_get(i);
         if (!dev) throw std::runtime_error("no GPU here (TIERLM_DEVICE names another device)");
         ggml_backend_t gpu = ggml_backend_dev_init(dev, nullptr);
-        ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        ggml_backend_t cpu = cpu_backend_init();
+        step("devices started");
         if (!gpu || !cpu) throw std::runtime_error("could not start the device");
         std::printf("%s (%s), a cache of %d positions as %s, head size %d, %d key/value heads, %d heads\n", ggml_backend_dev_name(dev),
                     ggml_backend_dev_description(dev), n_kv, ggml_type_name(kvt), HD, HKV, NH);
@@ -59,6 +64,7 @@ int main(int argc, char** argv) {
         ggml_tensor* vc = ggml_new_tensor_3d(wctx, kvt, HD, HKV, n_kv);
         ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, gpu);
         if (!wbuf) throw std::runtime_error("no room for the cache on the device");
+        step("cache allocated");
         std::mt19937 rng(1234);
         std::normal_distribution<float> nd(0.0f, 1.0f);
         {
@@ -78,6 +84,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        step("cache filled");
         const bool on_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;   // (TIERLM_DEVICE=CPU: the op's own check)
         ggml_backend_t backends[2] = { gpu, cpu };
         const int n_backends = on_cpu ? 1 : 2;
@@ -125,7 +132,10 @@ int main(int argc, char** argv) {
                 ggml_set_output(o);
                 ggml_build_forward_expand(gf, o);
                 ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, n_backends, 256, false, true);
+                if (!sched) throw std::runtime_error("no scheduler");
+                step(sparse ? "sparse: placing" : "masked: placing");
                 if (!ggml_backend_sched_alloc_graph(sched, gf)) throw std::runtime_error("no room for the step's working memory");
+                step("placed; computing");
                 ggml_backend_tensor_set(q, qv.data(), 0, ggml_nbytes(q));
                 ggml_backend_tensor_set(m, mask.data(), 0, ggml_nbytes(m));
                 double best = 1e30;
@@ -135,6 +145,7 @@ int main(int argc, char** argv) {
                     ggml_backend_sched_synchronize(sched);
                     if (it > 0) best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
                 }
+                step("computed");
                 out.resize(ggml_nelements(o));
                 ggml_backend_tensor_get(o, out.data(), 0, ggml_nbytes(o));
                 const bool on_gpu = ggml_backend_sched_get_tensor_backend(sched, o) == gpu;
@@ -161,6 +172,7 @@ int main(int argc, char** argv) {
         ggml_backend_buffer_free(wbuf);
         ggml_free(wctx);
         ggml_backend_free(gpu);
+        forget_cpu_backend(cpu);
         ggml_backend_free(cpu);
         std::printf(all_ok ? "PASS\n" : "FAIL\n");
         return all_ok ? 0 : 1;
