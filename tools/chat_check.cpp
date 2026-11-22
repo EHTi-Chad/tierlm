@@ -6,9 +6,12 @@
 //   tierlm-chat-check gemma4-reply   [{"raw": "...", "tools": [...]}, ...]
 //   tierlm-chat-check inkling-prompt [{"messages", "tools", "think": 0|1}, ...]  (tests/inkling_chat_test.py)
 //   tierlm-chat-check inkling-reply  ["<raw reply>", ...]
+//   tierlm-chat-check qwen-prompt    [{"messages" (as an app sends them), "tools", "think": 0|1, "effort", "effort_lines": bool}, ...]  (tests/qwen_chat_test.py)
 #include "harmony.h"
 #include "gemma4.h"
 #include "inkling.h"
+#include "messages.h"
+#include "qwen.h"
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -47,6 +50,10 @@ int main(int argc, char** argv) {
             const auto p = inkling::parse(r.get<std::string>(), nlohmann::ordered_json::array());
             std::cout << nlohmann::json({{"display", p.content}, {"calls", p.calls}}).dump() << "\n";
         }
-    } else { std::fprintf(stderr, "usage: tierlm-chat-check prompt|reply|gemma4-prompt|gemma4-reply|inkling-prompt|inkling-reply < input.json\n"); return 1; }
+    } else if (mode == "qwen-prompt") {
+        for (const auto& c : in)
+            std::cout << qwen::prompt(tierlm_msgs::normalize_messages(nlohmann::json(c["messages"])), c.value("tools", nlohmann::ordered_json::array()),
+                                      c.value("think", 0), c.value("effort", std::string()), c.value("effort_lines", false)) << '\x01';
+    } else { std::fprintf(stderr, "usage: tierlm-chat-check prompt|reply|gemma4-prompt|gemma4-reply|inkling-prompt|inkling-reply|qwen-prompt < input.json\n"); return 1; }
     return 0;
 }

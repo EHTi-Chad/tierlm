@@ -48,6 +48,8 @@
 #include "agent.h"
 #include "harmony.h"
 #include "inkling.h"
+#include "qwen.h"
+#include "messages.h"
 #include "gemma4.h"
 #include "workspace.h"
 #include "chats.h"
@@ -812,6 +814,8 @@ struct Engine {
     // begins inside it. thinking: on or off for this model (saved with its settings; a request can choose too).
     // gpt-oss always reasons; effort sets how much ("low", "medium", "high").
     bool think_switch = false, think_starts = false, thinking = true;
+    // Qwen3.5 / 3.6 / 3.8: the conversation as their templates write it (qwen.h); qwen_effort: with Qwen3.8's effort lines
+    bool qwen_family = false, qwen_effort = false;
     std::string effort = "medium";
     std::string identity;                                // harmony models: the model identity line of their template
     std::vector<int32_t> cached;      // the tokens currently in the KV cache
@@ -1181,11 +1185,9 @@ fs::path vision_file_for(const std::string& model_path, int n_embd) {
 
 // ---- OpenAI-compatible API helpers ----
 
-// Images in a conversation. A message may carry "images" (data: URLs or plain base64 of PNG / JPEG / ...); in its
-// text, each image's place is kPictureMark (the page puts them before the text; the API where they were sent).
-// For Qwen3.5 / 3.6 the mark is what their chat template writes for an image; its <|image_pad|> token is replaced by
-// the image's words just before the model reads the prompt.
-const char* const kPictureMark = "<|vision_start|><|image_pad|><|vision_end|>";
+// (kPictureMark, an image's place in a message's text, and normalize_messages: messages.h)
+using tierlm_msgs::kPictureMark;
+using tierlm_msgs::normalize_messages;
 
 // Base64 (standard or URL-safe; whitespace and padding ignored) to bytes. Empty if it isn't base64.
 std::string base64_decode(const std::string& in) {
@@ -1248,68 +1250,6 @@ std::vector<std::string> take_pictures(json& messages) {
 }
 
 
-// OpenAI messages to plain {role, content} ones. Content may be a string, a list of parts
-// ([{"type": "text", "text": ...}], images are skipped: no vision yet) or null. "developer" is OpenAI's newer
-// name for "system". Tool calls ({"function": {"name", "arguments": "<json>"}}) are kept as {"name", "arguments": {...}},
-// and tool results as role "tool".
-json normalize_messages(const json& in) {
-    json out = json::array();
-    for (const auto& m : in) {
-        if (!m.is_object()) continue;
-        std::string role = m.value("role", std::string("user")), text;
-        const json c = m.contains("content") ? m["content"] : json();
-        json images = json::array();
-        if (c.is_string()) text = c.get<std::string>();
-        else if (c.is_array())
-            for (const auto& part : c) {
-                if (part.is_string()) { text += part.get<std::string>(); continue; }
-                if (!part.is_object()) continue;
-                const std::string type = part.value("type", std::string());
-                if (type == "text" || type == "input_text") text += part.value("text", std::string());
-                else if (type == "image_url" || type == "input_image" || type == "image") {
-                    // {"image_url": {"url": "data:..."}} (OpenAI chat), {"image_url": "data:..."} (OpenAI responses),
-                    // {"source": {"data": "...", "media_type": ...}} (Anthropic-style)
-                    std::string url;
-                    const json iu = part.contains("image_url") ? part["image_url"] : json();
-                    if (iu.is_object()) url = iu.value("url", std::string());
-                    else if (iu.is_string()) url = iu.get<std::string>();
-                    else if (part.contains("source") && part["source"].is_object()) url = part["source"].value("data", std::string());
-                    else if (part.contains("data") && part["data"].is_string()) url = part["data"].get<std::string>();
-                    if (url.empty()) continue;
-                    images.push_back(url);
-                    text += kPictureMark;                          // where the image goes
-                }
-            }
-        if (role == "developer") role = "system";
-        if (role == "function") role = "tool";
-        if (role != "system" && role != "user" && role != "assistant" && role != "tool") role = "user";
-        // Thinking sent back separately (reasoning_content) goes back where the model wrote it.
-        if (role == "assistant" && m.contains("reasoning_content") && m["reasoning_content"].is_string() &&
-            !m["reasoning_content"].get<std::string>().empty() && text.find("<think>") == std::string::npos)
-            text = "<think>\n" + m["reasoning_content"].get<std::string>() + "\n</think>\n\n" + text;
-        json o = {{"role", role}, {"content", text}};
-        if (!images.empty()) o["images"] = images;
-        if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
-            json calls = json::array();
-            for (const auto& tc : m["tool_calls"]) {
-                const json f = agent::tool_function(tc);
-                if (!f.is_object()) continue;
-                json args = f.contains("arguments") ? f["arguments"] : json::object();
-                json call = {{"name", f.value("name", std::string())}};
-                if (args.is_string()) {                            // as sent: keeps the order the model wrote them in
-                    call["arguments_json"] = args;
-                    json p = json::parse(args.get<std::string>(), nullptr, false);
-                    args = p.is_object() ? p : json::object();
-                }
-                call["arguments"] = args.is_object() ? args : json::object();
-                calls.push_back(call);
-            }
-            if (!calls.empty()) o["tool_calls"] = calls;
-        }
-        out.push_back(o);
-    }
-    return out;
-}
 
 // Standard base64 (for embeddings sent as "encoding_format": "base64": little-endian float32s).
 std::string base64_encode(const unsigned char* p, size_t n) {
@@ -1906,6 +1846,8 @@ int main(int argc, char** argv) {
         {
             const std::string& ct = eng.tok.chat_template();
             eng.think_switch = eng.chat == ChatFmt::ChatML && ct.find("enable_thinking") != std::string::npos;
+            eng.qwen_family = eng.chat == ChatFmt::ChatML && qwen::is_family(ct);
+            eng.qwen_effort = eng.qwen_family && qwen::has_effort(ct);
             // (its generation prompt ends with '<think>\\n' }}, as Qwen3.5 and later do, and Nemotron 3.5's
             // '<|im_start|>assistant\\n<think>\\n' }})
             eng.think_starts = eng.think_switch &&
@@ -2700,6 +2642,8 @@ int main(int argc, char** argv) {
         return on ? (eng.think_starts ? 1 : -1) : 0;
     };
     auto effort_now = [&]() { return tl_effort == 1 ? std::string("low") : tl_effort == 2 ? std::string("medium") : tl_effort == 3 ? std::string("high") : eng.effort; };
+    // Qwen3.8's reasoning effort for this request: low, medium, or its template's default (xhigh; "high" counts as it)
+    auto qwen_effort_now = [&]() { return tl_effort == 1 ? std::string("low") : tl_effort == 2 ? std::string("medium") : std::string("xhigh"); };
     // A request's own choice, in the forms apps send it: {"chat_template_kwargs": {"enable_thinking": false}} (vLLM,
     // llama.cpp), "enable_thinking", "think" (Ollama), "thinking" (tierlm's page); "reasoning_effort" for gpt-oss
     // ("none" or "minimal" turn thinking off for the others).
@@ -2711,7 +2655,7 @@ int main(int argc, char** argv) {
         if (body.contains("chat_template_kwargs")) flag(body["chat_template_kwargs"], "enable_thinking");
         if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string()) {
             const std::string e = body["reasoning_effort"].get<std::string>();
-            tl_effort = e == "low" ? 1 : e == "medium" ? 2 : e == "high" ? 3 : 0;
+            tl_effort = e == "low" ? 1 : e == "medium" ? 2 : e == "high" || e == "xhigh" || e == "max" ? 3 : 0;
             if (e == "none" || e == "minimal") tl_think = 0; else if (tl_think < 0 && !e.empty()) tl_think = 1;
         }
     };
@@ -2753,6 +2697,7 @@ int main(int argc, char** argv) {
         if (ink) pre.clear();                                        // (Inkling: the model opens its own blocks)
         const std::string prompt_text = harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
                                       : ink ? inkling::prompt(msgs, tools, think)
+                                      : eng.qwen_family ? qwen::prompt(msgs, tools, think, qwen_effort_now(), eng.qwen_effort)
                                              : format_chat(agent::with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok, think);
         // (Gemma 4 thinking after its tools' results: its template opened the thought channel, as for <think> above)
         if (eng.chat == ChatFmt::Gemma4 && prompt_text.size() >= gemma4::kThoughtOpen.size() &&
@@ -2761,6 +2706,12 @@ int main(int argc, char** argv) {
         // (TIERLM_SHOW_PROMPT=1: the prompt as the model reads it, in the window, between two lines of ====)
         static const bool show_prompt = std::getenv("TIERLM_SHOW_PROMPT") != nullptr;
         if (show_prompt) std::fprintf(stderr, "==== prompt\n%s\n==== end of prompt\n", prompt_text.c_str());
+        // (TIERLM_PROMPT_DIR=folder: each prompt, exactly, in a file of its own there: 1.txt, 2.txt, ... For the tests.)
+        static const char* const prompt_dir = std::getenv("TIERLM_PROMPT_DIR");
+        if (prompt_dir) {
+            static std::atomic<int> n{0};
+            std::ofstream(fs::u8path(prompt_dir) / (std::to_string(++n) + ".txt"), std::ios::binary) << prompt_text;
+        }
         std::vector<int32_t> toks = tok.encode(prompt_text, true);
         if (!pics.empty()) {                                      // each image's <|image_pad|> becomes its words
             const int32_t pad = tok.find("<|image_pad|>");
@@ -3276,6 +3227,7 @@ int main(int argc, char** argv) {
         try { pics = take_pictures(msgs); } catch (...) {}
         int n = (int)eng.tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
                                     : eng.chat == ChatFmt::Inkling ? inkling::prompt(msgs, tools, think_mode())
+                                    : eng.qwen_family ? qwen::prompt(msgs, tools, think_mode(), qwen_effort_now(), eng.qwen_effort)
                                          : format_chat(agent::with_tools(msgs, tools, eng.tool_fmt), eng.chat, eng.tok, think_mode()), true).size();
         for (const std::string& b : pics) {                        // each image: its words instead of one pad token
             int w = 0, h = 0;
