@@ -74,7 +74,10 @@ public:
     // takes: Model::check_width) when every one of the many pays. Both sides of "pays" are measured as replies go:
     // how often guesses of a given sureness are kept, and what a check costs per token. So where a token of a check
     // costs little (a model all in VRAM) sure stretches are guessed many at a time, and where it costs a lot (experts
-    // read from RAM) the count stays as set. Off: always n_draft guesses, as before.
+    // read from RAM) the count stays as set. Off (the default): always n_draft guesses. tierlm-server turns it on
+    // only when asked (TIERLM_DRAFT_ADAPT): measured, it gains nothing. A token more in a check costs about what a
+    // token costs anyway, guesses made beyond the few are thrown away when the many don't come together, and the
+    // first check after a change of size is laid out anew (3 ms, and it computes about 6 ms slower).
     void set_adaptive(bool on, int most = 8) { adapt_ = on; adapt_most_ = std::max(1, most); }
     bool adaptive() const { return adapt_; }
 

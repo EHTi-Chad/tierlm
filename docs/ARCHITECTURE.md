@@ -474,8 +474,17 @@ to make, the check is no longer built and placed every round. The reservation co
 guess, and the catching-up after a check, which beside a quantized cache goes two tokens at a time (the GPU's
 attention reads such a cache as it is for one or two tokens; for more it first makes f16 copies of all its keys and
 values: 518 MB of working memory for a 9-token step at 256K). A prompt step, the reply's one-token graph or a check
-of another size takes the scheduler from the check, which is then built and placed again: 3 to 13 ms, so checks come
-in two sizes only (see `Speculator::set_adaptive`).
+of another size takes the scheduler from the check, which is then built and placed again (about 3 ms for
+Flash-Next's 9,126 nodes; each size's graph is built in memory of its own, so its tensors come back where they were
+and the GPU's recording of it still fits).
+
+How many guesses per check: the set number. Deciding it at each check from how sure the draft block is
+(`Speculator::set_adaptive`, `TIERLM_DRAFT_ADAPT=N`: the set number, or N when the block is sure of them all) was
+built and measured in 0.9.4 and is off: on an RTX 5090 over the same six 400-token replies, Flash-Next at 256K wrote
+77.6 tok/s with 3 guesses, 77.1 with 3 or 6 and 76.0 with 3 or 8; Qwen3.8-27B Q6_K, all in VRAM, 80.3, 80.7 and 80.8.
+The draft block's sureness does tell which guesses are kept (90% or more: kept 93 to 96% of the time), but a token
+more in a check costs about what a token costs anyway (6 ms of RAM experts for Flash-Next against 9 to 10 ms a token
+overall), so the best depth is flat from 3 to 6 guesses and there is little for a cleverer choice to win.
 
 The draft block's experts also go into VRAM before the model's own (since 0.8.7; `TIERLM_MTP_VRAM=0` for the old
 placement by use): the draft block runs once per guess, so its experts in RAM cost a GPU-to-CPU round trip each time.
