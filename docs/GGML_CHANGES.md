@@ -164,9 +164,10 @@ No change to ggml: what its CUDA attention does with a q8_0 KV cache, measured w
 
 - One or two queries go to the vector kernel, which reads the quantized cache as it is. From three, the tensor-core
   kernel first makes f16 copies of the whole K and V it was handed (its working memory holds them: 518 MB for 256K
-  positions), and that copy is most of a small step's cost deep in a long cache: 0.82 ms a layer for 4 queries over
-  256K positions, where an f16 cache of 72K takes 0.17 against 0.28 for q8_0. So two queries can cost more than three
-  (1.79 ms against 0.80 at 256K), and a step that must stay small in memory is best kept to two.
+  positions), and that copy is most of a small step's cost deep in a long cache: 4 queries over 72K positions take
+  0.28 ms a layer beside q8_0 and 0.17 beside f16, and 0.82 ms over 256K of q8_0. The vector kernel slows with length
+  too, so two queries can cost more than three (1.79 ms against 0.80 at 256K); a step that must stay small in memory
+  is still best kept to two.
 - `ggml_flash_attn_ext_set_n_kv_max(op, n)` says no mask row has more than n finite entries; the kernel then gathers
   those columns (it needs the cache to be at least 4,096 positions and twice the gather). With a key/value sharing
   above 4, up to 4 queries each gather their own; more share one gather a tile of 8 queries (the union of what they
