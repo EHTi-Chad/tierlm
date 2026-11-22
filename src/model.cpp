@@ -3545,7 +3545,12 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             // Streamed (see setup_stream): the RAM experts are read from their VRAM slot, filled ahead on another queue
             // (stream_on_: this step is big enough for it, see stream_ready; that is a smaller size than the copy's)
             const bool streamed = stream_on_ && L.stream_turn >= 0;
-            const bool cold_gpu = streamed || n_tok >= std::max(offload_batch, cold_offload_min_);
+            // (Inkling 2's loop layers: not handed to the GPU. ggml keeps one GPU copy of a weight for the whole step,
+            // and the loop reads a layer's experts again two and three passes later, so every loop layer's RAM
+            // experts would be in VRAM at once: 7.9 GB of working memory on an 8 GB RTX 3070 Laptop, which could not
+            // be reserved. Layers outside the loop are read once and handed over as usual.)
+            const bool in_loop = hp.ink && hp.ink_loop_passes > 1 && L.index >= hp.ink_loop_lo && L.index < hp.ink_loop_hi;
+            const bool cold_gpu = streamed || (!in_loop && n_tok >= std::max(offload_batch, cold_offload_min_));
             ggml_tensor* gu_c = streamed ? L.gate_up_xs : L.gate_up_xc;
             ggml_tensor* g_c  = streamed ? L.gate_xs : L.gate_xc;
             ggml_tensor* u_c  = streamed ? L.up_xs : L.up_xc;
@@ -4976,6 +4981,7 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
 // TIERLM_STREAM=0: as before.
 void Model::setup_stream() {
     if (const char* e = std::getenv("TIERLM_STREAM"); e && !std::strcmp(e, "0")) return;
+    if (hp_.ink) return;                                            // (Inkling 2: its loop reads layers out of order; see ffn_block)
     if (gpus_.size() != 1 || main_ == cpu_) return;
     ggml_backend_dev_t dev = ggml_backend_get_device(gpus_[0]);
     if (std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) != 0) return;

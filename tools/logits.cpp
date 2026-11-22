@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "%s: %s, VRAM %.2f MiB, RAM %.2f MiB, KV %d/%d, attention %d/%d, ffn %d/%d layers in VRAM\n",
                          m->device_name().c_str(), p.mode.c_str(), p.gpu_weights / 1048576.0, p.cpu_weights / 1048576.0,
                          p.kv_gpu_layers, p.layers, p.attn_gpu, p.layers, p.ffn_gpu, p.layers);
+            std::fprintf(stderr, "working memory on the GPU: %.2f MiB\n", p.compute_gpu / 1048576.0);
             if (p.hot_experts > 0) {
                 int split = 0;
                 for (size_t l = 0; l < p.hot.size(); ++l) split += !p.hot[l].empty() && !p.ffn_vram[l];
