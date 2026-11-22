@@ -55,6 +55,7 @@ int main(int argc, char** argv) {
         if (const char* v = std::getenv("TIERLM_VRAM_MB")) o.vram_budget_mb = std::atoi(v);
         if (const char* v = std::getenv("TIERLM_SPLIT")) o.split_mode = v;
         if (const char* v = std::getenv("TIERLM_DEVICE")) o.device = v;      // e.g. cpu, CUDA0, Vulkan0
+        if (const char* v = std::getenv("TIERLM_BATCH")) o.batch = std::atoi(v);   // prompt tokens per step (tests: with TIERLM_BATCH_SPAN)
         o.mtp = mtp || mtp_step || (gen_spec && !std::getenv("TIERLM_DRAFT_SCRIPT"));
         o.max_ctx = std::max<int>(o.max_ctx, (int)ids.size() + n_gen + 16);
         if (par) { o.parallel = par + 1; o.max_ctx = std::max<int>(o.max_ctx, (int)ids.size() * par + 64); }
@@ -232,8 +233,8 @@ int main(int argc, char** argv) {
         } else if (mtp || mtp_step) {
             const int n = (int)ids.size(), E = m->hparams().hidden_width();
             std::vector<float> hid;
-            for (int off = 0; off < n; off += m->batch()) {
-                const int k = std::min(m->batch(), n - off);
+            for (int off = 0, k = 0; off < n; off += k) {
+                k = std::min(m->batch_at(off), n - off);
                 auto r = m->eval_ex(ids.data() + off, k, nt, 1, true, 1);
                 hid.insert(hid.end(), r.hidden.begin(), r.hidden.end());
             }

@@ -93,8 +93,9 @@ std::string mtp_companion(const std::string& model_path) {
 std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& opt) {
     LoadOptions o = opt;
     // (per context, batch, connections and placement kind: the hot-expert split needs more than whole layers)
-    // ("v2": 0.8.4 sizes the scratch to the card; a note from 0.8.3 held 640 MB of scratch on every card, so isn't read)
-    const std::string key = "v2 " + std::to_string(opt.max_ctx) + " " + std::to_string(opt.batch) + " " + std::to_string(opt.parallel) + " " +
+    // ("v2": 0.8.4 sizes the scratch to the card; a note from 0.8.3 held 640 MB of scratch on every card, so isn't read;
+    // "v3": 0.9.4 needs less at long contexts (batch_at), and a note only ever grows)
+    const std::string key = "v3 " + std::to_string(opt.max_ctx) + " " + std::to_string(opt.batch) + " " + std::to_string(opt.parallel) + " " +
                             opt.split_mode + (opt.expert_usage.empty() ? "" : "+hot") + (opt.live_hot ? "+live" : "") + " ";
     if (o.vram_reserve_mb <= 0 && !o.vram_note.empty()) {
         std::ifstream f(std::filesystem::u8path(o.vram_note));
@@ -2191,17 +2192,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // was copy-bound, 8,192's working memory pushed experts out of VRAM)
     if (opt.batch <= 0 && !m->stream_.layers.empty()) m->batch_ = std::min(4096, std::max(256, m->max_ctx_));
     if (m->swa_R_) m->batch_ = std::min(m->batch_, m->ring_extra_ * 4 / 5);   // (a step never writes more than the rings allow for)
-    const int n_res = std::min(m->batch_, m->max_ctx_);
-    m->qsa_long_ = m->qsa_gpu_ = !m->qsa_.empty() && m->max_ctx_ % m->qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
-    m->stream_on_ = m->stream_ready(n_res);
-    if (std::getenv("TIERLM_STREAM_DEBUG")) std::fprintf(stderr, "stream: building the worst graph (streamed: %d)\n", (int)m->stream_on_);
-    Graph worst = m->hp_.dsv4 ? m->build_dsv4(n_res, m->max_ctx_ - n_res, true, 1, false, nullptr) : m->build(n_res, m->max_ctx_, true);
-    m->qsa_long_ = m->qsa_gpu_ = m->stream_on_ = false;
-    if (std::getenv("TIERLM_STREAM_DEBUG")) std::fprintf(stderr, "stream: worst graph built\n");
-    m->pin_cpu_layers(worst);
-    bool ok = ggml_backend_sched_reserve(m->sched_, worst.gf);
-    ggml_free(worst.ctx);
-    if (!ok) throw std::runtime_error("failed to reserve compute memory");
+    if (const char* e = std::getenv("TIERLM_BATCH_SPAN")) m->batch_span_ = std::max(0, std::atoi(e));
+    if (m->hp_.dsv4) m->batch_span_ = 0;                             // (DeepSeek V4's attention has its own memory pattern)
+    if (!m->reserve_worst()) throw std::runtime_error("failed to reserve compute memory");
+    if (std::getenv("TIERLM_MEM_PROBE")) m->reserve_worst(true);
     if (!m->gpus_.empty()) m->place_.compute_gpu = ggml_backend_sched_get_buffer_size(m->sched_, m->gpus_[0]) + m->stream_.bytes;
     if (std::getenv("TIERLM_PROFILE") && !m->gpus_.empty())
         std::fprintf(stderr, "profile: working memory for the largest batch: %.0f MB of VRAM\n", m->place_.compute_gpu / 1048576.0);
@@ -4774,17 +4768,75 @@ void Model::stream_send(int turn) {
     ggml_backend_event_record(stream_.ev[turn % 2], stream_.copy);
 }
 
-// Long prompts are processed in batches of batch_ tokens, which bounds the memory a single graph needs.
+// Reserves compute memory once, for the largest steps there will ever be, so it is not planned again on every token:
+// a full batch at the end of the longest span it is read over and, in a longer context, the last (smaller) batch at
+// the context's end. The memory goes with tokens + tokens x span + span, so between those two it is never more.
+// probe (TIERLM_MEM_PROBE=1, developers): prints what steps of other sizes would need, without reserving them.
+bool Model::reserve_worst(bool probe) {
+    const int n_res = std::min(batch_, max_ctx_);
+    std::vector<std::pair<int, int>> steps;                        // (tokens, where the cache ends)
+    if (probe) {
+        for (int end : {16384, 65536, 131072, 262144})
+            for (int n : {256, 1024, 2048, 4096, 8192})
+                if (end <= max_ctx_ && n <= end) steps.push_back({n, end});
+    } else if (hp_.dsv4 || batch_span_ <= 0 || max_ctx_ <= batch_span_) {
+        steps.push_back({n_res, max_ctx_});
+    } else {
+        steps.push_back({n_res, std::max(n_res, batch_span_)});
+        int b = 256;
+        while (b + 256 <= batch_ && (int64_t)(b + 256) * max_ctx_ <= (int64_t)batch_ * batch_span_) b += 256;
+        steps.push_back({std::min(b, max_ctx_), max_ctx_});
+    }
+    static const bool dbg = std::getenv("TIERLM_STREAM_DEBUG") != nullptr;
+    bool ok = true;
+    for (auto [n, end] : steps) {
+        qsa_long_ = qsa_gpu_ = !qsa_.empty() && kv_span(end) % qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
+        stream_on_ = stream_ready(n);
+        if (dbg) std::fprintf(stderr, "stream: building the graph of %d tokens ending at %d (streamed: %d)\n", n, end, (int)stream_on_);
+        Graph g = hp_.dsv4 ? build_dsv4(n, end - n, true, 1, false, nullptr) : build(n, end, true);
+        qsa_long_ = qsa_gpu_ = stream_on_ = false;
+        if (!probe) {
+            pin_cpu_layers(g);
+            ok = ggml_backend_sched_reserve(sched_, g.gf) && ok;
+        } else {
+            std::vector<ggml_backend_t> bs;
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched_); ++i) bs.push_back(ggml_backend_sched_get_backend(sched_, i));
+            ggml_backend_sched* sc = ggml_backend_sched_new(bs.data(), nullptr, (int)bs.size(), graph_size_, false, true);
+            if (sc) {
+                pin_cpu_layers(g, sc);
+                const bool fits = ggml_backend_sched_reserve(sc, g.gf);
+                std::fprintf(stderr, "probe: %5d tokens ending at %6d: %s", n, end, fits ? "" : "(doesn't fit) ");
+                for (ggml_backend_t b : bs) std::fprintf(stderr, " %s %.0f MB;", ggml_backend_name(b), ggml_backend_sched_get_buffer_size(sc, b) / 1048576.0);
+                std::fprintf(stderr, "\n");
+                ggml_backend_sched_free(sc);
+            }
+        }
+        ggml_free(g.ctx);
+    }
+    return ok;
+}
+
+int Model::batch_at(int n_past) const {
+    if (batch_span_ <= 0 || batch_ <= 256) return batch_;
+    const int64_t most = (int64_t)batch_ * batch_span_;            // tokens x span of the largest step
+    int b = batch_;
+    // (the span a step of b tokens ends at: found from the top, in whole 256s)
+    while (b > 256 && (int64_t)b * kv_span(std::min(max_ctx_, n_past + b)) > most) b -= 256;
+    return std::max(256, b);
+}
+
+// Long prompts are processed in batches of up to batch_ tokens (batch_at), which bounds the memory a single graph needs.
 std::vector<float> Model::eval(const std::vector<int32_t>& ids, int n_threads, std::vector<int32_t>* routing) {
     if (ids.empty()) return {};
     if (n_past_ + (int)ids.size() > max_ctx_) throw std::runtime_error("context full (" + std::to_string(max_ctx_) + " tokens)");
     if (routing) routing->clear();
     std::vector<float> lg;
     std::vector<int32_t> part;
-    for (size_t off = 0; off < ids.size(); off += (size_t)batch_) {
-        const size_t n = std::min<size_t>((size_t)batch_, ids.size() - off);
+    for (size_t off = 0; off < ids.size(); ) {
+        const size_t n = std::min<size_t>((size_t)batch_at(n_past_), ids.size() - off);
         lg = eval_batch(ids.data() + off, (int)n, n_threads, routing ? &part : nullptr);
         if (routing) routing->insert(routing->end(), part.begin(), part.end());
+        off += n;
     }
     return lg;
 }
@@ -5015,17 +5067,9 @@ void Model::resize_ctx(int new_ctx) {
     max_ctx_ = new_ctx;
     free_lo_ = std::min(free_lo_, max_ctx_);
     // 5. compute memory for the largest graph at the new size
-    const int n_res = std::min(batch_, max_ctx_);
-    qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
-    stream_on_ = stream_ready(n_res);
-    Graph worst = hp_.dsv4 ? build_dsv4(n_res, max_ctx_ - n_res, true, 1, false, nullptr) : build(n_res, max_ctx_, true);
-    qsa_long_ = qsa_gpu_ = stream_on_ = false;
-    pin_cpu_layers(worst);
     drop_reuse();
     ggml_backend_sched_reset(sched_);
-    const bool ok = ggml_backend_sched_reserve(sched_, worst.gf);
-    ggml_free(worst.ctx);
-    if (!ok) throw std::runtime_error("failed to reserve compute memory for the new context");
+    if (!reserve_worst()) throw std::runtime_error("failed to reserve compute memory for the new context");
     qsa_upload();                                                 // (the new cache starts empty)
 }
 
@@ -5100,10 +5144,11 @@ std::vector<std::vector<float>> Model::eval_seqs(const std::vector<SeqInput>& in
         std::vector<int32_t> ids;
         std::vector<SeqGroup> groups;
         std::vector<int> which;
-        for (size_t i = 0; i < in.size() && (int)ids.size() < batch_; ++i) {
+        const int most = batch_at(cells_end());                    // (fewer at a time when the cache is long)
+        for (size_t i = 0; i < in.size() && (int)ids.size() < most; ++i) {
             const size_t left = in[i].ids.size() - done[i];
             if (!left) continue;
-            const int n = (int)std::min<size_t>(left, (size_t)(batch_ - (int)ids.size()));
+            const int n = (int)std::min<size_t>(left, (size_t)(most - (int)ids.size()));
             ids.insert(ids.end(), in[i].ids.begin() + done[i], in[i].ids.begin() + done[i] + n);
             groups.push_back({in[i].seq, n});
             which.push_back((int)i);

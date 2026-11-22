@@ -192,4 +192,22 @@ if __name__ == "__main__":
             ok &= same
             print(f"{name:12s} {label:7s}: greedy output with speculation {'identical' if same else 'DIFFERENT'}  ->  {'ok' if same else 'FAIL'}")
         os.remove(path)
+    # Long prompts far into a long context are read fewer tokens at a time (Model::batch_at: the step's tokens x the
+    # cache span stay within what was planned for). However a prompt is cut into steps, the result is the same.
+    cfg, m = build(dict(indexer_budget=16, max_position_embeddings=4096), 77)
+    path, _ = write(cfg, m)
+    ids = [int(x) for x in np.random.default_rng(9).integers(2, V, 1500)]
+    want = ref_logits(m, ids)
+    worst = 0.0
+    for env in ({"TIERLM_BATCH": "2048", "TIERLM_BATCH_SPAN": "0"}, {"TIERLM_BATCH": "1024", "TIERLM_BATCH_SPAN": "256"},
+                {"TIERLM_BATCH": "512", "TIERLM_BATCH_SPAN": "512"}, {}):
+        r = subprocess.run([exe, path, *map(str, ids)], capture_output=True, text=True,
+                           env={**os.environ, "TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu", **env})
+        if r.returncode != 0: sys.exit(f"batch steps: tierlm-logits failed: {r.stderr.strip()[-800:]}")
+        got = np.array([float(v) for v in r.stdout.split()])
+        worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
+    passed = worst < 1e-4
+    ok &= passed
+    print(f"a 1,500-token prompt in steps of different sizes: worst relative diff {worst:.1e} (limit 1e-04)  ->  {'ok' if passed else 'FAIL'}")
+    os.remove(path)
     sys.exit(0 if ok else 1)

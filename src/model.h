@@ -411,6 +411,13 @@ public:
     bool flash_attn() const { return flash_attn_; }
     const char* kv_type() const;      // "f16", "f32", "q8_0", "q5_0" or "q4_0"
     int batch() const { return batch_; }
+    // The most prompt tokens to read in one step that starts at position n_past. Attention's working memory goes
+    // with (tokens in the step) x (the cache span they attend over): the mask alone is 2 bytes for each pair, 2.1 GB
+    // for 4,096 tokens at 262,144. Kept free on the GPU for the worst step, that memory held no weights: Flash-Next
+    // on an RTX 5090 had 5,786 experts in VRAM at a 256K context against 8,930 at 64K, and replies checked their
+    // guesses in 105 ms instead of 44 whatever the conversation's real length. So past batch_span_ positions (65,536)
+    // a step takes fewer tokens, the product staying the same: the worst step is then the same at any context length.
+    int batch_at(int n_past) const;
     int experts_default() const { return n_expert_used_file_; }   // active experts the model was trained with
 
     // ---- several conversations at once ----
@@ -768,6 +775,7 @@ private:
     bool flash_attn_ = true, kv_f32_ = false;
     int kv_t_ = 1;                               // ggml_type of the KV cache (GGML_TYPE_F16)
     int batch_ = 256, n_expert_used_file_ = 0;
+    int batch_span_ = 65536;                     // (batch_at: TIERLM_BATCH_SPAN, 0: batches never shrink)
     int cold_offload_min_ = 32;                  // (see load: when the GPU takes over the RAM experts' work in a batch)
     // Streamed prompt batches (see setup_stream): the split layers' RAM experts are copied into two VRAM slots on a
     // second GPU queue, the next layer's while this one computes, instead of by the scheduler before each layer.
@@ -786,6 +794,7 @@ private:
     bool stream_on_ = false;                     // this batch is streamed (built with the slots)
     void setup_stream();
     bool stream_ready(int n_tok) const;          // a batch this big is streamed
+    bool reserve_worst(bool probe = false);      // compute memory for the largest steps (see batch_at)
     void stream_send(int turn);                  // copy that turn's layer into its slot (on the second queue), then mark it
 };
 using OlmoeModel = Model;

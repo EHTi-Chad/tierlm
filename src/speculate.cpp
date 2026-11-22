@@ -25,20 +25,21 @@ std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_th
     if (s >= end) { m_.truncate(end - 1); s = m_.n_past(); }   // always evaluate at least one token
 
     std::vector<float> H, lg;                         // hidden states of positions [s, end)
-    for (int off = s; off < end; off += m_.batch()) {
-        const int k = std::min(m_.batch(), end - off);
+    for (int off = s; off < end; ) {
+        const int k = std::min(m_.batch_at(off), end - off);       // (fewer at a time far into a long context)
         std::vector<int32_t> part;
         Model::EvalOut r = m_.eval_ex(toks.data() + off, k, n_threads, 1, true, 1, routing ? &part : nullptr);
         if (routing) routing->insert(routing->end(), part.begin(), part.end());
         H.insert(H.end(), r.hidden.begin(), r.hidden.end());
         lg = std::move(r.logits);
+        off += k;
     }
     if (m_.has_mtp()) {
         const int c0 = c;                             // positions [c, end) need (re)doing in the draft block; the
                                                       // hidden state for c - 1 is in H (s <= c - 1) or kept (h_pos_)
         std::vector<float> hrows;
-        for (int p0 = c0; p0 < end; p0 += m_.batch()) {
-            const int k = std::min(m_.batch(), end - p0);
+        for (int p0 = c0, k = 0; p0 < end; p0 += k) {
+            k = std::min(m_.batch_at(p0), end - p0);
             hrows.assign((size_t)k * E, 0.0f);
             for (int i = 0; i < k; ++i) {
                 const int q = p0 + i - 1;             // the hidden state paired with token p0 + i
