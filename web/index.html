@@ -677,7 +677,7 @@ window.FIT = (() => {
         <span class="caption" id="patherr"></span>
       </div>
       <div class="choices" id="modellist"></div>
-      <div class="caption" style="margin-top:8px">tierlm reads models in the <b>.gguf</b> format, the same files LM Studio and other local apps use.</div>
+      <div class="caption" style="margin-top:8px">tierlm reads models in the <b>.gguf</b> format, the same files LM Studio and other local apps use. <span id="addons"></span></div>
     </div>
   </section>
 
@@ -2454,7 +2454,11 @@ function renderSetup() {
       <a href="#" id="rescan">Rescan</a>. Start with <a href="https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF/tree/main" target="_blank" rel="noopener">OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf</a> (4.2 GB).</div>`;
     $("rescan").onclick = e => { e.preventDefault(); loadSetup(); };
   }
-  for (const m of [...models].sort((a, b) => (b.supported - a.supported) || a.id.localeCompare(b.id))) {
+  // Vision (mmproj) and draft (MTP) files aren't models to choose: they load with their model by themselves, so they
+  // are only counted, under the list
+  const addOn = m => !m.supported && (m.kind === "mmproj" || m.kind === "draft");
+  const nVision = models.filter(m => addOn(m) && m.kind === "mmproj").length, nDraft = models.filter(m => addOn(m) && m.kind === "draft").length;
+  for (const m of [...models].filter(m => !addOn(m)).sort((a, b) => (b.supported - a.supported) || a.id.localeCompare(b.id))) {
     const lab = document.createElement("label");
     lab.className = "choice" + (selModel && m.id === selModel.id ? " sel" : "") + (m.supported ? "" : " off");
     lab.innerHTML = `<input type="radio" name="model"><div class="t"></div><div class="d"></div><div class="tags"></div>`;
@@ -2484,6 +2488,10 @@ function renderSetup() {
     if (m.supported) lab.onclick = e => { e.preventDefault(); if (selModel && selModel.id === m.id) return; selModel = m; applySaved(); renderSetup(); };
     ml.appendChild(lab);
   }
+  $("addons").textContent = nVision + nDraft === 0 ? "" :
+    "Also in this folder, not listed: " + [nVision ? nVision + " vision file" + (nVision > 1 ? "s" : "") + " (mmproj)" : "",
+                                           nDraft ? nDraft + " draft file" + (nDraft > 1 ? "s" : "") + " (MTP)" : ""].filter(Boolean).join(" and ") +
+    (nVision + nDraft === 1 ? ", which loads with its model by itself." : ", which load with their models by themselves.");
   // summary
   if (!selModel) {
     $("rec").textContent = models.length ? "None of the models in this folder are supported yet. This version of tierlm doesn't run their kind of model yet." : "";
