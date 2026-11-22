@@ -817,6 +817,64 @@ FP4 tensor cores (built for `120a`, which ggml's build picks for `120`). It is w
 32K prompt with 8-bit activations instead (`GGML_CUDA_MMQ_PREC=q8`) read at 2,057 tok/s against 2,125, because copying
 the RAM experts is what limits it.
 
+## Flash-Next deep in a long conversation (0.9.4)
+
+Qwen3.8 Flash-Next UD-IQ3_XXS on the RTX 5090 + Ryzen 9 9950X3D (64 GB DDR5-6000, Windows 11), 256K context, KV cache
+q8_0, 3 guesses a check. Past the attention budget three things cost a step more the longer the conversation was.
+
+**Every block's key, every step.** The indexer's masks are made on the GPU from the blocks' keys (the mean of a
+block's four raw keys, normed and rotated). The graph made all of them at each step: at 72K tokens, 18,000 blocks in
+each of the 12 indexed layers. A block's key is final once its last token is in, so it is now kept, in the row of the
+layer's raw keys that held its last token's (nothing reads that raw key again; a conversation cut back into the block
+reads the token again, which writes it anew). A step makes the keys of the blocks its own tokens are in, from four rows
+each, and the rest are read every fourth row. After a step that didn't go this way (within the budget, an image,
+several conversations) or a restore, the rows are sent again from the host's copy (`Model::qsa_upload_blocks`).
+
+**The whole cache behind a mask.** A query past the budget sees 2,048 positions and its own unfinished block. ggml's
+attention can be told that (`ggml_flash_attn_ext_set_n_kv_max`) and then gathers those keys and values instead of
+going through the cache. Whether that is faster depends on the step's size: up to 4 queries each gather their own;
+more share one gather a tile of 8 queries, which loses to the mask until there are several tiles. `tierlm-attn-check`
+measures it (a cache of the model's shape with masks like the indexer's; ms per layer, told / behind the mask):
+
+| Step, tokens | 1 | 2 | 4 | 7 | 9 | 24 | 64 | 256 | 2,048 |
+|---|---|---|---|---|---|---|---|---|---|
+| 72K positions, q8_0 | 0.24 / 0.24 | 0.38 / 0.37 | 0.28 / 0.30 | 0.53 / 0.34 | 0.55 / 0.41 | 0.55 / 0.58 | 0.90 / 1.22 | 2.22 / 4.42 | 16.2 / 33.0 |
+| 256K positions, q8_0 | 0.88 / 0.88 | 1.79 / 1.80 | 0.82 / 0.98 | 1.60 / 1.10 | 1.65 / 1.29 | 1.60 / 1.86 | 2.50 / 4.06 | 6.95 / 17.2 | 49.7 / 117.8 |
+| 72K positions, f16 | 0.09 / 0.15 | 0.10 / 0.16 | 0.17 / 0.19 | 0.26 / 0.24 | 0.29 / 0.28 | 0.35 / 0.46 | 0.69 / 1.11 | 2.10 / 4.39 | 16.1 / 32.8 |
+
+So tierlm tells it for steps of up to 4 tokens and from 24 (`TIERLM_QSA_SPARSE=1`: always, `=0`: never). (One and two
+tokens beside a quantized cache go to ggml's vector kernel either way, which reads the cache as it is; from three, the
+kernel first turns the whole cache into f16, which is most of what a small step costs at these depths.) The same tool
+checks the result: the GPU's attention works in half precision, so told or masked it is parts in ten thousand of the
+largest value from the exact result, which a lost position among 2,048 would not exceed. So every other head's query
+is made to pick out the last position it sees while pointing as hard at one only its neighbour in the step sees: a
+gather cut short, or a mask not applied query by query, then shows as an error the size of the result
+(`TIERLM_ATTN_CHECK_BREAK=1` shows that it does).
+
+**Ten plain ops for each stream mixer.** Flash-Next's residual stream is four copies of the width. Reading it for a
+block (the mean over the copies of sigmoid(gate) x copy) was a sigmoid, a product, three sums and a scale; writing a
+block's output back (copy + output x that copy's weight) a copy, a repeat, a product and a sum. ggml has one op for
+each (`ggml_dsv4_hc_pre_gated`, `ggml_dsv4_hc_post`; CPU, CUDA, Vulkan), and the per-layer embedding's four
+convolution taps, each copied and cast every step, are now turned once. That is 22 GPU kernels a layer fewer (a
+4-token check was 9,126 graph nodes), with results bit for bit the same on the CPU. It shows how little the kernel
+count matters once CUDA replays recorded graphs: a check's computing takes 38.1 ms instead of 38.6, a 24,258-token
+prompt 10.75 s instead of 10.83.
+
+Together, after a 72,074-token prompt: read at 2,019 tok/s (1,896 with the mask), then 200 tokens of code at 66.8
+tok/s (59.6 with every key made each step and the gather at every size).
+
+**What a check costs, and why more guesses don't pay.** `TIERLM_SPEC_TRACE` now gives each check's parts. A 4-token
+check (3 guesses) in a fresh conversation: 35.8 ms, of which computing 31.4, reading the results 2.8, setting inputs
+0.6. Each further token adds 5 to 8 ms, mostly the experts read from RAM (about 120 of a token's 480 picks at 75% in
+VRAM, 2.09 MiB each, at the 42 GB/s the CPU gets through them). A reply's tokens cost 9 to 13 ms each overall, so a
+guess beyond the third wins little even when it is kept, and what decides a reply's speed is the share of its picks
+that VRAM holds: the same six replies ran at 77 tok/s on one start and at 69 on another, after a session of tool calls
+and pictures had changed which experts VRAM started with. A check of
+another size than the last is built and placed again (3.2 ms), and the first few-token check after a wide one also
+computes about 6 ms slower. `TIERLM_PLAN_DIFF=1` shows the graph is the same to the GPU when it comes back (the same
+tensors at the same places), bar now and then one 512-byte-a-token tensor that is there or not, which moves the
+others.
+
 ## Several conversations at once
 
 With `LoadOptions::parallel` > 1 the model holds several conversations and `eval_seqs` advances any of them in one

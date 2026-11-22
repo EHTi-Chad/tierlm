@@ -17,23 +17,26 @@ serves your other apps, also with no page or browser at all: start it from the c
 ### In development for 0.9.4: Qwen3.8 Flash-Next as a coding agent's model
 
 Measured with the pi coding agent (1.6.0) working through a 15-task session against tierlm's OpenAI API (9 short
-questions it mostly checks with Python, 3 pictures to read, 3 small programs to trace, fix and run; thinking off; 39
+questions it mostly checks with Python, 3 pictures to read, 3 small programs to trace, fix and run; thinking off; 37
 to 47 turns, the model's own choice each time): RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, NVMe, Windows 11;
 Qwen3.8 Flash-Next UD-IQ3_XXS (77.9 GiB) with its MTP draft file and its vision file, **256K context**, KV cache
 q8_0, 8 threads, VRAM experts following the conversation, 3 guesses.
 
-| The same 15 tasks | the day's first build (it has the first two items below, and long contexts' VRAM experts) | **now** |
+| The same 15 tasks | the day's first build (it has the first two items below, and long contexts' VRAM experts) | **now** (two sessions) |
 |---|---|---|
-| Replies, all of them together | 49.7 tok/s (6,753 tokens) | **78.4 tok/s** (5,407 tokens) |
-| Replies after the first picture | 43.8 tok/s | **78.1 tok/s** |
-| New prompt tokens (tool results, pictures) read | 9,754 in 27.6 s | 8,629 in **20.8 s** |
-| The agent's own time for the session | 129 s for 14 tasks, and two reminders for the last | **90 s**, all 15, no reminder |
+| Replies, all of them together | 49.7 tok/s (6,753 tokens) | **78.3 and 79.8 tok/s** (6,283 and 6,297 tokens) |
+| Replies after the first picture | 43.8 tok/s | **77.7 tok/s** |
+| New prompt tokens (tool results, pictures) read | 9,754 in 27.6 s | 9,002 in **21.2 s**, 8,415 in **19.3 s** |
+| The agent's own time for the session | 129 s for 14 tasks, and two reminders for the last | **86 to 109 s** (four sessions), all 15 answered, no reminder |
+
+What the model answers is its own: in those four sessions 13 or 14 of the 15 were right (a picture misread, or a sum
+submitted without checking it first).
 
 - **Flash-Next reads images.** Its vision file (`mmproj-...`, the encoder Qwen3.5 / 3.6 use) now loads with it. The
   per-layer n-grams read an image's places as its image token and the image's 3-part positions reach the sparse
   attention's indexer; both checked against Hugging Face's Qwen4Exp code (`tests/tiny_flashnext_vision.py`: one image
   and two, fed whole, a token at a time and cut in the middle, also past the indexer's budget). An 800 x 600
-  screenshot (475 image words) is read in 0.14 to 0.22 s on the RTX 5090.
+  screenshot (475 image words) is read in 0.11 to 0.22 s on the RTX 5090.
 - **Qwen3.5 / 3.6 / 3.8 conversations exactly as their chat templates write them.** A new module builds these
   models' prompts and is checked character for character against the templates in the GGUF files (240 prompts:
   system messages, tools, tool calls with every kind of argument, several calls at once, thinking on and off and at
@@ -48,32 +51,44 @@ q8_0, 8 threads, VRAM experts following the conversation, 3 guesses.
 - **Long contexts keep their VRAM experts.** Attention's working memory goes with a step's tokens times the cache
   it attends over, and it was kept free on the GPU for a full batch at the context's very end, whatever the
   conversation's length: at 256K that left about 5,700 experts in VRAM against 8,930 at 64K. Past 65,536 positions a prompt
-  step now takes fewer tokens, so the memory is the same at any context length: **7,560 experts in VRAM at 256K**.
+  step now takes fewer tokens, so the memory is the same at any context length: **about 7,600 experts in VRAM at 256K**.
 - **Checking guesses needs no working memory of its own.** The check's graph stays placed on the model's own working
-  memory (695 MB of VRAM back at 64K: 9,470 experts in VRAM instead of 8,930; at 256K, where no second memory fit,
-  the check is no longer laid out again every time), and the draft block's catching-up goes two tokens at a time
-  beside a quantized cache, where a wider step made the GPU copy the whole cache as f16 first.
-- **The set number of guesses, or many when every one of them pays.** The draft block says how sure it is of each
-  guess, and that tells well whether the model keeps it (guesses it gave 90% or more: kept 93 to 96% of the time; at
-  50 to 60%: about 45%). When the chance that 8 guesses in a row are kept, times the reply's speed, beats what the
-  extra tokens cost the check, the check takes 8; else the number that was set. What a token of a check costs and how
-  far the block's sureness can be trusted are measured as replies go. In the agent's session a third of the checks
-  took 8. `TIERLM_DRAFT_ADAPT=0`: always the set number.
-- **Past its attention budget, Flash-Next's attention gathers what a query sees.** Past 2,048 tokens each query
-  attends to the 512 blocks its indexer picked and to its own unfinished block; the GPU was given the whole cache with
-  the rest masked out. ggml's attention can be told that bound and then gathers only those keys and values: a
-  72,074-token prompt is read at 2,010 tok/s instead of 1,896, and a check of 3 tokens at that depth takes 55.7 ms
-  instead of 62.8. `TIERLM_QSA_SPARSE=0`: as before.
+  memory (at 64K: about 9,300 experts in VRAM instead of 8,930; at 256K, where no second memory fit, the check is no
+  longer laid out again every time), and the draft block's catching-up goes two tokens at a time beside a quantized
+  cache, where a wider step made the GPU copy the whole cache as f16 first.
+- **Deep in a long conversation, replies no longer slow down as much.** Past its attention budget (2,048 tokens) each
+  query of Flash-Next attends to the 512 four-token blocks its indexer picked and to its own unfinished block. Three
+  things there: every step made every block's key again (18,000 blocks a layer at 72K tokens, 12 layers), where a
+  block's key is final once its last token is in, so a step now makes only the keys of the blocks it touches; the GPU
+  was given the whole cache with the rest masked out, where ggml's attention can be told how much a query sees and
+  gather just that (now for steps of up to 4 tokens and from 24, the sizes where tierlm's new check measures it
+  faster: a 2,048-token step over 72K positions takes 16.2 ms a layer instead of 33.0); and the stream mixers below.
+  After a 72,074-token prompt (read at 2,019 tok/s; 1,896 before), 200 tokens of code are written at **66.8 tok/s**
+  (59.6 with every block's key made at each step and the gather at every size). `TIERLM_QSA_SPARSE=0`: the mask, as
+  before.
 - **Streamed prompt batches from 256 tokens** instead of 512: with the RAM experts streamed through VRAM their pass
   costs about a second whatever the batch, and the CPU passes that at about 256 new tokens (a 290-token tool result:
   1.16 s on the CPU, a 560-token one: 1.04 s streamed).
+- **Flash-Next's stream mixers in one GPU op each.** Reading the four copies of its residual stream for a block and
+  writing a block's output back were ten plain ops; ggml has an op for each. About a thousand fewer GPU kernels a
+  step, the same numbers bit for bit, and little to show for it: replies the same within what runs vary by, a
+  24,258-token prompt read in 10.75 s instead of 10.83.
+- **How many guesses a check should hold: measured, and left at the set number.** The draft block says how sure it
+  is of each guess, and that does tell whether the model keeps it (guesses it gave 90% or more: kept 93 to 96% of the
+  time; at 50 to 60%: about 45%). Taking 6 or 8 guesses when it is sure of them all was built and measured against
+  always 3 over the same six 400-token replies: Flash-Next 77.6 tok/s with 3, 77.1 with 3 or 6, 76.0 with 3 or 8;
+  Qwen3.8-27B Q6_K, all in VRAM, 80.3, 80.7 and 80.8. A token more in a check costs about what a token costs anyway.
+  It stays in as an experiment (`TIERLM_DRAFT_ADAPT=N`), off. Always 4 or 5 guesses are slower than 3 as well (the
+  same replies after a tool session: 71.1, 69.6 and 65.2 tok/s).
 - **Fixed: the image reader's GPU helper kept its working memory after an image**, which pushed a long prompt's
   working memory out of VRAM (a 35K-token prompt read at 256 to 805 tok/s after an image, 1,430 to 2,135 before).
   It is now given back after each image.
-- For developers: `TIERLM_SPEC_TRACE=file` (a line per check: guesses, kept, times, how sure the draft block was),
-  `TIERLM_ROUTE_DUMP=file` (every step's expert picks), `TIERLM_MEM_PROBE=1` (what steps of each size need on the
-  GPU), `tierlm-attn-check` (ggml's sparse attention against the masked one on this build's GPU), `tierlm-logits`
-  takes `@file` for a long prompt.
+- For developers: `tierlm-attn-check` (ggml's attention told how much a query sees, and behind the mask, against the
+  exact result on this build's GPU, with a query in every other head that a wrong gather would get wrong by its own
+  size; and what each takes), `TIERLM_SPEC_TRACE=file` (a line per check: guesses, kept, how sure the draft block was,
+  and where the check's time went), `TIERLM_PLAN_DIFF=1` (is a check's graph, laid out again, the graph the GPU
+  recorded), `TIERLM_ROUTE_DUMP=file` (every step's expert picks), `TIERLM_MEM_PROBE=1` (what steps of each size need
+  on the GPU), `tierlm-logits` takes `@file` for a long prompt.
 
 ### New in 0.9.3: much less context memory for Gemma and gpt-oss, guessing ahead with several connections, a log for problem reports
 
