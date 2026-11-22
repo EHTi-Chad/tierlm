@@ -474,7 +474,10 @@ private:
         ggml_tensor *out_idx = nullptr;          // several conversations: the tokens whose logits are wanted
         ggml_tensor *ngram = nullptr;            // Flash-Next: each token's n-gram rows in the PLE table [heads * n_tok]
         std::vector<std::pair<int, ggml_tensor*>> qsa_k;   // QSA: per indexed layer, this batch's indexer keys
-        ggml_tensor *qsa_bpos = nullptr, *qsa_nb = nullptr;   // QSA on the GPU: each block's first position; each token's complete blocks
+        // QSA on the GPU: the blocks a step touches (their tokens' rows of raw keys, the row each one's key is kept
+        // in, their first tokens' positions); each token's complete blocks; the blocks the mask covers
+        ggml_tensor *qsa_crow = nullptr, *qsa_clast = nullptr, *qsa_cpos = nullptr, *qsa_nb = nullptr;
+        int64_t qsa_nbt = 0;
         int n_tok = 0;
         // Per layer (DeltaNet layers only): for dropping the last d tokens, rollback[layer][d] = {memory, conv inputs}
         std::map<int, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> rollback;
@@ -559,7 +562,9 @@ private:
         ggml_tensor *ple_norm_conv = nullptr, *ple_conv = nullptr;
         std::vector<ggml_tensor*> ple_states;
         ggml_tensor *idx_q = nullptr, *idx_k = nullptr, *idx_q_norm = nullptr, *idx_k_norm = nullptr;   // QSA indexer
-        ggml_tensor *qsa_kc = nullptr;           // QSA: every position's raw indexer key, by cache cell [qsa_dim, ctx] f16
+        // QSA: every position's raw indexer key, by cache cell [qsa_dim, ctx] f16; a whole block's last row holds the
+        // block's key instead (see qsa_mask_gpu)
+        ggml_tensor *qsa_kc = nullptr;
         ggml_tensor *attn_post_norm = nullptr, *ffn_post_norm = nullptr;   // Gemma: norms on the blocks' outputs
         ggml_tensor *ffn_pre_norm2 = nullptr, *ffn_post_norm1 = nullptr, *ffn_post_norm2 = nullptr;   // Gemma 4 MoE: the two paths' norms
         ggml_tensor *router_scale = nullptr, *exp_scale = nullptr;   // Gemma 4: the router input's scale, each expert's output scale
@@ -703,6 +708,12 @@ private:
     QsaBatch qsa_batch_;
     bool qsa_long_ = false;                      // this step has a query past the budget: build the sparse masks
     bool qsa_kc_ok_ = true;                      // qsa_kc holds every position's key (false after a restore until qsa_upload)
+    // qsa_kc holds the key of every whole block of conversation 0 in the block's last row. The GPU's mask-making steps
+    // keep it so; after any other step (within the budget, with an image, several conversations) or a restore the
+    // keys are sent again from the host's copy before the next one (qsa_upload_blocks).
+    bool qsa_bk_ok_ = false;
+    void qsa_upload_blocks();
+    void qsa_make_blocks();
     bool qsa_gpu_ = false;                       // ... made by the graph (on the layer's device), not on the CPU (see qsa_mask_gpu)
     ggml_tensor* qsa_mask_gpu(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* kc, ggml_tensor* qr, ggml_tensor* mask, int n_tok);
     void qsa_upload();                           // the CPU's copy of conversation 0's indexer keys into qsa_kc (after a restore)

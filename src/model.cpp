@@ -2930,15 +2930,24 @@ void Model::qsa_mask(const QsaLayer& Q, const ggml_tensor* mask, const ggml_tens
 ggml_tensor* Model::qsa_mask_gpu(ggml_context* c, Graph& g, const Layer& L, ggml_tensor* kc, ggml_tensor* qr, ggml_tensor* mask, int n_tok) {
     const Hparams& hp = hp_;
     const int D = hp.qsa_dim, NH = hp.qsa_heads, R = qsa_[L.qsa].ratio, top = hp.qsa_budget / R;
-    const int64_t nbt = g.qsa_bpos->ne[0];                                // blocks the mask covers: n_kv / R
-    // the blocks' keys [D, 1, nbt]
-    ggml_tensor* raw = ggml_cast(c, ggml_view_2d(c, kc, D, nbt * R, kc->nb[1], 0), GGML_TYPE_F32);
-    raw = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, raw, D, R, nbt), 1, 0, 2, 3));   // [R, D, nbt]
-    ggml_tensor* bk = ggml_reshape_2d(c, ggml_mean(c, raw), D, nbt);
-    bk = ggml_mul(c, ggml_rms_norm(c, bk, hp.rms_eps), L.idx_k_norm);
-    bk = ggml_rope_ext(c, ggml_reshape_3d(c, bk, D, 1, nbt), g.qsa_bpos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, hp.n_ctx,
+    const int64_t nbt = g.qsa_nbt;                                        // blocks the mask covers: n_kv / R
+    // The blocks' keys [D, nbt]. A block's key is final once its last token is in, so a step makes only the keys of
+    // the few blocks it touches (g.qsa_crow: their tokens' raw keys in kc, this step's included); making every
+    // block's key at each step was most of what a check far into a long context cost over a short one (72K tokens:
+    // 18K blocks a layer, 12 layers). A finished block's key is kept where its last token's raw key was (g.qsa_clast):
+    // nothing reads that raw key again unless the conversation is cut back into the block, and then the token is read
+    // again and writes it anew before the block's key is made again. A block not yet whole gets a key from what's
+    // there, in a row its last token will write over: it can't be seen (g.qsa_nb). So every R-th row of kc, from row
+    // R - 1, is the blocks' keys (as f16, like the raw keys).
+    const int64_t nc = g.qsa_clast->ne[0];
+    ggml_tensor* raw = ggml_get_rows(c, kc, g.qsa_crow);                                  // [D, nc * R], f32
+    raw = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, raw, D, R, nc), 1, 0, 2, 3));   // [R, D, nc]
+    ggml_tensor* ck = ggml_reshape_2d(c, ggml_mean(c, raw), D, nc);
+    ck = ggml_mul(c, ggml_rms_norm(c, ck, hp.rms_eps), L.idx_k_norm);
+    ck = ggml_rope_ext(c, ggml_reshape_3d(c, ck, D, 1, nc), g.qsa_cpos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, hp.n_ctx,
                        hp.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    bk = ggml_reshape_2d(c, bk, D, nbt);
+    ggml_tensor* kc2 = ggml_set_rows(c, kc, ggml_reshape_2d(c, ck, D, nc), g.qsa_clast);
+    ggml_tensor* bk = ggml_cast(c, ggml_view_2d(c, kc2, D, nbt, kc2->nb[1] * R, (size_t)(R - 1) * kc2->nb[1]), GGML_TYPE_F32);
     // the queries' heads [D, NH, n_tok], normed and rotated
     ggml_tensor* q = ggml_mul(c, ggml_rms_norm(c, ggml_reshape_3d(c, qr, D, NH, n_tok), hp.rms_eps), L.idx_q_norm);
     q = ggml_rope_ext(c, q, g.pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, hp.n_ctx, hp.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -3083,7 +3092,7 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
             if (kc) ggml_build_forward_expand(g.gf, kc);
             if (qsa_long_) {
                 ggml_tensor* qr = ggml_mul_mat(c, L.idx_q, h);               // [qsa_heads * qsa_dim, n_tok]
-                if (g.qsa_bpos && kc) mask = qsa_mask_gpu(c, g, L, kc, qr, mask, n_tok);
+                if (g.qsa_clast && kc) mask = qsa_mask_gpu(c, g, L, kc, qr, mask, n_tok);
                 else {
                     mask = ggml_map_custom3(c, mask, qr, kr, qsa_op, GGML_N_TASKS_MAX, (void*)&qsa_calls_[L.qsa]);
                     g.cpu_ops.push_back(mask);
@@ -3606,7 +3615,11 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     }
     if (qsa_long_ && qsa_gpu_) {                                           // QSA's masks on the GPU (see qsa_mask_gpu)
         const int R = qsa_[0].ratio;
-        g.qsa_bpos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_kv / R);       ggml_set_input(g.qsa_bpos);
+        const int nc = (n_tok + R - 1) / R + 1;                            // the blocks a step of n_tok can touch
+        g.qsa_nbt  = n_kv / R;
+        g.qsa_crow = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t)nc * R); ggml_set_input(g.qsa_crow);
+        g.qsa_clast = ggml_new_tensor_1d(c, GGML_TYPE_I32, nc);            ggml_set_input(g.qsa_clast);
+        g.qsa_cpos = ggml_new_tensor_1d(c, GGML_TYPE_I32, nc);             ggml_set_input(g.qsa_cpos);
         g.qsa_nb   = ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, n_tok);       ggml_set_input(g.qsa_nb);
     }
 
@@ -5208,8 +5221,46 @@ void Model::resize_ctx(int new_ctx) {
     qsa_upload();                                                 // (the new cache starts empty)
 }
 
+// QSA: the keys of the blocks finished so far that aren't made yet (each is made once; after a restore, all again).
+void Model::qsa_make_blocks() {
+    const int D = hp_.qsa_dim;
+    for (QsaLayer& Q : qsa_)
+        for (size_t s = 0; s < Q.keys.size() && s < seq_rope_.size(); ++s) {
+            const int nb = std::min((int)(Q.keys[s].size() / D), (int)seq_rope_[s].size()) / Q.ratio;
+            auto& bl = Q.blocks[s];
+            std::vector<const float*> parts(Q.ratio);
+            for (int bi = (int)(bl.size() / D); bi < nb; ++bi) {
+                for (int j = 0; j < Q.ratio; ++j) parts[j] = Q.keys[s].data() + (size_t)(bi * Q.ratio + j) * D;
+                bl.resize((size_t)(bi + 1) * D);
+                qsa_block_key(Q, parts.data(), seq_rope_[s][bi * Q.ratio], bl.data() + (size_t)bi * D);
+            }
+        }
+}
+
+// The GPU's copy of the indexer's keys with every whole block's key where it is kept (the row of the block's last
+// token: see qsa_mask_gpu), from the host's keys.
+void Model::qsa_upload_blocks() {
+    qsa_make_blocks();                                            // (after a restore they are made from the keys again)
+    for (const Layer& L : layers_) {
+        if (!L.qsa_kc || L.qsa < 0) continue;
+        const QsaLayer& Q = qsa_[L.qsa];
+        static const std::vector<float> none;
+        const std::vector<float>& k = Q.keys.empty() ? none : Q.keys[0];
+        const std::vector<float>& bl = Q.blocks.empty() ? none : Q.blocks[0];
+        const int64_t D = L.qsa_kc->ne[0], n = std::min<int64_t>((int64_t)k.size() / D, L.qsa_kc->ne[1]);
+        if (n <= 0) continue;
+        std::vector<float> rows(k.begin(), k.begin() + n * D);
+        const int64_t nb = std::min<int64_t>((int64_t)bl.size() / D, n / Q.ratio);
+        for (int64_t b = 0; b < nb; ++b) std::copy_n(bl.data() + b * D, D, rows.data() + (b * Q.ratio + Q.ratio - 1) * D);
+        std::vector<ggml_fp16_t> h((size_t)(n * D));
+        ggml_fp32_to_fp16_row(rows.data(), h.data(), n * D);
+        ggml_backend_tensor_set(L.qsa_kc, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+    }
+}
+
 void Model::qsa_upload() {
     qsa_kc_ok_ = true;
+    qsa_bk_ok_ = false;                                           // (the blocks' keys: sent before the next step that needs them)
     for (const Layer& L : layers_) {
         if (!L.qsa_kc || L.qsa < 0) continue;
         static const std::vector<float> none;          // (one branch a temporary would make the ?: copy keys[0])
@@ -5423,9 +5474,11 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
                 for (size_t q = 0; q < n; ++q) if (sc[q] != (int)q) { ok = false; break; }
             }
             qsa_gpu_ = ok;
+            if (ok && !qsa_bk_ok_) { qsa_upload_blocks(); qsa_bk_ok_ = true; }   // (the whole blocks so far; this step adds its own)
             static bool told = false;
             if (!told) { told = true; std::fprintf(stderr, "QSA: sparse-attention masks made %s\n", ok ? "by the GPU" : "on the CPU"); }
         }
+        if (!qsa_gpu_) qsa_bk_ok_ = false;                         // (this step's blocks don't reach the GPU's cache of them)
     }
     // Replies, one token at a time, make the same graph over and over: positions, cache cells and masks are inputs,
     // and the cache span grows in steps of 256. So it is built, placed and allocated once and then run again, until
@@ -5530,19 +5583,28 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     }
     if (g.cells->buffer) ggml_backend_tensor_set(g.cells, cells.data(), 0, sizeof(int32_t) * n_tok);
     if (g.cells_swa && g.cells_swa->buffer) ggml_backend_tensor_set(g.cells_swa, swa_cells.data(), 0, sizeof(int32_t) * n_tok);
-    if (g.qsa_bpos) {                                             // QSA on the GPU: blocks' first positions, tokens' whole blocks
-        const int R = qsa_[0].ratio, nbt = (int)g.qsa_bpos->ne[0];
-        std::vector<int32_t> bp(nbt, 0);
+    if (g.qsa_clast) {                                            // QSA on the GPU: the blocks this step touches, tokens' whole blocks
+        // The blocks this step touches (the last one again where it touches fewer than the graph has places for): their
+        // tokens' rows in the raw keys, the row each one's key is kept in (its last token's), their first tokens' positions.
+        const int R = qsa_[0].ratio, nc = (int)g.qsa_clast->ne[0];
         const auto& sr = seq_rope_.empty() ? std::vector<std::array<int, 3>>() : seq_rope_[0];
-        for (int b = 0; b < nbt; ++b) {
-            const int q = b * R;
-            if (q < (int)sr.size() && q < tok_pos[0]) bp[b] = sr[q][0];
-            else if (q >= tok_pos[0] && q - tok_pos[0] < n_tok) bp[b] = rope[q - tok_pos[0]][0];
-            else bp[b] = q;                                         // (not written yet: can't be seen)
+        int rows_max = 1 << 30;
+        for (const Layer& L : layers_) if (L.qsa_kc) rows_max = std::min(rows_max, (int)L.qsa_kc->ne[1]);
+        const int b0 = tok_pos[0] / R, b1 = std::min((tok_pos[0] + n_tok - 1) / R, rows_max / R - 1);
+        std::vector<int32_t> crow((size_t)nc * R), clast(nc), cpos(nc);
+        for (int j = 0; j < nc; ++j) {
+            const int b = std::min(b0 + j, b1), q = b * R;
+            clast[j] = q + R - 1;
+            for (int r = 0; r < R; ++r) crow[(size_t)j * R + r] = q + r;
+            if (q < (int)sr.size() && q < tok_pos[0]) cpos[j] = sr[q][0];
+            else if (q >= tok_pos[0] && q - tok_pos[0] < n_tok) cpos[j] = rope[q - tok_pos[0]][0];
+            else cpos[j] = q;                                       // (not written yet: can't be seen)
         }
         std::vector<float> nb(n_tok);
         for (int t = 0; t < n_tok; ++t) nb[t] = (float)((tok_pos[t] + 1) / R);
-        if (g.qsa_bpos->buffer) ggml_backend_tensor_set(g.qsa_bpos, bp.data(), 0, sizeof(int32_t) * nbt);
+        if (g.qsa_crow->buffer) ggml_backend_tensor_set(g.qsa_crow, crow.data(), 0, sizeof(int32_t) * crow.size());
+        if (g.qsa_clast->buffer) ggml_backend_tensor_set(g.qsa_clast, clast.data(), 0, sizeof(int32_t) * nc);
+        if (g.qsa_cpos->buffer) ggml_backend_tensor_set(g.qsa_cpos, cpos.data(), 0, sizeof(int32_t) * nc);
         if (g.qsa_nb->buffer) ggml_backend_tensor_set(g.qsa_nb, nb.data(), 0, sizeof(float) * n_tok);
     }
     if (g.zero_id && g.zero_id->buffer) { const int32_t z = 0; ggml_backend_tensor_set(g.zero_id, &z, 0, sizeof z); }
@@ -5763,18 +5825,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     }
     for (int t = 0; t < n_tok; ++t)
         if (is_image_id(ids[t])) { const ImageRec* im = image_of(ids[t]); seq_next_[tok_seq[t]] = std::max(seq_next_[tok_seq[t]], rope[t][0] + std::max(im->rows, im->cols)); }
-    for (QsaLayer& Q : qsa_)                                       // QSA: keys of the blocks finished so far, made once
-                                                                   // (after the positions above, which they need)
-        for (size_t s = 0; s < Q.keys.size(); ++s) {
-            const int D = hp.qsa_dim, nb = (int)(Q.keys[s].size() / D) / Q.ratio;
-            auto& bl = Q.blocks[s];
-            std::vector<const float*> parts(Q.ratio);
-            for (int bi = (int)(bl.size() / D); bi < nb; ++bi) {
-                for (int j = 0; j < Q.ratio; ++j) parts[j] = Q.keys[s].data() + (size_t)(bi * Q.ratio + j) * D;
-                bl.resize((size_t)(bi + 1) * D);
-                qsa_block_key(Q, parts.data(), seq_rope_[s][bi * Q.ratio], bl.data() + (size_t)bi * D);
-            }
-        }
+    qsa_make_blocks();                                             // (after the positions above, which they need)
     n_past_ = seq_past(0);
     if (std::getenv("TIERLM_PROFILE")) profile_step(n_tok, ms(t0, t3), ms(t3, t4), ms(t4, t5), ms(t0, t1), ms(t1, t2));
     if (n_tok > 64 && std::getenv("TIERLM_PROFILE_PROMPT"))       // a prompt's batches, one line each
