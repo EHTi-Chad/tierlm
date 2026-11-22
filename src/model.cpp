@@ -3495,6 +3495,11 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             if (L.gate_inp_s) sh = ggml_mul(c, sh, ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h)));   // gate: [1, n_tok]
             return sh;
         };
+        // Inkling 2's loop layers: their RAM experts are never handed to the GPU. ggml keeps one GPU copy of a weight for
+        // the whole step, and the loop reads a layer's experts again two and three passes later, so every loop layer's
+        // RAM experts would be in VRAM at once: 7.9 GB of working memory on an 8 GB RTX 3070 Laptop with the busiest
+        // experts in VRAM, 6.1 GB with all experts in RAM. Layers outside the loop are read once and handed over as usual.
+        const bool in_loop = hp.ink && hp.ink_loop_passes > 1 && L.index >= hp.ink_loop_lo && L.index < hp.ink_loop_hi;
         if (L.map_hot) {
             // Hot-expert split: each pick is computed by the part that holds it (VRAM or RAM); in the other part it
             // goes to the all-zero expert with weight 0, so it adds nothing. The sum is the same as unsplit.
@@ -3545,11 +3550,6 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             // Streamed (see setup_stream): the RAM experts are read from their VRAM slot, filled ahead on another queue
             // (stream_on_: this step is big enough for it, see stream_ready; that is a smaller size than the copy's)
             const bool streamed = stream_on_ && L.stream_turn >= 0;
-            // (Inkling 2's loop layers: not handed to the GPU. ggml keeps one GPU copy of a weight for the whole step,
-            // and the loop reads a layer's experts again two and three passes later, so every loop layer's RAM
-            // experts would be in VRAM at once: 7.9 GB of working memory on an 8 GB RTX 3070 Laptop, which could not
-            // be reserved. Layers outside the loop are read once and handed over as usual.)
-            const bool in_loop = hp.ink && hp.ink_loop_passes > 1 && L.index >= hp.ink_loop_lo && L.index < hp.ink_loop_hi;
             const bool cold_gpu = streamed || (!in_loop && n_tok >= std::max(offload_batch, cold_offload_min_));
             ggml_tensor* gu_c = streamed ? L.gate_up_xs : L.gate_up_xc;
             ggml_tensor* g_c  = streamed ? L.gate_xs : L.gate_xc;
@@ -3651,7 +3651,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             // gpt-oss-120b (38 GB of experts in RAM) took 0.7 s for a 34-token message.
             const ggml_tensor* wx = L.down_x;
             const bool in_ram = wx && wx->buffer && ggml_backend_buffer_is_host(wx->buffer) && main_ != cpu_;
-            if (in_ram && n_tok > 1 && n_tok < cold_offload_min_) {
+            if (in_ram && n_tok > 1 && (n_tok < cold_offload_min_ || in_loop)) {
                 std::set<ggml_tensor*> seen;
                 std::function<void(ggml_tensor*)> pin = [&](ggml_tensor* t) {
                     if (!t || t == ids || t == w || t == h3 || t == xin || t->op == GGML_OP_NONE || !seen.insert(t).second) return;
