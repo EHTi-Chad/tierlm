@@ -2210,7 +2210,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                           !std::getenv("TIERLM_DUMP_SCHED");
     if (plans_on) { m->check_main_ = true; m->check_.mem.resize(m->graph_mem_size_); }
     if (!m->reserve_worst()) throw std::runtime_error("failed to reserve compute memory");
-    if (std::getenv("TIERLM_MEM_PROBE")) m->reserve_worst(true);
+    if (std::getenv("TIERLM_MEM_PROBE")) { m->reserve_worst(true); m->reserve_worst(); }   // (measuring undoes the reservation)
     if (!m->gpus_.empty()) m->place_.compute_gpu = ggml_backend_sched_get_buffer_size(m->sched_, m->gpus_[0]) + m->stream_.bytes;
     if (std::getenv("TIERLM_PROFILE") && !m->gpus_.empty())
         std::fprintf(stderr, "profile: working memory for the largest batch: %.0f MB of VRAM (a check of up to %d tokens fits in it)\n",
@@ -4871,55 +4871,68 @@ bool Model::reserve_worst(bool probe) {
     }
     static const bool dbg = std::getenv("TIERLM_STREAM_DEBUG") != nullptr;
     const int nb = ggml_backend_sched_get_n_backends(sched_);
-    auto gpu_size = [&](ggml_cgraph* gf) -> size_t {                // what a graph would need on the first GPU, nothing reserved
+    // What a graph would need on the first GPU. Measuring lets go of the scheduler's own memory when the graph is
+    // bigger than it (ggml frees the buffer it would have to grow), so everything is measured first and reserved last.
+    auto gpu_size = [&](ggml_cgraph* gf) -> size_t {
         std::vector<size_t> sizes((size_t)nb, 0);
         ggml_backend_sched_reserve_size(sched_, gf, sizes.data());
         ggml_backend_sched_reset(sched_);
         for (int i = 0; i < nb; ++i) if (!gpus_.empty() && ggml_backend_sched_get_backend(sched_, i) == gpus_[0]) return sizes[i];
         return 0;
     };
-    bool ok = true;
-    for (auto [n, end] : steps) {
+    auto step_graph = [&](int n, int end) {
         qsa_long_ = qsa_gpu_ = !qsa_.empty() && kv_span(end) % qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
         stream_on_ = stream_ready(n);
         if (dbg) std::fprintf(stderr, "stream: building the graph of %d tokens ending at %d (streamed: %d)\n", n, end, (int)stream_on_);
         Graph g = hp_.dsv4 ? build_dsv4(n, end - n, true, 1, false, nullptr) : build(n, end, true);
         qsa_long_ = qsa_gpu_ = stream_on_ = false;
         pin_cpu_layers(g);
-        if (!probe) ok = ggml_backend_sched_reserve(sched_, g.gf) && ok;
-        else std::fprintf(stderr, "probe: %5d tokens ending at %6d: %.0f MB of VRAM\n", n, end, gpu_size(g.gf) / 1048576.0);
+        return g;
+    };
+    auto check_graph = [&](int w) {
+        qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;
+        Graph g = build(w, max_ctx_, true, w, true, w, nullptr, &check_.mem);
+        qsa_long_ = qsa_gpu_ = false;
+        pin_cpu_layers(g);
+        return g;
+    };
+    auto check_size = [&](int w) -> size_t { Graph g = check_graph(w); const size_t sz = gpu_size(g.gf); ggml_free(g.ctx); return sz; };
+    const bool checks = check_main_ && !hp_.dsv4 && !gpus_.empty();
+    if (probe) {
+        for (auto [n, end] : steps) {
+            Graph g = step_graph(n, end);
+            std::fprintf(stderr, "probe: %5d tokens ending at %6d: %.0f MB of VRAM\n", n, end, gpu_size(g.gf) / 1048576.0);
+            ggml_free(g.ctx);
+        }
+        if (checks) for (int w : {2, 5, 7, 9}) if (w <= max_ctx_) std::fprintf(stderr, "probe: a check of %d tokens: %.0f MB of VRAM\n", w, check_size(w) / 1048576.0);
+        return true;                                                   // (the caller reserves again)
+    }
+    // The check of the draft block's guesses stays placed on this scheduler: room for one of w0 tokens (TIERLM_PLAN_WIDTH,
+    // default 5: 4 guesses) if the prompt steps don't already give it and it's a small share of the card; and the widest
+    // check that fits in what is reserved is noted (check_width).
+    int w_res = 0;
+    if (checks) {
+        size_t have = 0;
+        for (auto [n, end] : steps) { Graph g = step_graph(n, end); have = std::max(have, gpu_size(g.gf)); ggml_free(g.ctx); }
+        const char* we = std::getenv("TIERLM_PLAN_WIDTH");
+        const int w0 = std::min(we ? std::max(2, std::atoi(we)) : 5, max_ctx_);
+        size_t vfree = 0, vtotal = 0;
+        device_memory(vfree, vtotal);
+        const size_t c0 = check_size(w0);
+        if (c0 > have && (std::getenv("TIERLM_PLANS") || (vtotal > 0 && c0 <= vtotal / 32))) { w_res = w0; have = c0; }
+        check_width_ = w0;
+        for (int w = 9; w > w0; --w) if (w <= max_ctx_ && check_size(w) <= have) { check_width_ = w; break; }
+    }
+    bool ok = true;
+    for (auto [n, end] : steps) {
+        Graph g = step_graph(n, end);
+        ok = ggml_backend_sched_reserve(sched_, g.gf) && ok;
         ggml_free(g.ctx);
     }
-    if (check_main_ && !hp_.dsv4 && !gpus_.empty()) {
-        auto check_size = [&](int w) -> size_t {
-            qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;
-            Graph g = build(w, max_ctx_, true, w, true, w, nullptr, &check_.mem);
-            qsa_long_ = qsa_gpu_ = false;
-            pin_cpu_layers(g);
-            const size_t sz = gpu_size(g.gf);
-            ggml_free(g.ctx);
-            return sz;
-        };
-        if (probe) {
-            for (int w : {2, 5, 7, 9}) if (w <= max_ctx_) std::fprintf(stderr, "probe: a check of %d tokens: %.0f MB of VRAM\n", w, check_size(w) / 1048576.0);
-        } else {
-            const char* we = std::getenv("TIERLM_PLAN_WIDTH");
-            const int w0 = std::min(we ? std::max(2, std::atoi(we)) : 5, max_ctx_);
-            size_t vfree = 0, vtotal = 0;
-            device_memory(vfree, vtotal);
-            const size_t have = ggml_backend_sched_get_buffer_size(sched_, gpus_[0]);
-            if (check_size(w0) > have && (std::getenv("TIERLM_PLANS") || (vtotal > 0 && check_size(w0) <= vtotal / 32))) {
-                qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;
-                Graph g = build(w0, max_ctx_, true, w0, true, w0, nullptr, &check_.mem);
-                qsa_long_ = qsa_gpu_ = false;
-                pin_cpu_layers(g);
-                ok = ggml_backend_sched_reserve(sched_, g.gf) && ok;
-                ggml_free(g.ctx);
-            }
-            const size_t now = ggml_backend_sched_get_buffer_size(sched_, gpus_[0]);
-            check_width_ = w0;
-            for (int w = 9; w > w0; --w) if (w <= max_ctx_ && check_size(w) <= now) { check_width_ = w; break; }
-        }
+    if (w_res > 0) {
+        Graph g = check_graph(w_res);
+        ok = ggml_backend_sched_reserve(sched_, g.gf) && ok;
+        ggml_free(g.ctx);
     }
     return ok;
 }
