@@ -83,6 +83,30 @@ submitted without checking it first).
 - **Fixed: the image reader's GPU helper kept its working memory after an image**, which pushed a long prompt's
   working memory out of VRAM (a 35K-token prompt read at 256 to 805 tok/s after an image, 1,430 to 2,135 before).
   It is now given back after each image.
+- **Inkling 2 Mini (early): Unsloth's files.** Thinking Machines' Inkling 2 was in (checked against Hugging Face's own
+  code) for files laid out as llama.cpp's converter writes them; Unsloth's `Inkling-2-Mini-UD-*` files use the earlier
+  looped layout (the loop's settings written out pass by pass, its message queries in two tensors) and keep the experts
+  in NVFP4 with a scale for each expert, and are now read too (checked against Hugging Face's code the same way, also
+  in BF16 and NVFP4 and split 20 ways between a stand-in GPU and RAM). On the first real load, at 32K context, tierlm
+  kept 20 GB of VRAM free for working memory and put 14 GB of the model in RAM (23.8 tok/s): this model's attention
+  is worked out in the open, a tensor of heads x new tokens x cache for each layer, so its prompt steps now get
+  smaller as the cache grows, and the working memory is under 2 GB. RTX 5090, Ryzen 9 9950X3D, 64 GB DDR5-6000,
+  Windows 11; Inkling-2-Mini-UD-Q8_K_XL (21.8 GiB, BF16 with NVFP4 experts), all in VRAM, 64K context, KV cache f16,
+  thinking off, the quick agent test: **66.7 tok/s** over 500 tokens of code, a 3,455-token prompt read at 1,319
+  tok/s, tool calls in its own format. With thinking off it no longer opens a thinking block anyway (its template
+  says "effort 0", and Mini thought all the same). A token is about 7,000 small GPU steps (the same values from 15%
+  fewer than at first: 76 → 79 tok/s for plain steps, one after the other on the same PC). Images aren't read yet.
+- **Prompt lookup gives up sooner where a check costs several plain steps.** Inkling 2's check of 4 guesses takes
+  about 5 times a plain step, and lookup lost 24 checks over a 500-token program before pausing (61.7 tok/s, against
+  66.4 now). A round losing by 3 times or more is now called after 2 checks, and the pause is longer by as much as it
+  lost. Models whose check costs about a plain step are unchanged.
+- **GLM's chat format and tool calls.** GLM-4.7-Flash (and the 4.5 / 4.6 layout) used the plain `<|user|>` format:
+  now its prompts are written as Z.ai's templates write them (checked character for character, thinking on and off,
+  tools, calls and results), with the thinking switch, and its tool calls (`<tool_call>NAME<arg_key>...`) are read.
+  Not yet tried with a real GLM file here.
+- **Fixed: a model split by whole layers between VRAM and RAM stopped tierlm with Inkling 2** (a RAM layer's steps
+  were pinned to the CPU, including views of what the GPU held). Other models never took such views; they place as
+  before (`TIERLM_PIN_VIEWS=1` for the old way, to compare).
 - For developers: `tierlm-attn-check` (ggml's attention told how much a query sees, and behind the mask, against the
   exact result on this build's GPU, with a query in every other head that a wrong gather would get wrong by its own
   size; and what each takes), `TIERLM_SPEC_TRACE=file` (a line per check: guesses, kept, how sure the draft block was,
@@ -678,6 +702,7 @@ to send one in, start tierlm with `start-tierlm-with-log.bat` and attach the new
 | DeepSeek V4 Flash (`deepseek4`) | **early**: model math checked against Hugging Face's own code (hyper-connections, sliding-window and compressed attention with its indexer, hash-routed first layers) on the CPU and CUDA; tested on the real DeepSeek-V4-Flash UD-IQ3_XXS (about 96 GB) on an RTX 5090 with 64 GB RAM and the SSD tier: 9.6 to 10.8 tok/s in chats (since 0.9.0). Tool calls not yet |
 | Gemma 3 (`gemma3`: gemma-3-1b ... 27b-it), text | **new in 0.9.1**: model math checked against Hugging Face's own code; gemma-3-12b-it Q4_K_M on an RTX 5090 |
 | Gemma 4 (`gemma4`: E2B, E4B, 26B-A4B, 31B), text | **new in 0.9.1**: model math checked against Hugging Face's own code (all four layouts: shared caches, per-layer inputs, the 26B's experts), chat format with thinking on or off and its own tool calls; E4B Q4_K_M (210-250 tok/s) and 26B-A4B UD-Q4_K_M (180-190 tok/s) on an RTX 5090 (Ryzen 9 9950X3D, 64 GB DDR5), all in VRAM; the 31B not yet |
+| Inkling 2 (`inkling2_loop`, and Unsloth's `inkling2` files), text | **early, new in 0.9.4**: model math checked against Hugging Face's own code (the loop, attention over the depth, relative-position attention, both GGUF layouts, BF16 and NVFP4 experts with their scales); Unsloth's Inkling-2-Mini-UD-Q8_K_XL all in VRAM on an RTX 5090 (66.7 tok/s at 64K context); its chat format with thinking on and off and its own tool calls; images not yet |
 | Qwen3.8 Flash-Next (`qwen4exp`) | model math checked against Hugging Face's own code (hyper-connections, the n-gram embedding, sparse attention past 2,048 tokens, the MTP draft block), text only for now; the real 120 GB Q4_K_M with Unsloth's MTP file at 80.3 tok/s in a chat (88.8 in Find the fastest settings) on an RTX 5090 with 64 GB RAM, with its n-gram table on the SSD tier; UD-IQ3_XXS (77.9 GiB) at 94.8 tok/s on the same PC (Ryzen 9 9950X3D, 64 GB DDR5-6000, VRAM experts following the conversation, 4 guesses, temperature 0.7; 0.8.7) |
 
 Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-MiniLM, e5) and Nomic
@@ -686,7 +711,8 @@ Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-Min
 Images: Qwen3.5 / 3.6 with their `mmproj` vision file (`qwen3vl_merger`), checked against Hugging Face's code and
 tested with Qwen3.5-9B (RTX 3070 laptop) and Qwen3.6-35B-A3B (RTX 5090).
 
-Not yet: Phi, GLM, MiniMax and others; Gemma's images and audio. Nemotron 3.5 (Mamba-2 and LatentMoE) is in since 0.8.8, checked on a tiny test model and on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s). The setup screen says which
+GLM-4.7-Flash files are DeepSeek V2's layout (`deepseek2`, above), with GLM's own chat format and tool calls (0.9.4).
+Not yet: Phi, GLM-4.5 / 4.6 (`glm4moe`), MiniMax and others; Gemma's images and audio. Nemotron 3.5 (Mamba-2 and LatentMoE) is in since 0.8.8, checked on a tiny test model and on the real Bolt 74B-A9B file (RTX 5090, 137-147 tok/s). The setup screen says which
 of your files are supported. Full list: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#supported-models).
 
 ## Build from source (Windows)
