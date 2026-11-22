@@ -5526,6 +5526,47 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         }
     }
     auto t2 = clk::now();
+    // TIERLM_PLAN_DIFF=1 (debugging): a check's graph laid out again should be, to the GPU, the graph it was the last
+    // time at this size (the same tensors at the same places with the same inputs), or the GPU's recording of it is
+    // made again. Says what differs, if anything.
+    if (plan && !reuse && std::getenv("TIERLM_PLAN_DIFF")) {
+        struct Sig { const void *node, *data, *buffer, *view_src; size_t view_offs; const void *src[4], *src_data[4]; int64_t ne[4]; int op; };
+        static std::vector<Sig> last[10];
+        std::vector<Sig> now((size_t)ggml_graph_n_nodes(g.gf));
+        for (size_t i = 0; i < now.size(); ++i) {
+            const ggml_tensor* t = ggml_graph_node(g.gf, (int)i);
+            Sig& x = now[i];
+            std::memset(&x, 0, sizeof(x));
+            x.node = t; x.data = t->data; x.buffer = t->buffer; x.view_src = t->view_src; x.view_offs = t->view_offs; x.op = (int)t->op;
+            for (int j = 0; j < 4; ++j) { x.src[j] = t->src[j]; x.src_data[j] = t->src[j] ? t->src[j]->data : nullptr; x.ne[j] = t->ne[j]; }
+        }
+        std::vector<Sig>& was = last[std::min(n_tok, 9)];
+        if (!was.empty()) {
+            int n_diff = 0;
+            std::string first;
+            const size_t n = std::min(was.size(), now.size());
+            for (size_t i = 0; i < n; ++i) {
+                const Sig &a = was[i], &b = now[i];
+                if (!std::memcmp(&a, &b, sizeof(Sig))) continue;
+                if (++n_diff > 4) continue;
+                const ggml_tensor* t = ggml_graph_node(g.gf, (int)i);
+                first += "\n    node " + std::to_string(i) + " " + ggml_op_name(t->op) + " '" + t->name + "':";
+                if (a.node != b.node) first += " the tensor itself";
+                if (a.op != b.op) first += " op";
+                if (a.data != b.data) first += " its place (by " + std::to_string((long long)((const char*)b.data - (const char*)a.data)) + ")";
+                if (a.buffer != b.buffer) first += " buffer";
+                if (a.view_src != b.view_src || a.view_offs != b.view_offs) first += " view";
+                for (int j = 0; j < 4; ++j) {
+                    if (a.src[j] != b.src[j]) first += " src" + std::to_string(j);
+                    if (a.src_data[j] != b.src_data[j]) first += " src" + std::to_string(j) + "'s place";
+                    if (a.ne[j] != b.ne[j]) first += " ne" + std::to_string(j);
+                }
+            }
+            std::fprintf(stderr, "plan diff: a check of %d tokens laid out again: %zu nodes (%zu before), %d differ%s\n", n_tok, now.size(),
+                         was.size(), n_diff, first.c_str());
+        }
+        was.swap(now);
+    }
     if (std::getenv("TIERLM_DUMP_SCHED") && n_tok == 1) {           // debugging: where the work switches device
         ggml_backend_t prev = nullptr;
         int layer = -1, shown = 0;
