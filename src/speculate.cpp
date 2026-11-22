@@ -221,6 +221,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     if (dist_) while ((int)qs.size() < k) qs.push_back({{drafts[qs.size()], 1.0f}});
     using sclk = std::chrono::steady_clock;
     const auto t1 = sclk::now();
+    const double lay0 = m_.stats().build_ms + m_.stats().alloc_ms;   // (the trace: what laying the check's graph out took)
 
     // ---- 2. check all guesses in one pass ----
     std::vector<int32_t> batch(1, x);
@@ -264,6 +265,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     if (routing && !routing->empty()) routing->resize(routing->size() / (size_t)(k + 1) * (size_t)(1 + m));
 
     const auto t2 = sclk::now();
+    const double lay_ms = m_.stats().build_ms + m_.stats().alloc_ms - lay0;
     // ---- 4. bring the draft block up to date with what was kept ----
     if (m_.has_mtp()) {
         std::vector<float> hrows((size_t)(m + 1) * E);
@@ -294,9 +296,9 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
             for (int i = 0; i < (int)conf.size() && i < k && i <= m; ++i) { ad_pred_ += conf[i]; ad_kept_ += i < m ? 1.0 : 0.0; }
         }
     }
-    if (trace_) {                                     // TIERLM_SPEC_TRACE: place, guesses, kept, from lookup, ms, then how sure each guess was
-        std::fprintf(trace_, "%d %d %d %d %.2f %.2f %.2f", P, k, m, from_lookup, std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                     std::chrono::duration<double, std::milli>(t2 - t1).count(), std::chrono::duration<double, std::milli>(t3 - t2).count());
+    if (trace_) {                                     // TIERLM_SPEC_TRACE: place, guesses, kept, from lookup, ms (the check's: all of it, and its graph's laying out), then how sure each guess was
+        std::fprintf(trace_, "%d %d %d %d %.2f %.2f %.2f %.2f", P, k, m, from_lookup, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                     std::chrono::duration<double, std::milli>(t2 - t1).count(), std::chrono::duration<double, std::milli>(t3 - t2).count(), lay_ms);
         for (size_t i = 0; i < trace_q_.size() && (int)i < k; ++i) std::fprintf(trace_, " %.4f", trace_q_[i]);
         std::fprintf(trace_, "\n");
         std::fflush(trace_);
