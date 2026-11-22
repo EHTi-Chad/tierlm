@@ -194,6 +194,8 @@ def main():
             plain, _ = gen("--gen")
             checks = [gen("--gen-spec")] + [gen("--gen-spec", {"TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k}) for k in ("3", "5")]
             checks += [gen("--gen-spec", {"TIERLM_DRAFT_N": "8", "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k}) for k in ("2", "7")]
+            # (the number of guesses decided at each check, from how sure the draft block is)
+            checks += [gen("--gen-spec", {"TIERLM_DRAFT_ADAPT": "1"}), gen("--gen-spec", {"TIERLM_DRAFT_ADAPT": "1", "TIERLM_DRAFT_N": "1"})]
             # (the draft block catching up two tokens at a time, as it does beside a quantized cache)
             checks += [gen("--gen-spec", {"TIERLM_MTP_STEP": "2", "TIERLM_DRAFT_N": "8", "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": "7"})]
             same = all(c[0] == plain for c in checks)
@@ -222,10 +224,11 @@ def main():
     path = write(cfg, m, mtp)
     env = {**os.environ, "TIERLM_DEVICE": "cpu", "TIERLM_SAMPLE_RUNS": "8000", "TIERLM_SAMPLE_TOPK": "16", "TIERLM_SAMPLE_TEMP": "1"}
     runs = {}
-    for mode in ("--gen", "--gen-spec"):
-        r = subprocess.run([exe, path, mode, "3", "5", "9", "13"], capture_output=True, text=True, env=env)
+    for mode, more in (("--gen", {}), ("--gen-spec", {}), ("adaptive", {"TIERLM_DRAFT_ADAPT": "1"})):
+        r = subprocess.run([exe, path, "--gen-spec" if mode == "adaptive" else mode, "3", "5", "9", "13"], capture_output=True, text=True, env={**env, **more})
         if r.returncode != 0: sys.exit(f"sampling: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
         runs[mode] = [tuple(l.split(",")) for l in r.stdout.split()]
+        if mode != "--gen": print(f"    ({mode}: {r.stderr.strip().splitlines()[-1]})")
     def z_of(a, b):
         ca, cb = Counter(a), Counter(b)
         na, nb = len(a), len(b)
@@ -245,6 +248,12 @@ def main():
     passed = all(abs(z) < 4 for z in zs)
     ok &= passed
     print(f"{'sampling':12s} {'exact':7s}: replies' odds with speculative sampling, z = {', '.join(f'{z:.1f}' for z in zs)} (limit 4)  ->  {'ok' if passed else 'FAIL'}")
+    Q = runs["adaptive"]
+    zs = [z_of([t[i] for t in P], [t[i] for t in Q]) for i in range(3)]
+    zs += [z_of([t[:2] for t in P], [t[:2] for t in Q]), z_of([t[1:] for t in P], [t[1:] for t in Q]), z_of(P, Q)]
+    passed = all(abs(z) < 4 for z in zs)
+    ok &= passed
+    print(f"{'sampling':12s} {'adaptive':7s}: the same with the number of guesses decided at each check, z = {', '.join(f'{z:.1f}' for z in zs)} (limit 4)  ->  {'ok' if passed else 'FAIL'}")
     os.remove(path)
     sys.exit(0 if ok else 1)
 

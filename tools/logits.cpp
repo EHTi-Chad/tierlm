@@ -119,6 +119,9 @@ int main(int argc, char** argv) {
                 return w.back().first;
             };
             int steps = 0, drafted = 0, accepted = 0;
+            // (one speculator for all the runs, as a server keeps one for all its replies: what it learns carries over)
+            Speculator sp(*m, std::getenv("TIERLM_DRAFT_N") ? std::atoi(std::getenv("TIERLM_DRAFT_N")) : 3);
+            if (const char* ad = std::getenv("TIERLM_DRAFT_ADAPT")) sp.set_adaptive(std::atoi(ad) != 0);
             for (int run = 0; run < R; ++run) {
                 m->reset();
                 std::vector<int32_t> out;
@@ -126,7 +129,8 @@ int main(int argc, char** argv) {
                     lg = m->eval(ids, nt);
                     while ((int)out.size() < n_gen) { out.push_back(draw(dist(lg.data(), {}))); lg = m->eval({out.back()}, nt); }
                 } else {
-                    Speculator sp(*m, std::getenv("TIERLM_DRAFT_N") ? std::atoi(std::getenv("TIERLM_DRAFT_N")) : 3);
+                    sp.set_state(Speculator::State());
+                    sp.reset_stats();
                     sp.set_sampling(dist, &rng);
                     lg = sp.prompt(ids, nt);
                     int32_t x = draw(dist(lg.data(), {}));
@@ -155,6 +159,7 @@ int main(int argc, char** argv) {
                 while ((int)out.size() < n_gen) { out.push_back(argmax(lg.data(), V)); lg = m->eval({out.back()}, nt); }
             } else {
                 Speculator sp(*m, std::getenv("TIERLM_DRAFT_N") ? std::atoi(std::getenv("TIERLM_DRAFT_N")) : 3);
+                if (const char* ad = std::getenv("TIERLM_DRAFT_ADAPT")) sp.set_adaptive(std::atoi(ad) != 0);
                 if (const char* lk = std::getenv("TIERLM_LOOKUP")) sp.set_lookup(std::atoi(lk), 2);
                 if (std::getenv("TIERLM_SELF_DRAFT")) {                   // guesses from the VRAM experts only
                     sp.set_self_draft(true);

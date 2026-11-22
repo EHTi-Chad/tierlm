@@ -883,7 +883,13 @@ struct Engine {
     std::unique_ptr<Speculator> make_spec(int d) {
         if (!model || d <= 0) return nullptr;
         auto sp = std::make_unique<Speculator>(*model, d, draft_p_min);
-        if (model->has_mtp()) return sp;
+        // With a draft block the number of guesses is decided at each check, from how sure the block is and what a
+        // check costs here (Speculator::set_adaptive); d is where it starts. TIERLM_DRAFT_ADAPT=0: always d.
+        if (model->has_mtp()) {
+            const char* e = std::getenv("TIERLM_DRAFT_ADAPT");
+            sp->set_adaptive(!(e && !std::strcmp(e, "0")));
+            return sp;
+        }
         sp->set_self_draft(true);
         return sp->self_draft_ok() ? std::move(sp) : nullptr;
     }

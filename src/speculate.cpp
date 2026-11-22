@@ -108,7 +108,22 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                                       std::vector<int32_t>* routing) {
     const int P = m_.n_past(), E = m_.hparams().hidden_width(), V = m_.hparams().n_vocab;
     const int room = m_.max_ctx() - P - 1;            // positions left after x
-    const int n_max = std::max(0, std::min(n_draft_, room));
+    // (adaptive: as many as pay, see set_adaptive; a guess needs room in the check the model's working memory holds)
+    const bool adapt = adapt_ && m_.has_mtp() && !draft_src_ && n_draft_ > 0;
+    // (until a few checks have been timed: n_draft at most, as without it)
+    const int n_max = std::max(0, std::min(adapt && ad_n_ >= 8 ? std::max(1, std::min(adapt_most_, m_.check_width() - 1)) : n_draft_, room));
+    // What one more token must bring in to be worth its place in the check: the reply's speed times the token's cost.
+    double theta = 0.5;
+    if (adapt && ad_ms_ > 0 && ad_n_ >= 8) {
+        const double n = ad_n_, mw = ad_w_ / n, mt = ad_t_ / n, var = ad_ww_ / n - mw * mw, cov = ad_wt_ / n - mw * mt;
+        double per = var > 0.3 ? cov / var : mt / (mw + 4.0);          // ms per token of a check (few widths seen: a guess at it)
+        per = std::min(std::max(per, mt / (mw + 12.0)), mt / (mw + 0.5));
+        theta = std::min(0.9, std::max(0.2, ad_tok_ / ad_ms_ * (per + ad_guess_ms_)));
+    }
+    // (how much of its sureness the draft block earns: of the guesses tested lately, kept over expected)
+    const double trust = ad_pred_ > 4.0 ? std::min(1.0, std::max(0.5, ad_kept_ / ad_pred_)) : 0.95;
+    std::vector<float> conf;                          // how sure the draft block was of each guess made
+    double chance = 1.0;                              // that every guess so far is kept
     const auto t0 = std::chrono::steady_clock::now();
 
     // ---- 1. guess ----
@@ -142,6 +157,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
             std::vector<float> lg = self_used ? m_.eval_ex(&tok, 1, n_threads, 1, false, 1).logits
                                               : m_.mtp_eval(&tok, h.data(), 1, P + i, n_threads, &hn);
             int32_t d;
+            float sure = 1.0f;                        // the draft block's probability for its best token
             if (dist_) {                              // sampling: draw the guess from the draft block's probabilities
                 std::vector<int32_t> ctx(1, x);
                 ctx.insert(ctx.end(), drafts.begin(), drafts.end());
@@ -150,18 +166,24 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                 float qmax = 0.0f;
                 for (const auto& e : q) qmax = std::max(qmax, e.second);
                 if (p_min_ > 0.0f && qmax < p_min_) break;
+                sure = qmax;
+                if (adapt && i > 0 && chance * trust * sure < theta) break;
                 d = draw(q);
                 qs.push_back(std::move(q));
             } else {
                 d = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
-                if (p_min_ > 0.0f || trace_) {        // how sure is the draft block? (softmax probability of d)
-                    double sum = 0.0;
-                    for (float v : lg) sum += std::exp((double)v - lg[d]);
-                    if (1.0 / sum < p_min_) break;
-                    if (trace_) trace_q_.push_back((float)(1.0 / sum));
+                if (p_min_ > 0.0f || trace_ || adapt) {   // how sure is the draft block? (softmax probability of d)
+                    const float top = lg[d];
+                    double sum = 0.0;                 // (tokens e^-20 below the best add nothing that matters)
+                    for (float v : lg) if (v > top - 20.0f) sum += std::exp((double)(v - top));
+                    sure = (float)(1.0 / sum);
+                    if (sure < p_min_) break;
+                    if (adapt && i > 0 && chance * trust * sure < theta) break;   // this guess doesn't pay: stop before it
                 }
             }
-            if (trace_ && dist_) trace_q_.push_back(prob_of(qs.back(), d));
+            if (trace_) trace_q_.push_back(dist_ ? prob_of(qs.back(), d) : sure);
+            conf.push_back(sure);
+            chance *= trust * sure;
             drafts.push_back(d);
             if (stop(d)) break;
             tok = d;
@@ -241,6 +263,21 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     st_.check_s += std::chrono::duration<double>(t2 - t1).count();
     st_.catch_s += std::chrono::duration<double>(t3 - t2).count();
     st_.steps++; st_.drafted += k; st_.accepted += m;
+    if (adapt_) {                                     // what this check tells (recent checks count most)
+        const double ms = std::chrono::duration<double, std::milli>(t3 - t0).count(), check_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        const double keep = 0.97, keepw = 0.99;
+        ad_tok_ = ad_tok_ * keep + (m + 1); ad_ms_ = ad_ms_ * keep + ms;
+        const double w = k + 1;
+        ad_n_ = ad_n_ * keepw + 1; ad_w_ = ad_w_ * keepw + w; ad_t_ = ad_t_ * keepw + check_ms; ad_ww_ = ad_ww_ * keepw + w * w; ad_wt_ = ad_wt_ * keepw + w * check_ms;
+        if (k > 0) {
+            const double each = (std::chrono::duration<double, std::milli>(t1 - t0).count() + std::chrono::duration<double, std::milli>(t3 - t2).count()) / k;
+            ad_guess_ms_ = 0.9 * ad_guess_ms_ + 0.1 * each;
+        }
+        if (from_lookup == 0) {                       // the draft block's guesses that were tested: the kept ones, and the first that wasn't
+            ad_pred_ *= 0.995; ad_kept_ *= 0.995;
+            for (int i = 0; i < (int)conf.size() && i < k && i <= m; ++i) { ad_pred_ += conf[i]; ad_kept_ += i < m ? 1.0 : 0.0; }
+        }
+    }
     if (trace_) {                                     // TIERLM_SPEC_TRACE: place, guesses, kept, from lookup, ms, then how sure each guess was
         std::fprintf(trace_, "%d %d %d %d %.2f %.2f %.2f", P, k, m, from_lookup, std::chrono::duration<double, std::milli>(t1 - t0).count(),
                      std::chrono::duration<double, std::milli>(t2 - t1).count(), std::chrono::duration<double, std::milli>(t3 - t2).count());

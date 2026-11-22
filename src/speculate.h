@@ -67,6 +67,16 @@ public:
     void set_sampling(Dist dist, std::mt19937* rng) { dist_ = std::move(dist); rng_ = rng; }
     void clear_sampling() { dist_ = nullptr; rng_ = nullptr; }
 
+    // How many guesses per check, decided each time (draft block only): the draft block says how sure it is of each
+    // guess, and a guess is worth checking only while the chance that it and all those before it are kept, times the
+    // tokens per second the reply is making, beats what one more token costs the check. So it guesses on while it is
+    // sure (up to `most`, and what the model's working memory takes: Model::check_width) and stops at the first guess
+    // that doesn't pay, always making at least one. Both sides of that are measured as the reply goes: how often
+    // guesses of a given sureness are kept, and what a check costs per token. n_draft is then only where it starts.
+    // Off: always n_draft guesses, as before.
+    void set_adaptive(bool on, int most = 8) { adapt_ = on; adapt_most_ = std::max(1, most); }
+    bool adaptive() const { return adapt_; }
+
     // Guessing with the model itself, cut down to the experts in VRAM (Model::set_hot_only), for models with experts
     // split between VRAM and RAM and no draft block: each guess is a step on the GPU alone, and the whole model then
     // checks them all in one pass, reading its RAM experts once for several tokens. Not for models whose running
@@ -131,6 +141,13 @@ private:
     double look_s_ = 0;           // this round of lookup checks: seconds, tokens produced, checks
     int look_tok_ = 0, look_n_ = 0;
     int pause_ = 0, pause_len_ = 16;   // steps left without lookup; how long the next pause is
+    // set_adaptive: running averages (per model: they carry over from reply to reply)
+    bool adapt_ = false;
+    int adapt_most_ = 8;
+    double ad_tok_ = 0, ad_ms_ = 0;    // tokens made and time spent, lately (their ratio: the reply's speed)
+    double ad_w_ = 0, ad_t_ = 0, ad_ww_ = 0, ad_wt_ = 0, ad_n_ = 0;   // checks' widths and times: a line through them gives the cost per token
+    double ad_guess_ms_ = 1.0;         // one guess, and its share of the catching up
+    double ad_pred_ = 0, ad_kept_ = 0; // of the guesses that were put to the test: the sureness they came with, and how many were kept
     std::FILE* trace_ = nullptr;       // TIERLM_SPEC_TRACE
     std::vector<float> trace_q_;       // this check's guesses: how sure the draft block was of each
 };
