@@ -465,6 +465,18 @@ kept free at load, so that many fewer experts fit: 10,729 instead of 11,005 of F
 still 90% of the expert work. The plans are made only for models with a draft block, and only when the check's
 memory is under 1/32 of the card (`TIERLM_PLANS=1`: always, `=0`: never).
 
+Since 0.9.4 the check has no scheduler of its own: its graph stays placed on the model's scheduler, whose working
+memory is there for prompt steps anyway and is larger than a check's (Flash-Next on an RTX 5090: 2.5 GB for a
+4,096-token step; a check of 9 tokens needs 1.5 GB at a 256K context). So nothing extra is kept free on the card
+(at 64K: 9,470 experts in VRAM instead of 8,930), and at long contexts, where a second working memory was too big
+to make, the check is no longer built and placed every round. The reservation covers the widest check that fits
+(`Model::check_width`). The draft block's two kinds of step keep their own small schedulers: one token for each
+guess, and the catching-up after a check, which beside a quantized cache goes two tokens at a time (the GPU's
+attention reads such a cache as it is for one or two tokens; for more it first makes f16 copies of all its keys and
+values: 518 MB of working memory for a 9-token step at 256K). A prompt step, the reply's one-token graph or a check
+of another size takes the scheduler from the check, which is then built and placed again: 3 to 13 ms, so checks come
+in two sizes only (see `Speculator::set_adaptive`).
+
 The draft block's experts also go into VRAM before the model's own (since 0.8.7; `TIERLM_MTP_VRAM=0` for the old
 placement by use): the draft block runs once per guess, so its experts in RAM cost a GPU-to-CPU round trip each time.
 

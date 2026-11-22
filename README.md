@@ -14,6 +14,67 @@ gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), NVIDIA Nemo
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
 
+### In development for 0.9.4: Qwen3.8 Flash-Next as a coding agent's model
+
+Measured with the pi coding agent (1.6.0) working through a 15-task session against tierlm's OpenAI API (9 short
+questions it mostly checks with Python, 3 pictures to read, 3 small programs to trace, fix and run; thinking off; 39
+to 47 turns, the model's own choice each time): RTX 5090 (32 GB), Ryzen 9 9950X3D, 64 GB DDR5-6000, NVMe, Windows 11;
+Qwen3.8 Flash-Next UD-IQ3_XXS (77.9 GiB) with its MTP draft file and its vision file, **256K context**, KV cache
+q8_0, 8 threads, VRAM experts following the conversation, 3 guesses.
+
+| The same 15 tasks | the day's first build (it has the first two items below, and long contexts' VRAM experts) | **now** |
+|---|---|---|
+| Replies, all of them together | 49.7 tok/s (6,753 tokens) | **78.4 tok/s** (5,407 tokens) |
+| Replies after the first picture | 43.8 tok/s | **78.1 tok/s** |
+| New prompt tokens (tool results, pictures) read | 9,754 in 27.6 s | 8,629 in **20.8 s** |
+| The agent's own time for the session | 129 s for 14 tasks, and two reminders for the last | **90 s**, all 15, no reminder |
+
+- **Flash-Next reads images.** Its vision file (`mmproj-...`, the encoder Qwen3.5 / 3.6 use) now loads with it. The
+  per-layer n-grams read an image's places as its image token and the image's 3-part positions reach the sparse
+  attention's indexer; both checked against Hugging Face's Qwen4Exp code (`tests/tiny_flashnext_vision.py`: one image
+  and two, fed whole, a token at a time and cut in the middle, also past the indexer's budget). An 800 x 600
+  screenshot (475 image words) is read in 0.14 to 0.22 s on the RTX 5090.
+- **Qwen3.5 / 3.6 / 3.8 conversations exactly as their chat templates write them.** A new module builds these
+  models' prompts and is checked character for character against the templates in the GGUF files (240 prompts:
+  system messages, tools, tool calls with every kind of argument, several calls at once, thinking on and off and at
+  each reasoning effort). An agent's system message used to keep its last newline, earlier replies were written
+  without the empty thinking block, and Qwen3.8's reasoning-effort line wasn't written at all. Besides being what the
+  model was trained on, a conversation now continues word for word from what the model itself wrote, so a turn reads
+  only its new tokens (these models can't rewind: a difference meant reading from the last checkpoint again).
+- **Guessing ahead carries on after a picture.** A conversation with an image in it lost speculative decoding for
+  the rest of its life: the draft block read text only. It now reads what the model's layers read (an image's words
+  where its tokens are, at their 3-part positions; the text after it at the conversation's own positions), checked
+  against a reference put together from Hugging Face's layers.
+- **Long contexts keep their VRAM experts.** Attention's working memory goes with a step's tokens times the cache
+  it attends over, and it was kept free on the GPU for a full batch at the context's very end, whatever the
+  conversation's length: at 256K that left about 5,700 experts in VRAM against 8,930 at 64K. Past 65,536 positions a prompt
+  step now takes fewer tokens, so the memory is the same at any context length: **7,560 experts in VRAM at 256K**.
+- **Checking guesses needs no working memory of its own.** The check's graph stays placed on the model's own working
+  memory (695 MB of VRAM back at 64K: 9,470 experts in VRAM instead of 8,930; at 256K, where no second memory fit,
+  the check is no longer laid out again every time), and the draft block's catching-up goes two tokens at a time
+  beside a quantized cache, where a wider step made the GPU copy the whole cache as f16 first.
+- **The set number of guesses, or many when every one of them pays.** The draft block says how sure it is of each
+  guess, and that tells well whether the model keeps it (guesses it gave 90% or more: kept 93 to 96% of the time; at
+  50 to 60%: about 45%). When the chance that 8 guesses in a row are kept, times the reply's speed, beats what the
+  extra tokens cost the check, the check takes 8; else the number that was set. What a token of a check costs and how
+  far the block's sureness can be trusted are measured as replies go. In the agent's session a third of the checks
+  took 8. `TIERLM_DRAFT_ADAPT=0`: always the set number.
+- **Past its attention budget, Flash-Next's attention gathers what a query sees.** Past 2,048 tokens each query
+  attends to the 512 blocks its indexer picked and to its own unfinished block; the GPU was given the whole cache with
+  the rest masked out. ggml's attention can be told that bound and then gathers only those keys and values: a
+  72,074-token prompt is read at 2,010 tok/s instead of 1,896, and a check of 3 tokens at that depth takes 55.7 ms
+  instead of 62.8. `TIERLM_QSA_SPARSE=0`: as before.
+- **Streamed prompt batches from 256 tokens** instead of 512: with the RAM experts streamed through VRAM their pass
+  costs about a second whatever the batch, and the CPU passes that at about 256 new tokens (a 290-token tool result:
+  1.16 s on the CPU, a 560-token one: 1.04 s streamed).
+- **Fixed: the image reader's GPU helper kept its working memory after an image**, which pushed a long prompt's
+  working memory out of VRAM (a 35K-token prompt read at 256 to 805 tok/s after an image, 1,430 to 2,135 before).
+  It is now given back after each image.
+- For developers: `TIERLM_SPEC_TRACE=file` (a line per check: guesses, kept, times, how sure the draft block was),
+  `TIERLM_ROUTE_DUMP=file` (every step's expert picks), `TIERLM_MEM_PROBE=1` (what steps of each size need on the
+  GPU), `tierlm-attn-check` (ggml's sparse attention against the masked one on this build's GPU), `tierlm-logits`
+  takes `@file` for a long prompt.
+
 ### New in 0.9.3: much less context memory for Gemma and gpt-oss, guessing ahead with several connections, a log for problem reports
 
 - **Sliding-window layers keep only their window.** Gemma 3 and 4, gpt-oss and Flint have layers that only ever read
@@ -661,6 +722,7 @@ or a systemd service:
 | `tierlm-plan` | Dry-run the VRAM/RAM/SSD placement plan for a memory budget |
 | `tierlm-kv` | Dump a GGUF file's metadata |
 | `tierlm-embed`, `tierlm-vision` | An embedding from an embedding model; image words from a vision (`mmproj`) file |
+| `tierlm-attn-check` | For developers: ggml's sparse attention against the masked one on this build's GPU (after changing the ggml pin) |
 | `tierlm-tok-test`, `tierlm-logits` | Test harnesses used by `tests/` |
 
 Details and options: [docs/TOOLS.md](docs/TOOLS.md).

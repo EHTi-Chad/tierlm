@@ -114,8 +114,8 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     // out again, which costs as much as one or two tokens (measured: 3 to 13 ms), so the size changes only when it
     // clearly pays. (Deciding every count freely was measured too: the size changed at more than half the checks, and
     // that took back what the longer guesses gained.) Until a few checks have been timed: the set number.
-    const int n_many = std::max(1, std::min(adapt_most_, m_.check_width() - 1));
-    const int n_few = std::min(n_draft_, n_many);
+    const int n_many = std::max(n_draft_, std::min(adapt_most_, m_.check_width() - 1));   // (never fewer than were set)
+    const int n_few = n_draft_;
     const int n_max = std::max(0, std::min(adapt && ad_n_ >= 8 ? n_many : n_draft_, room));
     // What one more token must bring in to be worth its place in the check: the reply's speed times the token's cost.
     double theta = 0.5;

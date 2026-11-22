@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
             all_ok = all_ok && ok;
             std::printf("a step of %4d: each query sees up to %d positions; told so %.2f ms, behind the mask %.2f ms%s; "
                         "largest difference %.1e of the largest value  ->  %s\n", n_tok, most, std::fabs(ts), std::fabs(td),
-                        td < 0 || ts < 0 ? " (not on the GPU)" : "", ok ? "ok" : "DIFFERENT");
+                        td < 0 || ts < 0 ? " (not on the GPU)" : "", big > 0 ? worst / big : 0.0, ok ? "ok" : "DIFFERENT");
             std::fflush(stdout);
         }
         ggml_backend_buffer_free(wbuf);
