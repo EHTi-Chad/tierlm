@@ -2748,7 +2748,7 @@ int main(int argc, char** argv) {
             // on, so this reply guesses ahead as with one connection. (Someone else starting meanwhile: shared steps.)
             {
                 std::lock_guard<std::mutex> lb(eng.batch.m);
-                solo = eng.batch.active == 0 && !has_pics && eng.active_spec() && !eng.slots[0].busy;
+                solo = eng.batch.active == 0 && eng.active_spec() && !eng.slots[0].busy;
             }
             if (solo) seq = 0;
             else for (int s = 0; s < (int)eng.slots.size(); ++s) {
@@ -2904,9 +2904,9 @@ int main(int argc, char** argv) {
         if (eng.vision && suffix.size() >= 8192) eng.vision->release_gpu();
         auto p0 = Clock::now();
         std::vector<float> lg;
-        // (speculation: one conversation at a time, on conversation 0, and not with images: the draft block reads
-        // text only. With several connections, while this reply has the model to itself: `solo`)
-        Speculator* const spx = has_pics || (par && !solo) ? nullptr : eng.active_spec();
+        // (speculation: one conversation at a time, on conversation 0. With several connections, while this reply
+        // has the model to itself: `solo`. Images too: the draft block reads their words as the model does.)
+        Speculator* const spx = par && !solo ? nullptr : eng.active_spec();
         // its steps call the model directly: never between the batcher's shared steps
         std::unique_lock<std::mutex> spec_run(eng.batch.run, std::defer_lock);
         auto run_lock = [&] { if (par) spec_run.lock(); };

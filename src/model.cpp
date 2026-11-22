@@ -113,25 +113,34 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     if (!m->gpus_.empty()) { size_t fr = 0; ggml_backend_dev_memory(ggml_backend_get_device(m->gpus_[0]), &fr, &vram_total); }
     const int runtime = [&]{ const char* e = std::getenv("TIERLM_VRAM_SCRATCH_MB");
                              return e ? std::atoi(e) : std::clamp((int)(vram_total >> 20) / 32, 192, 640); }();
-    const int need = (int)(m->place_.compute_gpu >> 20) + runtime;
+    auto need_of = [&](const Model& mm) { return (int)(mm.place_.compute_gpu >> 20) + runtime; };
+    int need = need_of(*m);
     const bool tight = m->place_.compute_gpu > 0 && need > used + 64 && opt.vram_budget_mb <= 0 && !std::getenv("TIERLM_VRAM_BYTES");
-    // remember it: the most seen (no reload back and forth), unless far more was noted than is needed now (a newer
-    // tierlm that needs less: the next load keeps less free)
-    if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && (need > o.vram_reserve_mb || (opt.vram_reserve_mb <= 0 && need + 256 < o.vram_reserve_mb))) {
+    // Keeping more free leaves fewer experts in VRAM, so each layer has more in RAM, and the two slots long prompts
+    // stream them through (setup_stream) grow with the biggest layer's: about a 24th of what's given up (48 layers).
+    if (tight && m->stream_.buf) need += (need - used) / 20;
+    auto note = [&](int mb) {
         std::vector<std::string> keep;
         { std::ifstream f(std::filesystem::u8path(o.vram_note)); for (std::string line; std::getline(f, line); ) if (line.compare(0, key.size(), key) != 0 && !line.empty()) keep.push_back(line); }
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::u8path(o.vram_note).parent_path(), ec);
         std::ofstream f(std::filesystem::u8path(o.vram_note), std::ios::trunc);
         for (const auto& l : keep) f << l << "\n";
-        f << key << std::max(need, 512) << "\n";
-    }
+        f << key << std::max(mb, 512) << "\n";
+    };
+    // remember it: the most seen (no reload back and forth), unless far more was noted than is needed now (a newer
+    // tierlm that needs less: the next load keeps less free)
+    if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && (need > o.vram_reserve_mb || (opt.vram_reserve_mb <= 0 && need + 256 < o.vram_reserve_mb)))
+        note(need);
     if (!tight) return m;
     std::fprintf(stderr, "VRAM: this model needs %d MB free for the GPU's working memory and %d MB was kept; loading again "
                          "with %d MB kept, so replies don't slow down when VRAM runs out (once: it's remembered)\n", need, used, need);
     m.reset();
     o.vram_reserve_mb = need;
-    return load_once(path, o);
+    m = load_once(path, o);
+    // (what it needs with that much kept, if still more: for next time)
+    if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && need_of(*m) > need + 64) note(need_of(*m));
+    return m;
 }
 
 std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptions& opt) {
@@ -2218,6 +2227,20 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             w = std::min(w, m->max_ctx_);
             Graph g = m->build_mtp(w, m->max_ctx_ - w, &p.mem);
             const bool fits = ggml_backend_sched_reserve(p.sched, g.gf);
+            if (std::getenv("TIERLM_MEM_PROBE")) {                // the graph's biggest results
+                std::vector<std::pair<size_t, int>> big;
+                for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) {
+                    ggml_tensor* t = ggml_graph_node(g.gf, i);
+                    if (t->view_src || t->op == GGML_OP_NONE) continue;
+                    big.push_back({ggml_nbytes(t), i});
+                }
+                std::sort(big.rbegin(), big.rend());
+                for (size_t k = 0; k < big.size() && k < 10; ++k) {
+                    ggml_tensor* t = ggml_graph_node(g.gf, big[k].second);
+                    std::fprintf(stderr, "probe: draft block, %d tokens: node %d %s %s %.1f MB [%lld x %lld x %lld x %lld]\n", w, big[k].second, ggml_op_desc(t),
+                                 ggml_type_name(t->type), big[k].first / 1048576.0, (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+                }
+            }
             ggml_free(g.ctx);
             if (!fits) { ggml_backend_sched_free(p.sched); p.sched = nullptr; p.mem = {}; return; }   // (as before)
             if (!m->gpus_.empty()) m->place_.compute_gpu += ggml_backend_sched_get_buffer_size(p.sched, m->gpus_[0]);
@@ -2226,7 +2249,12 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                              ggml_backend_sched_get_buffer_size(p.sched, m->gpus_[0]) / 1048576.0);
         };
         make(m->mtp1_, 1);
-        make(m->mtpk_, 9);
+        // A quantized cache: the GPU's attention reads it as it is for one or two tokens only; for more it first
+        // makes f16 copies of the whole cache's keys and values (Flash-Next at 256K: 518 MB for this plan alone). So
+        // there the catching-up goes two tokens at a time (see mtp_eval).
+        m->mtpk_w_ = ggml_is_quantized((ggml_type)m->kv_t_) ? 2 : 9;
+        if (const char* e = std::getenv("TIERLM_MTP_STEP")) m->mtpk_w_ = std::clamp(std::atoi(e), 1, 9);   // (tests)
+        make(m->mtpk_, m->mtpk_w_);
     }
     return m;
 }
@@ -4527,7 +4555,7 @@ Model::Graph Model::build_dsv4(int n_tok, int n_past, bool want_routing, int n_l
     return g;
 }
 
-Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem) {
+Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem, bool images) {
     const Hparams& hp = hp_;
     const Layer& L = *mtp_;
     const int n_kv = kv_span(n_past + n_tok);
@@ -4538,9 +4566,22 @@ Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem) 
     g.gf = ggml_new_graph_custom(c, kGraphSize, false);
     g.n_tok = n_tok;
     g.inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);  ggml_set_input(g.inp);
-    g.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);  ggml_set_input(g.pos);
+    // Rotary positions apart from the cache's places: after an image the conversation's positions run ahead of its
+    // places (see step), and an image's own words have 3-part positions and their own embeddings (`images`: a
+    // prompt step with image words in it).
+    g.mrope = images && hp.mrope;
+    g.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, g.mrope ? 4 * n_tok : n_tok);  ggml_set_input(g.pos);
+    g.cells = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);  ggml_set_input(g.cells);
+    if (images) {
+        g.img = ggml_new_tensor_2d(c, GGML_TYPE_F32, hp.n_embd, n_tok);  ggml_set_input(g.img);
+        g.keep = ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, n_tok);         ggml_set_input(g.keep);
+    }
     g.h_in = ggml_new_tensor_2d(c, GGML_TYPE_F32, hp.hidden_width(), n_tok);  ggml_set_input(g.h_in);
     if (flash_attn_) { g.mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tok); ggml_set_input(g.mask); }
+    auto embed = [&] {                                            // the tokens' embeddings, images' words in their places
+        ggml_tensor* e = ggml_get_rows(c, L.mtp_embd ? L.mtp_embd : tok_embd_, g.inp);
+        return g.img ? ggml_add(c, ggml_mul(c, e, g.keep), g.img) : e;
+    };
     if (hp.hc) {
         // Flash-Next: the model's hc copies (before its last mixer) are normed one by one; each copy, beside the
         // normed embedding, goes through eh_proj, which gives the block's own hc copies. Then one full-attention
@@ -4569,8 +4610,7 @@ Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem) 
             ggml_tensor* r = ggml_mul(c, ggml_repeat_4d(c, y3, E, HC, n_tok, 1), ggml_reshape_3d(c, inj, 1, HC, n_tok));
             return ggml_add(c, X, ggml_reshape_2d(c, r, (int64_t)E * HC, n_tok));
         };
-        ggml_tensor* e = ggml_get_rows(c, L.mtp_embd ? L.mtp_embd : tok_embd_, g.inp);
-        e = ggml_mul(c, ggml_rms_norm(c, e, hp.rms_eps), L.enorm);                                   // [E, n_tok]
+        ggml_tensor* e = ggml_mul(c, ggml_rms_norm(c, embed(), hp.rms_eps), L.enorm);              // [E, n_tok]
         ggml_tensor* e3 = ggml_repeat_4d(c, ggml_reshape_3d(c, e, E, 1, n_tok), E, HC, n_tok, 1);   // [E, HC, n_tok]
         ggml_tensor* hn = ggml_reshape_3d(c, gnorm(g.h_in, L.hnorm), E, HC, n_tok);
         ggml_tensor* x = ggml_mul_mat(c, L.eh_proj, ggml_concat(c, e3, hn, 0));                      // [E, HC, n_tok]
@@ -4589,8 +4629,7 @@ Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem) 
         return g;
     }
 
-    ggml_tensor* e = ggml_get_rows(c, L.mtp_embd ? L.mtp_embd : tok_embd_, g.inp);
-    e = ggml_mul(c, ggml_rms_norm(c, e, hp.rms_eps), L.enorm);
+    ggml_tensor* e = ggml_mul(c, ggml_rms_norm(c, embed(), hp.rms_eps), L.enorm);
     ggml_tensor* hn = ggml_mul(c, ggml_rms_norm(c, g.h_in, hp.rms_eps), L.hnorm);
     ggml_tensor* x = ggml_mul_mat(c, L.eh_proj, ggml_concat(c, e, hn, 0));  // [n_embd, n_tok]
     ggml_tensor* h = ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.attn_norm);
@@ -4614,7 +4653,19 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     const Hparams& hp = hp_;
     // One token (each guess, and catching up after a check that kept none): the kept plan, run again (see Plan).
     // A few tokens (catching up after a check): a second plan, so the main scheduler keeps the check's graph placed.
-    Plan* const P = n_tok == 1 && mtp1_.sched ? &mtp1_ : n_tok > 1 && n_tok <= 9 && mtpk_.sched ? &mtpk_ : nullptr;
+    bool any_image = false;                                       // (image words: a prompt step, built for them)
+    for (int i = 0; i < n_tok; ++i) any_image = any_image || is_image_id(ids[i]);
+    if (!any_image && mtpk_.sched && n_tok > mtpk_w_ && n_tok <= 9) {   // a few tokens, as many at a time as the plan takes
+        std::vector<float> lg, part;
+        if (h_out) h_out->clear();
+        for (int off = 0; off < n_tok; off += mtpk_w_) {
+            const int k = std::min(mtpk_w_, n_tok - off);
+            lg = mtp_eval(ids + off, h + (size_t)off * hp.hidden_width(), k, pos0 + off, n_threads, h_out ? &part : nullptr);
+            if (h_out) h_out->insert(h_out->end(), part.begin(), part.end());
+        }
+        return lg;
+    }
+    Plan* const P = any_image ? nullptr : n_tok == 1 && mtp1_.sched ? &mtp1_ : n_tok > 1 && n_tok <= mtpk_w_ && mtpk_.sched ? &mtpk_ : nullptr;
     const bool plan = P != nullptr;
     ReuseKey key{kv_span(pos0 + n_tok)};
     key.n_tok = n_tok;
@@ -4629,16 +4680,44 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     }
     Graph built;
     if (!plan) {
-        built = build_mtp(n_tok, pos0);
+        built = build_mtp(n_tok, pos0, nullptr, any_image);
         drop_reuse();
         ggml_backend_sched_reset(sched_);
         if (!ggml_backend_sched_alloc_graph(sched_, built.gf)) { ggml_free(built.ctx); throw std::runtime_error("failed to allocate compute memory"); }
     }
     Graph& g = plan ? P->g : built;
-    std::vector<int32_t> positions(n_tok);
-    for (int i = 0; i < n_tok; ++i) positions[i] = pos0 + i;
-    ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
-    ggml_backend_tensor_set(g.pos, positions.data(), 0, sizeof(int32_t) * n_tok);
+    // Each place's rotary position: the conversation's own (they run ahead of the places after an image, whose
+    // words have 3-part positions); for the guesses, which the model hasn't read yet, the positions that follow.
+    {
+        static const std::vector<std::array<int, 3>> none;
+        const auto& sr = seq_rope_.empty() ? none : seq_rope_[0];
+        const int have = (int)sr.size(), next = seq_next_.empty() ? have : seq_next_[0];
+        std::vector<int32_t> cells(n_tok), pos(g.mrope ? 4 * (size_t)n_tok : n_tok, 0);
+        for (int i = 0; i < n_tok; ++i) {
+            const int at = pos0 + i;
+            cells[i] = at;
+            if (at >= have && is_image_id(ids[i])) { if (!plan) ggml_free(g.ctx); throw std::runtime_error("MTP: an image's words the model hasn't read"); }
+            const std::array<int, 3> r = at < have ? sr[at] : std::array<int, 3>{next + at - have, next + at - have, next + at - have};
+            pos[i] = r[0];
+            if (g.mrope) { pos[n_tok + i] = r[1]; pos[2 * n_tok + i] = r[2]; }
+        }
+        ggml_backend_tensor_set(g.cells, cells.data(), 0, sizeof(int32_t) * n_tok);
+        ggml_backend_tensor_set(g.pos, pos.data(), 0, sizeof(int32_t) * pos.size());
+    }
+    if (g.img) {                                                  // images: their words replace the embeddings
+        std::vector<int32_t> tid(ids, ids + n_tok);
+        std::vector<float> keep(n_tok, 1.0f), words((size_t)hp.n_embd * n_tok, 0.0f);
+        for (int t = 0; t < n_tok; ++t) {
+            if (!is_image_id(ids[t])) continue;
+            const ImageRec* im = image_of(ids[t]);
+            if (!im) { ggml_free(g.ctx); throw std::runtime_error("an image this conversation refers to is no longer known; send it again"); }
+            std::copy_n(im->words.data() + (size_t)(ids[t] - im->first) * hp.n_embd, hp.n_embd, words.data() + (size_t)t * hp.n_embd);
+            tid[t] = 0; keep[t] = 0.0f;
+        }
+        ggml_backend_tensor_set(g.inp, tid.data(), 0, sizeof(int32_t) * n_tok);
+        ggml_backend_tensor_set(g.keep, keep.data(), 0, sizeof(float) * n_tok);
+        ggml_backend_tensor_set(g.img, words.data(), 0, sizeof(float) * words.size());
+    } else ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
     ggml_backend_tensor_set(g.h_in, h, 0, sizeof(float) * (size_t)hp.hidden_width() * n_tok);
     if (g.mask) {
         const int n_kv = kv_span(pos0 + n_tok);                    // padded columns are future: -inf

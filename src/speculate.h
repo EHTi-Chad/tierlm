@@ -16,6 +16,7 @@
 #include "model.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <functional>
 #include <random>
 #include <vector>
@@ -35,6 +36,9 @@ class Speculator {
 public:
     // n_draft: most tokens to guess per step. p_min: stop guessing once the draft block is less sure than this.
     explicit Speculator(Model& m, int n_draft = 3, float p_min = 0.0f);
+    ~Speculator();
+    Speculator(const Speculator&) = delete;
+    Speculator& operator=(const Speculator&) = delete;
 
     // Like Model::eval for a whole conversation: toks is the full token list, of which the first m.n_past() are
     // already in the model's cache (the caller truncates the cache to the part that still matches). Evaluates the
@@ -127,6 +131,8 @@ private:
     double look_s_ = 0;           // this round of lookup checks: seconds, tokens produced, checks
     int look_tok_ = 0, look_n_ = 0;
     int pause_ = 0, pause_len_ = 16;   // steps left without lookup; how long the next pause is
+    std::FILE* trace_ = nullptr;       // TIERLM_SPEC_TRACE
+    std::vector<float> trace_q_;       // this check's guesses: how sure the draft block was of each
 };
 
 }

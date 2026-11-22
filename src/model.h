@@ -515,7 +515,7 @@ private:
     // One graph: n_tok tokens of conversation 0 (groups null), or of the conversations in groups.
     EvalOut step(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
                  std::vector<int32_t>* routing, const std::vector<SeqGroup>* groups);
-    Graph build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem = nullptr);
+    Graph build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem = nullptr, bool images = false);
     void* pending_ = nullptr;                    // Graph of the last undoable batch, until accept()
     // Live hot experts: per split layer, which expert each VRAM slot holds and how much each is wanted.
     struct LivePart { ggml_tensor *hot, *cold; };   // an expert tensor's VRAM part and its RAM part (the rest)
@@ -739,7 +739,7 @@ private:
     // block's catching-up step (2 to 9 tokens), which used the main scheduler between checks, has its own small one.
     struct Plan { Graph g; ReuseKey key; ggml_backend_sched* sched = nullptr; std::vector<uint8_t> mem; };
     Plan check_, mtp1_, mtpk_;
-    bool check_main_ = false;                                      // the check's graph stays placed on sched_
+    int mtpk_w_ = 9; bool check_main_ = false;                                      // the check's graph stays placed on sched_
     int check_width_ = 5;                                          // tokens in a check that sched_'s memory holds (see check_width)
     void drop_plan(Plan& p);
     void drop_plans();                                             // reuse_ and both plans (the cache changes size)

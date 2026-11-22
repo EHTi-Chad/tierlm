@@ -31,29 +31,38 @@ tfn = {}
 exec(compile(src, spec.origin, "exec"), tfn)
 BASE, V, EOS, write_base = tfn["BASE"], tfn["V"], tfn["EOS"], tfn["write"]
 
-def build(over, seed):
-    torch.manual_seed(seed)
-    cfg = Qwen4ExpTextConfig(**{**BASE, **over})
-    m = Qwen4ExpForCausalLM(cfg).eval()
+def randomize(mod):
+    with torch.no_grad():
+        for n, p in mod.named_parameters():
+            if n.endswith("A_log"): p.copy_(torch.log(torch.empty_like(p).uniform_(0.5, 4)))
+            elif n.endswith("dt_bias"): p.copy_(0.5 + 0.1 * torch.randn_like(p))
+            elif "linear_attn.norm" in n: p.copy_(1 + 0.1 * torch.randn_like(p))
+            elif "norm" in n: p.copy_(0.1 * torch.randn_like(p))
+            else: p.copy_(0.2 * torch.randn_like(p))
+
+def draft_block(cfg):
+    # A draft block for a model with this (text) configuration, random: the pieces, then their weights
     li = cfg.num_hidden_layers - 1                       # a full-attention layer's kind (the last one is)
     assert cfg.layer_types[li] != "linear_attention"
     blk = Qwen4ExpTextDecoderLayer(cfg, li).eval()
     head = Qwen4ExpTextGatedResidual(cfg, use_combine=False).eval()
     E, HC = cfg.hidden_size, cfg.hc_count
     eh = torch.nn.Linear(2 * E, E, bias=False)
-    with torch.no_grad():
-        for mod in (m, blk, head, eh):
-            for n, p in mod.named_parameters():
-                if n.endswith("A_log"): p.copy_(torch.log(torch.empty_like(p).uniform_(0.5, 4)))
-                elif n.endswith("dt_bias"): p.copy_(0.5 + 0.1 * torch.randn_like(p))
-                elif "linear_attn.norm" in n: p.copy_(1 + 0.1 * torch.randn_like(p))
-                elif "norm" in n: p.copy_(0.1 * torch.randn_like(p))
-                else: p.copy_(0.2 * torch.randn_like(p))
-    mtp = dict(blk=blk, head=head, eh=eh,
-               enorm=(1 + 0.1 * torch.randn(E)).numpy(), hnorm=(1 + 0.1 * torch.randn(HC * E)).numpy())
-    return cfg, m, mtp
+    def weights():
+        for mod in (blk, head, eh): randomize(mod)
+        return dict(blk=blk, head=head, eh=eh,
+                    enorm=(1 + 0.1 * torch.randn(E)).numpy(), hnorm=(1 + 0.1 * torch.randn(HC * E)).numpy())
+    return weights
 
-def write(cfg, m, mtp):
+def build(over, seed):
+    torch.manual_seed(seed)
+    cfg = Qwen4ExpTextConfig(**{**BASE, **over})
+    m = Qwen4ExpForCausalLM(cfg).eval()
+    weights = draft_block(cfg)
+    randomize(m)
+    return cfg, m, weights()
+
+def write(cfg, m, mtp, **kw):
     # The model as tiny_flashnext.py writes it, with the block count one higher, the draft block's settings and its
     # tensors added (a GGUFWriter that adds them on the way).
     n, A, cr = cfg.num_hidden_layers, "qwen4exp", cfg.indexer_compress_ratio
@@ -68,7 +77,7 @@ def write(cfg, m, mtp):
             super().write_header_to_file(*a, **kw)
     mod = types.ModuleType("gguf_mtp"); mod.__dict__.update(gguf.__dict__); mod.GGUFWriter = W
     tfn["gguf"] = mod
-    try: path, _ = write_base(cfg, m)
+    try: path, _ = write_base(cfg, m, **kw)
     finally: tfn["gguf"] = gguf
     return path
 
@@ -125,21 +134,26 @@ def block_tensors(cfg, mtp):
               b + "nextn.hc_head_up.weight": hs["input_mix_weight_up.weight"]})
     return T
 
-def mtp_reference(cfg, m, mtp, ids):
+def mtp_reference(cfg, m, mtp, ids, text=None, run=None):
+    # text: the text model (its layers, last mixer and token embeddings); run: the model's own pass over the
+    # conversation. With images (tests/tiny_flashnext_vision.py) the block reads what the model's layers read: the
+    # images' words where their tokens are, and the layers' positions (3-part at the images, running ahead after them).
+    text = text or m.model
     E, HC = cfg.hidden_size, cfg.hc_count
     got = {}
     full = [i for i, t in enumerate(cfg.layer_types) if t != "linear_attention"][0]
-    h1 = m.model.hyper_connection_mixer.register_forward_pre_hook(lambda mod, args: got.__setitem__("X", args[0]))
-    h2 = m.model.layers[full].register_forward_pre_hook(lambda mod, args, kw: got.update(pe=kw["position_embeddings"], mask=kw["attention_mask"]), with_kwargs=True)
+    h1 = text.hyper_connection_mixer.register_forward_pre_hook(lambda mod, args: got.__setitem__("X", args[0]))
+    h2 = text.layers[full].register_forward_pre_hook(lambda mod, args, kw: got.update(pe=kw["position_embeddings"], mask=kw["attention_mask"]), with_kwargs=True)
+    h3 = text.register_forward_pre_hook(lambda mod, args, kw: got.__setitem__("embeds", kw.get("inputs_embeds")), with_kwargs=True)
     with torch.no_grad():
-        m(torch.tensor([ids]))
-    h1.remove(); h2.remove()
+        run() if run else m(torch.tensor([ids]))
+    h1.remove(); h2.remove(); h3.remove()
     X = got["X"][0]                                       # [T, HC*E], before the last mixer
     T_ = len(ids)
     hprev = torch.cat([torch.zeros(1, HC * E), X[:-1]])
     def rms(x): return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps)
     with torch.no_grad():
-        e = m.model.embed_tokens(torch.tensor(ids)).float()
+        e = (got["embeds"][0] if got.get("embeds") is not None else text.embed_tokens(torch.tensor(ids))).float()
         en = rms(e) * torch.tensor(mtp["enorm"])                                       # [T, E]
         hn = (rms(hprev.reshape(T_, HC, E)).reshape(T_, HC * E) * torch.tensor(mtp["hnorm"])).reshape(T_, HC, E)
         x = mtp["eh"](torch.cat([en[:, None, :].expand(T_, HC, E), hn], -1)).reshape(1, T_, HC * E)
@@ -147,85 +161,92 @@ def mtp_reference(cfg, m, mtp, ids):
         o = mtp["head"](x)                                                             # [1, T, E]
         return m.lm_head(o)[0, -1].double().numpy()
 
-exe = sys.argv[1]
-long_ids = [int(x) for x in np.random.default_rng(3).integers(2, V, 200)]
-long_ids[37] = long_ids[120] = EOS
-tests = [[5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55, 117, EOS, 4, 4, 9], long_ids]
-CASES = {"mtp": dict(), "mtp-8layer": dict(num_hidden_layers=8)}
-ok = True
-for ci, (name, over) in enumerate(CASES.items()):
-    cfg, m, mtp = build(over, 50 + ci)
-    path = write(cfg, m, mtp)
-    for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}, 1e-4), ("normal", {}, 6e-2)):
-        worst, top = 0.0, True
-        for mode in (["--mtp"], ["--mtp-step"]):
-            for ids in tests:
-                want = mtp_reference(cfg, m, mtp, ids)
-                r = subprocess.run([exe, path, *mode, *map(str, ids)], capture_output=True, text=True, env={**os.environ, **env})
-                if r.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode[0]} failed: {r.stderr.strip()[-800:]}")
-                got = np.array([float(v) for v in r.stdout.split()])
-                worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
-                top &= bool(got.argmax() == want.argmax())
-        passed = worst < tol and top
-        ok &= passed
-        print(f"{name:12s} {label:7s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {top}  ->  {'ok' if passed else 'FAIL'}")
-        # Speculative decoding with the draft block: greedy output must not change, with its own guesses (poor on
-        # random weights) and with scripted guesses wrong at different depths, so undo runs at every depth.
-        def gen(mode, extra=None):
-            r = subprocess.run([exe, path, mode, "60", "5", "9", "13"], capture_output=True, text=True, env={**os.environ, **env, **(extra or {})})
-            if r.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
-            return r.stdout.split(), r.stderr.strip().splitlines()[-1:] if r.stderr.strip() else []
-        plain, _ = gen("--gen")
-        checks = [gen("--gen-spec")] + [gen("--gen-spec", {"TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k}) for k in ("3", "5")]
-        checks += [gen("--gen-spec", {"TIERLM_DRAFT_N": "8", "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k}) for k in ("2", "7")]
-        same = all(c[0] == plain for c in checks)
+def main():
+    global exe
+    exe = sys.argv[1]
+    long_ids = [int(x) for x in np.random.default_rng(3).integers(2, V, 200)]
+    long_ids[37] = long_ids[120] = EOS
+    tests = [[5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55, 117, EOS, 4, 4, 9], long_ids]
+    CASES = {"mtp": dict(), "mtp-8layer": dict(num_hidden_layers=8)}
+    ok = True
+    for ci, (name, over) in enumerate(CASES.items()):
+        cfg, m, mtp = build(over, 50 + ci)
+        path = write(cfg, m, mtp)
+        for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}, 1e-4), ("normal", {}, 6e-2)):
+            worst, top = 0.0, True
+            for mode, more in ((["--mtp"], {}), (["--mtp-step"], {}), (["--mtp"], {"TIERLM_MTP_STEP": "2"})):
+                for ids in tests:
+                    want = mtp_reference(cfg, m, mtp, ids)
+                    r = subprocess.run([exe, path, *mode, *map(str, ids)], capture_output=True, text=True, env={**os.environ, **env, **more})
+                    if r.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode[0]} failed: {r.stderr.strip()[-800:]}")
+                    got = np.array([float(v) for v in r.stdout.split()])
+                    worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
+                    top &= bool(got.argmax() == want.argmax())
+            passed = worst < tol and top
+            ok &= passed
+            print(f"{name:12s} {label:7s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {top}  ->  {'ok' if passed else 'FAIL'}")
+            # Speculative decoding with the draft block: greedy output must not change, with its own guesses (poor on
+            # random weights) and with scripted guesses wrong at different depths, so undo runs at every depth.
+            def gen(mode, extra=None):
+                r = subprocess.run([exe, path, mode, "60", "5", "9", "13"], capture_output=True, text=True, env={**os.environ, **env, **(extra or {})})
+                if r.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
+                return r.stdout.split(), r.stderr.strip().splitlines()[-1:] if r.stderr.strip() else []
+            plain, _ = gen("--gen")
+            checks = [gen("--gen-spec")] + [gen("--gen-spec", {"TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k}) for k in ("3", "5")]
+            checks += [gen("--gen-spec", {"TIERLM_DRAFT_N": "8", "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k}) for k in ("2", "7")]
+            # (the draft block catching up two tokens at a time, as it does beside a quantized cache)
+            checks += [gen("--gen-spec", {"TIERLM_MTP_STEP": "2", "TIERLM_DRAFT_N": "8", "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": "7"})]
+            same = all(c[0] == plain for c in checks)
+            ok &= same
+            print(f"{name:12s} {label:7s}: greedy output with speculation {'identical' if same else 'DIFFERENT'} ({'; '.join(' '.join(c[1]) for c in checks)})  ->  {'ok' if same else 'FAIL'}")
+        # The draft block from a separate "mtp-" file next to the model: found, and the same predictions and output.
+        main, comp = split_companion(path, cfg.num_hidden_layers)
+        env = {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}
+        same = True
+        for mode in (["--mtp", "1", "2", "3"], ["--gen-spec", "40", "5", "9", "13"]):
+            a = subprocess.run([exe, path, *mode], capture_output=True, text=True, env={**os.environ, **env})
+            b = subprocess.run([exe, main, *mode], capture_output=True, text=True, env={**os.environ, **env})
+            if b.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode[0]} with the separate draft file failed: {b.stderr.strip()[-800:]}")
+            found = "draft block from" in b.stderr
+            same &= found and a.stdout == b.stdout and a.returncode == 0
         ok &= same
-        print(f"{name:12s} {label:7s}: greedy output with speculation {'identical' if same else 'DIFFERENT'} ({'; '.join(' '.join(c[1]) for c in checks)})  ->  {'ok' if same else 'FAIL'}")
-    # The draft block from a separate "mtp-" file next to the model: found, and the same predictions and output.
-    main, comp = split_companion(path, cfg.num_hidden_layers)
-    env = {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}
-    same = True
-    for mode in (["--mtp", "1", "2", "3"], ["--gen-spec", "40", "5", "9", "13"]):
-        a = subprocess.run([exe, path, *mode], capture_output=True, text=True, env={**os.environ, **env})
-        b = subprocess.run([exe, main, *mode], capture_output=True, text=True, env={**os.environ, **env})
-        if b.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode[0]} with the separate draft file failed: {b.stderr.strip()[-800:]}")
-        found = "draft block from" in b.stderr
-        same &= found and a.stdout == b.stdout and a.returncode == 0
-    ok &= same
-    print(f"{name:12s} {'file':7s}: separate mtp- draft file {'found, same results' if same else 'NOT the same'}  ->  {'ok' if same else 'FAIL'}")
-    os.remove(path)
+        print(f"{name:12s} {'file':7s}: separate mtp- draft file {'found, same results' if same else 'NOT the same'}  ->  {'ok' if same else 'FAIL'}")
+        os.remove(path)
 
-# Speculative sampling (temperature > 0): guesses drawn from the draft block's probabilities and kept by the ratio of
-# the model's to the draft block's must leave the replies' odds exactly as the model's own. On a 16-token vocabulary
-# (so the guesses are often kept: about 40%), many 3-token replies are drawn with and without guessing and compared
-# with a chi-square test, token by token, in pairs and whole (z within 4: a real error shows up far beyond that).
-from collections import Counter
-cfg, m, mtp = build(dict(vocab_size=16), 60)
-path = write(cfg, m, mtp)
-env = {**os.environ, "TIERLM_DEVICE": "cpu", "TIERLM_SAMPLE_RUNS": "8000", "TIERLM_SAMPLE_TOPK": "16", "TIERLM_SAMPLE_TEMP": "1"}
-runs = {}
-for mode in ("--gen", "--gen-spec"):
-    r = subprocess.run([exe, path, mode, "3", "5", "9", "13"], capture_output=True, text=True, env=env)
-    if r.returncode != 0: sys.exit(f"sampling: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
-    runs[mode] = [tuple(l.split(",")) for l in r.stdout.split()]
-def z_of(a, b):
-    ca, cb = Counter(a), Counter(b)
-    na, nb = len(a), len(b)
-    chi, df, rest = 0.0, -1, [0, 0]
-    for k in set(ca) | set(cb):
-        x, y = ca[k], cb[k]
-        if x + y < 10: rest[0] += x; rest[1] += y; continue
-        ex, ey = (x + y) * na / (na + nb), (x + y) * nb / (na + nb)
-        chi += (x - ex) ** 2 / ex + (y - ey) ** 2 / ey; df += 1
-    if sum(rest):
-        x, y = rest; ex, ey = (x + y) * na / (na + nb), (x + y) * nb / (na + nb)
-        chi += (x - ex) ** 2 / ex + (y - ey) ** 2 / ey; df += 1
-    return (chi - df) / (2 * df) ** 0.5 if df > 0 else 0.0
-P, Q = runs["--gen"], runs["--gen-spec"]
-zs = [z_of([t[i] for t in P], [t[i] for t in Q]) for i in range(3)]
-zs += [z_of([t[:2] for t in P], [t[:2] for t in Q]), z_of([t[1:] for t in P], [t[1:] for t in Q]), z_of(P, Q)]
-passed = all(abs(z) < 4 for z in zs)
-ok &= passed
-print(f"{'sampling':12s} {'exact':7s}: replies' odds with speculative sampling, z = {', '.join(f'{z:.1f}' for z in zs)} (limit 4)  ->  {'ok' if passed else 'FAIL'}")
-os.remove(path)
-sys.exit(0 if ok else 1)
+    # Speculative sampling (temperature > 0): guesses drawn from the draft block's probabilities and kept by the ratio of
+    # the model's to the draft block's must leave the replies' odds exactly as the model's own. On a 16-token vocabulary
+    # (so the guesses are often kept: about 40%), many 3-token replies are drawn with and without guessing and compared
+    # with a chi-square test, token by token, in pairs and whole (z within 4: a real error shows up far beyond that).
+    from collections import Counter
+    cfg, m, mtp = build(dict(vocab_size=16), 60)
+    path = write(cfg, m, mtp)
+    env = {**os.environ, "TIERLM_DEVICE": "cpu", "TIERLM_SAMPLE_RUNS": "8000", "TIERLM_SAMPLE_TOPK": "16", "TIERLM_SAMPLE_TEMP": "1"}
+    runs = {}
+    for mode in ("--gen", "--gen-spec"):
+        r = subprocess.run([exe, path, mode, "3", "5", "9", "13"], capture_output=True, text=True, env=env)
+        if r.returncode != 0: sys.exit(f"sampling: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
+        runs[mode] = [tuple(l.split(",")) for l in r.stdout.split()]
+    def z_of(a, b):
+        ca, cb = Counter(a), Counter(b)
+        na, nb = len(a), len(b)
+        chi, df, rest = 0.0, -1, [0, 0]
+        for k in set(ca) | set(cb):
+            x, y = ca[k], cb[k]
+            if x + y < 10: rest[0] += x; rest[1] += y; continue
+            ex, ey = (x + y) * na / (na + nb), (x + y) * nb / (na + nb)
+            chi += (x - ex) ** 2 / ex + (y - ey) ** 2 / ey; df += 1
+        if sum(rest):
+            x, y = rest; ex, ey = (x + y) * na / (na + nb), (x + y) * nb / (na + nb)
+            chi += (x - ex) ** 2 / ex + (y - ey) ** 2 / ey; df += 1
+        return (chi - df) / (2 * df) ** 0.5 if df > 0 else 0.0
+    P, Q = runs["--gen"], runs["--gen-spec"]
+    zs = [z_of([t[i] for t in P], [t[i] for t in Q]) for i in range(3)]
+    zs += [z_of([t[:2] for t in P], [t[:2] for t in Q]), z_of([t[1:] for t in P], [t[1:] for t in Q]), z_of(P, Q)]
+    passed = all(abs(z) < 4 for z in zs)
+    ok &= passed
+    print(f"{'sampling':12s} {'exact':7s}: replies' odds with speculative sampling, z = {', '.join(f'{z:.1f}' for z in zs)} (limit 4)  ->  {'ok' if passed else 'FAIL'}")
+    os.remove(path)
+    sys.exit(0 if ok else 1)
+
+if __name__ == "__main__":
+    main()

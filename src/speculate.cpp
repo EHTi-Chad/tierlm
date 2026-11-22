@@ -1,11 +1,17 @@
 #include "speculate.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace tierlm {
 
-Speculator::Speculator(Model& m, int n_draft, float p_min) : m_(m), n_draft_(std::max(0, n_draft)), p_min_(p_min) {}
+Speculator::Speculator(Model& m, int n_draft, float p_min) : m_(m), n_draft_(std::max(0, n_draft)), p_min_(p_min) {
+    // TIERLM_SPEC_TRACE=file (developers): a line per check (appended; every speculator of the process writes there)
+    if (const char* e = std::getenv("TIERLM_SPEC_TRACE"); e && *e) trace_ = std::fopen(e, "a");
+}
+Speculator::~Speculator() { if (trace_) std::fclose(trace_); }
 
 std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_threads, std::vector<int32_t>* routing) {
     if (routing) routing->clear();
@@ -72,7 +78,7 @@ std::vector<int32_t> Speculator::lookup_guesses(const std::vector<int32_t>& ctx,
         // Candidate starts i: ctx[i, i+len) == tail, with at least one token after it, searched from the end.
         for (int i = N - len - 1; i >= 0; --i) {
             if (ctx[i] != tail[0] || !std::equal(tail, tail + len, ctx.data() + i)) continue;
-            for (int j = i + len; j < N && (int)out.size() < n; ++j) out.push_back(ctx[j]);
+            for (int j = i + len; j < N && (int)out.size() < n && !Model::is_image_id(ctx[j]); ++j) out.push_back(ctx[j]);   // (never an image's words)
             break;
         }
     }
@@ -106,6 +112,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     const auto t0 = std::chrono::steady_clock::now();
 
     // ---- 1. guess ----
+    trace_q_.clear();
     std::vector<int32_t> drafts;
     std::vector<std::vector<std::pair<int32_t, float>>> qs;   // sampling: the probabilities each guess was drawn from
     if (hist_.size() != (size_t)P) hist_.clear();     // out of step with the cache (it was changed elsewhere): no lookup
@@ -147,12 +154,14 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                 qs.push_back(std::move(q));
             } else {
                 d = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
-                if (p_min_ > 0.0f) {                  // how sure is the draft block? (softmax probability of d)
+                if (p_min_ > 0.0f || trace_) {        // how sure is the draft block? (softmax probability of d)
                     double sum = 0.0;
                     for (float v : lg) sum += std::exp((double)v - lg[d]);
                     if (1.0 / sum < p_min_) break;
+                    if (trace_) trace_q_.push_back((float)(1.0 / sum));
                 }
             }
+            if (trace_ && dist_) trace_q_.push_back(prob_of(qs.back(), d));
             drafts.push_back(d);
             if (stop(d)) break;
             tok = d;
@@ -232,6 +241,13 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     st_.check_s += std::chrono::duration<double>(t2 - t1).count();
     st_.catch_s += std::chrono::duration<double>(t3 - t2).count();
     st_.steps++; st_.drafted += k; st_.accepted += m;
+    if (trace_) {                                     // TIERLM_SPEC_TRACE: place, guesses, kept, from lookup, ms, then how sure each guess was
+        std::fprintf(trace_, "%d %d %d %d %.2f %.2f %.2f", P, k, m, from_lookup, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                     std::chrono::duration<double, std::milli>(t2 - t1).count(), std::chrono::duration<double, std::milli>(t3 - t2).count());
+        for (size_t i = 0; i < trace_q_.size() && (int)i < k; ++i) std::fprintf(trace_, " %.4f", trace_q_[i]);
+        std::fprintf(trace_, "\n");
+        std::fflush(trace_);
+    }
     if (from_lookup > 0) {
         st_.looked += k; st_.look_ok += m;
         // A match that led nowhere costs a wider check for nothing: guess just one token after a miss (cheap to

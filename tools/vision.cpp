@@ -6,11 +6,15 @@
 //   tierlm-vision mmproj.gguf --chat model.gguf image.png[,image2.png...] out.f32 MODE id ... -1 ... id
 //       a chat model reading the image(s): each -1 in the ids marks where the next image's words go. Writes the last position's
 //       logits to out.f32. MODE: "all" (one call), "step" (one id per call) or a number (calls of that many ids,
-//       so an image can be cut in the middle).
+//       so an image can be cut in the middle). With the model's MTP draft block: "mtp" its prediction after the
+//       last id, run over every place at once, "mtp-step" one place at a time, "mtp-N" N at a time; "gen" the 24
+//       tokens the model writes next (greedy; out.f32: their ids), "gen-spec" the same guessing ahead.
 // Environment: TIERLM_DEVICE (cpu, CUDA0, ...) as for the other tools; TIERLM_VISION_EXACT=1 plain attention.
 #include "model.h"
+#include "speculate.h"
 #include "vision.h"
 #include "backends.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -56,6 +60,8 @@ int main(int argc, char** argv) {
             LoadOptions o;
             if (dev) o.device = dev;
             o.max_ctx = 2048;
+            const std::string how = argv[6];
+            o.mtp = how.compare(0, 3, "mtp") == 0 || how == "gen-spec";
             auto m = Model::load(argv[3], o);
             struct Img { int32_t first; int n, rows, cols; };
             std::vector<Img> imgs;                            // (several images: their files with commas between)
@@ -80,7 +86,42 @@ int main(int argc, char** argv) {
                     ++next;
                 } else ids.push_back(id);
             }
-            const std::string how = argv[6];
+            if (how == "gen" || how == "gen-spec") {              // what the model writes next, with and without guessing
+                const int V = m->hparams().n_vocab, n_gen = 24;
+                auto argmax = [&](const float* v) { return (int32_t)(std::max_element(v, v + V) - v); };
+                std::vector<int32_t> out;
+                if (how == "gen") {
+                    std::vector<float> lg = m->eval(ids, threads);
+                    while ((int)out.size() < n_gen) { out.push_back(argmax(lg.data())); lg = m->eval({out.back()}, threads); }
+                } else {
+                    Speculator sp(*m, std::getenv("TIERLM_DRAFT_N") ? std::atoi(std::getenv("TIERLM_DRAFT_N")) : 3);
+                    std::vector<float> lg = sp.prompt(ids, threads);
+                    int32_t x = argmax(lg.data());
+                    out.push_back(x);
+                    while ((int)out.size() < n_gen) {
+                        auto prod = sp.step(x, threads, [&](const float* row, const std::vector<int32_t>&) { return argmax(row); }, [](int32_t) { return false; });
+                        for (int32_t t : prod) out.push_back(t);
+                        x = prod.back();
+                    }
+                    out.resize(n_gen);
+                    std::printf("steps %d, drafted %d, accepted %d\n", sp.stats().steps, sp.stats().drafted, sp.stats().accepted);
+                }
+                write_floats(argv[5], std::vector<float>(out.begin(), out.end()));
+                return 0;
+            }
+            if (how.compare(0, 3, "mtp") == 0) {                  // the draft block over the conversation, images and all
+                const int E = m->hparams().hidden_width(), n = (int)ids.size();
+                const int chunk = how == "mtp" ? n : how == "mtp-step" ? 1 : std::max(1, std::atoi(how.c_str() + 4));
+                Model::EvalOut r = m->eval_ex(ids.data(), n, threads, 1, true, 1, nullptr);
+                std::vector<float> h((size_t)n * E, 0.0f), logits;    // place t: the token at t beside the model's state at t - 1
+                std::copy(r.hidden.begin(), r.hidden.begin() + (size_t)(n - 1) * E, h.begin() + E);
+                for (int off = 0; off < n; off += chunk) {
+                    const int k = std::min(chunk, n - off);
+                    logits = m->mtp_eval(ids.data() + off, h.data() + (size_t)off * E, k, off, threads);
+                }
+                write_floats(argv[5], logits);
+                return 0;
+            }
             const int chunk = how == "all" ? (int)ids.size() : how == "step" ? 1 : std::max(1, std::atoi(how.c_str()));
             std::vector<float> logits;
             for (size_t off = 0; off < ids.size(); off += chunk) {

@@ -10,6 +10,12 @@ Hugging Face's. What's particular to Flash-Next here:
     context goes far past its tiny budget).
 Fed in one call, one token per call, and in calls that cut the image in the middle; one image and two.
 
+The MTP draft block after images (guessing ahead in a conversation with pictures): the block reads what the model's
+own layers read, the images' words where their tokens are and the layers' positions (3-part at an image, running
+ahead of the places after it). Hugging Face's code has no draft block, so the reference is put together from its
+layers as in tests/tiny_flashnext_mtp.py. Checked over every place at once, one at a time and seven at a time; and
+the model's greedy reply after the images is the same with guessing as without.
+
 usage: python tests/tiny_flashnext_vision.py build
 """
 import os, subprocess, sys, tempfile
@@ -22,6 +28,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tiny_flashnext as fn
+import tiny_flashnext_mtp as fm
 
 build = sys.argv[1] if len(sys.argv) > 1 else "build"
 exe = os.path.join(build, "tierlm-vision")
@@ -141,6 +148,47 @@ for ci, (name, over) in enumerate(CASES.items()):
             ok = d < 1e-3 and got.argmax() == want.argmax()
             print(f"{name:16s} images {str(which):7s} {mode:4s}: worst relative diff {d:.1e}, top {got.argmax()} vs {want.argmax()}  ->  {'ok' if ok else 'FAIL'}")
             if not ok: fails.append(f"{name} {which} {mode}")
+    os.remove(textm)
+# ---- the draft block after images ----
+EXACT = {**os.environ, "TIERLM_DEVICE": "cpu", "TIERLM_VISION_EXACT": "1", "TIERLM_KV_F32": "1"}
+for ci, (name, over) in enumerate({"draft": dict(), "draft-8layer": dict(num_hidden_layers=8, ple_layer_ids=[2])}.items()):
+    torch.manual_seed(70 + ci)
+    cfg, m = build_model(over, 70 + ci)
+    mtp = fm.draft_block(cfg.text_config)()
+    textm = fm.write(cfg.text_config, TextView(m), mtp, image_tok=IMG)
+    mmproj = os.path.join(tmp, f"mmproj-{name}.gguf")
+    write_mmproj(m, mmproj)
+    for which in ((0,), (0, 1)):
+        segs = [[int(x) for x in rng.integers(2, 290, 4)] + [VSTART]]
+        for k, w in enumerate(which):
+            segs.append([VEND] + [int(x) for x in rng.integers(2, 290, 9 if k == len(which) - 1 else 3)] + ([VSTART] if k < len(which) - 1 else []))
+        pvs, grids, ids = [], [], list(segs[0])
+        for k, w in enumerate(which):
+            pv, gh, gw = hf_patches(pics[w]); pvs.append(pv); grids.append([1, gh, gw])
+            ids += [IMG] * (gh * gw // 4) + segs[k + 1]
+        run = lambda: m(input_ids=torch.tensor([ids]), pixel_values=torch.tensor(np.concatenate(pvs)), image_grid_thw=torch.tensor(grids),
+                        mm_token_type_ids=torch.tensor([[int(t == IMG) for t in ids]]))
+        want = fm.mtp_reference(cfg.text_config, m, mtp, ids, text=m.model.language_model, run=run)
+        cmd_ids = []
+        for k in range(len(which)): cmd_ids += segs[k] + [-1]
+        cmd_ids += segs[-1]
+        out = os.path.join(tmp, "o.f32")
+        def tool(mode, env=EXACT):
+            r = subprocess.run([exe, mmproj, "--chat", textm, ",".join(pics[w] for w in which), out, mode, *map(str, cmd_ids)], capture_output=True, text=True, env=env)
+            if r.returncode: print(f"{name}: tierlm-vision {mode} failed: {r.stderr.strip()[-600:]}"); return None, ""
+            return np.fromfile(out, np.float32), r.stdout.strip()
+        for mode in ("mtp", "mtp-step", "mtp-7"):
+            got, _ = tool(mode)
+            d = rel(got, want) if got is not None else 1.0
+            ok = got is not None and d < 1e-3 and got.argmax() == want.argmax()
+            print(f"{name:16s} images {str(which):7s} {mode:8s}: worst relative diff {d:.1e}  ->  {'ok' if ok else 'FAIL'}")
+            if not ok: fails.append(f"{name} {which} {mode}")
+        for label, env in (("exact", EXACT), ("normal", {**os.environ})):
+            plain, _ = tool("gen", env)
+            spec, stats = tool("gen-spec", env)
+            ok = plain is not None and spec is not None and np.array_equal(plain, spec)
+            print(f"{name:16s} images {str(which):7s} {label:8s}: the reply with guessing is {'the same' if ok else 'DIFFERENT'} ({stats})  ->  {'ok' if ok else 'FAIL'}")
+            if not ok: fails.append(f"{name} {which} gen {label}")
     os.remove(textm)
 print("PASS" if not fails else "FAIL: " + ", ".join(fails))
 sys.exit(1 if fails else 0)
