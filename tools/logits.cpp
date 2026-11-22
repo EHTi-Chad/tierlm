@@ -74,7 +74,10 @@ int main(int argc, char** argv) {
                 const int64_t ai = gguf_find_key(gc, "general.architecture");
                 const std::string arch = ai >= 0 && gguf_get_kv_type(gc, ai) == GGUF_TYPE_STRING ? gguf_get_val_str(gc, ai) : "";
                 auto u = [&](const std::string& k) { const int64_t i = gguf_find_key(gc, k.c_str()); return i >= 0 && gguf_get_kv_type(gc, i) == GGUF_TYPE_UINT32 ? (int)gguf_get_val_u32(gc, i) : 0; };
-                const int L = u(arch + ".block_count"), E = u(arch + ".expert_count");
+                int L = u(arch + ".block_count");
+                const int E = u(arch + ".expert_count");
+                // (Inkling 2's earlier looped layout counts a loop layer once for every pass over it)
+                if (const int passes = u(arch + ".num_loops"); passes > 1) L -= (passes - 1) * (u(arch + ".loop.core_end") - u(arch + ".loop.core_start"));
                 gguf_free(gc);
                 if (L > 0 && E > 0) {
                     o.expert_usage.assign((size_t)L * E, 0.0f);

@@ -467,16 +467,52 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.ink = true;
         hp.hybrid = true;                                         // (the convolutions' kept inputs can't be rewound: see truncate)
         hp.n_swa = u32(arch + ".attention.sliding_window", true);
-        hp.swa.assign(hp.n_layer, false);
+        // Two layouts of a looped model. llama.cpp's converter writes arch "inkling2_loop": the layers once, and the
+        // loop as loop.start / loop.end / loop.count. An earlier one, which Unsloth's files have (Inkling-2-Mini-UD-*),
+        // is arch "inkling2" with num_loops: the settings that go by layer are written out visit by visit (the layers
+        // before the loop, every pass over the loop's layers, the layers after), block_count counts the visits, and
+        // the loop is loop.core_start / loop.core_end / num_loops. The tensors are stored once either way. Here the
+        // visits are folded back onto the layers (a pass must repeat its layers' settings), and from then on the two
+        // are one. (The mapping as Unsloth's llama.cpp reads that layout: unslothai/llama.cpp #395.)
+        hp.ink_earlier = arch == "inkling2" && gguf_find_key(g, (arch + ".num_loops").c_str()) >= 0;
+        const int n_visit = hp.n_layer;
+        int v_lo = 0, v_hi = 0, v_extra = 0;
+        if (hp.ink_earlier) {
+            v_lo = u32(arch + ".loop.core_start", true);
+            v_hi = u32(arch + ".loop.core_end", true);
+            hp.ink_loop_passes = u32(arch + ".num_loops", true);
+            hp.ink_loop_rank = u32(arch + ".loop.gate_rank", true);
+            if (v_lo < 1 || v_hi <= v_lo || hp.ink_loop_passes < 2 || hp.ink_loop_passes > 64 ||
+                (int64_t)v_hi + (int64_t)(hp.ink_loop_passes - 1) * (v_hi - v_lo) > n_visit) bad("loop");
+            v_extra = (hp.ink_loop_passes - 1) * (v_hi - v_lo);
+            hp.ink_loop_lo = v_lo; hp.ink_loop_hi = v_hi;
+            hp.n_layer = n_visit - v_extra;
+        }
+        auto layer_of = [&](int v) { return v < v_hi + v_extra ? (v < v_lo ? v : v_lo + (v - v_lo) % std::max(1, v_hi - v_lo)) : v - v_extra; };
+        // a setting per visit -> per layer (every visit of a layer must say the same)
+        auto folded = [&](const std::vector<int>& by_visit) {
+            std::vector<int> by_layer((size_t)hp.n_layer, 0);
+            std::vector<char> seen((size_t)hp.n_layer, 0);
+            for (int v = 0; v < n_visit; ++v) {
+                const int l = layer_of(v);
+                if (seen[l] && by_layer[l] != by_visit[v]) bad("a pass of the loop differs from its layers");
+                by_layer[l] = by_visit[v]; seen[l] = 1;
+            }
+            return by_layer;
+        };
         const int64_t pid = gguf_find_key(g, (arch + ".attention.sliding_window_pattern").c_str());
         if (pid < 0 || gguf_get_kv_type(g, pid) != GGUF_TYPE_ARRAY || gguf_get_arr_type(g, pid) != GGUF_TYPE_BOOL ||
-            (int)gguf_get_arr_n(g, pid) != hp.n_layer) bad("sliding-window pattern");
+            (int)gguf_get_arr_n(g, pid) != n_visit) bad("sliding-window pattern");
         const bool* sw = (const bool*)gguf_get_arr_data(g, pid);
-        for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = sw[i];
+        std::vector<int> sw_v((size_t)n_visit);
+        for (int i = 0; i < n_visit; ++i) sw_v[i] = sw[i] ? 1 : 0;
+        const std::vector<int> sw_l = folded(sw_v);
+        hp.swa.assign(hp.n_layer, false);
+        for (int i = 0; i < hp.n_layer; ++i) hp.swa[i] = sw_l[i] != 0;
         const int hd_full = (int)u32(arch + ".attention.key_length", true);
         const int hd_swa = gguf_find_key(g, (arch + ".attention.key_length_swa").c_str()) >= 0 ? (int)u32(arch + ".attention.key_length_swa", false) : hd_full;
-        const std::vector<int> nh = per_layer(arch + ".attention.head_count", hp.n_layer);
-        const std::vector<int> kvh = per_layer(arch + ".attention.head_count_kv", hp.n_layer);
+        const std::vector<int> nh = folded(per_layer(arch + ".attention.head_count", n_visit));
+        const std::vector<int> kvh = folded(per_layer(arch + ".attention.head_count_kv", n_visit));
         hp.hd_l.resize(hp.n_layer); hp.kvh_l.resize(hp.n_layer); hp.nh_l.resize(hp.n_layer);
         for (int i = 0; i < hp.n_layer; ++i) {
             hp.hd_l[i] = hp.swa[i] ? hd_swa : hd_full;
@@ -519,7 +555,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         for (float v : {hp.ink_qk_clip, hp.ink_rel_clip, hp.situ_beta, hp.situ_lbeta, hp.rms_eps})
             if (!std::isfinite(v) || v <= 0) bad("clip, softcap or norm settings");
         if (!std::isfinite(hp.ink_log_alpha) || hp.ink_log_alpha < 0) bad("logarithmic scale");
-        if (hp.ink_loop_passes > 1 || arch == "inkling2_loop") {
+        if (hp.ink_loop_passes > 1 || arch == "inkling2_loop" || hp.ink_earlier) {
             const int lo = hp.ink_loop_lo, hi = hp.ink_loop_hi, B = hp.ink_res_block;
             if (lo < 1 || hi <= lo || hi > hp.n_layer || lo % B || hi % B ||
                 hp.ink_loop_passes < 1 || hp.ink_loop_passes > 64 || hp.ink_loop_rank < 1) bad("loop");
@@ -1792,6 +1828,13 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     if (hp.ink) {
         m->tok_norm_ = T("token_embd_norm.weight");
         m->ink_out_res_ = T("output_res_query.weight");
+        if (hp.ink_earlier) {                                         // the loop layers' message queries: see ink_layers
+            m->ink_res_q_ = T("loop_res_query.weight");
+            m->ink_kv_q_ = T("loop_kv_res_query.weight");
+            for (ggml_tensor* t : {m->ink_res_q_, m->ink_kv_q_})
+                if (t->ne[0] != hp.n_embd || t->ne[1] != 2 * hp.ink_loop_n() || t->type != GGML_TYPE_F32)
+                    throw std::runtime_error("unexpected shape of the loop's message queries");
+        }
     }
     m->output_     = T("output.weight", false);
     m->rope_freqs_ = T("rope_freqs.weight", false);   // Llama 3.1+ long-context frequency factors (Gemma 4: proportional RoPE)
@@ -1897,6 +1940,18 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             L.up_s = T(b + "ffn_up_shexp.weight"); L.gate_s = T(b + "ffn_gate_shexp.weight"); L.down_s = T(b + "ffn_down_shexp.weight");
             return L;
         }
+        // Experts kept as a model's makers quantized them (NVFP4) come with a scale for each expert beside the weights:
+        // what an expert's matrix gives is times that expert's scale (see ffn_block). The down matrix's is the same
+        // thing as Gemma 4's own scale per expert.
+        auto expert_scales = [&](Layer& L, const std::string& b) {
+            L.x_scale_gu = T(b + "ffn_gate_up_exps.scale", false);
+            L.x_scale_gate = T(b + "ffn_gate_exps.scale", false);
+            L.x_scale_up = T(b + "ffn_up_exps.scale", false);
+            if (!L.exp_scale) L.exp_scale = T(b + "ffn_down_exps.scale", false);
+            for (ggml_tensor* sc : {L.x_scale_gu, L.x_scale_gate, L.x_scale_up, L.exp_scale})
+                if (sc && (ggml_nelements(sc) != hp.n_expert || sc->type != GGML_TYPE_F32))
+                    throw std::runtime_error("unexpected shape of an expert scale in " + b);
+        };
         if (hp.ink) {                                                 // Inkling 2 (see Hparams::ink, Layer::ink_*)
             L.swa = hp.is_swa(i);
             L.rope = false;
@@ -1938,11 +1993,15 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             L.gate_up_x = T(b + "ffn_gate_up_exps.weight", false);
             if (!L.gate_up_x) { L.gate_x = T(b + "ffn_gate_exps.weight"); L.up_x = T(b + "ffn_up_exps.weight"); }
             L.down_x = T(b + "ffn_down_exps.weight");
+            expert_scales(L, b);
             if (hp.ink_loop_passes > 1 && i >= hp.ink_loop_lo && i < hp.ink_loop_hi) {
-                L.ink_msgq = shaped(b + "loop_msg_query.weight", {H, 4});
+                // (the earlier layout: the gates named for where they act, and every layer's message queries in two
+                // tensors of the whole model: see ink_layers)
+                if (!hp.ink_earlier) L.ink_msgq = shaped(b + "loop_msg_query.weight", {H, 4});
                 const char* site[4] = {"q", "k", "v", "ffn"};
+                const char* site_e[4] = {"attn", "k", "v", "mlp"};
                 for (int k = 0; k < 4; ++k) {
-                    const std::string p = b + "loop_" + site[k] + "_ctrl_";
+                    const std::string p = hp.ink_earlier ? b + "loop_" + site_e[k] + "_" : b + "loop_" + site[k] + "_ctrl_";
                     L.ink_down[k] = shaped(p + "down.weight", {2 * H, hp.ink_loop_rank});
                     L.ink_gain[k] = shaped(p + "gain.weight", {hp.ink_loop_rank, H});
                     L.ink_forget[k] = shaped(p + "forget.weight", {hp.ink_loop_rank, H});
@@ -1967,6 +2026,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                 L.lat_down = T(b + "ffn_latent_down.weight", false);
                 L.lat_up = T(b + "ffn_latent_up.weight", false);
                 L.up_x = T(b + "ffn_up_exps.weight");       L.down_x = T(b + "ffn_down_exps.weight");
+                expert_scales(L, b);
                 L.up_s = T(b + "ffn_up_shexp.weight", false);
                 if (L.up_s) L.down_s = T(b + "ffn_down_shexp.weight");
             }
@@ -2051,6 +2111,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                 L.up_x   = T(b + "ffn_up_exps.weight");
             }
             L.down_x = T(b + "ffn_down_exps.weight");
+            expert_scales(L, b);
             L.router_b = T(b + "ffn_gate_inp.bias", false);               // gpt-oss: biases on the router and experts
             L.gate_xb  = T(b + "ffn_gate_exps.bias", false);
             L.up_xb    = T(b + "ffn_up_exps.bias", false);
@@ -2283,9 +2344,22 @@ void Model::pin_cpu_layers(const Graph& g, ggml_backend_sched* sc) {
     }
     for (ggml_tensor* t : g.cpu_ops) ggml_backend_sched_set_tensor_backend(sc, t, cpu_);
     if (!pin_layers_) return;
+    // A view computes nothing: it is its source's memory, so it can only be where its source is. A layer that takes a
+    // view of what another device holds or made must not pin it (Inkling 2's depth mixers reshape every earlier
+    // block's output and the embedding's, and take columns of query tables that are weights of the whole model):
+    // those are left to the scheduler, which puts a view with its source and copies for the step that reads it.
+    std::unordered_map<const ggml_tensor*, int> dev_of;
+    for (const auto& [t, layer] : g.owner)
+        if (layer >= 0 && layer < (int)layer_dev_.size()) dev_of[t] = layer_dev_[layer];
     for (const auto& [t, layer] : g.owner) {
         if (layer < 0 || layer >= (int)layer_dev_.size()) continue;
         const int d = layer_dev_[layer];
+        if (const ggml_tensor* src = t->view_src) {
+            const auto it = dev_of.find(src);
+            const bool here = it != dev_of.end() ? it->second == d             // made by a layer on this device,
+                                                 : src->op == GGML_OP_NONE && !src->buffer;   // or an input of the graph
+            if (!here) continue;
+        }
         if (d < 0) ggml_backend_sched_set_tensor_backend(sc, t, cpu_);
         else if (gpus_.size() > 1) ggml_backend_sched_set_tensor_backend(sc, t, gpus_[d]);
     }
@@ -3301,21 +3375,30 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         const int64_t XW   = hx->ne[0];
         ggml_tensor* h3    = ggml_reshape_3d(c, hx, XW, 1, n_tok);
         ggml_tensor* xin   = h3;                                            // what the experts read (see overlap below)
+        // Experts with a scale each beside their weights (NVFP4 files): what a pick's matrix gives is times its expert's
+        // scale, [1, n_used, n_tok]. By the router's own picks, so a split layer's two parts (whose ids are places in
+        // their own tensors) share them.
+        auto pick_scale = [&](ggml_tensor* sc) -> ggml_tensor* {
+            if (!sc) return nullptr;
+            return ggml_reshape_3d(c, ggml_get_rows(c, ggml_reshape_2d(c, sc, 1, NE), ggml_reshape_1d(c, ggml_cont(c, sel), (int64_t)NU * n_tok)), 1, NU, n_tok);
+        };
+        ggml_tensor *s_gu = pick_scale(L.x_scale_gu), *s_gate = pick_scale(L.x_scale_gate), *s_up = pick_scale(L.x_scale_up);
         // The chosen experts' outputs, weighted and summed: [n_embd, n_tok]. ids: [n_used, n_tok] into these tensors.
         auto experts = [&](ggml_tensor* gate_up_x, ggml_tensor* gate_x, ggml_tensor* up_x, ggml_tensor* down_x,
                            ggml_tensor* ids, ggml_tensor* wt, ggml_tensor* gate_b = nullptr, ggml_tensor* up_b = nullptr,
                            ggml_tensor* down_b = nullptr, ggml_tensor* bias_ids = nullptr) {
             if (!bias_ids) bias_ids = ids;                                   // (a split layer: the router's own ids, see below)
             ggml_tensor *up, *gate = nullptr;
-            if (hp.expert_relu2) up = ggml_mul_mat_id(c, up_x, xin, ids);   // Nemotron: no gate
+            auto scaled = [&](ggml_tensor* t, ggml_tensor* s) { return s ? ggml_mul(c, t, s) : t; };   // (see pick_scale)
+            if (hp.expert_relu2) up = scaled(ggml_mul_mat_id(c, up_x, xin, ids), s_up);   // Nemotron: no gate
             else if (gate_up_x) {                                                 // [2*n_ff_exp, n_used, n_tok]: gate, then up
-                ggml_tensor* gu = ggml_mul_mat_id(c, gate_up_x, xin, ids);
+                ggml_tensor* gu = scaled(ggml_mul_mat_id(c, gate_up_x, xin, ids), s_gu);
                 const int64_t f = gu->ne[0] / 2;
                 gate = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
                 up   = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], f * gu->nb[0]);
             } else {
-                up   = ggml_mul_mat_id(c, up_x, xin, ids);                    // [n_ff_exp, n_used, n_tok]
-                gate = ggml_mul_mat_id(c, gate_x, xin, ids);
+                up   = scaled(ggml_mul_mat_id(c, up_x, xin, ids), s_up);               // [n_ff_exp, n_used, n_tok]
+                gate = scaled(ggml_mul_mat_id(c, gate_x, xin, ids), s_gate);
             }
             if (up_b)   up   = ggml_add_id(c, up, up_b, bias_ids);            // each pick gets its own expert's bias
             if (gate_b) gate = ggml_add_id(c, gate, gate_b, bias_ids);
@@ -3482,7 +3565,8 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                                                                             // whose ids skip the VRAM part's picks with -1)
                 std::set<ggml_tensor*> seen;
                 std::function<void(ggml_tensor*)> pin = [&](ggml_tensor* t) {
-                    if (!t || t == ids_c || t == ids_b || t == w_cold || t == h3 || t == xin || t->op == GGML_OP_NONE || !seen.insert(t).second) return;
+                    if (!t || t == ids_c || t == ids_b || t == w_cold || t == h3 || t == xin || t == s_gu || t == s_gate || t == s_up ||
+                        t->op == GGML_OP_NONE || !seen.insert(t).second) return;      // (what the part reads: not its own steps)
                     g.cpu_ops.push_back(t);
                     for (ggml_tensor* src : t->src) pin(src);
                 };
@@ -4280,6 +4364,20 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
     };
     const bool loop = hp.ink_loop_passes > 1;
     const int lo = loop ? hp.ink_loop_lo : hp.n_layer, hi = loop ? hp.ink_loop_hi : hp.n_layer;
+    // A loop layer's four message queries [H, 4]: for its q, k, v and experts' input. The earlier layout keeps all the
+    // layers' in two tensors of the whole model, [H, 2 per loop layer] each: the first holds layer i's q and experts'
+    // queries (columns 2i and 2i + 1), the second its k and v queries.
+    std::vector<ggml_tensor*> msgq_made((size_t)std::max(0, hi - lo), nullptr);
+    auto msgq = [&](int li) -> ggml_tensor* {
+        if (layers_[li].ink_msgq) return layers_[li].ink_msgq;
+        ggml_tensor*& q = msgq_made[(size_t)(li - lo)];
+        if (!q) {
+            const int i = li - lo;
+            auto cols = [&](ggml_tensor* t, int at, int n) { return ggml_view_2d(c, t, t->ne[0], n, t->nb[1], (size_t)at * t->nb[1]); };
+            q = ggml_concat(c, ggml_concat(c, cols(ink_res_q_, 2 * i, 1), cols(ink_kv_q_, 2 * i, 2), 1), cols(ink_res_q_, 2 * i + 1, 1), 1);
+        }
+        return q;
+    };
     for (int li = 0; li < lo; ++li) layer(li, layers_[li], nullptr);
     if (loop) {
         ggml_tensor* pre = x;
@@ -4294,7 +4392,7 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
                 blocks = pre_blocks;
             }
             for (int li = lo; li < hi; ++li)
-                layer(li, ink_slot(li, p), p > 0 ? mix(bank, bank_out, layers_[li].ink_msgq, 4) : nullptr);
+                layer(li, ink_slot(li, p), p > 0 ? mix(bank, bank_out, msgq(li), 4) : nullptr);
         }
     }
     for (int li = hi; li < hp.n_layer; ++li) layer(li, layers_[li], nullptr);

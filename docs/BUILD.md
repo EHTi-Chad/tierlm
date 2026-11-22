@@ -171,6 +171,7 @@ python3 -m venv ~/tierlm-oracle
 ~/tierlm-oracle/bin/python tests/tiny_qwen35.py build/tierlm-logits
 ~/tierlm-oracle/bin/python tests/tiny_deepseek.py build/tierlm-logits     # DeepSeek / Kimi, against transformers' own code
 ~/tierlm-oracle/bin/python tests/tiny_nemotron.py build/tierlm-logits     # Nemotron 3.5: Mamba-2, LatentMoE, attention
+~/tierlm-oracle/bin/python tests/tiny_inkling2.py build/tierlm-logits     # Inkling 2, against transformers' own code (needs torch and a transformers that has Inkling 2)
 
 # Tokenizers, without any model: trains small BPE and SentencePiece tokenizers and compares
 ~/tierlm-oracle/bin/pip install sentencepiece
@@ -191,6 +192,8 @@ cmake -S . -B build-rpc -G Ninja -DGGML_RPC=ON && cmake --build build-rpc
 ./build-rpc/tierlm-rpc-server 127.0.0.1:50052 &
 TIERLM_RPC=127.0.0.1:50052 ~/tierlm-oracle/bin/python tests/tiny_models.py build-rpc/tierlm-logits
 ```
+
+`tiny_qwen35.py`, `tiny_nemotron.py` and `tiny_inkling2.py` take `TIERLM_RPC` the same way.
 
 `tiny_models.py` and `tiny_qwen35.py` run two passes per architecture: **exact**, on the CPU with an f32 KV cache,
 must match the NumPy reference to about 1e-5; **normal**, with the usual settings on the default device (your GPU

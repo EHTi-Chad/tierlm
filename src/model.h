@@ -87,6 +87,7 @@ struct Hparams {
     int ink_conv = 0, ink_rel_dim = 0, ink_rel_extent = 0, ink_res_block = 0, ink_log_floor = 0;
     float ink_qk_clip = 0, ink_rel_clip = 0, ink_log_alpha = 0, situ_beta = 0, situ_lbeta = 0;
     int ink_loop_lo = 0, ink_loop_hi = 0, ink_loop_passes = 1, ink_loop_rank = 0;
+    bool ink_earlier = false;                 // the earlier layout of a looped file (arch "inkling2" with num_loops)
     int n_vocab_real = 0;             // logits kept (0: all the output rows); Inkling 2 pads its tables past it
     int ink_loop_n() const { return ink_loop_hi - ink_loop_lo; }
     // The convolutions' saved inputs per layer: keys, values (head width x key/value heads each), both outputs
@@ -614,6 +615,9 @@ private:
         ggml_tensor *ink_relclip = nullptr, *ink_kconv = nullptr, *ink_vconv = nullptr, *ink_aconv = nullptr, *ink_fconv = nullptr;
         ggml_tensor *ink_kconvp = nullptr, *ink_vconvp = nullptr, *ink_qn = nullptr, *ink_kn = nullptr, *ink_vn = nullptr;
         ggml_tensor *ink_ares = nullptr, *ink_fres = nullptr, *ink_msgq = nullptr;
+        // experts stored with a scale each beside their weights (NVFP4 files): the gate+up, gate and up matrices'
+        // (the down matrix's is exp_scale)
+        ggml_tensor *x_scale_gu = nullptr, *x_scale_gate = nullptr, *x_scale_up = nullptr;
         ggml_tensor *ink_down[4] = {}, *ink_gain[4] = {}, *ink_forget[4] = {};
         std::vector<ggml_tensor*> ink_states;    // per conversation: the convolutions' last inputs [conv - 1, channels]
         ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
@@ -665,6 +669,7 @@ private:
     ggml_tensor *tok_embd_ = nullptr, *out_norm_ = nullptr, *output_ = nullptr, *rope_freqs_ = nullptr;
     ggml_tensor *g4_ple_tok_ = nullptr, *g4_ple_proj_ = nullptr, *g4_ple_norm_ = nullptr;   // Gemma 4 E2B/E4B: per-layer inputs
     ggml_tensor *tok_norm_ = nullptr, *ink_out_res_ = nullptr;   // Inkling 2: the embedding's norm, the last depth mixer's query
+    ggml_tensor *ink_res_q_ = nullptr, *ink_kv_q_ = nullptr;     // (the earlier layout: all loop layers' message queries, see ink_layers)
     // Inkling 2's loop: the caches of the loop layers' later passes, pass p >= 1 of layer i at
     // (p - 1) * (loop_hi - loop_lo) + i - loop_lo. Each holds only its own cache (index: the layer it repeats).
     std::vector<Layer> ink_slots_;
