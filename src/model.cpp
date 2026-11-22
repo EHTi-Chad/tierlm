@@ -3088,6 +3088,13 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
             ggml_tensor* V = ggml_permute(c, vall, 0, 2, 1, 3);              // [hd, n_kv, n_head_kv], no copy
             o = ggml_flash_attn_ext(c, Q, K, V, mask, scale, 0.0f, hp.attn_softcap);   // [hd, n_head, n_tok]
             if (L.sinks) ggml_flash_attn_ext_add_sinks(o, L.sinks);          // gpt-oss: one more score per head, never attended to
+            // QSA: past the budget a query sees the budget's worth of whole blocks and its own unfinished block, nothing
+            // else. Told so, the GPU's attention gathers just those keys and values instead of going through the whole
+            // cache behind the mask (ggml's sparse attention; it decides by sizes whether that pays: from about 16K
+            // tokens of context for a check of 4). The sum is the same. TIERLM_QSA_SPARSE=0: as before.
+            static const bool qsa_sparse = !(std::getenv("TIERLM_QSA_SPARSE") && !std::strcmp(std::getenv("TIERLM_QSA_SPARSE"), "0"));
+            if (L.idx_k && qsa_long_ && qsa_sparse && L.qsa >= 0)
+                ggml_flash_attn_ext_set_n_kv_max(o, hp.qsa_budget + qsa_[L.qsa].ratio);
         } else {
             ggml_tensor* kq = ggml_mul_mat(c, K, Q);                         // [n_kv, n_tok, n_head]
             float sm_scale = scale;
