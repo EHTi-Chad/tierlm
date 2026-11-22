@@ -5,6 +5,7 @@
 //       speculative undo: the last B+1 ids are a batch of B (evaluated as an undoable check) and one final id. Only
 //       the first KEEP of the batch are accepted; the output must equal plain evaluation of the ids without the
 //       other B-KEEP.
+//       (an id written @file stands for the ids in that file: a long prompt)
 //   tierlm-logits model.gguf --mtp id [id ...]       the MTP draft block's prediction after the last id (fed with the
 //                                                   model's hidden states; position 0 gets zeros)
 //   tierlm-logits model.gguf --mtp-step id [id ...]  the same, running the draft block one position at a time
@@ -15,6 +16,7 @@
 #include "model.h"
 #include "speculate.h"
 #include "gguf.h"
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <stdexcept>
@@ -44,7 +46,12 @@ int main(int argc, char** argv) {
         int nb = 0, keep = 0, first = step || mtp || mtp_step ? 3 : gen || gen_spec || par ? 4 : 2;
         if (rollback) { nb = std::atoi(argv[3]); keep = std::atoi(argv[4]); first = 5; }
         std::vector<int32_t> ids;
-        for (int i = first; i < argc; ++i) ids.push_back(std::atoi(argv[i]));
+        for (int i = first; i < argc; ++i) {
+            if (argv[i][0] != '@') { ids.push_back(std::atoi(argv[i])); continue; }
+            std::ifstream f(argv[i] + 1);                                    // @file: ids from a file (a long prompt)
+            if (!f) throw std::runtime_error(std::string("can't open ") + (argv[i] + 1));
+            for (int32_t t; f >> t;) ids.push_back(t);
+        }
         // Test hooks: TIERLM_RPC=host:port adds an RPC device (seen as a GPU); TIERLM_VRAM_MB limits the VRAM
         // the tier loader may use, forcing a model to be split between the device and RAM.
         load_backends();
