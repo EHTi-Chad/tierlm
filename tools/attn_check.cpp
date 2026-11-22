@@ -6,11 +6,14 @@
 // gathers just those keys and values. This makes a cache of the model's shape (head size 256, 2 key/value heads, 24
 // heads, blocks of 4, budget 2,048) full of random numbers, with masks like QSA's, and for steps of several sizes
 // prints what each takes and how far each result is from the exact one (worked out here in double precision from
-// the cache as stored). The GPU's attention works in half precision, so neither is exact; the check is that being
-// told the bound doesn't make it worse.
+// the cache as stored). The GPU's attention works in half precision, so neither is exact (parts in a thousand).
+// Every other head's query is made to pick out one position: the last one it sees (the first a gather cut short
+// would lose), while pointing just as hard at a position only another query of the step sees (which a gather that
+// forgot whose key is whose would let in). Either mistake puts that head's result off by about its own size.
 //
 //   tierlm-attn-check [positions in the cache = 73728] [cache type: q8_0 or f16] [steps' sizes, e.g. 1,4,9,256]
-// TIERLM_DEVICE: the device (default: the first GPU).
+// TIERLM_DEVICE: the device (default: the first GPU). TIERLM_ATTN_CHECK_BREAK=1: the check checked, by showing
+// each query the position it mustn't see; every step of two tokens or more must then come out DIFFERENT.
 #include "backends.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -32,7 +35,7 @@ using namespace tierlm;
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);                     // (each line out at once: it is read from a file while this runs)
-    const bool say = std::getenv("TIERLM_ATTN_CHECK_STEPS") != nullptr;
+    const bool say = std::getenv("TIERLM_ATTN_CHECK_STEPS") != nullptr, brk = std::getenv("TIERLM_ATTN_CHECK_BREAK") != nullptr;
     auto step = [&](const char* what) { if (say) std::fprintf(stderr, "step: %s\n", what); };
     try {
         load_backends();
@@ -124,6 +127,25 @@ int main(int argc, char** argv) {
             }
             std::vector<float> qv((size_t)HD * NH * n_tok);
             for (float& x : qv) x = nd(rng);
+            // every other head: the query is twice its last visible position's key plus twice the key of a position
+            // only the next (or previous) query sees, and a little of the random one
+            std::vector<ggml_fp16_t> shown = mask;                 // what the device is given (the same, unless breaking it)
+            for (int t = 0; t < n_tok; ++t) {
+                const ggml_fp16_t* row = mask.data() + (size_t)t * n_kv;
+                const ggml_fp16_t* other = n_tok > 1 ? mask.data() + (size_t)(t + 1 < n_tok ? t + 1 : t - 1) * n_kv : nullptr;
+                int last = n_kv - 1, hidden = -1;
+                while (last > 0 && !std::isfinite(ggml_fp16_to_fp32(row[last]))) --last;
+                for (int p2 = 0; other && p2 < n_kv; ++p2)
+                    if (std::isfinite(ggml_fp16_to_fp32(other[p2])) && !std::isfinite(ggml_fp16_to_fp32(row[p2]))) { hidden = p2; break; }
+                if (brk && hidden >= 0) shown[(size_t)t * n_kv + hidden] = zero;
+                for (int h = 0; h < NH; h += 2) {
+                    const int kh = h / (NH / HKV);
+                    float* q = qv.data() + ((size_t)t * NH + h) * HD;
+                    const float* k1 = kf.data() + ((size_t)last * HKV + kh) * HD;
+                    const float* k2 = hidden >= 0 ? kf.data() + ((size_t)hidden * HKV + kh) * HD : nullptr;
+                    for (int j = 0; j < HD; ++j) q[j] = 0.1f * q[j] + 2.0f * k1[j] + (k2 ? 2.0f * k2[j] : 0.0f);
+                }
+            }
 
             auto run = [&](bool sparse, std::vector<float>& out) -> double {
                 ggml_init_params gp{ 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -144,7 +166,7 @@ int main(int argc, char** argv) {
                 if (!ggml_backend_sched_alloc_graph(sched, gf)) throw std::runtime_error("no room for the step's working memory");
                 step("placed; computing");
                 ggml_backend_tensor_set(q, qv.data(), 0, ggml_nbytes(q));
-                ggml_backend_tensor_set(m, mask.data(), 0, ggml_nbytes(m));
+                ggml_backend_tensor_set(m, shown.data(), 0, ggml_nbytes(m));
                 double best = 1e30;
                 for (int it = 0; it < 6; ++it) {
                     const auto t0 = std::chrono::steady_clock::now();
@@ -209,8 +231,8 @@ int main(int argc, char** argv) {
                 off_s = std::max(off_s, (double)std::fabs(b[i] - x[i]));
                 big = std::max(big, (double)std::fabs(x[i]));
             }
-            // (half precision: a few parts in a thousand of the largest value; told the bound, no further off than behind the mask)
-            const bool ok = finite && big > 0 && off_s <= std::max(2e-3 * big, 1.25 * off_d) && off_s <= 3e-2 * big;
+            // (half precision: parts in a thousand of the largest value; a position lost or let in: about the largest value)
+            const bool ok = finite && big > 0 && off_s <= 2e-2 * big && off_d <= 2e-2 * big;
             all_ok = all_ok && ok;
             std::printf("a step of %4d: each query sees up to %d positions; told so %.2f ms, behind the mask %.2f ms%s; off the exact "
                         "result by %.1e and %.1e of its largest value  ->  %s\n", n_tok, most, std::fabs(ts), std::fabs(td),

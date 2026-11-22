@@ -3106,9 +3106,15 @@ ggml_tensor* Model::attn_block(ggml_context* c, Graph& g, const Layer& L, ggml_t
             // QSA: past the budget a query sees the budget's worth of whole blocks and its own unfinished block, nothing
             // else. Told so, the GPU's attention gathers just those keys and values instead of going through the whole
             // cache behind the mask (ggml's sparse attention; it decides by sizes whether that pays: from about 16K
-            // tokens of context for a check of 4). The sum is the same. TIERLM_QSA_SPARSE=0: as before.
-            static const bool qsa_sparse = !(std::getenv("TIERLM_QSA_SPARSE") && !std::strcmp(std::getenv("TIERLM_QSA_SPARSE"), "0"));
-            if (L.idx_k && qsa_long_ && qsa_sparse && L.qsa >= 0)
+            // tokens of context for a check of 4). The sum is the same. Not for steps of 5 to 23 tokens: up to 4
+            // queries each gather their own, more share one gather a tile of 8, and that loses to the mask until there
+            // are several tiles (tierlm-attn-check on an RTX 5090, a q8_0 cache of 72K positions, per layer: 4 tokens
+            // 0.28 ms told / 0.30 behind the mask, 7 tokens 0.52 / 0.34, 9 tokens 0.55 / 0.41, 24 tokens 0.55 / 0.58,
+            // 256 tokens 2.2 / 4.5; at 256K positions 7 tokens 1.60 / 1.09). TIERLM_QSA_SPARSE=0: never told (as
+            // before 0.9.4), 1: always.
+            static const int qsa_sparse = std::getenv("TIERLM_QSA_SPARSE") ? std::atoi(std::getenv("TIERLM_QSA_SPARSE")) : -1;
+            const int64_t nq = Q->ne[1];
+            if (L.idx_k && qsa_long_ && L.qsa >= 0 && (qsa_sparse > 0 || (qsa_sparse < 0 && (nq <= 4 || nq >= 24))))
                 ggml_flash_attn_ext_set_n_kv_max(o, hp.qsa_budget + qsa_[L.qsa].ratio);
         } else {
             ggml_tensor* kq = ggml_mul_mat(c, K, Q);                         // [n_kv, n_tok, n_head]
