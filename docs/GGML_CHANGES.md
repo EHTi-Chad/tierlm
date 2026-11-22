@@ -157,6 +157,30 @@ op. That is why reading a long prompt is fast even with experts in RAM. It also 
 computed by the CPU, so anything that only the CPU accepts (like Change 1's negative ids) must not reach those ops
 for big batches. tierlm uses negative ids only for batches below that size, and distinct ids otherwise.
 
+## Finding 4: CUDA attention beside a quantized cache, and when telling it what a query sees pays (0.9.4)
+
+No change to ggml: what its CUDA attention does with a q8_0 KV cache, measured with `tierlm-attn-check` (head size
+256, 2 key/value heads, 24 heads) on an RTX 5090.
+
+- One or two queries go to the vector kernel, which reads the quantized cache as it is. From three, the tensor-core
+  kernel first makes f16 copies of the whole K and V it was handed (its working memory holds them: 518 MB for 256K
+  positions), and that copy is most of a small step's cost deep in a long cache: 0.82 ms a layer for 4 queries over
+  256K positions, where an f16 cache of 72K takes 0.17 against 0.28 for q8_0. So two queries can cost more than three
+  (1.79 ms against 0.80 at 256K), and a step that must stay small in memory is best kept to two.
+- `ggml_flash_attn_ext_set_n_kv_max(op, n)` says no mask row has more than n finite entries; the kernel then gathers
+  those columns (it needs the cache to be at least 4,096 positions and twice the gather). With a key/value sharing
+  above 4, up to 4 queries each gather their own; more share one gather a tile of 8 queries (the union of what they
+  see). That is faster than the mask for up to 4 queries and from about 24, and slower in between (7 queries over 72K
+  positions: 0.53 ms against 0.34). The table is in ARCHITECTURE.md ("Flash-Next deep in a long conversation").
+- Both ways the result is parts in ten thousand of its largest value from the exact one (half precision).
+
+## Finding 5: the hyper-connection ops fit Flash-Next's stream mixers (0.9.4)
+
+`ggml_dsv4_hc_pre_gated` (the mean over the copies of sigmoid(gate) x copy) and `ggml_dsv4_hc_post` without a
+combining matrix (copy + output x weight) are Qwen3.8 Flash-Next's two stream operations exactly, on the CPU, CUDA and
+Vulkan (Vulkan: 4 copies only). tierlm built them from plain ops until 0.9.4; the fused ops give the same numbers bit
+for bit on the CPU and take 16 GPU kernels a layer fewer. With CUDA graphs replaying, that is worth about 1%.
+
 ---
 
 ## Change 3: CPU and GPU at once, and fewer waits between them
