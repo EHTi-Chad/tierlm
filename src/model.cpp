@@ -5518,6 +5518,20 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     // offline: int32 n_tok, n_layer, n_used, snapshots; then int16 picks [n_tok][n_layer][n_used].
     if (routing && !routing->empty()) {
         static FILE* const dump = [] { const char* e = std::getenv("TIERLM_ROUTE_DUMP"); return e ? std::fopen(e, "wb") : nullptr; }();
+        static bool first = true;
+        if (dump && first) {                                      // the VRAM experts at the start: int32 -1, layers, n_expert, 0;
+            first = false;                                        // per layer int32 layer, slots; float score[E]; uint8 in VRAM[E]
+            const int32_t head[4] = { -1, (int32_t)live_.size(), hp.n_expert, 0 };
+            std::fwrite(head, sizeof(head), 1, dump);
+            for (const LiveLayer& ll : live_) {
+                const int32_t lh[2] = { ll.layer, ll.H };
+                std::fwrite(lh, sizeof(lh), 1, dump);
+                std::fwrite(ll.score.data(), sizeof(float), ll.score.size(), dump);
+                std::vector<uint8_t> in(ll.slot_of.size());
+                for (size_t e = 0; e < in.size(); ++e) in[e] = ll.slot_of[e] >= 0;
+                std::fwrite(in.data(), 1, in.size(), dump);
+            }
+        }
         if (dump) {
             const int32_t head[4] = { n_tok, hp.n_layer, hp.n_expert_used, snapshots };
             std::fwrite(head, sizeof(head), 1, dump);
