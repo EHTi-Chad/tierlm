@@ -2214,7 +2214,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     if (m->hp_.dsv4) m->batch_span_ = 0;                             // (DeepSeek V4's attention has its own memory pattern)
     const bool plans_on = m->mtp_ && m->flash_attn_ && !(std::getenv("TIERLM_PLANS") && !std::strcmp(std::getenv("TIERLM_PLANS"), "0")) &&
                           !std::getenv("TIERLM_DUMP_SCHED");
-    if (plans_on) { m->check_main_ = true; m->check_.mem.resize(m->graph_mem_size_); }
+    if (plans_on) m->check_main_ = true;
     if (!m->reserve_worst()) throw std::runtime_error("failed to reserve compute memory");
     if (std::getenv("TIERLM_MEM_PROBE")) { m->reserve_worst(true); m->reserve_worst(); }   // (measuring undoes the reservation)
     if (!m->gpus_.empty()) m->place_.compute_gpu = ggml_backend_sched_get_buffer_size(m->sched_, m->gpus_[0]) + m->stream_.bytes;
@@ -4905,7 +4905,7 @@ bool Model::reserve_worst(bool probe) {
     };
     auto check_graph = [&](int w) {
         qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;
-        Graph g = build(w, max_ctx_, true, w, true, w, nullptr, &check_.mem);
+        Graph g = build(w, max_ctx_, true, w, true, w, nullptr, &check_mem(w));
         qsa_long_ = qsa_gpu_ = false;
         pin_cpu_layers(g);
         return g;
@@ -5448,7 +5448,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         swa_kv_build_ = n_kv_swa;
         try {
             built = hp.dsv4 ? build_dsv4(n_tok, tok_pos[0], routing != nullptr, n_logits, want_hidden, nullptr)
-                            : build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups, plan ? &check_.mem : nullptr);
+                            : build(n_tok, n_kv_end, routing != nullptr, n_logits, want_hidden, snapshots, groups, plan ? &check_mem(n_tok) : nullptr);
         } catch (...) { swa_kv_build_ = 0; throw; }
         swa_kv_build_ = 0;
         if (plan) { built.kept = true; check_.g = built; check_.key = key; }

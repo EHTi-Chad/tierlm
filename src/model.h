@@ -739,6 +739,16 @@ private:
     // block's catching-up step (2 to 9 tokens), which used the main scheduler between checks, has its own small one.
     struct Plan { Graph g; ReuseKey key; ggml_backend_sched* sched = nullptr; std::vector<uint8_t> mem; };
     Plan check_, mtp1_, mtpk_;
+    // A check's graph is built in memory of its own size's: built again (after a prompt step, or a check of another
+    // size, took the scheduler) its tensors are where they were, and the GPU engine, which keeps a recorded run of each
+    // graph it has seen twice (by its first tensor and what it holds), runs the recording again instead of warming up
+    // and recording anew. Sharing one memory, a check of another size cost the next checks 3 to 13 ms each.
+    std::vector<uint8_t> check_mems_[10];
+    std::vector<uint8_t>& check_mem(int n_tok) {
+        std::vector<uint8_t>& v = check_mems_[std::min(std::max(n_tok, 0), 9)];
+        if (v.size() < graph_mem_size_) v.resize(graph_mem_size_);
+        return v;
+    }
     int mtpk_w_ = 9; bool check_main_ = false;                                      // the check's graph stays placed on sched_
     int check_width_ = 5;                                          // tokens in a check that sched_'s memory holds (see check_width)
     void drop_plan(Plan& p);
