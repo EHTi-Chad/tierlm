@@ -3,8 +3,8 @@
 //       the image's image words (prints "rows cols dim"; out.f32: rows*cols*dim floats, row by row)
 //   tierlm-vision mmproj.gguf --patches image.png out.f32 [max_tokens]
 //       just the prepared patches (prints "gh gw"; out.f32: gh*gw patches of 3*16*16 numbers)
-//   tierlm-vision mmproj.gguf --chat model.gguf image.png out.f32 MODE id ... -1 ... id
-//       a chat model reading the image: -1 in the ids marks where its words go. Writes the last position's
+//   tierlm-vision mmproj.gguf --chat model.gguf image.png[,image2.png...] out.f32 MODE id ... -1 ... id
+//       a chat model reading the image(s): each -1 in the ids marks where the next image's words go. Writes the last position's
 //       logits to out.f32. MODE: "all" (one call), "step" (one id per call) or a number (calls of that many ids,
 //       so an image can be cut in the middle).
 // Environment: TIERLM_DEVICE (cpu, CUDA0, ...) as for the other tools; TIERLM_VISION_EXACT=1 plain attention.
@@ -53,19 +53,32 @@ int main(int argc, char** argv) {
         if (mode == "--chat") {
             if (argc < 8) throw std::runtime_error("--chat needs model.gguf image.png out.f32 MODE ids");
             auto v = Vision::load(argv[1], dev ? dev : "cpu");
-            const auto bytes = read_file(argv[4]);
-            const auto p = v->prepare(decode_image(bytes.data(), bytes.size()));
-            const std::vector<float> words = v->encode(p, threads);
             LoadOptions o;
             if (dev) o.device = dev;
             o.max_ctx = 2048;
             auto m = Model::load(argv[3], o);
-            const int32_t first = m->add_image(0x1234, words, p.gh / v->merge(), p.gw / v->merge());
+            struct Img { int32_t first; int n, rows, cols; };
+            std::vector<Img> imgs;                            // (several images: their files with commas between)
+            std::string list = argv[4];
+            for (size_t a = 0; a <= list.size();) {
+                size_t b = list.find(',', a);
+                if (b == std::string::npos) b = list.size();
+                const auto bytes = read_file(list.substr(a, b - a).c_str());
+                const auto p = v->prepare(decode_image(bytes.data(), bytes.size()));
+                const std::vector<float> words = v->encode(p, threads);
+                const int rows = p.gh / v->merge(), ncol = p.gw / v->merge();
+                imgs.push_back({m->add_image(0x1234 + (uint64_t)imgs.size(), words, rows, ncol), p.tokens(), rows, ncol});
+                a = b + 1;
+            }
             std::vector<int32_t> ids;
+            size_t next = 0;
             for (int i = 7; i < argc; ++i) {
                 const int id = std::atoi(argv[i]);
-                if (id == -1) for (int k = 0; k < p.tokens(); ++k) ids.push_back(first + k);
-                else ids.push_back(id);
+                if (id == -1) {
+                    if (next >= imgs.size()) throw std::runtime_error("more -1 than images");
+                    for (int k = 0; k < imgs[next].n; ++k) ids.push_back(imgs[next].first + k);
+                    ++next;
+                } else ids.push_back(id);
             }
             const std::string how = argv[6];
             const int chunk = how == "all" ? (int)ids.size() : how == "step" ? 1 : std::max(1, std::atoi(how.c_str()));
@@ -75,7 +88,7 @@ int main(int argc, char** argv) {
                 logits = m->eval(part, threads);
             }
             write_floats(argv[5], logits);
-            std::printf("%zu tokens, %d image words (%dx%d)\n", ids.size(), p.tokens(), p.gh / v->merge(), p.gw / v->merge());
+            std::printf("%zu tokens, %zu image(s), the first %d image words (%dx%d)\n", ids.size(), imgs.size(), imgs[0].n, imgs[0].rows, imgs[0].cols);
             return 0;
         }
         auto v = Vision::load(argv[1], dev ? dev : "cpu");

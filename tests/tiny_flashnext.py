@@ -51,7 +51,7 @@ def build(over, seed):
             else: p.copy_(0.2 * torch.randn_like(p))
     return cfg, m
 
-def write(cfg, m):
+def write(cfg, m, image_tok=None):
     sd = {k: v.detach().float().numpy() for k, v in m.state_dict().items()}
     E, HC, HK, HV, S = cfg.hidden_size, cfg.hc_count, cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim
     R = HV // HK
@@ -132,6 +132,7 @@ def write(cfg, m):
     u64(f"{A}.ple.layer_multipliers", e0.layer_multipliers)          # (as the real file: 64-bit numbers)
     u64(f"{A}.ple.head_offsets", e0.ngram_heads_offsets)
     u64(f"{A}.ple.head_vocab_sizes", e0.ngram_heads_vocab_sizes)
+    if image_tok is not None: w.add_uint32(f"{A}.ple.image_token_id", image_tok)   # (as the real file)
     for name, t in T.items(): w.add_tensor(name, np.ascontiguousarray(t).astype(np.float32))
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
     return path, len(ple_layers)
@@ -140,54 +141,55 @@ def ref_logits(m, ids):
     with torch.no_grad():
         return m(torch.tensor([ids])).logits[0, -1].double().numpy()
 
-exe = sys.argv[1]
-long_ids = [int(x) for x in np.random.default_rng(3).integers(2, V, 200)]
-long_ids[37] = long_ids[120] = EOS                                  # end-of-text tokens cut the n-grams
-tests = [[5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55, 117, EOS, 4, 4, 9], long_ids]
-ok = True
-for ci, (name, over) in enumerate(CASES.items()):
-    cfg, m = build(over, 30 + ci)
-    path, n_ple = write(cfg, m)
-    if n_ple != 1:
-        print(f"{name:12s}: skipped (tierlm reads one PLE layer's hash settings, as the real file has)"); os.remove(path); continue
-    for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}, 1e-4),
-                            ("normal", {}, 6e-2)):
-        worst, top = 0.0, True
-        for mode in ([], ["--step"], ["snapshot"]):
-            for ids in tests:
-                want = ref_logits(m, ids)
-                r = subprocess.run([exe, path, *[x for x in mode if x != "snapshot"], *map(str, ids)], capture_output=True, text=True,
-                                   env={**os.environ, **env, **({"TIERLM_SNAPSHOT": "1"} if mode == ["snapshot"] else {})})
-                if r.returncode != 0: sys.exit(f"{name}: tierlm-logits failed: {r.stderr.strip()[-800:]}")
-                got = np.array([float(v) for v in r.stdout.split()])
-                worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
-                top &= bool(got.argmax() == want.argmax())
-        for ids in (tests[2], long_ids):                    # three conversations at once
-            r = subprocess.run([exe, path, "--parallel", "3", *map(str, ids)], capture_output=True, text=True, env={**os.environ, **env})
-            if r.returncode != 0: sys.exit(f"{name}: tierlm-logits --parallel failed: {r.stderr.strip()[-800:]}")
-            got = np.array([float(v) for v in r.stdout.split()]).reshape(3, -1)
-            n = len(ids)
-            for sq in range(3):
-                want = ref_logits(m, [ids[(i + 3 * sq) % n] for i in range(max(1, n - sq))])
-                worst = max(worst, float(np.abs(got[sq] - want).max() / np.abs(want).max()))
-                top &= bool(got[sq].argmax() == want.argmax())
-        passed = worst < tol and top
-        ok &= passed
-        print(f"{name:12s} {label:7s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {top}  ->  {'ok' if passed else 'FAIL'}")
-        # Speculative decoding (scripted guesses wrong at different depths, and prompt lookup): greedy output must not
-        # change, so undoing the guesses that weren't kept restores every running state (DeltaNet's, the PLE
-        # convolution's, the n-gram history, QSA's keys). The prompt is past the QSA budget in the qsa cases.
-        prompt = [str(x) for x in long_ids[:40]]
-        def gen(mode, extra=None):
-            r = subprocess.run([exe, path, mode, "50", *prompt], capture_output=True, text=True, env={**os.environ, **env, **(extra or {})})
-            if r.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
-            return r.stdout.split()
-        plain = gen("--gen")
-        checks = [gen("--gen-spec", {"TIERLM_DRAFT_N": n, "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k})
-                  for n, k in (("1", "1"), ("3", "3"), ("3", "5"), ("8", "2"), ("8", "7"))]
-        checks.append(gen("--gen-spec", {"TIERLM_LOOKUP": "8"}))
-        same = all(c == plain for c in checks)
-        ok &= same
-        print(f"{name:12s} {label:7s}: greedy output with speculation {'identical' if same else 'DIFFERENT'}  ->  {'ok' if same else 'FAIL'}")
-    os.remove(path)
-sys.exit(0 if ok else 1)
+if __name__ == "__main__":
+    exe = sys.argv[1]
+    long_ids = [int(x) for x in np.random.default_rng(3).integers(2, V, 200)]
+    long_ids[37] = long_ids[120] = EOS                                  # end-of-text tokens cut the n-grams
+    tests = [[5], [1, 2, 3], [7, 42, 99, 0, 13, 13, 64, 8, 21, 55, 117, EOS, 4, 4, 9], long_ids]
+    ok = True
+    for ci, (name, over) in enumerate(CASES.items()):
+        cfg, m = build(over, 30 + ci)
+        path, n_ple = write(cfg, m)
+        if n_ple != 1:
+            print(f"{name:12s}: skipped (tierlm reads one PLE layer's hash settings, as the real file has)"); os.remove(path); continue
+        for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}, 1e-4),
+                                ("normal", {}, 6e-2)):
+            worst, top = 0.0, True
+            for mode in ([], ["--step"], ["snapshot"]):
+                for ids in tests:
+                    want = ref_logits(m, ids)
+                    r = subprocess.run([exe, path, *[x for x in mode if x != "snapshot"], *map(str, ids)], capture_output=True, text=True,
+                                       env={**os.environ, **env, **({"TIERLM_SNAPSHOT": "1"} if mode == ["snapshot"] else {})})
+                    if r.returncode != 0: sys.exit(f"{name}: tierlm-logits failed: {r.stderr.strip()[-800:]}")
+                    got = np.array([float(v) for v in r.stdout.split()])
+                    worst = max(worst, float(np.abs(got - want).max() / np.abs(want).max()))
+                    top &= bool(got.argmax() == want.argmax())
+            for ids in (tests[2], long_ids):                    # three conversations at once
+                r = subprocess.run([exe, path, "--parallel", "3", *map(str, ids)], capture_output=True, text=True, env={**os.environ, **env})
+                if r.returncode != 0: sys.exit(f"{name}: tierlm-logits --parallel failed: {r.stderr.strip()[-800:]}")
+                got = np.array([float(v) for v in r.stdout.split()]).reshape(3, -1)
+                n = len(ids)
+                for sq in range(3):
+                    want = ref_logits(m, [ids[(i + 3 * sq) % n] for i in range(max(1, n - sq))])
+                    worst = max(worst, float(np.abs(got[sq] - want).max() / np.abs(want).max()))
+                    top &= bool(got[sq].argmax() == want.argmax())
+            passed = worst < tol and top
+            ok &= passed
+            print(f"{name:12s} {label:7s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {top}  ->  {'ok' if passed else 'FAIL'}")
+            # Speculative decoding (scripted guesses wrong at different depths, and prompt lookup): greedy output must not
+            # change, so undoing the guesses that weren't kept restores every running state (DeltaNet's, the PLE
+            # convolution's, the n-gram history, QSA's keys). The prompt is past the QSA budget in the qsa cases.
+            prompt = [str(x) for x in long_ids[:40]]
+            def gen(mode, extra=None):
+                r = subprocess.run([exe, path, mode, "50", *prompt], capture_output=True, text=True, env={**os.environ, **env, **(extra or {})})
+                if r.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
+                return r.stdout.split()
+            plain = gen("--gen")
+            checks = [gen("--gen-spec", {"TIERLM_DRAFT_N": n, "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k})
+                      for n, k in (("1", "1"), ("3", "3"), ("3", "5"), ("8", "2"), ("8", "7"))]
+            checks.append(gen("--gen-spec", {"TIERLM_LOOKUP": "8"}))
+            same = all(c == plain for c in checks)
+            ok &= same
+            print(f"{name:12s} {label:7s}: greedy output with speculation {'identical' if same else 'DIFFERENT'}  ->  {'ok' if same else 'FAIL'}")
+        os.remove(path)
+    sys.exit(0 if ok else 1)

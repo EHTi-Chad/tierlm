@@ -1881,9 +1881,9 @@ int main(int argc, char** argv) {
         if (eng.spec && !eng.model->has_mtp())
             std::fprintf(stderr, "speculative decoding: guesses from the experts in VRAM, %d per check\n", eng.draft_max);
         eng.spec_changed();
-        // Its eyes: an mmproj (vision) file in the same folder, for models that read images (Qwen3.5 / 3.6).
-        // (Not Flash-Next yet: its images aren't tested, so it runs text only and doesn't say it reads images.)
-        if (eng.model->has_positions3() && !eng.model->hparams().any_ple()) {
+        // Its eyes: an mmproj (vision) file in the same folder, for models that read images (Qwen3.5 / 3.6 and
+        // Flash-Next, whose n-grams read an image's places as its image token; tests/tiny_flashnext_vision.py).
+        if (eng.model->has_positions3()) {
             const fs::path vf = vision_file_for(path, eng.model->hparams().n_embd);
             if (!vf.empty()) {
                 try {
