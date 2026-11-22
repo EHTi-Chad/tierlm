@@ -5514,6 +5514,19 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             }
         }
     }
+    // TIERLM_ROUTE_DUMP=file (developers): every step's picks, for trying VRAM-expert rules on a real conversation
+    // offline: int32 n_tok, n_layer, n_used, snapshots; then int16 picks [n_tok][n_layer][n_used].
+    if (routing && !routing->empty()) {
+        static FILE* const dump = [] { const char* e = std::getenv("TIERLM_ROUTE_DUMP"); return e ? std::fopen(e, "wb") : nullptr; }();
+        if (dump) {
+            const int32_t head[4] = { n_tok, hp.n_layer, hp.n_expert_used, snapshots };
+            std::fwrite(head, sizeof(head), 1, dump);
+            std::vector<int16_t> picks(routing->size());
+            for (size_t i = 0; i < picks.size(); ++i) picks[i] = (int16_t)(*routing)[i];
+            std::fwrite(picks.data(), sizeof(int16_t), picks.size(), dump);
+            std::fflush(dump);
+        }
+    }
     if (routing && !live_.empty() && !live_frozen_) adapt_hot(*routing, n_tok);
     for (auto [qi, kr] : g.qsa_k) {                                // QSA: this step's indexer keys, kept by position
         const int D = hp.qsa_dim;
