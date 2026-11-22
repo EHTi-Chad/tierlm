@@ -2371,7 +2371,8 @@ void Model::pin_cpu_layers(const Graph& g, ggml_backend_sched* sc) {
     for (const auto& [t, layer] : g.owner) {
         if (layer < 0 || layer >= (int)layer_dev_.size()) continue;
         const int d = layer_dev_[layer];
-        if (const ggml_tensor* src = t->view_src) {
+        static const bool pin_views = std::getenv("TIERLM_PIN_VIEWS") != nullptr;   // (developers: every view pinned, as before 0.9.4)
+        if (const ggml_tensor* src = pin_views ? nullptr : t->view_src) {
             const auto it = dev_of.find(src);
             const bool here = it != dev_of.end() ? it->second == d             // made by a layer on this device,
                                                  : src->op == GGML_OP_NONE && !src->buffer;   // or an input of the graph
