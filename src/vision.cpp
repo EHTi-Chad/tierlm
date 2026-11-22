@@ -491,18 +491,18 @@ std::vector<float> Vision::encode(const Prepared& p, int n_threads) {
         std::lock_guard<std::recursive_mutex> lk(device_mutex());
         // With a helping GPU: its working memory may not fit next to the chat model; then the CPU alone.
         ggml_backend_sched_t sched = nullptr;
-        // The GPU's working memory is given back once the image is read (the helper's backend and scheduler, and
-        // the scheduler's buffers when the reader is on the GPU): kept, they hold GBs next to a chat model that
-        // was planned to fill the GPU, and Windows then moves GPU memory out to RAM and everything slows down.
+        // The GPU's working memory is given back once the image is read (the schedulers' buffers: GBs for a big
+        // image): kept, they sit next to a chat model that was planned to fill the GPU, and Windows then moves GPU
+        // memory out to RAM and everything slows down. The helper's backend stays (starting one costs seconds).
         struct Release {
             Vision& v;
             ~Release() {
                 if (v.sched_help_) { ggml_backend_sched_free(v.sched_help_); v.sched_help_ = nullptr; }
-                if (v.help_) { ggml_backend_free(v.help_); v.help_ = nullptr; }
                 if (v.main_ != v.cpu_ && v.sched_) { ggml_backend_sched_free(v.sched_); v.sched_ = nullptr; }
             }
         } release{*this};
-        if (help_dev_ && (help_ = ggml_backend_dev_init(help_dev_, nullptr))) {
+        if (help_dev_ && !help_) help_ = ggml_backend_dev_init(help_dev_, nullptr);
+        if (help_) {
             ggml_backend_t hb[2] = { help_, cpu_ };
             sched_help_ = ggml_backend_sched_new(hb, nullptr, 2, 16384, false, true);   // op_offload: big ops to the GPU
         }
