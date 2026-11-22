@@ -1041,6 +1041,11 @@ json describe_model(const std::string& path, bool header_only = false) {
     const int64_t layers = u32(arch + ".block_count") - u32(arch + ".nextn_predict_layers"), embd = u32(arch + ".embedding_length");
     const int64_t heads = u32(arch + ".attention.head_count"), kv_heads = u32(arch + ".attention.head_count_kv");
     j["layers"] = layers;
+    // (Inkling 2's earlier layout counts a loop layer once for every pass over it; the model has fewer, and the learned
+    // expert usage is kept per real layer: with the visits' count it never matched, so the busiest experts were never
+    // put in VRAM. The context estimates below go by visits, as each pass keeps its own cache.)
+    if (const int64_t passes = u32(arch + ".num_loops"); arch == "inkling2" && passes > 1)
+        j["layers"] = layers - (passes - 1) * (u32(arch + ".loop.core_end") - u32(arch + ".loop.core_start"));
     j["experts"] = u32(arch + ".expert_count");
     j["experts_used"] = u32(arch + ".expert_used_count");
     j["ctx_train"] = u32(arch + ".context_length");
