@@ -92,6 +92,9 @@ target_link_libraries(tierlm-kv PRIVATE ggml)
 
 add_executable(tierlm-devices tools/devices.cpp)
 target_link_libraries(tierlm-devices PRIVATE tierlm_core)
+# (developers: ggml's sparse attention against the masked one, on this build's GPU)
+add_executable(tierlm-attn-check tools/attn_check.cpp)
+target_link_libraries(tierlm-attn-check PRIVATE tierlm_core)
 
 # Web server + dashboard (third_party/httplib and third_party/json are single-header, MIT licensed)
 find_package(Threads REQUIRED)
