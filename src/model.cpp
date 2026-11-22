@@ -45,6 +45,7 @@ Model::~Model() {
     drop_plans();
     if (check_.sched) ggml_backend_sched_free(check_.sched);
     if (mtp1_.sched) ggml_backend_sched_free(mtp1_.sched);
+    if (mtpk_.sched) ggml_backend_sched_free(mtpk_.sched);
     if (sched_) ggml_backend_sched_free(sched_);
     free_kv();
     for (auto* b : wbufs_) if (b) ggml_backend_buffer_free(b);
@@ -2194,43 +2195,36 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     if (m->swa_R_) m->batch_ = std::min(m->batch_, m->ring_extra_ * 4 / 5);   // (a step never writes more than the rings allow for)
     if (const char* e = std::getenv("TIERLM_BATCH_SPAN")) m->batch_span_ = std::max(0, std::atoi(e));
     if (m->hp_.dsv4) m->batch_span_ = 0;                             // (DeepSeek V4's attention has its own memory pattern)
+    const bool plans_on = m->mtp_ && m->flash_attn_ && !(std::getenv("TIERLM_PLANS") && !std::strcmp(std::getenv("TIERLM_PLANS"), "0")) &&
+                          !std::getenv("TIERLM_DUMP_SCHED");
+    if (plans_on) { m->check_main_ = true; m->check_.mem.resize(m->graph_mem_size_); }
     if (!m->reserve_worst()) throw std::runtime_error("failed to reserve compute memory");
     if (std::getenv("TIERLM_MEM_PROBE")) m->reserve_worst(true);
     if (!m->gpus_.empty()) m->place_.compute_gpu = ggml_backend_sched_get_buffer_size(m->sched_, m->gpus_[0]) + m->stream_.bytes;
     if (std::getenv("TIERLM_PROFILE") && !m->gpus_.empty())
-        std::fprintf(stderr, "profile: working memory for the largest batch: %.0f MB of VRAM\n", m->place_.compute_gpu / 1048576.0);
-    // A draft block: schedulers of their own for the check and for the block's one-token step (see Plan), with
-    // working memory for a check of up to 8 guesses. Counted with the compute memory, so the VRAM kept free covers it.
-    if (m->mtp_ && m->flash_attn_ && !(std::getenv("TIERLM_PLANS") && !std::strcmp(std::getenv("TIERLM_PLANS"), "0")) &&
-        !std::getenv("TIERLM_DUMP_SCHED")) {
-        auto make = [&](Plan& p, bool mtp) {
+        std::fprintf(stderr, "profile: working memory for the largest batch: %.0f MB of VRAM (a check of up to %d tokens fits in it)\n",
+                     m->place_.compute_gpu / 1048576.0, m->check_width_);
+    // A draft block: the check's graph stays placed on the main scheduler (reserve_worst above made room for it), and
+    // the block's own steps (one token for each guess; a few when it catches up) get small schedulers of their own
+    // (see Plan). Counted with the compute memory, so the VRAM kept free covers them.
+    if (plans_on) {
+        auto make = [&](Plan& p, int w) {
             p.sched = ggml_backend_sched_new(backends.data(), sched_bufts.data(), n_backends, m->graph_size_, false, offload);
             if (!p.sched) return;
             ggml_backend_sched_set_overlap(p.sched, m->overlap_ && !(std::getenv("TIERLM_OVERLAP") && !std::strcmp(std::getenv("TIERLM_OVERLAP"), "2")));
             p.mem.resize(m->graph_mem_size_);
-            // (4 guesses and the token before them: the default, and the most Find the fastest settings tries; a
-            // wider check makes its scheduler grow, as the one scheduler did before. TIERLM_PLAN_WIDTH: another width.)
-            const char* we = std::getenv("TIERLM_PLAN_WIDTH");
-            const int w = std::min(we ? std::max(2, std::atoi(we)) : 5, m->max_ctx_);
-            Graph g = mtp ? m->build_mtp(1, m->max_ctx_ - 1, &p.mem) : m->build(w, m->max_ctx_, true, w, true, w, nullptr, &p.mem);
-            if (!mtp) m->pin_cpu_layers(g, p.sched);
+            w = std::min(w, m->max_ctx_);
+            Graph g = m->build_mtp(w, m->max_ctx_ - w, &p.mem);
             const bool fits = ggml_backend_sched_reserve(p.sched, g.gf);
             ggml_free(g.ctx);
-            // Not when it would take more than 1/32 of the card (a check keeps a copy of every DeltaNet layer's memory
-            // per guess: 571 MB for Flash-Next, 1.8% of an RTX 5090, for 11% more speed there; on a small card the
-            // same memory holds weights that matter more). TIERLM_PLANS=1: always.
-            size_t vfree = 0, vtotal = 0;
-            m->device_memory(vfree, vtotal);
-            const bool big = fits && !m->gpus_.empty() && vtotal > 0 && !std::getenv("TIERLM_PLANS") &&
-                             ggml_backend_sched_get_buffer_size(p.sched, m->gpus_[0]) > vtotal / 32;
-            if (!fits || big) { ggml_backend_sched_free(p.sched); p.sched = nullptr; p.mem = {}; return; }   // (as before)
+            if (!fits) { ggml_backend_sched_free(p.sched); p.sched = nullptr; p.mem = {}; return; }   // (as before)
             if (!m->gpus_.empty()) m->place_.compute_gpu += ggml_backend_sched_get_buffer_size(p.sched, m->gpus_[0]);
             if (std::getenv("TIERLM_PROFILE") && !m->gpus_.empty())
-                std::fprintf(stderr, "profile: the %s's own working memory: %.0f MB of VRAM\n", mtp ? "draft block step" : "check",
+                std::fprintf(stderr, "profile: the draft block's %s working memory: %.0f MB of VRAM\n", w == 1 ? "one-token step's" : "catching-up step's",
                              ggml_backend_sched_get_buffer_size(p.sched, m->gpus_[0]) / 1048576.0);
         };
-        make(m->check_, false);
-        make(m->mtp1_, true);
+        make(m->mtp1_, 1);
+        make(m->mtpk_, 9);
     }
     return m;
 }
@@ -4617,16 +4611,19 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     release_pending();
     const Hparams& hp = hp_;
     // One token (each guess, and catching up after a check that kept none): the kept plan, run again (see Plan).
-    const bool plan = n_tok == 1 && mtp1_.sched;
-    const ReuseKey key{kv_span(pos0 + n_tok)};
-    ggml_backend_sched* sc = plan ? mtp1_.sched : sched_;
-    if (plan && !(mtp1_.g.ctx && mtp1_.key == key)) {
-        drop_plan(mtp1_);
-        mtp1_.g = build_mtp(1, pos0, &mtp1_.mem);
-        mtp1_.g.kept = true;
-        mtp1_.key = key;
+    // A few tokens (catching up after a check): a second plan, so the main scheduler keeps the check's graph placed.
+    Plan* const P = n_tok == 1 && mtp1_.sched ? &mtp1_ : n_tok > 1 && n_tok <= 9 && mtpk_.sched ? &mtpk_ : nullptr;
+    const bool plan = P != nullptr;
+    ReuseKey key{kv_span(pos0 + n_tok)};
+    key.n_tok = n_tok;
+    ggml_backend_sched* sc = plan ? P->sched : sched_;
+    if (plan && !(P->g.ctx && P->key == key)) {
+        drop_plan(*P);
+        P->g = build_mtp(n_tok, pos0, &P->mem);
+        P->g.kept = true;
+        P->key = key;
         ggml_backend_sched_reset(sc);
-        if (!ggml_backend_sched_alloc_graph(sc, mtp1_.g.gf)) { drop_plan(mtp1_); throw std::runtime_error("failed to allocate compute memory"); }
+        if (!ggml_backend_sched_alloc_graph(sc, P->g.gf)) { drop_plan(*P); throw std::runtime_error("failed to allocate compute memory"); }
     }
     Graph built;
     if (!plan) {
@@ -4635,7 +4632,7 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
         ggml_backend_sched_reset(sched_);
         if (!ggml_backend_sched_alloc_graph(sched_, built.gf)) { ggml_free(built.ctx); throw std::runtime_error("failed to allocate compute memory"); }
     }
-    Graph& g = plan ? mtp1_.g : built;
+    Graph& g = plan ? P->g : built;
     std::vector<int32_t> positions(n_tok);
     for (int i = 0; i < n_tok; ++i) positions[i] = pos0 + i;
     ggml_backend_tensor_set(g.inp, ids, 0, sizeof(int32_t) * n_tok);
@@ -4651,7 +4648,7 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
     }
     set_n_threads(cpu_, n_threads);
     if (ggml_backend_sched_graph_compute(sc, g.gf) != GGML_STATUS_SUCCESS) {
-        if (plan) drop_plan(mtp1_); else ggml_free(g.ctx);
+        if (plan) drop_plan(*P); else ggml_free(g.ctx);
         throw std::runtime_error("graph compute failed");
     }
     std::vector<float> out(hp.n_vocab);
@@ -4771,6 +4768,10 @@ void Model::stream_send(int turn) {
 // Reserves compute memory once, for the largest steps there will ever be, so it is not planned again on every token:
 // a full batch at the end of the longest span it is read over and, in a longer context, the last (smaller) batch at
 // the context's end. The memory goes with tokens + tokens x span + span, so between those two it is never more.
+// Then the check of guesses, whose graph is kept on this scheduler (check_main_): 5 tokens wide, when that is a small
+// part of the card (1/32: on a small card the memory holds weights that matter more, and a check that needs more
+// makes the scheduler grow when it comes, as before); check_width_ becomes the widest check that fits in what is
+// reserved by then, so a wider one is only made where it costs nothing.
 // probe (TIERLM_MEM_PROBE=1, developers): prints what steps of other sizes would need, without reserving them.
 bool Model::reserve_worst(bool probe) {
     const int n_res = std::min(batch_, max_ctx_);
@@ -4788,6 +4789,14 @@ bool Model::reserve_worst(bool probe) {
         steps.push_back({std::min(b, max_ctx_), max_ctx_});
     }
     static const bool dbg = std::getenv("TIERLM_STREAM_DEBUG") != nullptr;
+    const int nb = ggml_backend_sched_get_n_backends(sched_);
+    auto gpu_size = [&](ggml_cgraph* gf) -> size_t {                // what a graph would need on the first GPU, nothing reserved
+        std::vector<size_t> sizes((size_t)nb, 0);
+        ggml_backend_sched_reserve_size(sched_, gf, sizes.data());
+        ggml_backend_sched_reset(sched_);
+        for (int i = 0; i < nb; ++i) if (!gpus_.empty() && ggml_backend_sched_get_backend(sched_, i) == gpus_[0]) return sizes[i];
+        return 0;
+    };
     bool ok = true;
     for (auto [n, end] : steps) {
         qsa_long_ = qsa_gpu_ = !qsa_.empty() && kv_span(end) % qsa_[0].ratio == 0;   // (QSA: room for the GPU's masks)
@@ -4795,23 +4804,41 @@ bool Model::reserve_worst(bool probe) {
         if (dbg) std::fprintf(stderr, "stream: building the graph of %d tokens ending at %d (streamed: %d)\n", n, end, (int)stream_on_);
         Graph g = hp_.dsv4 ? build_dsv4(n, end - n, true, 1, false, nullptr) : build(n, end, true);
         qsa_long_ = qsa_gpu_ = stream_on_ = false;
-        if (!probe) {
-            pin_cpu_layers(g);
-            ok = ggml_backend_sched_reserve(sched_, g.gf) && ok;
-        } else {
-            std::vector<ggml_backend_t> bs;
-            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched_); ++i) bs.push_back(ggml_backend_sched_get_backend(sched_, i));
-            ggml_backend_sched* sc = ggml_backend_sched_new(bs.data(), nullptr, (int)bs.size(), graph_size_, false, true);
-            if (sc) {
-                pin_cpu_layers(g, sc);
-                const bool fits = ggml_backend_sched_reserve(sc, g.gf);
-                std::fprintf(stderr, "probe: %5d tokens ending at %6d: %s", n, end, fits ? "" : "(doesn't fit) ");
-                for (ggml_backend_t b : bs) std::fprintf(stderr, " %s %.0f MB;", ggml_backend_name(b), ggml_backend_sched_get_buffer_size(sc, b) / 1048576.0);
-                std::fprintf(stderr, "\n");
-                ggml_backend_sched_free(sc);
-            }
-        }
+        pin_cpu_layers(g);
+        if (!probe) ok = ggml_backend_sched_reserve(sched_, g.gf) && ok;
+        else std::fprintf(stderr, "probe: %5d tokens ending at %6d: %.0f MB of VRAM\n", n, end, gpu_size(g.gf) / 1048576.0);
         ggml_free(g.ctx);
+    }
+    if (check_main_ && !hp_.dsv4 && !gpus_.empty()) {
+        auto check_size = [&](int w) -> size_t {
+            qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;
+            Graph g = build(w, max_ctx_, true, w, true, w, nullptr, &check_.mem);
+            qsa_long_ = qsa_gpu_ = false;
+            pin_cpu_layers(g);
+            const size_t sz = gpu_size(g.gf);
+            ggml_free(g.ctx);
+            return sz;
+        };
+        if (probe) {
+            for (int w : {2, 5, 7, 9}) if (w <= max_ctx_) std::fprintf(stderr, "probe: a check of %d tokens: %.0f MB of VRAM\n", w, check_size(w) / 1048576.0);
+        } else {
+            const char* we = std::getenv("TIERLM_PLAN_WIDTH");
+            const int w0 = std::min(we ? std::max(2, std::atoi(we)) : 5, max_ctx_);
+            size_t vfree = 0, vtotal = 0;
+            device_memory(vfree, vtotal);
+            const size_t have = ggml_backend_sched_get_buffer_size(sched_, gpus_[0]);
+            if (check_size(w0) > have && (std::getenv("TIERLM_PLANS") || (vtotal > 0 && check_size(w0) <= vtotal / 32))) {
+                qsa_long_ = qsa_gpu_ = !qsa_.empty() && max_ctx_ % qsa_[0].ratio == 0;
+                Graph g = build(w0, max_ctx_, true, w0, true, w0, nullptr, &check_.mem);
+                qsa_long_ = qsa_gpu_ = false;
+                pin_cpu_layers(g);
+                ok = ggml_backend_sched_reserve(sched_, g.gf) && ok;
+                ggml_free(g.ctx);
+            }
+            const size_t now = ggml_backend_sched_get_buffer_size(sched_, gpus_[0]);
+            check_width_ = w0;
+            for (int w = 9; w > w0; --w) if (w <= max_ctx_ && check_size(w) <= now) { check_width_ = w; break; }
+        }
     }
     return ok;
 }
@@ -5165,9 +5192,12 @@ std::vector<std::vector<float>> Model::eval_seqs(const std::vector<SeqInput>& in
     return out;
 }
 
+// The graphs kept placed on the main scheduler (a reply's one-token graph, the check's): gone when another graph is
+// about to be built and placed there.
 void Model::drop_reuse() {
     if (reuse_.ctx) ggml_free(reuse_.ctx);
     reuse_ = Graph();
+    if (check_main_) drop_plan(check_);
 }
 
 void Model::drop_plan(Plan& p) {
@@ -5177,7 +5207,7 @@ void Model::drop_plan(Plan& p) {
     p.g = Graph();
 }
 
-void Model::drop_plans() { drop_reuse(); drop_plan(check_); drop_plan(mtp1_); }
+void Model::drop_plans() { drop_reuse(); drop_plan(check_); drop_plan(mtp1_); drop_plan(mtpk_); }
 
 Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
                            std::vector<int32_t>* routing, const std::vector<SeqGroup>* groups) {
@@ -5297,15 +5327,16 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     // (DeepSeek V4: its graph's inputs depend on the position, so it's built every step)
     if (hp.dsv4 && groups && groups->size() > 1) throw std::runtime_error("DeepSeek V4 runs one conversation at a time");
     const bool cacheable = reuse_on && n_tok == 1 && !groups && !any_image && snapshots <= 1 && !hp.dsv4;
-    // A check of guesses (an undoable step) has a scheduler of its own, where its graph stays placed (see Plan).
-    const bool plan = reuse_on && check_.sched && snapshots > 1 && !groups && !any_image && !hp.dsv4;
+    // A check of guesses (an undoable step): its graph stays placed on the main scheduler until another graph needs it
+    // (a prompt batch; see Plan and check_main_), so check after check runs the same graph again.
+    const bool plan = reuse_on && check_main_ && snapshots > 1 && !groups && !any_image && !hp.dsv4;
     stream_on_ = !plan && !groups && stream_ready(n_tok);
     const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_, qsa_gpu_, n_kv_swa};
     const bool reuse = plan ? check_.g.ctx && key == check_.key : cacheable && reuse_.ctx && key == reuse_key_;
-    ggml_backend_sched* const sc = plan ? check_.sched : sched_;
+    ggml_backend_sched* const sc = sched_;
     Graph built;
     if (!reuse) {
-        if (plan) drop_plan(check_);
+        if (plan) { drop_plan(check_); drop_reuse(); }              // (the one-token graph was placed there too)
         swa_kv_build_ = n_kv_swa;
         try {
             built = hp.dsv4 ? build_dsv4(n_tok, tok_pos[0], routing != nullptr, n_logits, want_hidden, nullptr)

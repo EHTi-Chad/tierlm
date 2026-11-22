@@ -411,6 +411,9 @@ public:
     bool flash_attn() const { return flash_attn_; }
     const char* kv_type() const;      // "f16", "f32", "q8_0", "q5_0" or "q4_0"
     int batch() const { return batch_; }
+    // The most tokens a check of guesses can have (the token before them and the guesses) without taking more
+    // working memory than is kept free: at least 5; up to 9 where a prompt batch's memory is larger anyway.
+    int check_width() const { return check_width_; }
     // The most prompt tokens to read in one step that starts at position n_past. Attention's working memory goes
     // with (tokens in the step) x (the cache span they attend over): the mask alone is 2 bytes for each pair, 2.1 GB
     // for 4,096 tokens at 262,144. Kept free on the GPU for the worst step, that memory held no weights: Flash-Next
@@ -730,8 +733,14 @@ private:
     // own (with its own working memory), so their graphs stay placed and are run again, like a reply's one-token
     // graph above. Only for models with a draft block, and when the check's memory is a small part of the card.
     // TIERLM_PLANS=0: as before.
+    // Since 0.9.4 the check's graph is kept on the main scheduler instead (check_main_): that one holds the working
+    // memory of a whole prompt batch, idle while a reply is written, so the check needs none of its own (695 MB for
+    // Flash-Next on an RTX 5090: 330 more experts in VRAM) and a wider check costs no memory either. The draft
+    // block's catching-up step (2 to 9 tokens), which used the main scheduler between checks, has its own small one.
     struct Plan { Graph g; ReuseKey key; ggml_backend_sched* sched = nullptr; std::vector<uint8_t> mem; };
-    Plan check_, mtp1_;
+    Plan check_, mtp1_, mtpk_;
+    bool check_main_ = false;                                      // the check's graph stays placed on sched_
+    int check_width_ = 5;                                          // tokens in a check that sched_'s memory holds (see check_width)
     void drop_plan(Plan& p);
     void drop_plans();                                             // reuse_ and both plans (the cache changes size)
     bool overlap_ = true;                                          // CPU and GPU at once on split expert layers
