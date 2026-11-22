@@ -2200,6 +2200,11 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // Reserve compute memory once, for the largest graph we will ever build (a full batch at the end
     // of the context), so it is not re-planned on every token.
     m->setup_stream();
+    // Streamed, the RAM experts' pass costs about the same whatever the batch (Flash-Next, RTX 5090, 256K context,
+    // 35.8 GB of experts in RAM: 1.0 to 1.15 s for 512 to 1,600 new tokens), and the CPU passes that at about 256
+    // tokens (measured over agent sessions, medians: 180 tokens 0.76 s, 230 0.93 s, 290 1.16 s, 385 1.88 s, 480
+    // 1.69 s). So streamed batches start at 256 tokens instead of 512.
+    if (!std::getenv("TIERLM_COLD_OFFLOAD_MIN") && !m->stream_.layers.empty()) m->cold_offload_min_ = std::min(m->cold_offload_min_, 256);
     // Auto prompt batch size: 4,096 when streamed (see setup_stream: the copies then hide behind the work; 2,048
     // was copy-bound, 8,192's working memory pushed experts out of VRAM)
     if (opt.batch <= 0 && !m->stream_.layers.empty()) m->batch_ = std::min(4096, std::max(256, m->max_ctx_));
