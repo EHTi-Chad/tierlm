@@ -195,7 +195,11 @@ def main():
             checks = [gen("--gen-spec")] + [gen("--gen-spec", {"TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k}) for k in ("3", "5")]
             checks += [gen("--gen-spec", {"TIERLM_DRAFT_N": "8", "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": k}) for k in ("2", "7")]
             # (the number of guesses decided at each check, from how sure the draft block is)
-            checks += [gen("--gen-spec", {"TIERLM_DRAFT_ADAPT": "1"}), gen("--gen-spec", {"TIERLM_DRAFT_ADAPT": "1", "TIERLM_DRAFT_N": "1"})]
+            # (TIERLM_DRAFT_THETA: what a guess must bring in, set low enough here that this draft block's poor guesses
+            # sometimes all pass and sometimes don't, so checks of both sizes are made and the size changes)
+            checks += [gen("--gen-spec", {"TIERLM_DRAFT_ADAPT": "1"}), gen("--gen-spec", {"TIERLM_DRAFT_ADAPT": "1", "TIERLM_DRAFT_N": "1", "TIERLM_DRAFT_THETA": "2e-7"}),
+                       gen("--gen-spec", {"TIERLM_DRAFT_ADAPT": "1", "TIERLM_DRAFT_N": "1", "TIERLM_DRAFT_THETA": "4e-7"}),
+                       gen("--gen-spec", {"TIERLM_DRAFT_ADAPT": "1", "TIERLM_DRAFT_N": "2", "TIERLM_DRAFT_THETA": "0"})]
             # (the draft block catching up two tokens at a time, as it does beside a quantized cache)
             checks += [gen("--gen-spec", {"TIERLM_MTP_STEP": "2", "TIERLM_DRAFT_N": "8", "TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": "7"})]
             same = all(c[0] == plain for c in checks)
@@ -224,7 +228,7 @@ def main():
     path = write(cfg, m, mtp)
     env = {**os.environ, "TIERLM_DEVICE": "cpu", "TIERLM_SAMPLE_RUNS": "8000", "TIERLM_SAMPLE_TOPK": "16", "TIERLM_SAMPLE_TEMP": "1"}
     runs = {}
-    for mode, more in (("--gen", {}), ("--gen-spec", {}), ("adaptive", {"TIERLM_DRAFT_ADAPT": "1"})):
+    for mode, more in (("--gen", {}), ("--gen-spec", {}), ("adaptive", {"TIERLM_DRAFT_ADAPT": "1", "TIERLM_DRAFT_N": "1", "TIERLM_DRAFT_THETA": "3e-3"})):
         r = subprocess.run([exe, path, "--gen-spec" if mode == "adaptive" else mode, "3", "5", "9", "13"], capture_output=True, text=True, env={**env, **more})
         if r.returncode != 0: sys.exit(f"sampling: tierlm-logits {mode} failed: {r.stderr.strip()[-800:]}")
         runs[mode] = [tuple(l.split(",")) for l in r.stdout.split()]

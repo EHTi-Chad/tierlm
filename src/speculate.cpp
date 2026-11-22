@@ -110,11 +110,12 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     const int room = m_.max_ctx() - P - 1;            // positions left after x
     // (adaptive: see set_adaptive; a guess needs room in the check the model's working memory holds)
     const bool adapt = adapt_ && m_.has_mtp() && !draft_src_ && n_draft_ > 0;
-    // Two sizes of check, few or many guesses: a check of another size than the last has to be laid out again, which
-    // costs as much as one or two tokens (measured: 3 to 13 ms), so the size changes only when it clearly pays.
-    // (until a few checks have been timed: n_draft at most, as without it)
+    // Two sizes of check, the set number of guesses or many: a check of another size than the last has to be laid
+    // out again, which costs as much as one or two tokens (measured: 3 to 13 ms), so the size changes only when it
+    // clearly pays. (Deciding every count freely was measured too: the size changed at more than half the checks, and
+    // that took back what the longer guesses gained.) Until a few checks have been timed: the set number.
     const int n_many = std::max(1, std::min(adapt_most_, m_.check_width() - 1));
-    const int n_few = std::min(2, n_many);
+    const int n_few = std::min(n_draft_, n_many);
     const int n_max = std::max(0, std::min(adapt && ad_n_ >= 8 ? n_many : n_draft_, room));
     // What one more token must bring in to be worth its place in the check: the reply's speed times the token's cost.
     double theta = 0.5;
@@ -123,6 +124,8 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
         double per = var > 0.3 ? cov / var : mt / (mw + 4.0);          // ms per token of a check (few widths seen: a guess at it)
         per = std::min(std::max(per, mt / (mw + 12.0)), mt / (mw + 0.5));
         theta = std::min(0.9, std::max(0.2, ad_tok_ / ad_ms_ * (per + ad_guess_ms_)));
+        static const double fixed = [] { const char* e = std::getenv("TIERLM_DRAFT_THETA"); return e ? std::atof(e) : -1.0; }();   // (tests)
+        if (fixed >= 0) theta = fixed;
     }
     // (how much of its sureness the draft block earns: of the guesses tested lately, kept over expected)
     const double trust = ad_pred_ > 4.0 ? std::min(1.0, std::max(0.5, ad_kept_ / ad_pred_)) : 0.95;
@@ -202,7 +205,6 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
             drafts.resize(n_few); conf.resize(n_few);
             if (dist_) qs.resize(n_few);
         }
-        if (adapt) last_many_ = (int)drafts.size() >= n_many && n_many > n_few;
     }
     // With the draft block's guesses, lookup only extends them: when lookup's guess starts with all of the draft
     // block's, two independent guessers agree and the longer guess is worth checking; when they differ, the draft block (usually the better
@@ -214,6 +216,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
         if (agree) { drafts = look; from_lookup = (int)look.size(); }
     }
     const int k = (int)drafts.size();
+    if (adapt) last_many_ = k >= n_many && n_many > n_few;
     // (lookup's guesses, and any without a draw: certain, as far as the guesser goes)
     if (dist_) while ((int)qs.size() < k) qs.push_back({{drafts[qs.size()], 1.0f}});
     using sclk = std::chrono::steady_clock;

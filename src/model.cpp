@@ -2203,8 +2203,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // Streamed, the RAM experts' pass costs about the same whatever the batch (Flash-Next, RTX 5090, 256K context,
     // 35.8 GB of experts in RAM: 1.0 to 1.15 s for 512 to 1,600 new tokens), and the CPU passes that at about 256
     // tokens (measured over agent sessions, medians: 180 tokens 0.76 s, 230 0.93 s, 290 1.16 s, 385 1.88 s, 480
-    // 1.69 s). So streamed batches start at 256 tokens instead of 512.
-    if (!std::getenv("TIERLM_COLD_OFFLOAD_MIN") && !m->stream_.layers.empty()) m->cold_offload_min_ = std::min(m->cold_offload_min_, 256);
+    // 1.69 s). So streamed batches start at 256 tokens instead of 512 (TIERLM_COLD_OFFLOAD_MIN: at that size).
+    // (only the layers that are streamed: a layer whose RAM experts are copied the old way keeps its own size)
+    m->stream_min_ = std::getenv("TIERLM_COLD_OFFLOAD_MIN") ? m->cold_offload_min_ : std::min(m->cold_offload_min_, 256);
     // Auto prompt batch size: 4,096 when streamed (see setup_stream: the copies then hide behind the work; 2,048
     // was copy-bound, 8,192's working memory pushed experts out of VRAM)
     if (opt.batch <= 0 && !m->stream_.layers.empty()) m->batch_ = std::min(4096, std::max(256, m->max_ctx_));
@@ -3391,9 +3392,10 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             // the same cost whatever its size, so it only pays for big batches (see cold_offload_min_): below that
             // the CPU computes just the picks that are in RAM, as it does for a reply's steps.
             static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
-            const bool cold_gpu = n_tok >= std::max(offload_batch, cold_offload_min_);
             // Streamed (see setup_stream): the RAM experts are read from their VRAM slot, filled ahead on another queue
-            const bool streamed = cold_gpu && stream_on_ && L.stream_turn >= 0;
+            // (stream_on_: this step is big enough for it, see stream_ready; that is a smaller size than the copy's)
+            const bool streamed = stream_on_ && L.stream_turn >= 0;
+            const bool cold_gpu = streamed || n_tok >= std::max(offload_batch, cold_offload_min_);
             ggml_tensor* gu_c = streamed ? L.gate_up_xs : L.gate_up_xc;
             ggml_tensor* g_c  = streamed ? L.gate_xs : L.gate_xc;
             ggml_tensor* u_c  = streamed ? L.up_xs : L.up_xc;
@@ -4842,7 +4844,7 @@ void Model::setup_stream() {
 
 bool Model::stream_ready(int n_tok) const {
     static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
-    return !stream_.layers.empty() && n_tok >= std::max(offload_batch, cold_offload_min_) &&
+    return !stream_.layers.empty() && n_tok >= std::max(offload_batch, stream_min_) &&
            !std::getenv("TIERLM_OPPROF") && !std::getenv("TIERLM_TRACE");
 }
 

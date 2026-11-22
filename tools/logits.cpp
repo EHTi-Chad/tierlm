@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
             const int R = std::atoi(std::getenv("TIERLM_SAMPLE_RUNS")), V = m->hparams().n_vocab;
             const float T = std::getenv("TIERLM_SAMPLE_TEMP") ? (float)std::atof(std::getenv("TIERLM_SAMPLE_TEMP")) : 1.0f;
             const int K = std::getenv("TIERLM_SAMPLE_TOPK") ? std::atoi(std::getenv("TIERLM_SAMPLE_TOPK")) : 4;
-            std::mt19937 rng(gen_spec ? 12345u : 777u);
+            std::mt19937 rng((gen_spec ? 12345u : 777u) + (std::getenv("TIERLM_SAMPLE_SEED") ? 7919u * (unsigned)std::atoi(std::getenv("TIERLM_SAMPLE_SEED")) : 0u));
             auto dist = [&](const float* row, const std::vector<int32_t>&) {
                 std::vector<int32_t> idx(V);
                 for (int i = 0; i < V; ++i) idx[i] = i;

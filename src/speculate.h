@@ -70,10 +70,11 @@ public:
     // How many guesses per check, decided each time (draft block only): the draft block says how sure it is of each
     // guess, and a guess is worth checking only while the chance that it and all those before it are kept, times the
     // tokens per second the reply is making, beats what one more token costs the check. Checks come in two sizes, so
-    // their graph is seldom laid out anew: many guesses (`most`, or what the model's working memory takes:
-    // Model::check_width) while every one of them pays, else two. Both sides of "pays" are measured as replies go:
-    // how often guesses of a given sureness are kept, and what a check costs per token. n_draft is then only where
-    // it starts. Off: always n_draft guesses, as before.
+    // their graph is seldom laid out anew: n_draft guesses, or many (`most`, or what the model's working memory
+    // takes: Model::check_width) when every one of the many pays. Both sides of "pays" are measured as replies go:
+    // how often guesses of a given sureness are kept, and what a check costs per token. So where a token of a check
+    // costs little (a model all in VRAM) sure stretches are guessed many at a time, and where it costs a lot (experts
+    // read from RAM) the count stays as set. Off: always n_draft guesses, as before.
     void set_adaptive(bool on, int most = 8) { adapt_ = on; adapt_most_ = std::max(1, most); }
     bool adaptive() const { return adapt_; }
 
