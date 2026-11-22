@@ -1458,7 +1458,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             on_cpu.clear();
             // Prompt batch size "auto" (0): 2,048 when the RAM weights are pinned, so a long prompt goes in batches big
             // enough for the GPU to take over their work (from cold_offload_min_ tokens); 256 otherwise.
-            if (opt.batch <= 0 && m->place_.pinned_weights > 0) m->batch_ = std::min(2048, std::max(256, max_ctx));
+            if (opt.batch <= 0 && m->place_.pinned_weights > 0 && !hp.ink) m->batch_ = std::min(2048, std::max(256, max_ctx));   // (Inkling 2: see batch_span_)
         }
         alloc(cpu_buft, on_cpu, m->place_.cpu_weights);
         if (!on_repack.empty()) alloc(repack_buft, on_repack, m->place_.cpu_weights);
@@ -2271,6 +2271,18 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // was copy-bound, 8,192's working memory pushed experts out of VRAM)
     if (opt.batch <= 0 && !m->stream_.layers.empty()) m->batch_ = std::min(4096, std::max(256, m->max_ctx_));
     if (m->swa_R_) m->batch_ = std::min(m->batch_, m->ring_extra_ * 4 / 5);   // (a step never writes more than the rings allow for)
+    if (hp.ink) {
+        // Inkling 2's attention has a bias for every head, query and key, so it is worked out in the open: a few
+        // tensors of heads x new tokens x cache, 4 bytes each. Mini (24 heads) at 32K with 2,048 new tokens: 6.4 GB a
+        // tensor, 20 GB of working memory, which pushed 14 GB of the weights out of an RTX 5090's VRAM. So a prompt
+        // step is 256 tokens at most and gets smaller with the cache, in 16s: tokens x cache stays under 256 x 16,384
+        // for 24 heads (about 1.3 GB of working memory), 128 tokens a step at 32K, 16 at 256K.
+        int nh = 1;
+        for (int i = 0; i < hp.n_layer; ++i) nh = std::max(nh, hp.nh_at(i));
+        if (opt.batch <= 0) m->batch_ = std::min(m->batch_, 256);
+        m->batch_gran_ = 16;
+        m->batch_span_ = std::clamp(16384 * 24 / nh / 256 * 256, 1024, 65536);
+    }
     if (const char* e = std::getenv("TIERLM_BATCH_SPAN")) m->batch_span_ = std::max(0, std::atoi(e));
     if (m->hp_.dsv4) m->batch_span_ = 0;                             // (DeepSeek V4's attention has its own memory pattern)
     const bool plans_on = m->mtp_ && m->flash_attn_ && !(std::getenv("TIERLM_PLANS") && !std::strcmp(std::getenv("TIERLM_PLANS"), "0")) &&
@@ -5010,8 +5022,9 @@ bool Model::reserve_worst(bool probe) {
         steps.push_back({n_res, max_ctx_});
     } else {
         steps.push_back({n_res, std::max(n_res, batch_span_)});
-        int b = 256;
-        while (b + 256 <= batch_ && (int64_t)(b + 256) * max_ctx_ <= (int64_t)batch_ * batch_span_) b += 256;
+        const int G = batch_gran_;
+        int b = G;
+        while (b + G <= batch_ && (int64_t)(b + G) * max_ctx_ <= (int64_t)batch_ * batch_span_) b += G;
         steps.push_back({std::min(b, max_ctx_), max_ctx_});
     }
     static const bool dbg = std::getenv("TIERLM_STREAM_DEBUG") != nullptr;
@@ -5083,12 +5096,13 @@ bool Model::reserve_worst(bool probe) {
 }
 
 int Model::batch_at(int n_past) const {
-    if (batch_span_ <= 0 || batch_ <= 256) return batch_;
+    const int G = batch_gran_;                                     // (256; Inkling 2: 16)
+    if (batch_span_ <= 0 || batch_ <= G) return batch_;
     const int64_t most = (int64_t)batch_ * batch_span_;            // tokens x span of the largest step
     int b = batch_;
-    // (the span a step of b tokens ends at: found from the top, in whole 256s)
-    while (b > 256 && (int64_t)b * kv_span(std::min(max_ctx_, n_past + b)) > most) b -= 256;
-    return std::max(256, b);
+    // (the span a step of b tokens ends at: found from the top, in whole granules)
+    while (b > G && (int64_t)b * kv_span(std::min(max_ctx_, n_past + b)) > most) b -= G;
+    return std::max(G, b);
 }
 
 // Long prompts are processed in batches of up to batch_ tokens (batch_at), which bounds the memory a single graph needs.

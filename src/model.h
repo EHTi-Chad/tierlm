@@ -811,6 +811,7 @@ private:
     int kv_t_ = 1;                               // ggml_type of the KV cache (GGML_TYPE_F16)
     int batch_ = 256, n_expert_used_file_ = 0;
     int batch_span_ = 65536;                     // (batch_at: TIERLM_BATCH_SPAN, 0: batches never shrink)
+    int batch_gran_ = 256;                       // (batch_at: the smallest step, and what steps shrink by)
     int cold_offload_min_ = 32;                  // (see load: when the GPU takes over the RAM experts' work in a batch)
     int stream_min_ = 512;                       // ... and from which a streamed layer's are (see setup_stream)
     // Streamed prompt batches (see setup_stream): the split layers' RAM experts are copied into two VRAM slots on a

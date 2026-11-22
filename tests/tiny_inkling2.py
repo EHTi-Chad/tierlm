@@ -11,7 +11,8 @@ starting again from the same input, with messages from the previous pass mixed i
 experts' inputs. Each model is written as a GGUF laid out as llama.cpp's converter writes Inkling 2 (convolution taps
 oldest first, the relative bias table [d_rel, extent] transposed, padded output rows), run with tierlm-logits and
 compared with transformers' logits for the same tokens: whole prompts, token by token, with speculative snapshots,
-three conversations at once, and with the sliding-window rings cut down to 48 tokens.
+three conversations at once, with the sliding-window rings cut down to 48 tokens, and with a prompt read in steps
+that get smaller as the cache grows (what bounds the attention's working memory in a long context).
 
 The "earlier" cases write the same models the way Unsloth's Inkling-2-Mini files are laid out: arch "inkling2" with
 num_loops, the per-layer settings written out visit by visit (block_count counts the visits), the loop as
@@ -257,7 +258,9 @@ if __name__ == "__main__":
             os.remove(path)
             continue
         for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}, 6e-2 if real else 1e-3), ("normal", {}, 6e-2),
-                                ("ring48", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu", "TIERLM_SWA_RING_EXTRA": "48"}, 6e-2 if real else 1e-3)):
+                                ("ring48", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu", "TIERLM_SWA_RING_EXTRA": "48"}, 6e-2 if real else 1e-3),
+                                # (a prompt read in steps that shrink as the cache grows, as in a long context: 64 tokens, then 32)
+                                ("steps", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu", "TIERLM_BATCH_SPAN": "64"}, 6e-2 if real else 1e-3)):
             worst, top, diffs = 0.0, True, []
             for mode in ([], ["--step"], ["snapshot"]):
                 for ids in tests:
