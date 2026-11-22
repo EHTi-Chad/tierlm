@@ -488,6 +488,7 @@ private:
         // (full-attention layers; sliding layers: their cells or ring slots); per layer and pass (key: the state
         // tensor) the convolutions' inputs as they were d tokens back, ink_rollback[state][d]
         ggml_tensor *ink_tau = nullptr, *ink_rel = nullptr, *ink_rel_swa = nullptr;
+        ggml_tensor *ink_capv = nullptr;         // (the experts' softcaps: 1 / cap for each row of gate and up, as input)
         std::map<ggml_tensor*, std::vector<ggml_tensor*>> ink_rollback;
         std::vector<ggml_tensor*> orders;        // each layer's chosen experts (when routing is wanted)
         std::vector<int> order_layers;           // the layer each of orders belongs to

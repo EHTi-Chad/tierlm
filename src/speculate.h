@@ -140,7 +140,8 @@ private:
     std::vector<int32_t> hist_;   // the tokens in the model's cache, for prompt lookup
     // Prompt lookup pays for itself only when its checks give more tokens per second than plain steps: a guessed
     // token costs real time to check (on MoE models it reads its own experts), and a miss gets nothing for it. So
-    // it times both and pauses when guessing is losing, trying again later (twice as late each time it loses).
+    // it times both and pauses when guessing is losing, trying again later (twice as late each time it loses, and
+    // later still by how much it lost).
     double t_plain_ = 0;          // seconds per step without guesses (running average)
     double look_s_ = 0;           // this round of lookup checks: seconds, tokens produced, checks
     int look_tok_ = 0, look_n_ = 0;

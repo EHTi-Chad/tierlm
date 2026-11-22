@@ -316,9 +316,17 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     if (k == 0) t_plain_ = t_plain_ > 0 ? 0.9 * t_plain_ + 0.1 * dt : dt;
     else if (from_lookup > 0) {
         look_s_ += dt; look_tok_ += m + 1; look_n_++;
-        if (look_n_ >= 4 && t_plain_ > 0) {           // a round of 4 checks: their tokens/s against plain steps'
-            if (look_tok_ / look_s_ < 1.0 / t_plain_) { pause_ = pause_len_; pause_len_ = std::min(pause_len_ * 2, 1024); }
-            else pause_len_ = 16;
+        // A round of 4 checks: their tokens/s against plain steps'. Where a check with guesses costs several plain
+        // steps (Inkling 2 Mini on an RTX 5090: 65 ms against 13, its step being thousands of small GPU steps that
+        // only a plain step replays in one go), a round losing by 3 times or more is called after 2 checks, and a
+        // lost round's pause is as many times longer as it lost by (up to 8): over a 500-token program that was 24
+        // lost checks, now about 6.
+        const double lost_by = t_plain_ > 0 && look_tok_ > 0 ? (look_s_ / look_tok_) / t_plain_ : 0.0;   // (1: the same speed)
+        if (t_plain_ > 0 && (look_n_ >= 4 || (look_n_ >= 2 && lost_by >= 3.0))) {
+            if (lost_by > 1.0) {
+                pause_ = pause_len_ * std::clamp((int)lost_by, 1, 8);
+                pause_len_ = std::min(pause_len_ * 2, 1024);
+            } else pause_len_ = 16;
             look_s_ = 0; look_tok_ = look_n_ = 0;
         }
     }

@@ -3383,10 +3383,16 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             w2 = ggml_div(c, w2, ggml_sum_rows(c, w2));
             w = ggml_reshape_3d(c, w2, 1, NU, n_tok);
         }
-        if (hp.expert_scale != 0.0f && hp.expert_scale != 1.0f) w = ggml_scale(c, w, hp.expert_scale);
+        // Inkling 2 (see ink_layers' lean): its softcaps' two factors go with the weights here, and the picks'
+        // outputs are summed with one product instead of an addition a pick.
+        static const bool ink_lean = std::getenv("TIERLM_INK_PLAIN") == nullptr;
+        const bool cap_lean = ink_lean && hp.situ_beta > 0 && L.gate_up_x;
+        const float w_scale = (hp.expert_scale != 0.0f ? hp.expert_scale : 1.0f) * (cap_lean ? hp.situ_beta * hp.situ_lbeta : 1.0f);
+        if (w_scale != 1.0f) w = ggml_scale(c, w, w_scale);
+        ggml_tensor* sel_flat = nullptr;                                     // the picks in a row, made once for all the lookups by pick
+        auto sel1d = [&] { return sel_flat ? sel_flat : (sel_flat = ggml_reshape_1d(c, ggml_cont(c, sel), (int64_t)NU * n_tok)); };
         if (L.exp_scale)                                                     // Gemma 4: each expert's own scale
-            w = ggml_mul(c, w, ggml_reshape_3d(c, ggml_get_rows(c, ggml_reshape_2d(c, L.exp_scale, 1, NE),
-                                                                ggml_reshape_1d(c, ggml_cont(c, sel), (int64_t)NU * n_tok)), 1, NU, n_tok));
+            w = ggml_mul(c, w, ggml_reshape_3d(c, ggml_get_rows(c, ggml_reshape_2d(c, L.exp_scale, 1, NE), sel1d()), 1, NU, n_tok));
         // LatentMoE (Nemotron): the experts read and write a narrower width, between a down and an up projection;
         // the router above and the shared expert below work at the model's.
         ggml_tensor* hx    = L.lat_down ? ggml_mul_mat(c, L.lat_down, h) : h;
@@ -3398,7 +3404,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
         // their own tensors) share them.
         auto pick_scale = [&](ggml_tensor* sc) -> ggml_tensor* {
             if (!sc) return nullptr;
-            return ggml_reshape_3d(c, ggml_get_rows(c, ggml_reshape_2d(c, sc, 1, NE), ggml_reshape_1d(c, ggml_cont(c, sel), (int64_t)NU * n_tok)), 1, NU, n_tok);
+            return ggml_reshape_3d(c, ggml_get_rows(c, ggml_reshape_2d(c, sc, 1, NE), sel1d()), 1, NU, n_tok);
         };
         ggml_tensor *s_gu = pick_scale(L.x_scale_gu), *s_gate = pick_scale(L.x_scale_gate), *s_up = pick_scale(L.x_scale_up);
         // The chosen experts' outputs, weighted and summed: [n_embd, n_tok]. ids: [n_used, n_tok] into these tensors.
@@ -3406,12 +3412,13 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                            ggml_tensor* ids, ggml_tensor* wt, ggml_tensor* gate_b = nullptr, ggml_tensor* up_b = nullptr,
                            ggml_tensor* down_b = nullptr, ggml_tensor* bias_ids = nullptr) {
             if (!bias_ids) bias_ids = ids;                                   // (a split layer: the router's own ids, see below)
-            ggml_tensor *up, *gate = nullptr;
+            ggml_tensor *up, *gate = nullptr, *gu_all = nullptr;             // (gu_all: gate and up in one, when stored so)
             auto scaled = [&](ggml_tensor* t, ggml_tensor* s) { return s ? ggml_mul(c, t, s) : t; };   // (see pick_scale)
             if (hp.expert_relu2) up = scaled(ggml_mul_mat_id(c, up_x, xin, ids), s_up);   // Nemotron: no gate
             else if (gate_up_x) {                                                 // [2*n_ff_exp, n_used, n_tok]: gate, then up
                 ggml_tensor* gu = scaled(ggml_mul_mat_id(c, gate_up_x, xin, ids), s_gu);
                 const int64_t f = gu->ne[0] / 2;
+                gu_all = gu;
                 gate = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
                 up   = ggml_view_3d(c, gu, f, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], f * gu->nb[0]);
             } else {
@@ -3425,13 +3432,34 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                 gate = ggml_clamp(c, ggml_cont(c, gate), -INFINITY, lim);
                 up = ggml_clamp(c, ggml_cont(c, up), -lim, lim);
             }
-            if (hp.situ_beta > 0) {                                         // Inkling 2: capped gate and up
+            ggml_tensor* lean_act = nullptr;
+            if (cap_lean && gu_all) {
+                // Inkling 2: capped gate and up, cap(t, b) = b tanh(t / b), and act = cap(gate, beta) cap(up, lbeta)
+                // sigmoid(gate). Both tanh at once over [gate; up], each row divided by its cap first (capv, an input);
+                // beta lbeta is in the picks' weights (w_scale above).
+                ggml_tensor* gu = gu_all;                                      // [2 f, n_used, n_tok]: gate, then up
+                const int64_t f = gu->ne[0] / 2;
+                if (!g.ink_capv) {
+                    std::vector<float> v((size_t)(2 * f), 1.0f / hp.situ_lbeta);
+                    std::fill(v.begin(), v.begin() + f, 1.0f / hp.situ_beta);
+                    g.ink_capv = ggml_new_tensor_1d(c, GGML_TYPE_F32, 2 * f);
+                    ggml_set_input(g.ink_capv);
+                    g.in_f32.push_back({g.ink_capv, std::move(v)});
+                }
+                ggml_tensor* th = ggml_tanh(c, ggml_mul(c, gu, g.ink_capv));
+                ggml_tensor* tg = ggml_view_3d(c, th, f, th->ne[1], th->ne[2], th->nb[1], th->nb[2], 0);
+                ggml_tensor* tu = ggml_view_3d(c, th, f, th->ne[1], th->ne[2], th->nb[1], th->nb[2], f * th->nb[0]);
+                ggml_tensor* sg = ggml_sigmoid(c, gu);                         // (of both halves: one step, where the gate's alone needs a copy first)
+                sg = ggml_view_3d(c, sg, f, sg->ne[1], sg->ne[2], sg->nb[1], sg->nb[2], 0);
+                lean_act = ggml_mul(c, ggml_mul(c, tg, tu), sg);
+            } else if (hp.situ_beta > 0) {                                  // Inkling 2: capped gate and up
                 gate = ggml_cont(c, gate); up = ggml_cont(c, up);
                 auto cap = [&](ggml_tensor* t, float b) { return ggml_scale(c, ggml_tanh(c, ggml_scale(c, t, 1.0f / b)), b); };
                 up = ggml_mul(c, cap(up, hp.situ_lbeta), ggml_sigmoid(c, gate));
                 gate = cap(gate, hp.situ_beta);
             }
-            ggml_tensor* act  = hp.situ_beta > 0 ? ggml_mul(c, gate, up)
+            ggml_tensor* act  = lean_act ? lean_act
+                              : hp.situ_beta > 0 ? ggml_mul(c, gate, up)
                               : hp.expert_relu2 ? ggml_sqr(c, ggml_relu(c, up))
                               : hp.swiglu_oai ? ggml_swiglu_oai(c, gate_up_x ? ggml_cont(c, gate) : gate,
                                                                 gate_up_x ? ggml_cont(c, up) : up, 1.702f, 7.0f)
@@ -3439,6 +3467,12 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
                               : ggml_swiglu_split(c, gate, up);   // one step (gate_up: on the two halves in place)
             ggml_tensor* down = ggml_mul_mat_id(c, down_x, act, ids);        // [n_embd, n_used, n_tok]
             if (down_b) down = ggml_add_id(c, down, down_b, bias_ids);
+            if (ink_lean && hp.ink && !down_b) {                             // the picks' outputs times their weights, summed: one product
+                ggml_tensor* dp = ggml_cont(c, ggml_permute(c, down, 1, 0, 2, 3));                    // [n_used, width, n_tok]
+                ggml_tensor* s1 = ggml_mul_mat(c, dp, ggml_reshape_3d(c, ggml_is_contiguous(wt) ? wt : ggml_cont(c, wt), NU, 1, n_tok));   // [width, 1, n_tok]
+                ggml_mul_mat_set_prec(s1, GGML_PREC_F32);
+                return ggml_reshape_2d(c, s1, XW, n_tok);
+            }
             down = ggml_mul(c, down, wt);                                    // weight each expert's output
             ggml_tensor* sum = nullptr;
             for (int e = 0; e < NU; ++e) {
@@ -4225,10 +4259,30 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
     tag(-1);
     // Attention over the depth: the earlier blocks' outputs and cur, each normed (no weight), mixed by attention with
     // nq learned queries (the same at every position). Returns [E, nq, n_tok].
+    // Inkling 2 on a GPU: a token's step is thousands of small GPU steps (Mini, an RTX 5090: 8,157, and 13.3 ms for
+    // them, whatever they compute), so its time goes with their number. lean: the same values from fewer steps
+    // (TIERLM_INK_PLAIN=1, developers: as first written, to compare).
+    static const bool lean = std::getenv("TIERLM_INK_PLAIN") == nullptr;
+    // (lean: the blocks' outputs normed and stacked once for all the mixers that read the same blocks; a norm is per
+    // vector, so it is the same whether a vector is normed alone or in the stack)
+    std::map<std::vector<ggml_tensor*>, ggml_tensor*> stacks;                 // [E, blocks, n_tok], the latest block first
+    std::function<ggml_tensor*(const std::vector<ggml_tensor*>&)> stack_of = [&](const std::vector<ggml_tensor*>& bl) -> ggml_tensor* {
+        if (bl.empty()) return nullptr;
+        auto it = stacks.find(bl);
+        if (it != stacks.end()) return it->second;
+        ggml_tensor* top = ggml_rms_norm(c, ggml_reshape_3d(c, bl.back(), E, 1, n_tok), 1e-6f);
+        ggml_tensor* under = stack_of(std::vector<ggml_tensor*>(bl.begin(), bl.end() - 1));
+        return stacks[bl] = under ? ggml_concat(c, top, under, 1) : top;
+    };
     auto mix = [&](const std::vector<ggml_tensor*>& blocks, ggml_tensor* cur, ggml_tensor* query, int nq) -> ggml_tensor* {
         ggml_tensor* S = ggml_reshape_3d(c, cur, E, 1, n_tok);
-        for (ggml_tensor* b : blocks) S = ggml_concat(c, ggml_reshape_3d(c, b, E, 1, n_tok), S, 1);
-        S = ggml_rms_norm(c, S, 1e-6f);                                       // [E, nb, n_tok]
+        if (lean) {
+            S = ggml_rms_norm(c, S, 1e-6f);
+            if (ggml_tensor* under = stack_of(blocks)) S = ggml_concat(c, under, S, 1);
+        } else {
+            for (ggml_tensor* b : blocks) S = ggml_concat(c, ggml_reshape_3d(c, b, E, 1, n_tok), S, 1);
+            S = ggml_rms_norm(c, S, 1e-6f);                                   // [E, nb, n_tok]
+        }
         const int64_t nb = S->ne[1];
         ggml_tensor* sc = ggml_mul_mat(c, ggml_reshape_2d(c, query, E, nq), ggml_reshape_2d(c, S, E, nb * n_tok));   // [nq, nb n_tok]
         sc = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, sc, nq, nb, n_tok), 1, 0, 2, 3));          // [nb, nq, n_tok]
@@ -4236,11 +4290,16 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
         return ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, S, 1, 0, 2, 3)), sc);                     // [E, nq, n_tok]
     };
     auto pick = [&](ggml_tensor* m, int j) {                                  // query j's output of mix: [E, n_tok]
+        if (lean && m->ne[1] == 1) return ggml_reshape_2d(c, m, E, n_tok);    // (the only one: as it is)
         return ggml_cont(c, ggml_view_2d(c, m, E, n_tok, m->nb[2], (size_t)j * m->nb[1]));
     };
     // Each vector (over ne0) times scale, then scaled down to a length of at most thr
     auto clip = [&](ggml_tensor* t, ggml_tensor* scale, float thr) {
         if (scale) t = ggml_mul(c, t, scale);
+        if (lean) {                                                           // its direction, times its length or thr
+            ggml_tensor* len = ggml_sqrt(c, ggml_sum_rows(c, ggml_sqr(c, t)));
+            return ggml_mul(c, ggml_l2_norm(c, t, 1e-12f), ggml_clamp(c, len, 0.0f, thr));
+        }
         ggml_tensor* d = ggml_scale_bias(c, ggml_sqrt(c, ggml_sum_rows(c, ggml_sqr(c, t))), 1.0f, 1e-6f);
         ggml_tensor* f = ggml_clamp(c, ggml_div(c, ggml_fill(c, d, thr), d), -INFINITY, 1.0f);
         return ggml_mul(c, t, f);
@@ -4272,7 +4331,8 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
         // Short causal convolutions, conversation by conversation, each with its last K - 1 inputs kept in the
         // state at channel offset off ([K - 1, channels], time first): out = (x + conv(x) [+ per-token taps]) / sqrt(...)
         std::vector<std::pair<int64_t, ggml_tensor*>> conv_in;               // (one conversation: its inputs, for undo)
-        auto conv = [&](ggml_tensor* xin, ggml_tensor* w, ggml_tensor* dyn, int64_t off) -> ggml_tensor* {
+        // (raw: without the last division, for what is normed next: see v)
+        auto conv = [&](ggml_tensor* xin, ggml_tensor* w, ggml_tensor* dyn, int64_t off, bool raw = false) -> ggml_tensor* {
             const int64_t C = xin->ne[0];
             ggml_tensor* out = nullptr;
             for (int gi = 0, t0 = 0; gi < (int)grp.size(); t0 += grp[gi].n, ++gi) {
@@ -4296,7 +4356,8 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
                         co = ggml_add(c, co, ggml_reshape_2d(c, ggml_mul(c, win, tap), C, n));
                     }
                 }
-                ggml_tensor* r = ggml_scale(c, ggml_add(c, xs, co), 1.0f / std::sqrt((float)((dyn ? 2 : 1) * K + 1)));
+                ggml_tensor* r = ggml_add(c, xs, co);
+                if (!raw) r = ggml_scale(c, r, 1.0f / std::sqrt((float)((dyn ? 2 : 1) * K + 1)));
                 out = out ? ggml_concat(c, out, r, 1) : r;
             }
             return out;
@@ -4318,9 +4379,10 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
         }
         ggml_tensor* q = clip(ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, in[0]), hd, nh, n_tok), L.ink_qclip, hp.ink_qk_clip);
         ggml_tensor* k = conv(ggml_mul_mat(c, L.wk, in[1]), L.ink_kconv, swa ? nullptr : ggml_mul_mat(c, L.ink_kconvp, in[1]), 0);
-        ggml_tensor* v = conv(ggml_mul_mat(c, L.wv, in[2]), L.ink_vconv, swa ? nullptr : ggml_mul_mat(c, L.ink_vconvp, in[2]), kvd);
+        // (lean: the values are normed next, and y / s normed with eps is y normed with eps s^2: no division)
+        ggml_tensor* v = conv(ggml_mul_mat(c, L.wv, in[2]), L.ink_vconv, swa ? nullptr : ggml_mul_mat(c, L.ink_vconvp, in[2]), kvd, lean);
         k = clip(ggml_reshape_3d(c, k, hd, kvh, n_tok), nullptr, hp.ink_qk_clip);
-        v = ggml_rms_norm(c, ggml_reshape_3d(c, v, hd, kvh, n_tok), hp.rms_eps);
+        v = ggml_rms_norm(c, ggml_reshape_3d(c, v, hd, kvh, n_tok), lean ? hp.rms_eps * (float)((swa ? 1 : 2) * K + 1) : hp.rms_eps);
         ggml_tensor* r = clip(ggml_reshape_3d(c, ggml_mul_mat(c, L.ink_rel, in[0]), D, nh, n_tok), L.ink_relclip, hp.ink_rel_clip);
         if (!swa) { q = ggml_mul(c, q, g.ink_tau); r = ggml_mul(c, r, g.ink_tau); }
         // The bias by distance, less the token's sink score (so a zero sink after the softmax stands for it):
@@ -5721,7 +5783,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         std::fprintf(stderr, "splits %d\n", ggml_backend_sched_get_n_splits(sc));
         // TIERLM_DUMP_SCHED=2: also every step of layers 1-4 (op, where it runs, shape), and the step count per device
         if (std::atoi(std::getenv("TIERLM_DUMP_SCHED")) >= 2) {
-            std::map<std::string, int> per_dev;
+            std::map<std::string, int> per_dev, per_op;
             layer = -1;
             for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) {
                 ggml_tensor* t = ggml_graph_node(g.gf, i);
@@ -5729,12 +5791,18 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
                 ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sc, t);
                 const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
                 const std::string dev = b ? ggml_backend_name(b) : "?";
-                if (!view) per_dev[dev]++;
+                if (!view) { per_dev[dev]++; per_op[ggml_op_desc(t)]++; }
                 if (i < 400)
                     std::fprintf(stderr, "node %4d %-8s %-16s %-28s %lld x %lld x %lld%s\n", i, dev.c_str(), ggml_op_desc(t), t->name,
                                  (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], view ? " (view)" : "");
             }
             for (const auto& [d, n] : per_dev) std::fprintf(stderr, "steps on %s: %d per token\n", d.c_str(), n);
+            std::vector<std::pair<int, std::string>> kinds;                // (and of each kind, the most first)
+            for (const auto& [o, n] : per_op) kinds.push_back({n, o});
+            std::sort(kinds.rbegin(), kinds.rend());
+            std::string line;
+            for (const auto& [n, o] : kinds) line += " " + o + " " + std::to_string(n);
+            std::fprintf(stderr, "steps by kind:%s\n", line.c_str());
         }
     }
 
