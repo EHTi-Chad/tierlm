@@ -95,8 +95,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     LoadOptions o = opt;
     // (per context, batch, connections and placement kind: the hot-expert split needs more than whole layers)
     // ("v2": 0.8.4 sizes the scratch to the card; a note from 0.8.3 held 640 MB of scratch on every card, so isn't read;
-    // "v3": 0.9.4 needs less at long contexts (batch_at), and a note only ever grows)
-    const std::string key = "v3 " + std::to_string(opt.max_ctx) + " " + std::to_string(opt.batch) + " " + std::to_string(opt.parallel) + " " +
+    // "v3": 0.9.4 needs less at long contexts (batch_at); "v4": and nothing beside it for checking guesses)
+    const std::string key = "v4 " + std::to_string(opt.max_ctx) + " " + std::to_string(opt.batch) + " " + std::to_string(opt.parallel) + " " +
                             opt.split_mode + (opt.expert_usage.empty() ? "" : "+hot") + (opt.live_hot ? "+live" : "") + " ";
     if (o.vram_reserve_mb <= 0 && !o.vram_note.empty()) {
         std::ifstream f(std::filesystem::u8path(o.vram_note));
@@ -115,7 +115,9 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                              return e ? std::atoi(e) : std::clamp((int)(vram_total >> 20) / 32, 192, 640); }();
     const int need = (int)(m->place_.compute_gpu >> 20) + runtime;
     const bool tight = m->place_.compute_gpu > 0 && need > used + 64 && opt.vram_budget_mb <= 0 && !std::getenv("TIERLM_VRAM_BYTES");
-    if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && need > o.vram_reserve_mb) {   // remember it (the most seen: no reload back and forth)
+    // remember it: the most seen (no reload back and forth), unless far more was noted than is needed now (a newer
+    // tierlm that needs less: the next load keeps less free)
+    if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && (need > o.vram_reserve_mb || (opt.vram_reserve_mb <= 0 && need + 256 < o.vram_reserve_mb))) {
         std::vector<std::string> keep;
         { std::ifstream f(std::filesystem::u8path(o.vram_note)); for (std::string line; std::getline(f, line); ) if (line.compare(0, key.size(), key) != 0 && !line.empty()) keep.push_back(line); }
         std::error_code ec;
