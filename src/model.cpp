@@ -3528,6 +3528,41 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
 
 // Builds the compute graph for n_tok new tokens placed after n_past cached ones.
 // Only a description: the scheduler allocates its memory on the right device later.
+// ---- Flash-Next's stream mixers (see build) ----
+// The residual stream is HC copies of the width. Reading it for a block is the mean over the copies of
+// sigmoid(gate) x copy; writing a block's output back is copy + output x that copy's weight. ggml has one op for each
+// (written for DeepSeek V4's hyper-connections; the gated reading is Flash-Next's), on the CPU, CUDA and Vulkan: one
+// pass over the copies instead of six ops and four (a sigmoid, a product, three sums and a scale; a copy, a repeat, a
+// product and a sum), which for a check of a few tokens is 16 fewer GPU kernels a layer and for a prompt batch that
+// many fewer passes over HC x the width x the batch. TIERLM_HC_FUSED=0: the plain ops, as before 0.9.4.
+static bool hc_fused() {
+    static const bool on = !(std::getenv("TIERLM_HC_FUSED") && !std::strcmp(std::getenv("TIERLM_HC_FUSED"), "0"));
+    return on;
+}
+// xn [HC * E, n_tok] (the normed copies), gate the same shape (before its sigmoid) -> [E, n_tok]
+static ggml_tensor* hc_mean(ggml_context* c, ggml_tensor* xn, ggml_tensor* gate, int HC, int E, int64_t n_tok) {
+    if (hc_fused())
+        return ggml_dsv4_hc_pre_gated(c, ggml_reshape_3d(c, xn, E, HC, n_tok), ggml_reshape_3d(c, gate, E, HC, n_tok), 1.0f / HC);
+    ggml_tensor* p = ggml_mul(c, ggml_sigmoid(c, gate), xn);              // [HC * E, n_tok]
+    ggml_tensor* s = nullptr;
+    for (int k = 0; k < HC; ++k) {
+        ggml_tensor* v = ggml_view_2d(c, p, E, n_tok, p->nb[1], (size_t)k * E * ggml_element_size(p));
+        s = s ? ggml_add(c, s, v) : v;
+    }
+    return ggml_scale(c, s, 1.0f / HC);
+}
+// X [HC * E, n_tok] + y [E, n_tok] into every copy, times that copy's weight inj [HC, n_tok]
+static ggml_tensor* hc_inject(ggml_context* c, ggml_tensor* X, ggml_tensor* y, ggml_tensor* inj, int HC, int E, int64_t n_tok) {
+    if (hc_fused())
+        return ggml_reshape_2d(c, ggml_dsv4_hc_post(c, ggml_reshape_2d(c, ggml_is_contiguous(y) ? y : ggml_cont(c, y), E, n_tok),
+                                                    ggml_reshape_3d(c, X, E, HC, n_tok), inj, nullptr), (int64_t)E * HC, n_tok);
+    ggml_tensor* y3 = ggml_reshape_3d(c, ggml_cont(c, y), E, 1, n_tok);
+    ggml_tensor* r = ggml_mul(c, ggml_repeat_4d(c, y3, E, HC, n_tok, 1), ggml_reshape_3d(c, inj, 1, HC, n_tok));
+    return ggml_add(c, X, ggml_reshape_2d(c, r, (int64_t)E * HC, n_tok));
+}
+// (a copy only of what isn't in one piece)
+static ggml_tensor* whole(ggml_context* c, ggml_tensor* t) { return ggml_is_contiguous(t) ? t : ggml_cont(c, t); }
+
 // TIERLM_PROFILE=1: every 64 graphs of up to 8 tokens (replies, not prompts), prints where the time per graph
 // went: preparing it, and per device the input copies and the work. Each split is waited for while this is on.
 void Model::profile_step(int n_tok, double prep_ms, double compute_ms, double out_ms, double build_ms, double alloc_ms) {
@@ -3661,22 +3696,11 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     };
     auto hc_mix = [&](ggml_tensor* X, ggml_tensor* nw, ggml_tensor* down, ggml_tensor* up, ggml_tensor* injw, ggml_tensor** inj) {
         ggml_tensor* xn = gnorm(X, nw, n_tok);
-        ggml_tensor* m = ggml_sigmoid(c, ggml_mul_mat(c, up, ggml_silu(c, ggml_scale(c, ggml_mul_mat(c, down, xn), 1.0f / HC))));
-        ggml_tensor* p = ggml_mul(c, m, xn);                               // [HC * E, n_tok]
-        ggml_tensor* s = nullptr;
-        for (int k = 0; k < HC; ++k) {
-            ggml_tensor* v = ggml_view_2d(c, p, E, n_tok, p->nb[1], (size_t)k * E * ggml_element_size(p));
-            s = s ? ggml_add(c, s, v) : v;
-        }
-        s = ggml_scale(c, s, 1.0f / HC);                                   // [E, n_tok]
+        ggml_tensor* s = hc_mean(c, xn, ggml_mul_mat(c, up, ggml_silu(c, ggml_scale(c, ggml_mul_mat(c, down, xn), 1.0f / HC))), HC, E, n_tok);
         if (inj) *inj = ggml_scale(c, ggml_sigmoid(c, ggml_scale(c, ggml_mul_mat(c, injw, xn), 1.0f / HC)), 2.0f);   // [HC, n_tok]
-        return s;
+        return s;                                                           // [E, n_tok]
     };
-    auto hc_add = [&](ggml_tensor* X, ggml_tensor* y, ggml_tensor* inj) {  // X + y into every copy, times inj
-        ggml_tensor* y3 = ggml_reshape_3d(c, ggml_cont(c, y), E, 1, n_tok);
-        ggml_tensor* r = ggml_mul(c, ggml_repeat_4d(c, y3, E, HC, n_tok, 1), ggml_reshape_3d(c, inj, 1, HC, n_tok));
-        return ggml_add(c, X, ggml_reshape_2d(c, r, (int64_t)E * HC, n_tok));
-    };
+    auto hc_add = [&](ggml_tensor* X, ggml_tensor* y, ggml_tensor* inj) { return hc_inject(c, X, y, inj, HC, E, n_tok); };
     // ---- Flash-Next's per-layer embedding (Hugging Face's Qwen4ExpTextPLELayer) ----
     // The token's n-gram rows (heads x ple_dim numbers) give one value for the width and a key for every copy;
     // each copy's normed activations gate the value: g = sum(key x query) / sqrt(E), sign(g) sqrt(|g|), sigmoid.
@@ -3695,12 +3719,13 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
         ggml_tensor* gv = ggml_mul(c, ggml_repeat_4d(c, ggml_reshape_3d(c, val, E, 1, n_tok), E, HC, n_tok, 1), ggml_sigmoid(c, gt));
         gv = ggml_reshape_2d(c, gv, C, n_tok);                                               // [C, n_tok]
         ggml_tensor* gvn = gnorm(gv, L.ple_norm_conv, n_tok);
-        // the taps, one [C, 1] each (channel c's taps are K numbers in a row)
+        // the taps, one [C, 1] each (channel c's taps are K numbers in a row: turned once, [C, K], and tap k is its
+        // k-th column)
         std::vector<ggml_tensor*> w(K);
-        for (int k = 0; k < K; ++k) {
-            ggml_tensor* v = ggml_cont(c, ggml_view_2d(c, L.ple_conv, 1, C, L.ple_conv->nb[1], (size_t)k * ggml_element_size(L.ple_conv)));
-            if (v->type != GGML_TYPE_F32) v = ggml_cast(c, v, GGML_TYPE_F32);
-            w[k] = ggml_reshape_2d(c, v, C, 1);
+        {
+            ggml_tensor* all = ggml_cont(c, ggml_transpose(c, ggml_reshape_2d(c, L.ple_conv, K, C)));
+            if (all->type != GGML_TYPE_F32) all = ggml_cast(c, all, GGML_TYPE_F32);
+            for (int k = 0; k < K; ++k) w[k] = ggml_view_2d(c, all, C, 1, all->nb[1], (size_t)k * all->nb[1]);
         }
         ggml_tensor* co = nullptr;
         for (int gi = 0, t0 = 0; gi < (int)grp.size(); t0 += grp[gi].n, ++gi) {
@@ -4025,7 +4050,7 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     if (want_hidden && HC) {                                                // [HC * E, n_tok]: the copies, for the MTP block
         g.hidden = ggml_cont(c, x); ggml_set_output(g.hidden); ggml_build_forward_expand(g.gf, g.hidden);
     }
-    x = HC ? ggml_cont(c, hc_mix(x, out_hc_norm_, out_hc_down_, out_hc_up_, nullptr, nullptr))   // the last mixer
+    x = HC ? whole(c, hc_mix(x, out_hc_norm_, out_hc_down_, out_hc_up_, nullptr, nullptr))   // the last mixer
            : ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), out_norm_);
     tr(x, "final", -1);
     if (want_hidden && !HC) { g.hidden = x; ggml_set_output(x); }          // [n_embd, n_tok]: what the MTP head reads
@@ -4627,22 +4652,11 @@ Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem, 
         };
         auto mix = [&](ggml_tensor* X, ggml_tensor* nw, ggml_tensor* down, ggml_tensor* up, ggml_tensor* injw, ggml_tensor** inj) {
             ggml_tensor* xn = gnorm(X, nw);
-            ggml_tensor* mw = ggml_sigmoid(c, ggml_mul_mat(c, up, ggml_silu(c, ggml_scale(c, ggml_mul_mat(c, down, xn), 1.0f / HC))));
-            ggml_tensor* p = ggml_mul(c, mw, xn);
-            ggml_tensor* s = nullptr;
-            for (int k = 0; k < HC; ++k) {
-                ggml_tensor* v = ggml_view_2d(c, p, E, n_tok, p->nb[1], (size_t)k * E * ggml_element_size(p));
-                s = s ? ggml_add(c, s, v) : v;
-            }
-            s = ggml_scale(c, s, 1.0f / HC);
+            ggml_tensor* s = hc_mean(c, xn, ggml_mul_mat(c, up, ggml_silu(c, ggml_scale(c, ggml_mul_mat(c, down, xn), 1.0f / HC))), HC, E, n_tok);
             if (inj) *inj = ggml_scale(c, ggml_sigmoid(c, ggml_scale(c, ggml_mul_mat(c, injw, xn), 1.0f / HC)), 2.0f);
             return s;
         };
-        auto add = [&](ggml_tensor* X, ggml_tensor* y, ggml_tensor* inj) {
-            ggml_tensor* y3 = ggml_reshape_3d(c, ggml_cont(c, y), E, 1, n_tok);
-            ggml_tensor* r = ggml_mul(c, ggml_repeat_4d(c, y3, E, HC, n_tok, 1), ggml_reshape_3d(c, inj, 1, HC, n_tok));
-            return ggml_add(c, X, ggml_reshape_2d(c, r, (int64_t)E * HC, n_tok));
-        };
+        auto add = [&](ggml_tensor* X, ggml_tensor* y, ggml_tensor* inj) { return hc_inject(c, X, y, inj, HC, E, n_tok); };
         ggml_tensor* e = ggml_mul(c, ggml_rms_norm(c, embed(), hp.rms_eps), L.enorm);              // [E, n_tok]
         ggml_tensor* e3 = ggml_repeat_4d(c, ggml_reshape_3d(c, e, E, 1, n_tok), E, HC, n_tok, 1);   // [E, HC, n_tok]
         ggml_tensor* hn = ggml_reshape_3d(c, gnorm(g.h_in, L.hnorm), E, HC, n_tok);
@@ -4654,7 +4668,7 @@ Model::Graph Model::build_mtp(int n_tok, int n_past, std::vector<uint8_t>* mem, 
         h = mix(x, L.hc_f_norm, L.hc_f_down, L.hc_f_up, L.hc_f_inj, &inj);
         x = add(x, ffn_block(c, g, L, h, n_tok, false), inj);
         g.hidden = ggml_cont(c, x); ggml_set_output(g.hidden); ggml_build_forward_expand(g.gf, g.hidden);   // [HC * E, n_tok]
-        ggml_tensor* o = ggml_cont(c, mix(x, L.hc_head_norm, L.hc_head_down, L.hc_head_up, nullptr, nullptr));   // [E, n_tok]
+        ggml_tensor* o = whole(c, mix(x, L.hc_head_norm, L.hc_head_down, L.hc_head_up, nullptr, nullptr));   // [E, n_tok]
         ggml_tensor* last = ggml_view_2d(c, o, E, 1, o->nb[1], (size_t)(n_tok - 1) * o->nb[1]);
         g.logits = ggml_mul_mat(c, L.head ? L.head : output_, last);
         ggml_set_output(g.logits);
