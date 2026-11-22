@@ -69,11 +69,11 @@ public:
 
     // How many guesses per check, decided each time (draft block only): the draft block says how sure it is of each
     // guess, and a guess is worth checking only while the chance that it and all those before it are kept, times the
-    // tokens per second the reply is making, beats what one more token costs the check. So it guesses on while it is
-    // sure (up to `most`, and what the model's working memory takes: Model::check_width) and stops at the first guess
-    // that doesn't pay, always making at least one. Both sides of that are measured as the reply goes: how often
-    // guesses of a given sureness are kept, and what a check costs per token. n_draft is then only where it starts.
-    // Off: always n_draft guesses, as before.
+    // tokens per second the reply is making, beats what one more token costs the check. Checks come in two sizes, so
+    // their graph is seldom laid out anew: many guesses (`most`, or what the model's working memory takes:
+    // Model::check_width) while every one of them pays, else two. Both sides of "pays" are measured as replies go:
+    // how often guesses of a given sureness are kept, and what a check costs per token. n_draft is then only where
+    // it starts. Off: always n_draft guesses, as before.
     void set_adaptive(bool on, int most = 8) { adapt_ = on; adapt_most_ = std::max(1, most); }
     bool adaptive() const { return adapt_; }
 
@@ -144,6 +144,7 @@ private:
     // set_adaptive: running averages (per model: they carry over from reply to reply)
     bool adapt_ = false;
     int adapt_most_ = 8;
+    bool last_many_ = false;           // the last check was of the many-guesses size
     double ad_tok_ = 0, ad_ms_ = 0;    // tokens made and time spent, lately (their ratio: the reply's speed)
     double ad_w_ = 0, ad_t_ = 0, ad_ww_ = 0, ad_wt_ = 0, ad_n_ = 0;   // checks' widths and times: a line through them gives the cost per token
     double ad_guess_ms_ = 1.0;         // one guess, and its share of the catching up

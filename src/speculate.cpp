@@ -108,10 +108,14 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                                       std::vector<int32_t>* routing) {
     const int P = m_.n_past(), E = m_.hparams().hidden_width(), V = m_.hparams().n_vocab;
     const int room = m_.max_ctx() - P - 1;            // positions left after x
-    // (adaptive: as many as pay, see set_adaptive; a guess needs room in the check the model's working memory holds)
+    // (adaptive: see set_adaptive; a guess needs room in the check the model's working memory holds)
     const bool adapt = adapt_ && m_.has_mtp() && !draft_src_ && n_draft_ > 0;
+    // Two sizes of check, few or many guesses: a check of another size than the last has to be laid out again, which
+    // costs as much as one or two tokens (measured: 3 to 13 ms), so the size changes only when it clearly pays.
     // (until a few checks have been timed: n_draft at most, as without it)
-    const int n_max = std::max(0, std::min(adapt && ad_n_ >= 8 ? std::max(1, std::min(adapt_most_, m_.check_width() - 1)) : n_draft_, room));
+    const int n_many = std::max(1, std::min(adapt_most_, m_.check_width() - 1));
+    const int n_few = std::min(2, n_many);
+    const int n_max = std::max(0, std::min(adapt && ad_n_ >= 8 ? n_many : n_draft_, room));
     // What one more token must bring in to be worth its place in the check: the reply's speed times the token's cost.
     double theta = 0.5;
     if (adapt && ad_ms_ > 0 && ad_n_ >= 8) {
@@ -122,6 +126,8 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     }
     // (how much of its sureness the draft block earns: of the guesses tested lately, kept over expected)
     const double trust = ad_pred_ > 4.0 ? std::min(1.0, std::max(0.5, ad_kept_ / ad_pred_)) : 0.95;
+    // (the last check had many guesses: this one keeps that size unless its guesses are far from paying)
+    const double bar = adapt && last_many_ ? theta * 0.6 : theta;
     std::vector<float> conf;                          // how sure the draft block was of each guess made
     double chance = 1.0;                              // that every guess so far is kept
     const auto t0 = std::chrono::steady_clock::now();
@@ -167,7 +173,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                 for (const auto& e : q) qmax = std::max(qmax, e.second);
                 if (p_min_ > 0.0f && qmax < p_min_) break;
                 sure = qmax;
-                if (adapt && i > 0 && chance * trust * sure < theta) break;
+                if (adapt && i >= n_few && chance * trust * sure < bar) break;
                 d = draw(q);
                 qs.push_back(std::move(q));
             } else {
@@ -178,7 +184,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                     for (float v : lg) if (v > top - 20.0f) sum += std::exp((double)(v - top));
                     sure = (float)(1.0 / sum);
                     if (sure < p_min_) break;
-                    if (adapt && i > 0 && chance * trust * sure < theta) break;   // this guess doesn't pay: stop before it
+                    if (adapt && i >= n_few && chance * trust * sure < bar) break;   // this guess doesn't pay: stop before it
                 }
             }
             if (trace_) trace_q_.push_back(dist_ ? prob_of(qs.back(), d) : sure);
@@ -190,6 +196,13 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
             h.swap(hn);
         }
         if (marked) { m_.set_hot_only(false); m_.draft_rewind(); }   // back to x's place (the check writes it all again)
+        // (adaptive, timed: the many when every one of them pays, else the few)
+        if (adapt && ad_n_ >= 8 && n_max == n_many && (int)drafts.size() < n_many && (int)drafts.size() > n_few &&
+            !(std::find_if(drafts.begin(), drafts.end(), stop) != drafts.end())) {
+            drafts.resize(n_few); conf.resize(n_few);
+            if (dist_) qs.resize(n_few);
+        }
+        if (adapt) last_many_ = (int)drafts.size() >= n_many && n_many > n_few;
     }
     // With the draft block's guesses, lookup only extends them: when lookup's guess starts with all of the draft
     // block's, two independent guessers agree and the longer guess is worth checking; when they differ, the draft block (usually the better
