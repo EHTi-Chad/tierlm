@@ -3050,14 +3050,20 @@ int main(int argc, char** argv) {
             if (g4 && (t == g4_open || t == g4_close || t == g4_think)) return false;   // (Gemma 4's thinking goes on)
             return t == tok.eos() || t == tok.eot() || tok.is_control(t);
         };
-        // "ignore_eos": the reply goes on to max_tokens (to time long replies): the end-of-reply tokens are never
-        // picked (their scores set to -inf in a copy of each row)
+        // Tokens that are never picked (their scores set to -inf in a copy of each row). "ignore_eos": the reply goes
+        // on to max_tokens (to time long replies), so the end-of-reply tokens.
         std::vector<int32_t> no_end;
         std::vector<float> unended;
         const bool ignore_eos = tl_ignore_eos;
         tl_ignore_eos = false;                                    // (one request's: the thread serves others later)
         if (ignore_eos && max_tokens > 0)
             for (int32_t t = 0; t < (int32_t)tok.vocab_size(); ++t) if (is_end(t)) no_end.push_back(t);
+        // Inkling 2 with thinking off: the prompt says "Thinking effort level: 0", as its template does, and the model
+        // opens thinking blocks all the same (Mini, on an RTX 5090: a few lines before most replies, and all of a
+        // 500-token limit before a program). Off is off: the thinking block's token is never picked either, so a
+        // reply's blocks are its text and its tool calls.
+        if (ink && think == 0)
+            if (const int32_t t = tok.find(inkling::kThink); t >= 0) no_end.push_back(t);
         auto unend = [&](const float* row, size_t n) -> const float* {
             if (no_end.empty()) return row;
             unended.assign(row, row + n);

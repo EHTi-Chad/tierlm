@@ -909,6 +909,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             std::fprintf(stderr, "note: this model's head size (%d) can't use a %s cache; using f16\n", hp.head_dim, want.c_str());
             m->kv_t_ = GGML_TYPE_F16;
         }
+        if (ggml_is_quantized((ggml_type)m->kv_t_) && hp.ink) {     // (only flash attention reads a quantized cache)
+            std::fprintf(stderr, "note: Inkling 2's attention doesn't read a %s cache yet; using f16\n", want.c_str());
+            m->kv_t_ = GGML_TYPE_F16;
+        }
         m->kv_f32_ = m->kv_t_ == GGML_TYPE_F32;
     }
     // Sliding-window layers: rings instead of the whole context (see swa_R_), when that's smaller
@@ -1017,7 +1021,8 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         const std::string name = ggml_get_name(t);
         int prio = 1, layer = -1;
         bool own = false;                                                // a group of its own
-        if (name == "token_embd.weight") { prio = tied ? 1 : 9; own = true; }   // only looked up by row: fine in RAM
+        // (TIERLM_EMBD_VRAM=1, developers: the table in VRAM when it fits, to measure what its place costs)
+        if (name == "token_embd.weight") { prio = tied || std::getenv("TIERLM_EMBD_VRAM") ? 1 : 9; own = true; }   // only looked up by row: fine in RAM
         else if (name == "per_layer_token_embd.weight") { prio = 9; own = true; }   // Flash-Next's n-gram table: 16 rows a token
         else if (name == "output.weight") { prio = 1; layer = hp.n_layer; own = true; }
         else if (name.compare(0, 4, "blk.") == 0) {

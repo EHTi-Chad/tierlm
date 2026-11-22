@@ -244,6 +244,7 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_DEVICE=cpu` | `tierlm-logits` (tests): device to load the model on |
 | `TIERLM_KV_TYPE=q8_0` | KV cache precision for the tools and tests: `f16`, `q8_0`, `q5_0`, `q4_0` or `f32` |
 | `TIERLM_NO_REPACK=1` | Keep RAM weights in the file's layout instead of rearranging them for the CPU (since 0.9.1 they always are when they're pinned, so the GPU can take over their work for long prompts) |
+| `TIERLM_EMBD_VRAM=1` | Developers: the token table in VRAM when it fits (it is looked up by row, so it stays in RAM otherwise), to measure what its place costs |
 | `TIERLM_RPC=host:port[,host:port]` | Tests: add `tierlm-rpc-server` instances as stand-in GPUs (needs a build with `-DGGML_RPC=ON`) |
 | `TIERLM_VRAM_MB=N` / `TIERLM_VRAM_BYTES=n[,n...]` | Tests: VRAM budget for `tierlm-logits`, in MiB, or in bytes per GPU |
 | `TIERLM_SPLIT=layers\|experts` | Tests: split mode for `tierlm-logits` |

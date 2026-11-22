@@ -409,7 +409,7 @@ public:
     bool on_gpu() const { return main_ != cpu_; }
     bool integrated_gpu() const;                  // shares system memory (e.g. Intel Arc in a laptop)
     void device_memory(size_t& free, size_t& total) const;   // of the device holding the weights
-    bool flash_attn() const { return flash_attn_; }
+    bool flash_attn() const { return flash_attn_ && !hp_.ink; }   // (Inkling 2's attention has a bias per head and pair: worked out in the open)
     const char* kv_type() const;      // "f16", "f32", "q8_0", "q5_0" or "q4_0"
     int batch() const { return batch_; }
     // The most tokens a check of guesses can have (the token before them and the guesses) without taking more
