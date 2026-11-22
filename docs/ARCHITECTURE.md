@@ -872,8 +872,8 @@ that VRAM holds: the same six replies ran at 77 tok/s on one start and at 69 on 
 and pictures had changed which experts VRAM started with. A check of
 another size than the last is built and placed again (3.2 ms), and the first few-token check after a wide one also
 computes about 6 ms slower. `TIERLM_PLAN_DIFF=1` shows the graph is the same to the GPU when it comes back (the same
-tensors at the same places), bar now and then one 512-byte-a-token tensor that is there or not, which moves the
-others.
+tensors at the same places), except when the cache's span has grown by its step of 256 positions meanwhile: the mask
+is then 512 bytes a token longer and the tensors after it have moved.
 
 ## Several conversations at once
 
