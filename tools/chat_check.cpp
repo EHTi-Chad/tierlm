@@ -6,10 +6,13 @@
 //   tierlm-chat-check gemma4-reply   [{"raw": "...", "tools": [...]}, ...]
 //   tierlm-chat-check inkling-prompt [{"messages", "tools", "think": 0|1}, ...]  (tests/inkling_chat_test.py)
 //   tierlm-chat-check inkling-reply  ["<raw reply>", ...]
+//   tierlm-chat-check glm-prompt     [{"messages", "tools", "think": 0|1, "layout": "46"|"47"}, ...]  (tests/glm_chat_test.py)
+//   tierlm-chat-check glm-reply      [{"raw": "...", "tools": [...]}, ...]
 //   tierlm-chat-check qwen-prompt    [{"messages" (as an app sends them), "tools", "think": 0|1, "effort", "effort_lines": bool}, ...]  (tests/qwen_chat_test.py)
 #include "harmony.h"
 #include "gemma4.h"
 #include "inkling.h"
+#include "glm.h"
 #include "messages.h"
 #include "qwen.h"
 #include <cstdio>
@@ -50,10 +53,19 @@ int main(int argc, char** argv) {
             const auto p = inkling::parse(r.get<std::string>(), nlohmann::ordered_json::array());
             std::cout << nlohmann::json({{"display", p.content}, {"calls", p.calls}}).dump() << "\n";
         }
+    } else if (mode == "glm-prompt") {
+        for (const auto& c : in)
+            std::cout << glm::prompt(nlohmann::json(c["messages"]), c.value("tools", nlohmann::ordered_json::array()), c.value("think", 0),
+                                     c.value("layout", std::string("47")) == "46" ? glm::Layout::v46 : glm::Layout::v47) << '\x01';
+    } else if (mode == "glm-reply") {
+        for (const auto& r : in) {
+            const auto p = agent::parse_tool_calls(r.value("raw", std::string()), r.value("tools", nlohmann::ordered_json::array()));
+            std::cout << nlohmann::json({{"display", p.content}, {"calls", p.calls}}).dump() << "\n";
+        }
     } else if (mode == "qwen-prompt") {
         for (const auto& c : in)
             std::cout << qwen::prompt(tierlm_msgs::normalize_messages(nlohmann::json(c["messages"])), c.value("tools", nlohmann::ordered_json::array()),
                                       c.value("think", 0), c.value("effort", std::string()), c.value("effort_lines", false)) << '\x01';
-    } else { std::fprintf(stderr, "usage: tierlm-chat-check prompt|reply|gemma4-prompt|gemma4-reply|inkling-prompt|inkling-reply|qwen-prompt < input.json\n"); return 1; }
+    } else { std::fprintf(stderr, "usage: tierlm-chat-check prompt|reply|gemma4-prompt|gemma4-reply|inkling-prompt|inkling-reply|glm-prompt|glm-reply|qwen-prompt < input.json\n"); return 1; }
     return 0;
 }

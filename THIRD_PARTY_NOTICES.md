@@ -12,6 +12,7 @@ keep these notices and licence files with it.
 | [KaTeX](https://github.com/KaTeX/KaTeX) v0.19.0 (`dist/katex.min.js`, unmodified) | Drawing maths in the chat page (as MathML, no fonts needed) | MIT, Copyright (c) 2013-2020 Khan Academy and other contributors | `web/vendor/katex-LICENSE.txt` |
 | [stb_image](https://github.com/nothings/stb) v2.30 (`stb_image.h`, unmodified) | Reading images (PNG, JPEG, GIF, BMP) for models that read images | Public domain or MIT, Copyright (c) 2017 Sean Barrett (your choice) | `third_party/stb/LICENSE` |
 | OpenAI's gpt-oss chat template, as copied in [llama.cpp](https://github.com/ggml-org/llama.cpp) (`models/templates/openai-gpt-oss-120b.jinja`) | Tests only: `tests/harmony_test.py` checks tierlm's harmony prompts against it | Apache-2.0 (gpt-oss), MIT (llama.cpp) | `tests/openai-gpt-oss.jinja` |
+| Z.ai's GLM-4.6 and GLM-4.7-Flash chat templates, as copied in [llama.cpp](https://github.com/ggml-org/llama.cpp) (`models/templates/GLM-4.6.jinja`, `GLM-4.7-Flash.jinja`) | Tests only: `tests/glm_chat_test.py` checks tierlm's GLM prompts against them | MIT (GLM-4.6, GLM-4.7-Flash and llama.cpp) | `tests/glm-4.6.jinja`, `tests/glm-4.7-flash.jinja` |
 
 ### Changes to ggml
 

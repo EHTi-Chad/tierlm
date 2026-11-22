@@ -172,6 +172,7 @@ python3 -m venv ~/tierlm-oracle
 ~/tierlm-oracle/bin/python tests/tiny_deepseek.py build/tierlm-logits     # DeepSeek / Kimi, against transformers' own code
 ~/tierlm-oracle/bin/python tests/tiny_nemotron.py build/tierlm-logits     # Nemotron 3.5: Mamba-2, LatentMoE, attention
 ~/tierlm-oracle/bin/python tests/tiny_inkling2.py build/tierlm-logits     # Inkling 2, against transformers' own code (needs torch and a transformers that has Inkling 2)
+~/tierlm-oracle/bin/python tests/glm_chat_test.py build/tierlm-chat-check  # GLM's chat format and tool calls, against its templates
 
 # Tokenizers, without any model: trains small BPE and SentencePiece tokenizers and compares
 ~/tierlm-oracle/bin/pip install sentencepiece

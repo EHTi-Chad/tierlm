@@ -500,6 +500,42 @@ inline Parsed parse_tool_calls(const std::string& text, const ojson& tools) {
                 call["arguments_json"] = ordered.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
                 r.calls.push_back(call);
             }
+        } else if (!trim(inner).empty() && trim(inner)[0] != '{') {
+            // GLM: NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>... (with or without newlines between), a
+            // value as text when the tool calls it text, else JSON (glm.h)
+            const size_t k0 = inner.find("<arg_key>");
+            json call = {{"name", trim(inner.substr(0, k0))}, {"arguments", json::object()}};
+            nlohmann::ordered_json ordered = nlohmann::ordered_json::object();
+            const std::string name = call["name"];
+            size_t q = k0;
+            while (q != std::string::npos) {
+                const size_t ke = inner.find("</arg_key>", q);
+                if (ke == std::string::npos) break;
+                const std::string key = trim(inner.substr(q + 9, ke - q - 9));
+                const size_t vs = inner.find("<arg_value>", ke);
+                if (vs == std::string::npos) break;
+                size_t ve = inner.find("</arg_value>", vs);
+                const size_t next = inner.find("<arg_key>", vs);
+                if (ve == std::string::npos || (next != std::string::npos && next < ve)) ve = next == std::string::npos ? inner.size() : next;
+                const std::string v = inner.substr(vs + 11, ve - vs - 11);
+                const std::string ty = param_type(tools, name, key);
+                json val = v;
+                if (ty != "string") {
+                    json j = json::parse(trim(v), nullptr, false);
+                    if (!j.is_discarded() && (ty.empty() ? !j.is_string() : true)) val = j;
+                }
+                call["arguments"][key] = val;
+                ordered[key] = nlohmann::ordered_json(val);
+                q = next;
+            }
+            // (a name, not prose that happens to follow the tag: one word, and one of the tools when they are known)
+            bool known = tools.empty();
+            for (const auto& tl : tools) known |= tool_function(tl).value("name", std::string()) == name;
+            const bool word = !name.empty() && std::none_of(name.begin(), name.end(), [](char ch) { return std::isspace((unsigned char)ch); });
+            if (word && known) {
+                call["arguments_json"] = ordered.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+                r.calls.push_back(call);
+            }
         } else {
             nlohmann::ordered_json j = nlohmann::ordered_json::parse(trim(inner), nullptr, false);
             if (j.is_object() && j.contains("name") && j["name"].is_string()) {

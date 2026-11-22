@@ -48,6 +48,7 @@
 #include "agent.h"
 #include "harmony.h"
 #include "inkling.h"
+#include "glm.h"
 #include "qwen.h"
 #include "messages.h"
 #include "gemma4.h"
@@ -197,13 +198,13 @@ std::string model_display_name(const std::string& name, const std::string& path)
 
 // Chat formats. Each model family wraps a conversation in its own markers; the GGUF's chat template (and
 // failing that, its vocabulary) says which one. Control tokens are matched when encoding with parse_special.
-enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, DeepSeek, Kimi, Gemma, Gemma4, Inkling, Plain };
+enum class ChatFmt { Tulu, ChatML, Llama3, Mistral, Harmony, DeepSeek, Kimi, Gemma, Gemma4, Inkling, Glm, Plain };
 
 const char* chat_fmt_name(ChatFmt f) {
     switch (f) {
         case ChatFmt::Tulu: return "tulu"; case ChatFmt::ChatML: return "chatml";
         case ChatFmt::Llama3: return "llama3"; case ChatFmt::Mistral: return "mistral"; case ChatFmt::Harmony: return "harmony";
-        case ChatFmt::DeepSeek: return "deepseek"; case ChatFmt::Kimi: return "kimi"; case ChatFmt::Gemma: return "gemma"; case ChatFmt::Gemma4: return "gemma4"; case ChatFmt::Inkling: return "inkling";
+        case ChatFmt::DeepSeek: return "deepseek"; case ChatFmt::Kimi: return "kimi"; case ChatFmt::Gemma: return "gemma"; case ChatFmt::Gemma4: return "gemma4"; case ChatFmt::Inkling: return "inkling"; case ChatFmt::Glm: return "glm";
         default: return "plain";
     }
 }
@@ -213,6 +214,7 @@ ChatFmt detect_chat(const Tokenizer& tok) {
     auto has = [&](const char* s) { return t.find(s) != std::string::npos; };
     if (has("<|channel|>")) return ChatFmt::Harmony;                 // gpt-oss (OpenAI's harmony format)
     if (has("<|message_user|>")) return ChatFmt::Inkling;            // Inkling 2 (inkling.h)
+    if (glm::is_glm(t)) return ChatFmt::Glm;                         // GLM-4.5 to 4.7 (glm.h)
     if (has("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") || tok.find("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") >= 0) return ChatFmt::DeepSeek;   // <｜Assistant｜>
     if (has("<|im_middle|>") || tok.find("<|im_middle|>") >= 0) return ChatFmt::Kimi;
     if (has("<|turn>")) return ChatFmt::Gemma4;
@@ -223,6 +225,7 @@ ChatFmt detect_chat(const Tokenizer& tok) {
     if (has("[INST]")) return ChatFmt::Mistral;
     if (tok.find("<|channel|>") >= 0 && tok.find("<|return|>") >= 0) return ChatFmt::Harmony;
     if (tok.find("<|message_user|>") >= 0 && tok.find("<|message_model|>") >= 0) return ChatFmt::Inkling;
+    if (tok.find("[gMASK]") >= 0 && tok.find("<|observation|>") >= 0) return ChatFmt::Glm;
     if (tok.find("<|im_start|>") >= 0) return ChatFmt::ChatML;
     if (tok.find("<|turn>") >= 0 && tok.find("<turn|>") >= 0) return ChatFmt::Gemma4;
     if (tok.find("<start_of_turn>") >= 0) return ChatFmt::Gemma;
@@ -816,6 +819,7 @@ struct Engine {
     bool think_switch = false, think_starts = false, thinking = true;
     // Qwen3.5 / 3.6 / 3.8: the conversation as their templates write it (qwen.h); qwen_effort: with Qwen3.8's effort lines
     bool qwen_family = false, qwen_effort = false;
+    glm::Layout glm_layout = glm::Layout::v47;         // (GLM: which of its two layouts the template writes)
     std::string effort = "medium";
     std::string identity;                                // harmony models: the model identity line of their template
     std::vector<int32_t> cached;      // the tokens currently in the KV cache
@@ -1864,6 +1868,11 @@ int main(int argc, char** argv) {
             eng.think_starts = eng.think_switch &&
                 std::regex_search(ct, std::regex(R"(<think>(\\n|\n)'\s*\}\})"));
             if (eng.chat == ChatFmt::Gemma4 || eng.chat == ChatFmt::Inkling) eng.think_switch = true;   // (<|think|> in the system turn; Inkling: its effort)
+            if (eng.chat == ChatFmt::Glm) {               // GLM: enable_thinking; GLM-4.7's reply turn opens the thinking itself
+                eng.glm_layout = glm::layout_of(ct);
+                eng.think_switch = true;
+                eng.think_starts = eng.glm_layout == glm::Layout::v47;
+            }
             if (eng.chat == ChatFmt::DeepSeek) {          // V3.1 has a thinking switch; R1 always starts by thinking
                 eng.think_switch = ct.find("</think>") != std::string::npos && ct.find("thinking") != std::string::npos;
                 eng.think_starts = eng.think_switch || ct.find("<think>\\n") != std::string::npos;
@@ -2706,8 +2715,11 @@ int main(int argc, char** argv) {
         // (the template opened the <think> block: the reply is shown, split and saved with it, as the model wrote it)
         std::string pre = think == 1 ? "<think>\n" : "";
         if (ink) pre.clear();                                        // (Inkling: the model opens its own blocks)
+        const bool glmf = eng.chat == ChatFmt::Glm;
+        if (glmf) pre = glm::reply_prefix(think, eng.glm_layout);   // (GLM-4.7: "<think>" with no newline)
         const std::string prompt_text = harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
                                       : ink ? inkling::prompt(msgs, tools, think)
+                                      : glmf ? glm::prompt(msgs, tools, think, eng.glm_layout)
                                       : eng.qwen_family ? qwen::prompt(msgs, tools, think, qwen_effort_now(), eng.qwen_effort)
                                              : format_chat(agent::with_tools(msgs, tools, eng.tool_fmt), eng.chat, tok, think);
         // (Gemma 4 thinking after its tools' results: its template opened the thought channel, as for <think> above)
@@ -3043,7 +3055,12 @@ int main(int argc, char** argv) {
                 if (t == tok.find(*k)) return true;
             return false;
         };
+        // GLM: its thinking and tool-call tags are special tokens too; a reply ends at the next turn's token (the user's,
+        // or a tool result's after its calls) or at the end of text
+        const int32_t glm_user = glmf ? tok.find("<|user|>") : -1, glm_obs = glmf ? tok.find("<|observation|>") : -1,
+                      glm_eot = glmf ? tok.find("<|endoftext|>") : -1;
         auto is_end = [&](int32_t t) {
+            if (glmf) return t == glm_user || t == glm_obs || t == glm_eot || t == tok.eos() || t == tok.eot();
             if (harm) return t == h_return || t == h_call || t == h_eot || (t == tok.eos() && t != h_end);
             if (ink) return t == ink_stop || ((t == tok.eos() || t == tok.eot()) && !ink_block_tok(t));   // (its blocks' tokens go on)
             if (g4 && t == g4_tool_resp) return true;
@@ -3244,6 +3261,7 @@ int main(int argc, char** argv) {
         try { pics = take_pictures(msgs); } catch (...) {}
         int n = (int)eng.tok.encode(harm ? harmony::prompt(msgs, tools, eng.identity, effort_now())
                                     : eng.chat == ChatFmt::Inkling ? inkling::prompt(msgs, tools, think_mode())
+                                    : eng.chat == ChatFmt::Glm ? glm::prompt(msgs, tools, think_mode(), eng.glm_layout)
                                     : eng.qwen_family ? qwen::prompt(msgs, tools, think_mode(), qwen_effort_now(), eng.qwen_effort)
                                          : format_chat(agent::with_tools(msgs, tools, eng.tool_fmt), eng.chat, eng.tok, think_mode()), true).size();
         for (const std::string& b : pics) {                        // each image: its words instead of one pad token
