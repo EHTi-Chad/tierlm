@@ -70,6 +70,7 @@ public:
     const std::string& device_name() const { return device_name_; }
     size_t weight_bytes() const { return weight_bytes_; }
     bool on_gpu() const { return main_ != cpu_; }
+    void release_gpu();                            // the GPU helper's backend and its memory, until the next image
     bool gpu_helps() const { return help_dev_ != nullptr; }   // weights in RAM, a GPU doing the heavy work
     bool last_helped() const { return last_helped_; }      // the last image: did it (or was there no room)
 

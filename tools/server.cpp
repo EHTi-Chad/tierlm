@@ -2948,6 +2948,9 @@ int main(int argc, char** argv) {
         if (par && seq == 0) for (Speculator* s : {eng.spec.get(), eng.look.get()}) if (s) s->forget_after((int)common);
 
         std::vector<int32_t> suffix(toks.begin() + common, toks.end()), routing;
+        // A long prompt needs all the GPU's working memory: the image reader's GPU helper, kept between images (it
+        // takes ~3 s to start), lets it go first (Flash-Next, RTX 5090: a 35K prompt at 1,130 tok/s with it, 2,130 without)
+        if (eng.vision && suffix.size() >= 8192) eng.vision->release_gpu();
         auto p0 = Clock::now();
         std::vector<float> lg;
         // (speculation: one conversation at a time, on conversation 0, and not with images: the draft block reads

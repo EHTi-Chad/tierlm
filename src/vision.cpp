@@ -325,6 +325,12 @@ std::unique_ptr<Vision> Vision::load(const std::string& path, const std::string&
     return v;
 }
 
+void Vision::release_gpu() {
+    std::lock_guard<std::recursive_mutex> lk(device_mutex());
+    if (sched_help_) { ggml_backend_sched_free(sched_help_); sched_help_ = nullptr; }
+    if (help_) { ggml_backend_free(help_); help_ = nullptr; }
+}
+
 void Vision::resized(int width, int height, int max_tokens, int& rw, int& rh) const {
     const int unit = patch_ * merge_;
     const double maxp = (double)(max_tokens > 0 ? std::min(max_tokens, max_tokens_) : max_tokens_) * unit * unit;
@@ -493,7 +499,8 @@ std::vector<float> Vision::encode(const Prepared& p, int n_threads) {
         ggml_backend_sched_t sched = nullptr;
         // The GPU's working memory is given back once the image is read (the schedulers' buffers: GBs for a big
         // image): kept, they sit next to a chat model that was planned to fill the GPU, and Windows then moves GPU
-        // memory out to RAM and everything slows down. The helper's backend stays (starting one costs seconds).
+        // memory out to RAM and everything slows down. The helper's backend stays (starting one costs seconds) until a
+        // long prompt needs its memory (release_gpu).
         struct Release {
             Vision& v;
             ~Release() {
