@@ -50,6 +50,7 @@ Model::~Model() {
     free_kv();
     for (auto* b : wbufs_) if (b) ggml_backend_buffer_free(b);
     release_kept_ram(kept_ram_);
+    if (pack_views_) ggml_free(pack_views_);
     if (wctx_) ggml_free(wctx_);
     for (auto* b : gpus_) if (b && b != cpu_) ggml_backend_free(b);
     if (cpu_) { forget_cpu_backend(cpu_); ggml_backend_free(cpu_); }
@@ -593,6 +594,49 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     struct MlaDerive { int layer; ggml_tensor *kv = nullptr, *k = nullptr, *v = nullptr; bool k_t = false, v_t = false; ggml_tensor *kb = nullptr, *vb = nullptr; };
     std::vector<MlaDerive> mla_derive;
     std::set<const ggml_tensor*> skip_load;                        // in the file but not loaded (rearranged instead)
+    // Inkling 2 (lean): weights that read the same input, or that are applied together, packed into one tensor at load,
+    // so one GPU step does what several did (a token is thousands of small steps: see ink_layers). Only parts of one
+    // type and row length; their bytes one after the other, as in the file. The parts aren't loaded: from then on they
+    // are views of the pack (bound below), so nothing is stored twice.
+    struct InkPack { ggml_tensor* t; std::vector<ggml_tensor*> parts; };
+    std::vector<InkPack> ink_packs;
+    if (hp.ink && std::getenv("TIERLM_INK_PLAIN") == nullptr && std::getenv("TIERLM_INK_NOPACK") == nullptr) {
+        auto get = [&](const std::string& n) { return ggml_get_tensor(m->wctx_, n.c_str()); };
+        // parts: each [ne0, rows] (or [ne0]); slices > 1: a 3-d pack of that many equal slices
+        auto pack = [&](const std::string& name, const std::vector<ggml_tensor*>& parts, int64_t slices) {
+            int64_t rows = 0;
+            for (ggml_tensor* t : parts) {
+                if (!t || t->type != parts[0]->type || t->ne[0] != parts[0]->ne[0] || t->ne[2] != 1 || t->ne[3] != 1 || skip_load.count(t)) return;
+                rows += t->ne[1];
+            }
+            if (rows % slices) return;
+            ggml_tensor* t = slices > 1 ? ggml_new_tensor_3d(m->wctx_, parts[0]->type, parts[0]->ne[0], rows / slices, slices)
+                                        : ggml_new_tensor_2d(m->wctx_, parts[0]->type, parts[0]->ne[0], rows);
+            ggml_set_name(t, name.c_str());
+            for (ggml_tensor* p : parts) skip_load.insert(p);
+            ink_packs.push_back({t, parts});
+        };
+        for (int i = 0; i < hp.n_layer; ++i) {
+            const std::string b = "blk." + std::to_string(i) + ".";
+            std::vector<ggml_tensor*> qx = {get(b + "attn_q.weight"), get(b + "attn_rel.weight"), get(b + "attn_gate.weight")};
+            if (hp.swa[i]) { qx.push_back(get(b + "attn_k.weight")); qx.push_back(get(b + "attn_v.weight")); }
+            pack(b + "attn_qx.tierlm", qx, 1);
+            if (!hp.swa[i]) pack(b + "attn_qkv_norm.tierlm", {get(b + "attn_q_inp_norm.weight"), get(b + "attn_k_inp_norm.weight"),
+                                                               get(b + "attn_v_inp_norm.weight")}, 1);
+            if (hp.ink_loop_passes > 1 && i >= hp.ink_loop_lo && i < hp.ink_loop_hi) {
+                const char* site[4] = {"q", "k", "v", "ffn"};
+                const char* site_e[4] = {"attn", "k", "v", "mlp"};
+                std::vector<ggml_tensor*> down, gf;
+                for (int k = 0; k < 4; ++k) {
+                    const std::string p = hp.ink_earlier ? b + "loop_" + site_e[k] + "_" : b + "loop_" + site[k] + "_ctrl_";
+                    down.push_back(get(p + "down.weight"));
+                    gf.push_back(get(p + "gain.weight")); gf.push_back(get(p + "forget.weight"));
+                }
+                pack(b + "loop_down.tierlm", down, 4);
+                pack(b + "loop_gain_forget.tierlm", gf, 4);
+            }
+        }
+    }
     if (arch == "deepseek2") {
         hp.mla = true;
         hp.rope_neox = false;                                     // rotated in adjacent pairs (Hugging Face's "interleave")
@@ -1609,6 +1653,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         std::vector<char> layer_all(hp.n_layer, 1);
         for (ggml_tensor* t = ggml_get_first_tensor(m->wctx_); t; t = ggml_get_next_tensor(m->wctx_, t)) {
             int l = -1;
+            if (skip_load.count(t)) continue;                                // (not loaded: packed or rearranged)
             if (std::sscanf(ggml_get_name(t), "blk.%d.", &l) == 1 && l >= 0 && l < hp.n_layer && !vram.count(t)) layer_all[l] = 0;
         }
         for (int i = 0; i < hp.n_layer; ++i) {
@@ -1750,6 +1795,24 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         ggml_backend_tensor_set(s.t, chunk.data(), 0, n);
         if (auto bc = bias_copy.find(s.t); bc != bias_copy.end()) ggml_backend_tensor_set(bc->second, chunk.data(), 0, n);
         set_s += since(t_set);
+    }
+    if (!ink_packs.empty()) {                                          // the packs: their parts' bytes one after the other
+        std::map<const ggml_tensor*, const Source*> src_of;
+        for (const Source& s : sources) src_of[s.t] = &s;
+        for (const InkPack& pk : ink_packs) {
+            if (!pk.t->buffer) throw std::runtime_error(std::string(ggml_get_name(pk.t)) + " was not placed");
+            size_t at = 0;
+            for (ggml_tensor* p : pk.parts) {
+                const Source* sr = src_of.at(p);
+                const size_t n = ggml_nbytes(p);
+                chunk.resize(n);
+                auto& f = files[sr->part];
+                f.seekg((std::streamoff)sr->offset);
+                if (!f.read(chunk.data(), (std::streamsize)n)) throw std::runtime_error("short read on " + paths[sr->part]);
+                ggml_backend_tensor_set(pk.t, chunk.data(), at, n);
+                at += n;
+            }
+        }
     }
     std::vector<char>().swap(hb); std::vector<char>().swap(cb); std::vector<char>().swap(chunk);   // (their RAM back now)
     if (std::getenv("TIERLM_LOAD_TRACE"))
@@ -2166,8 +2229,45 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             if (div != 1.0f) m->ink_fold_sc_.insert(t);
         }
     };
+    // The packed tensors' parts as views of their packs (see ink_packs): the graph takes either
+    if (!ink_packs.empty()) {
+        ggml_init_params ip{ ggml_tensor_overhead() * 16 * (size_t)hp.n_layer + 1024, nullptr, true };
+        m->pack_views_ = ggml_init(ip);
+    }
+    auto bind_packs = [&](Layer& L, int i) {
+        if (!m->pack_views_) return;
+        const std::string b = "blk." + std::to_string(i) + ".";
+        auto view = [&](ggml_tensor* pk, int64_t ne0, int64_t ne1, size_t off) {
+            ggml_tensor* v = ne1 > 0 ? ggml_view_2d(m->pack_views_, pk, ne0, ne1, pk->nb[1], off) : ggml_view_1d(m->pack_views_, pk, ne0, off);
+            if (ggml_backend_view_init(v) != GGML_STATUS_SUCCESS) throw std::runtime_error("can't view a packed weight");
+            return v;
+        };
+        if ((L.ink_qx = ggml_get_tensor(m->wctx_, (b + "attn_qx.tierlm").c_str()))) {
+            size_t at = 0;
+            for (ggml_tensor** w : {&L.wq, &L.ink_rel, &L.ink_gate, &L.wk, &L.wv}) {
+                if ((w == &L.wk || w == &L.wv) && !L.swa) break;
+                *w = view(L.ink_qx, (*w)->ne[0], (*w)->ne[1], at);
+                at += (size_t)(*w)->ne[1] * L.ink_qx->nb[1];
+            }
+        }
+        if ((L.ink_qkvn = ggml_get_tensor(m->wctx_, (b + "attn_qkv_norm.tierlm").c_str()))) {
+            L.ink_qn = view(L.ink_qkvn, hp.n_embd, 0, 0);
+            L.ink_kn = view(L.ink_qkvn, hp.n_embd, 0, L.ink_qkvn->nb[1]);
+            L.ink_vn = view(L.ink_qkvn, hp.n_embd, 0, 2 * L.ink_qkvn->nb[1]);
+        }
+        if ((L.ink_down4 = ggml_get_tensor(m->wctx_, (b + "loop_down.tierlm").c_str())))
+            for (int k = 0; k < 4; ++k) L.ink_down[k] = view(L.ink_down4, L.ink_down4->ne[0], L.ink_down4->ne[1], (size_t)k * L.ink_down4->nb[2]);
+        if ((L.ink_gf4 = ggml_get_tensor(m->wctx_, (b + "loop_gain_forget.tierlm").c_str()))) {
+            const int64_t H = L.ink_gf4->ne[1] / 2;
+            for (int k = 0; k < 4; ++k) {
+                L.ink_gain[k] = view(L.ink_gf4, L.ink_gf4->ne[0], H, (size_t)k * L.ink_gf4->nb[2]);
+                L.ink_forget[k] = view(L.ink_gf4, L.ink_gf4->ne[0], H, (size_t)k * L.ink_gf4->nb[2] + (size_t)H * L.ink_gf4->nb[1]);
+            }
+        }
+    };
     for (int i = 0; i < hp.n_layer; ++i) {
         Layer L = bind_layer(i); bind_hot(L, i);
+        bind_packs(L, i);
         ink_fold(L);
         if (L.down_x && ssd_set.count(L.down_x)) {
             SsdPrefetch& pf = m->ssd_pf_[i];
@@ -4349,8 +4449,16 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
                                                                                   ggml_reshape_3d(c, msg, E, 1, n_tok), 1), hp.rms_eps), 2 * E, n_tok)
                                : ggml_concat(c, ggml_rms_norm(c, cur, hp.rms_eps), ggml_rms_norm(c, msg, hp.rms_eps), 0);
         ggml_tensor* lo = ggml_mul_mat(c, L.ink_down[k], in);
-        ggml_tensor* gain = ggml_tanh(c, ggml_mul_mat(c, L.ink_gain[k], lo));
-        ggml_tensor* forget = ggml_tanh(c, ggml_mul_mat(c, L.ink_forget[k], lo));
+        ggml_tensor *gain, *forget;
+        if (L.ink_gf4) {                                                      // (packed: both from one product)
+            ggml_tensor* gf = ggml_tanh(c, ggml_mul_mat(c, ggml_view_2d(c, L.ink_gf4, L.ink_gf4->ne[0], 2 * E, L.ink_gf4->nb[1],
+                                                                        (size_t)k * L.ink_gf4->nb[2]), lo));   // [2E, n_tok]
+            gain = ggml_view_2d(c, gf, E, n_tok, gf->nb[1], 0);
+            forget = ggml_view_2d(c, gf, E, n_tok, gf->nb[1], (size_t)E * ggml_element_size(gf));
+        } else {
+            gain = ggml_tanh(c, ggml_mul_mat(c, L.ink_gain[k], lo));
+            forget = ggml_tanh(c, ggml_mul_mat(c, L.ink_forget[k], lo));
+        }
         return ggml_add(c, ggml_sub(c, cur, ggml_mul(c, forget, cur)), ggml_mul(c, gain, msg));
     };
     std::map<int, ggml_tensor*> zero_sinks;                                    // one zero score per head (the sink's value)
@@ -4406,10 +4514,34 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
         ggml_tensor* inp = x;
         // ---- attention ----
         ggml_tensor* in[3] = {x, x, x};                                       // the query's, key's and value's inputs
+        ggml_tensor* m3 = nullptr;                                            // (full attention: the three side by side [E, 3, n_tok])
         if (L.ink_ares) {
             ggml_tensor* m = mix(blocks, x, L.ink_ares, swa ? 1 : 3);
+            if (!swa) m3 = m;
             for (int j = 0; j < 3; ++j) in[j] = pick(m, swa ? 0 : j);
         }
+        // the three inputs normed and side by side [E, 3] (one token), or [E, 3, n_tok]: in[j] are then views of it
+        auto views_of = [&](ggml_tensor* st) { for (int j = 0; j < 3; ++j) in[j] = pick(ggml_reshape_3d(c, st, E, 3, n_tok), j); };
+        ggml_tensor* norm3 = L.ink_qkvn ? ggml_reshape_3d(c, L.ink_qkvn, E, 3, 1) : nullptr;   // (full attention, packed)
+        if (msgs && lean && n_tok == 1 && L.ink_down4 && L.ink_gf4 && (swa || norm3)) {
+            // One token: the q, k and v gates as one, each with its own slice of the packs (a product of 3 at once),
+            // and their outputs normed together
+            ggml_tensor* msg3 = ggml_view_3d(c, msgs, E, 1, 3, msgs->nb[1], msgs->nb[1], 0);                 // [E, 1, 3]
+            ggml_tensor* cur3 = m3 ? ggml_reshape_3d(c, m3, E, 1, 3) : ggml_repeat(c, ggml_reshape_3d(c, in[0], E, 1, 1), msg3);
+            ggml_tensor* pair = ggml_rms_norm(c, ggml_concat(c, cur3, msg3, 1), hp.rms_eps);                   // [E, 2, 3]
+            ggml_tensor* lo = ggml_mul_mat(c, ggml_view_3d(c, L.ink_down4, L.ink_down4->ne[0], L.ink_down4->ne[1], 3,
+                                                           L.ink_down4->nb[1], L.ink_down4->nb[2], 0),
+                                           ggml_reshape_3d(c, pair, 2 * E, 1, 3));                              // [rank, 1, 3]
+            ggml_tensor* gf = ggml_tanh(c, ggml_mul_mat(c, ggml_view_3d(c, L.ink_gf4, L.ink_gf4->ne[0], L.ink_gf4->ne[1], 3,
+                                                                        L.ink_gf4->nb[1], L.ink_gf4->nb[2], 0), lo));   // [2E, 1, 3]
+            ggml_tensor* gain = ggml_view_3d(c, gf, E, 1, 3, gf->nb[1], gf->nb[2], 0);
+            ggml_tensor* forget = ggml_view_3d(c, gf, E, 1, 3, gf->nb[1], gf->nb[2], (size_t)E * ggml_element_size(gf));
+            ggml_tensor* g3 = ggml_add(c, ggml_sub(c, cur3, ggml_mul(c, forget, cur3)), ggml_mul(c, gain, msg3));
+            ggml_tensor* st = ggml_rms_norm(c, ggml_reshape_3d(c, g3, E, 3, 1), hp.rms_eps);
+            views_of(ggml_mul(c, st, swa ? L.attn_norm : norm3));
+        } else if (lean && !msgs && m3 && norm3) {                            // the three normed at once
+            views_of(ggml_mul(c, ggml_rms_norm(c, m3, hp.rms_eps), norm3));
+        } else {
         if (msgs) for (int j = 0; j < 3; ++j) in[j] = gate(L, j, in[j], pick(msgs, j));
         if (swa && msgs) for (int j = 0; j < 3; ++j) in[j] = ggml_mul(c, ggml_rms_norm(c, in[j], hp.rms_eps), L.attn_norm);
         else if (swa) { in[0] = ggml_mul(c, ggml_rms_norm(c, in[0], hp.rms_eps), L.attn_norm); in[1] = in[2] = in[0]; }
@@ -4418,15 +4550,31 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
             in[1] = ggml_mul(c, ggml_rms_norm(c, in[1], hp.rms_eps), L.ink_kn);
             in[2] = ggml_mul(c, ggml_rms_norm(c, in[2], hp.rms_eps), L.ink_vn);
         }
+        }
+        // The products that read the query's input, as one where packed (and with the key's and value's when those
+        // read the same input: sliding-window layers outside the loop's later passes); each part a view of it
+        ggml_tensor *qp = nullptr, *rp = nullptr, *gp = nullptr, *kp = nullptr, *vp = nullptr;
+        if (L.ink_qx) {
+            const bool kv_too = swa && in[1] == in[0] && in[2] == in[0];
+            const int64_t nq = (int64_t)hd * nh, nr = (int64_t)D * nh;
+            ggml_tensor* W = kv_too ? L.ink_qx : ggml_view_2d(c, L.ink_qx, L.ink_qx->ne[0], 2 * nq + nr, L.ink_qx->nb[1], 0);
+            ggml_tensor* y = ggml_mul_mat(c, W, in[0]);
+            auto part = [&](int64_t at, int64_t len) {
+                ggml_tensor* v = ggml_view_2d(c, y, len, n_tok, y->nb[1], (size_t)at * ggml_element_size(y));
+                return n_tok == 1 ? v : ggml_cont(c, v);
+            };
+            qp = part(0, nq); rp = part(nq, nr); gp = part(nq + nr, nq);
+            if (kv_too) { kp = part(2 * nq + nr, kvd); vp = part(2 * nq + nr + kvd, kvd); }
+        }
         // (lean: the query's clip without its last scale, folded into the scores' scale below)
-        ggml_tensor* q = clip(ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, in[0]), hd, nh, n_tok), L.ink_qclip, hp.ink_qk_clip, true);
+        ggml_tensor* q = clip(ggml_reshape_3d(c, qp ? qp : ggml_mul_mat(c, L.wq, in[0]), hd, nh, n_tok), L.ink_qclip, hp.ink_qk_clip, true);
         const float q_fold = lean ? hp.ink_qk_clip : 1.0f;
-        ggml_tensor* k = conv(ggml_mul_mat(c, L.wk, in[1]), L.ink_kconv, swa ? nullptr : ggml_mul_mat(c, L.ink_kconvp, in[1]), 0);
+        ggml_tensor* k = conv(kp ? kp : ggml_mul_mat(c, L.wk, in[1]), L.ink_kconv, swa ? nullptr : ggml_mul_mat(c, L.ink_kconvp, in[1]), 0);
         // (lean: the values are normed next, and y / s normed with eps is y normed with eps s^2: no division)
-        ggml_tensor* v = conv(ggml_mul_mat(c, L.wv, in[2]), L.ink_vconv, swa ? nullptr : ggml_mul_mat(c, L.ink_vconvp, in[2]), kvd, lean);
+        ggml_tensor* v = conv(vp ? vp : ggml_mul_mat(c, L.wv, in[2]), L.ink_vconv, swa ? nullptr : ggml_mul_mat(c, L.ink_vconvp, in[2]), kvd, lean);
         k = clip(ggml_reshape_3d(c, k, hd, kvh, n_tok), nullptr, hp.ink_qk_clip);
         v = ggml_rms_norm(c, ggml_reshape_3d(c, v, hd, kvh, n_tok), lean ? hp.rms_eps * (float)((swa ? 1 : 2) * K + 1) : hp.rms_eps);
-        ggml_tensor* r = clip(ggml_reshape_3d(c, ggml_mul_mat(c, L.ink_rel, in[0]), D, nh, n_tok), L.ink_relclip, hp.ink_rel_clip);
+        ggml_tensor* r = clip(ggml_reshape_3d(c, rp ? rp : ggml_mul_mat(c, L.ink_rel, in[0]), D, nh, n_tok), L.ink_relclip, hp.ink_rel_clip);
         if (!swa) { q = ggml_mul(c, q, g.ink_tau); r = ggml_mul(c, r, g.ink_tau); }
         // The bias by distance, less the token's sink score (so a zero sink after the softmax stands for it):
         // [ext + 1 rows (the last: beyond the table, zero), nh, n_tok], then each cell's row
@@ -4454,7 +4602,7 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
         ggml_soft_max_add_sinks(kq, sinks0(nh));
         ggml_tensor* o = ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3)), kq);      // [hd, n_tok, nh]
         o = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3)), (int64_t)hd * nh, n_tok);
-        o = ggml_mul(c, o, ggml_sigmoid(c, ggml_mul_mat(c, L.ink_gate, in[0])));
+        o = ggml_mul(c, o, ggml_sigmoid(c, gp ? gp : ggml_mul_mat(c, L.ink_gate, in[0])));
         o = conv(ggml_mul_mat(c, L.wo, o), L.ink_aconv, nullptr, 2 * kvd);
         // ---- the residual: a block's first layer starts a new one (its input joins the blocks) ----
         ggml_tensor* res;

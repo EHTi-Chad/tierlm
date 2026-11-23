@@ -621,6 +621,11 @@ private:
         // (the down matrix's is exp_scale)
         ggml_tensor *x_scale_gu = nullptr, *x_scale_gate = nullptr, *x_scale_up = nullptr;
         ggml_tensor *ink_down[4] = {}, *ink_gain[4] = {}, *ink_forget[4] = {};
+        // (packed at load, see Model::load_once: the tensors above are then views of these)
+        ggml_tensor *ink_qx = nullptr;           // attn_q, attn_rel, attn_gate (and for sliding-window layers attn_k, attn_v) as one
+        ggml_tensor *ink_qkvn = nullptr;         // the query's, key's and value's input norms [H, 3] (full-attention layers)
+        ggml_tensor *ink_down4 = nullptr;        // the four loop gates' down projections [2H, rank, 4]
+        ggml_tensor *ink_gf4 = nullptr;          // their gain and forget projections, each gate's one after the other [rank, 2H, 4]
         std::vector<ggml_tensor*> ink_states;    // per conversation: the convolutions' last inputs [conv - 1, channels]
         ggml_tensor *ssm_state_t = nullptr;      // [S, S, H_v]: the running memory
         std::vector<ggml_tensor*> conv_states, ssm_states;   // per conversation ([0]: conv_state, ssm_state_t)
@@ -646,6 +651,7 @@ private:
     ggml_backend* cpu_ = nullptr;                // fallback for ops the device can't run
     ggml_backend_sched* sched_ = nullptr;
     ggml_context* wctx_ = nullptr;               // weight tensor descriptors
+    ggml_context* pack_views_ = nullptr;         // views of tensors packed at load (Inkling 2), as the file's tensors
     ggml_context* kvctx_ = nullptr;              // KV cache tensor descriptors
     std::vector<ggml_backend_buffer*> wbufs_;    // weight memory: one buffer in VRAM, one in system RAM
     std::vector<SsdPrefetch> ssd_pf_;            // per layer (sized at load, so Layer::ssd pointers stay valid)
