@@ -10,11 +10,11 @@ in [docs/GGML_CHANGES.md](docs/GGML_CHANGES.md); the tokenizers, model graphs, K
 encoder, server and web page are all tierlm's own. It does not use llama.cpp.
 
 It runs **Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8 dense and MoE, Qwen3-Next,
-gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
+gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), Inkling 2 (early), NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
 
-### In development for 0.9.4: Qwen3.8 Flash-Next as a coding agent's model
+### New in 0.9.4: Qwen3.8 Flash-Next as a coding agent's model, Inkling 2 Mini, GLM's chat format
 
 Measured with the pi coding agent (1.6.0) working through a 15-task session against tierlm's OpenAI API (9 short
 questions it mostly checks with Python, 3 pictures to read, 3 small programs to trace, fix and run; thinking off; 37
@@ -104,9 +104,26 @@ submitted without checking it first).
   now its prompts are written as Z.ai's templates write them (checked character for character, thinking on and off,
   tools, calls and results), with the thinking switch, and its tool calls (`<tool_call>NAME<arg_key>...`) are read.
   Not yet tried with a real GLM file here.
+- **Inkling 2 Mini on an 8 GB card.** RTX 3070 Laptop (8 GB), Ryzen 9 5900HX, 32 GB RAM, Windows 11;
+  Inkling-2-Mini-UD-Q4_K_M (16.6 GB), 32K context, KV cache f16, thinking off, the settings Find the fastest settings
+  chose (VRAM experts following the conversation, 6 threads): 5.4 GB in VRAM (20 of 24 layers' attention and the 384
+  busiest experts), 13.5 GB in RAM; **12.2 tok/s** over a 350-token answer and 12.3 over 558 tokens. Three things
+  stopped it there first, all fixed: loading failed (the GPU kept every loop layer's RAM experts for a long prompt at
+  once, 7.9 GB of working memory; those layers' RAM experts are now computed by the CPU in prompts, 1.6 GB);
+  "Keep the busiest experts in VRAM" did nothing (Unsloth's files count each pass over a loop layer as a layer, 48
+  for 24, and the learned expert usage never matched); and a reply could run for minutes with nothing shown (text
+  written straight after a block's start, without its tag; it's shown now) and no way to stop it (Stop now works
+  while a reply shows nothing).
+- **Setup: vision (mmproj) and draft (MTP) files are no longer listed as models.** They can't be chosen (each loads
+  with its own model); a line under the list counts them.
 - **Fixed: a model split by whole layers between VRAM and RAM stopped tierlm with Inkling 2** (a RAM layer's steps
   were pinned to the CPU, including views of what the GPU held). Other models never took such views; they place as
   before (`TIERLM_PIN_VIEWS=1` for the old way, to compare).
+- **Known items:** Inkling 2 doesn't read images yet, and for its loop layers only the last pass counts toward the
+  experts it learns are busiest; GLM's chat format is checked against its templates but not yet with a real GLM file;
+  a dense model that doesn't quite fit (Qwen3.8-27B Q6_K at 256K on an RTX 5090: 3 of 64 layers in RAM) reads prompts
+  at about 1,100 tok/s, where putting part of the context in RAM instead of weights would keep it near the 3,300 it
+  reads at 128K, all in VRAM (next).
 - For developers: `tierlm-attn-check` (ggml's attention told how much a query sees, and behind the mask, against the
   exact result on this build's GPU, with a query in every other head that a wrong gather would get wrong by its own
   size; and what each takes), `TIERLM_SPEC_TRACE=file` (a line per check: guesses, kept, how sure the draft block was,
