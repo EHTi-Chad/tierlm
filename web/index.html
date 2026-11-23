@@ -998,6 +998,7 @@ window.FIT = (() => {
         <input id="rpen" type="range" min="1" max="1.5" step="0.01" value="1.1" class="full">
         <label class="lrow" for="ppen" title="Takes a fixed amount off every word used in the last 64 tokens, so the model moves on instead of repeating itself. Qwen suggests 1.5 for its models with thinking off. 0 = off.">Presence penalty <b id="ppenv">0.0</b></label>
         <input id="ppen" type="range" min="0" max="2" step="0.1" value="0" class="full">
+        <div class="help" id="recrow" hidden><span id="rectext"></span> <a href="#" id="recuse">Use these</a></div>
         <label class="lrow" for="maxtok" title="Longest reply. Thinking models (Qwen3.x) can use thousands of tokens before they answer.">Max reply <b id="maxv">No limit</b></label>
         <input id="maxtok" type="range" min="0" max="8" step="1" value="8" class="full">
         <div id="lspecrow" class="lrow2">
@@ -1315,6 +1316,14 @@ async function loadInfo() {
   if (!info.loaded) { info = null; $("devname").textContent = "no model loaded"; $("modelname").textContent = "setup"; showSetup(); return; }
   showApp();
   loadEmbed();
+  // A model loaded before the page opened (or by an app): the chat's sliders as saved for it, or its recommendation
+  if (info.path !== samplingPath) {
+    samplingPath = info.path;
+    const sv = info.saved_sampling || {}, rec = recSampling(info);
+    if (rec && sv.sampling_from !== "own") setSampling(rec);
+    else setSampling({ temperature: 0.7, top_k: 40, top_p: 0.9, min_p: 0.05, repeat_penalty: 1.1, presence_penalty: 0, ...sv });
+  }
+  showRec();
   if (info.path !== specsPath) { specsPath = info.path; lastBench = lastReply = null; }   // speeds from another model don't carry over
   L = info.layers; E = info.experts || 0; K = info.experts_used || 0;
   counts = new Float64Array(L * E); flash = new Float64Array(L * E);
@@ -1639,7 +1648,7 @@ async function streamReply(useWs) {
         }
         else if (ev.type === "done") {
           doneEv = ev;
-          meta = ev.n_gen + " tokens · " + ev.gen_tps.toFixed(1) + " tok/s" + (ev.stop === "length" ? " · hit the max reply length (raise Max reply below)" : ev.stop === "context" ? " · context full" : "");
+          meta = ev.n_gen + " tokens · " + ev.gen_tps.toFixed(1) + " tok/s" + (ev.stop === "length" ? " · hit the max reply length (raise Max reply below)" : ev.stop === "context" ? " · context full" : ev.stop === "loop" ? " · ended: the model was repeating itself word for word" : "");
           if (ev.spec && ev.spec.checks && ev.spec.drafted) meta += " · speculative: " + (ev.n_gen / ev.spec.checks).toFixed(1) + " tokens per check, " +
             Math.round(100 * ev.spec.accepted / Math.max(1, ev.spec.drafted)) + "% of guesses kept" +
             (ev.spec.looked ? " (prompt lookup: " + ev.spec.look_ok + " of " + ev.spec.looked + ")" : "");
@@ -2272,6 +2281,39 @@ function showSavedTune() {
   done.hidden = false;
   done.innerHTML = `<span>Fastest: <b>${(+t.tps).toFixed(1)} tok/s</b>, in use for this model every time it loads, so there's no need to run it again. Run it again after a tierlm update, a change to the PC (graphics card, RAM) or a much different context length.</span><div class="help" style="margin-top:4px">Measured on three short test questions: chats run faster or slower than this depending on what's written (code and repeated text are easier to guess ahead).</div>`;
 }
+// The sampling a model's file recommends (its makers' values), filled out with tierlm's for the rest: no repetition
+// or presence penalty, as the makers' values are meant to be used alone. null: the file recommends nothing.
+function recSampling(m) {
+  const r = m && m.sampling;
+  if (!r || !Object.keys(r).length) return null;
+  return { temperature: 0.7, top_k: 40, top_p: 0.9, min_p: 0.05, repeat_penalty: 1.0, presence_penalty: 0, ...r };
+}
+let samplingPath = null;                          // the loaded model the chat's sliders were set for
+const SAMPLERS = { temp: "temperature", topk: "top_k", topp: "top_p", minp: "min_p", rpen: "repeat_penalty", ppen: "presence_penalty" };
+function setSampling(v) {
+  for (const [id, k] of Object.entries(SAMPLERS)) if (v[k] != null) $(id).value = v[k];
+  for (const id of Object.keys(SAMPLERS)) $(id).oninput();
+}
+// Whether the sliders differ from a set of values (the slider's step is the closeness that counts).
+function samplingDiffers(v) {
+  return Object.entries(SAMPLERS).some(([id, k]) => v[k] != null && Math.abs(+$(id).value - v[k]) > (+$(id).step || 0.01) / 2);
+}
+// The chat's Settings: what the loaded model recommends, and a link back to it once the sliders are moved.
+function showRec() {
+  const r = info && recSampling(info);
+  $("recrow").hidden = !r;
+  if (!r) return;
+  const n = info.sampling, parts = [];
+  if (n.temperature != null) parts.push("temperature " + n.temperature);
+  if (n.top_p != null) parts.push("top-p " + n.top_p);
+  if (n.top_k != null) parts.push("top-k " + n.top_k);
+  if (n.min_p != null) parts.push("min-p " + n.min_p);
+  if (n.repeat_penalty != null) parts.push("repeat penalty " + n.repeat_penalty);
+  $("rectext").textContent = "This model's makers recommend " + parts.join(", ") + (n.repeat_penalty == null ? ", with no repeat or presence penalty." : ".");
+  $("recuse").hidden = !samplingDiffers(r);
+}
+for (const id of Object.keys(SAMPLERS)) $(id).addEventListener("input", () => { if (info) showRec(); });
+$("recuse").onclick = e => { e.preventDefault(); const r = info && recSampling(info); if (r) setSampling(r); showRec(); };
 function applySaved() {
   showSavedTune();
   const s = (selModel && md.saved && md.saved[selModel.id]) || {};
@@ -2288,11 +2330,17 @@ function applySaved() {
   $("exphelp").textContent = E ? `How many of the ${E} experts each layer uses per token (this model was trained with ${K}). Fewer is faster but lower quality.`
                                : "Only for mixture-of-experts models.";
   $("seed").value = s.seed ?? -1;
-  $("topk").value = s.top_k ?? 40; $("topp").value = s.top_p ?? 0.9; $("minp").value = s.min_p ?? 0.05;
-  $("rpen").value = s.repeat_penalty || 1.1;
-  $("ppen").value = s.presence_penalty ?? 0;
-  if (s.temperature != null) $("temp").value = s.temperature;
-  for (const id of ["topk", "topp", "minp", "rpen", "ppen", "temp"]) $(id).oninput();
+  // A model whose file recommends sampling starts from that, every load, unless the sliders were set otherwise for it
+  // (sampling_from "own", saved at load). Earlier saves have no sampling_from: the recommendation wins.
+  const rec = recSampling(selModel);
+  if (rec && s.sampling_from !== "own") setSampling(rec);
+  else {
+    $("topk").value = s.top_k ?? 40; $("topp").value = s.top_p ?? 0.9; $("minp").value = s.min_p ?? 0.05;
+    $("rpen").value = s.repeat_penalty || 1.1;
+    $("ppen").value = s.presence_penalty ?? 0;
+    if (s.temperature != null) $("temp").value = s.temperature;
+    for (const id of ["topk", "topp", "minp", "rpen", "ppen", "temp"]) $(id).oninput();
+  }
   $("forcecpu").checked = !!s.force_cpu;
   $("vramlim").value = s.vram_limit_mb ? +(s.vram_limit_mb * 1048576 / 1e9).toFixed(1) : 0;   // (kept in MiB, shown in GB)
   // Settings saved before "Automatic" existed (no settings_v) had whole layers as the default: treat as Automatic.
@@ -2685,6 +2733,8 @@ function loadBody(p) {
                  experts_used: selModel.experts && exp !== selModel.experts_used ? exp : 0, seed: +$("seed").value,
                  force_cpu: $("forcecpu").checked, vram_limit_mb: Math.round(+$("vramlim").value * 1e9 / 1048576), split_mode: $("splitsel").value, settings_v: 2, multi_gpu: $("allgpus").checked, connections: +$("connsel").value || 1, min_tps: +$("mintps").value || 5, hot_experts: $("hotexp").checked || $("liveexp").checked, live_experts: $("liveexp").checked, top_k: +$("topk").value, top_p: +$("topp").value, min_p: +$("minp").value, repeat_penalty: +$("rpen").value, presence_penalty: +$("ppen").value, temperature: +$("temp").value };
   if ($("forcecpu").checked) body.device = "cpu";
+  const rec = recSampling(selModel);
+  if (rec) body.sampling_from = samplingDiffers(rec) ? "own" : "model";
   return body;
 }
 // Auto-tune: the server loads the model, measures the settings that affect speed (split mode, CPU threads,

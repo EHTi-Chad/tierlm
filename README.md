@@ -103,7 +103,17 @@ submitted without checking it first).
 - **GLM's chat format and tool calls.** GLM-4.7-Flash (and the 4.5 / 4.6 layout) used the plain `<|user|>` format:
   now its prompts are written as Z.ai's templates write them (checked character for character, thinking on and off,
   tools, calls and results), with the thinking switch, and its tool calls (`<tool_call>NAME<arg_key>...`) are read.
-  Not yet tried with a real GLM file here.
+  Tried on the RTX 3070 Laptop (8 GB), Ryzen 9 5900HX, 32 GB RAM: GLM-4.7-Flash Q3_K_M, 32K context, VRAM experts
+  following the conversation, 6 threads: Find the fastest settings 39.1 tok/s; a 516-token answer with thinking on
+  at 32.7 tok/s, and an F# class with thinking off at 32.3.
+- **Sampling as the model's makers recommend it.** A file can say which sampling its model is made for
+  (`general.sampling.*`: GLM-4.7-Flash's say temperature 1.0, top-p 0.95). tierlm didn't read it, and with its own
+  defaults (temperature 0.7, repeat penalty 1.1) or a presence penalty, GLM's thinking went wrong and looped for good.
+  Now a model's chat starts from its recommendation (no repeat or presence penalty unless it names one) each time it
+  loads, unless its sliders were set otherwise and saved; Settings says what it recommends, with a link back to it.
+  Apps that don't send their own values get it too.
+- **A reply that loops word for word is ended.** The same block of words over and over for 1,024 tokens or more,
+  with Max reply on No limit, ran until stopped by hand; it now ends, saying why (not on the benchmark page).
 - **Inkling 2 Mini on an 8 GB card.** RTX 3070 Laptop (8 GB), Ryzen 9 5900HX, 32 GB RAM, Windows 11;
   Inkling-2-Mini-UD-Q4_K_M (16.6 GB), 32K context, KV cache f16, thinking off, the settings Find the fastest settings
   chose (VRAM experts following the conversation, 6 threads): 5.4 GB in VRAM (20 of 24 layers' attention and the 384
@@ -120,8 +130,7 @@ submitted without checking it first).
   were pinned to the CPU, including views of what the GPU held). Other models never took such views; they place as
   before (`TIERLM_PIN_VIEWS=1` for the old way, to compare).
 - **Known items:** Inkling 2 doesn't read images yet, and for its loop layers only the last pass counts toward the
-  experts it learns are busiest; GLM's chat format is checked against its templates but not yet with a real GLM file;
-  a dense model that doesn't quite fit (Qwen3.8-27B Q6_K at 256K on an RTX 5090: 3 of 64 layers in RAM) reads prompts
+  experts it learns are busiest; a dense model that doesn't quite fit (Qwen3.8-27B Q6_K at 256K on an RTX 5090: 3 of 64 layers in RAM) reads prompts
   at about 1,100 tok/s, where putting part of the context in RAM instead of weights would keep it near the 3,300 it
   reads at 128K, all in VRAM (next).
 - For developers: `tierlm-attn-check` (ggml's attention told how much a query sees, and behind the mask, against the

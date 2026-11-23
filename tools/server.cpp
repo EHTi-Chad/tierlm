@@ -367,6 +367,22 @@ std::string format_chat(const json& messages, ChatFmt f, const Tokenizer& tok, i
 }
 
 // Sampling settings, as in LM Studio / llama.cpp.
+// A reply stuck in a loop: its last tokens are one block of p tokens (1 to 1,024) over and over, word for word, for
+// at least 1,024 tokens and five rounds. Thinking and code repeat lines and numbers on purpose, but not like that; a
+// model in this state (GLM-4.7-Flash with penalties it isn't made for) never comes out of it, and with no length
+// limit it went on until stopped by hand.
+static bool stuck_repeating(const std::vector<int32_t>& t) {
+    const size_t n = t.size();
+    for (size_t p = 1; p <= 1024; ++p) {
+        const size_t need = std::max<size_t>(5 * p, 1024);     // (grows with p)
+        if (need > n) break;
+        size_t k = 0;
+        while (k < need - p && t[n - 1 - k] == t[n - 1 - k - p]) ++k;
+        if (k >= need - p) return true;
+    }
+    return false;
+}
+
 struct Sampling {
     float temperature = 0.7f, top_p = 0.9f, min_p = 0.05f, repeat_penalty = 1.1f;
     float presence_penalty = 0.0f, frequency_penalty = 0.0f;   // OpenAI's: subtracted from a used token's logit
@@ -781,6 +797,9 @@ struct Engine {
     int lookup = -1;
     std::unique_ptr<Speculator> look;
     std::unique_ptr<Model> model;
+    // The loaded model's recommended sampling (describe_model's "sampling": only what its file gives), for apps that
+    // don't send their own values.
+    json rec_sampling = json::object();
     std::unique_ptr<Vision> vision;     // the model's eyes (Qwen3.5 / 3.6 with an mmproj file next to it)
     std::string vision_file;
     // Most image words per image (bigger images are scaled down; reading time grows faster than this). The page's
@@ -1049,6 +1068,26 @@ json describe_model(const std::string& path, bool header_only = false) {
     j["experts"] = u32(arch + ".expert_count");
     j["experts_used"] = u32(arch + ".expert_used_count");
     j["ctx_train"] = u32(arch + ".context_length");
+    // The sampling its makers recommend, when the file has it (general.sampling.*, as llama.cpp's converter writes
+    // from the model's generation_config.json): the chat's settings start from these. Only the values the file gives.
+    {
+        json rec = json::object();
+        auto num = [&](const char* k, const char* name) {
+            const int64_t id = gguf_find_key(g, k);
+            if (id < 0) return;
+            const auto t = gguf_get_kv_type(g, id);
+            double v = t == GGUF_TYPE_FLOAT32 ? gguf_get_val_f32(g, id) : t == GGUF_TYPE_FLOAT64 ? gguf_get_val_f64(g, id)
+                     : t == GGUF_TYPE_INT32 ? gguf_get_val_i32(g, id) : t == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g, id) : NAN;
+            if (std::isfinite(v)) rec[name] = std::round(v * 1000.0) / 1000.0;
+        };
+        num("general.sampling.temp", "temperature");
+        num("general.sampling.top_p", "top_p");
+        num("general.sampling.top_k", "top_k");
+        num("general.sampling.min_p", "min_p");
+        num("general.sampling.penalty_repeat", "repeat_penalty");
+        if (rec.contains("top_k")) rec["top_k"] = (int)rec["top_k"].get<double>();
+        if (!rec.empty()) j["sampling"] = rec;
+    }
     // KV cache cost per token of context, at f16: K and V for every layer.
     const int64_t head_dim = u32(arch + ".attention.key_length") ? u32(arch + ".attention.key_length") : (heads ? embd / heads : 0);
     // Only attention layers keep a KV cache; in hybrid models (qwen35, qwen35moe) that's one layer in every few.
@@ -1805,6 +1844,7 @@ int main(int argc, char** argv) {
         eng.saved.clear();
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
+        eng.rec_sampling = info.value("sampling", json::object());
         LoadOptions o = opt;
         const int uL = info.value("layers", 0), uE = info.value("experts", 0);
         eng.usage.clear(); eng.usage_path.clear(); eng.usage_dirty = false; eng.hot_L = uL; eng.hot_E = uE;
@@ -2086,7 +2126,7 @@ int main(int argc, char** argv) {
         json j = {
             {"loaded", true}, {"path", eng.path},
             {"name", eng.name.empty() ? fs::u8path(eng.path).stem().u8string() : eng.name}, {"arch", eng.model->arch()},
-            {"chat_format", chat_fmt_name(eng.chat)}, {"moe", hp.is_moe()},
+            {"chat_format", chat_fmt_name(eng.chat)}, {"moe", hp.is_moe()}, {"sampling", eng.rec_sampling},
             {"layers", hp.n_layer}, {"experts", hp.n_expert}, {"experts_used", hp.n_expert_used},
             {"vocab", hp.n_vocab}, {"ctx", eng.slots.empty() ? eng.model->max_ctx() : eng.ctx_per}, {"n_past", eng.model->n_past()},
             {"connections", std::max<int>(1, (int)eng.slots.size())},
@@ -2133,6 +2173,15 @@ int main(int argc, char** argv) {
             }()},
         };
         j["idle_eject_min"] = idle_minutes(); j["idle_fixed"] = a.idle_given;
+        // The sampling saved for this model (the page's sliders when it was loaded), for a page opened while it's loaded
+        {
+            const json ms = smodels(), m = ms.value(model_key(eng.path), json::object());
+            json sv = json::object();
+            if (m.is_object())
+                for (const char* k : {"temperature", "top_k", "top_p", "min_p", "repeat_penalty", "presence_penalty", "sampling_from"})
+                    if (m.contains(k)) sv[k] = m[k];
+            j["saved_sampling"] = sv;
+        }
         info_set(j);
         res.set_content(dump(j), "application/json; charset=utf-8");
     });
@@ -3138,6 +3187,11 @@ int main(int argc, char** argv) {
                 }
             }
             if (!emit(visible, limit)) { r.stop = "abort"; return false; }
+            if (!tl_ignore_eos && out.size() % 32 == 0 && stuck_repeating(out)) {   // (not the benchmark page: it writes on whatever comes)
+                std::fprintf(stderr, "chat: the reply was repeating itself word for word, so it was ended after %zu tokens\n", out.size());
+                r.stop = "loop";
+                return false;
+            }
             return true;
         };
         auto plain = [&] {                                                // one word per step
@@ -3612,6 +3666,19 @@ int main(int argc, char** argv) {
         eng.model->reset();
         eng.cached.clear();
         return toks / std::max(secs, 1e-9);
+    };
+    // The API's starting values for a reply: tierlm's, without the repetition penalty (it harms code), then the
+    // loaded model's recommended ones from its file.
+    auto model_sampling = [&]() {
+        Sampling sp;
+        sp.repeat_penalty = 1.0f;
+        const json& r = eng.rec_sampling;
+        sp.temperature = r.value("temperature", sp.temperature);
+        sp.top_p = r.value("top_p", sp.top_p);
+        sp.top_k = r.value("top_k", sp.top_k);
+        sp.min_p = r.value("min_p", sp.min_p);
+        sp.repeat_penalty = r.value("repeat_penalty", sp.repeat_penalty);
+        return sp;
     };
     auto sampling_of = [&](const json& b) {
         Sampling sp;
@@ -4449,12 +4516,12 @@ int main(int argc, char** argv) {
         if (!eng.model)
             return oai_error(res, 400, "no model is loaded: load one in tierlm, or name one from /v1/models", "invalid_request_error", "model_not_found");
 
-        Sampling sp;
+        Sampling sp = model_sampling();               // (what the app doesn't send: the model's recommended values)
         sp.temperature = body.value("temperature", sp.temperature);
         sp.top_p = body.value("top_p", sp.top_p);
         sp.top_k = body.value("top_k", sp.top_k);
         sp.min_p = body.value("min_p", sp.min_p);
-        sp.repeat_penalty = body.value("repeat_penalty", 1.0f);   // off unless asked: it harms code, where repeats are normal
+        sp.repeat_penalty = body.value("repeat_penalty", sp.repeat_penalty);   // (1.0 unless the model asks: it harms code, where repeats are normal)
         sp.presence_penalty = body.value("presence_penalty", sp.presence_penalty);
         sp.frequency_penalty = body.value("frequency_penalty", sp.frequency_penalty);
         sp.repeat_last_n = body.value("repeat_last_n", sp.repeat_last_n);
@@ -4621,11 +4688,10 @@ int main(int argc, char** argv) {
         if (!eng.model && idle_out) { std::string err; if (!bring_back(err)) return fail(500, err, anthropic ? "api_error" : "server_error"); }
         if (!eng.model) return fail(400, "no model is loaded: load one in tierlm first", "invalid_request_error");
         const json body = json::parse(req.body, nullptr, false);
-        Sampling sp;
+        Sampling sp = model_sampling();                               // (as for /v1/chat/completions)
         sp.temperature = body.value("temperature", sp.temperature);
         sp.top_p = body.value("top_p", sp.top_p);
         sp.top_k = body.value("top_k", sp.top_k);
-        sp.repeat_penalty = 1.0f;                                     // (off, as for /v1/chat/completions)
         json messages = normalize_messages(rq.messages);
         const agent::ojson tools = rq.tools;
         const std::string model_id = loaded_id();
