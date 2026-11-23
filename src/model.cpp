@@ -2142,8 +2142,33 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         ggml_backend_tensor_get(t, v.data(), 0, v.size() * 4);
         return v;
     };
+    // Inkling 2 (lean): each short convolution's output is (x + conv(x)) / sqrt(n) with x its newest input. Adding 1 to
+    // the newest tap's weights gives x + conv(x) from the convolution itself, and dividing all of them by sqrt(n) the
+    // division too: two fewer GPU steps for each (four a layer, 48 layers a token). Not the division where per-token
+    // taps are added before it (the keys of full-attention layers: there only the 1), nor for the values (normed next:
+    // the division is folded there already); and not weights stored other than as F32 or read from the drive as used.
+    auto ink_fold = [&](const Layer& L) {
+        if (!hp.ink || std::getenv("TIERLM_INK_PLAIN")) return;
+        const float sq = std::sqrt((float)(hp.ink_conv + 1));
+        const std::pair<ggml_tensor*, float> convs[4] = {
+            {L.ink_kconv, L.ink_kconvp ? 1.0f : sq}, {L.ink_vconv, 1.0f}, {L.ink_aconv, sq}, {L.ink_fconv, sq}};
+        for (auto [t, div] : convs) {
+            if (!t || !t->buffer || t->type != GGML_TYPE_F32 || ssd_set.count(t) || m->ink_fold_id_.count(t)) continue;
+            std::vector<float> w((size_t)ggml_nelements(t));               // [K, channels]: the newest tap last
+            ggml_backend_tensor_get(t, w.data(), 0, w.size() * 4);
+            const int64_t K = t->ne[0], C = ggml_nelements(t) / K;
+            for (int64_t ch = 0; ch < C; ++ch) {
+                w[ch * K + K - 1] += 1.0f;
+                if (div != 1.0f) for (int64_t k = 0; k < K; ++k) w[ch * K + k] /= div;
+            }
+            ggml_backend_tensor_set(t, w.data(), 0, w.size() * 4);
+            m->ink_fold_id_.insert(t);
+            if (div != 1.0f) m->ink_fold_sc_.insert(t);
+        }
+    };
     for (int i = 0; i < hp.n_layer; ++i) {
         Layer L = bind_layer(i); bind_hot(L, i);
+        ink_fold(L);
         if (L.down_x && ssd_set.count(L.down_x)) {
             SsdPrefetch& pf = m->ssd_pf_[i];
             pf.parts[0] = L.gate_up_x; pf.parts[1] = L.gate_x; pf.parts[2] = L.up_x; pf.parts[3] = L.down_x;
@@ -4289,21 +4314,29 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
             S = ggml_rms_norm(c, S, 1e-6f);                                   // [E, nb, n_tok]
         }
         const int64_t nb = S->ne[1];
-        ggml_tensor* sc = ggml_mul_mat(c, ggml_reshape_2d(c, query, E, nq), ggml_reshape_2d(c, S, E, nb * n_tok));   // [nq, nb n_tok]
-        sc = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, sc, nq, nb, n_tok), 1, 0, 2, 3));          // [nb, nq, n_tok]
+        ggml_tensor* sc;
+        if (lean && n_tok == 1)                                               // (one token: the scores laid out as used)
+            sc = ggml_reshape_3d(c, ggml_mul_mat(c, ggml_reshape_2d(c, S, E, nb), ggml_reshape_2d(c, query, E, nq)), nb, nq, 1);
+        else {
+            sc = ggml_mul_mat(c, ggml_reshape_2d(c, query, E, nq), ggml_reshape_2d(c, S, E, nb * n_tok));   // [nq, nb n_tok]
+            sc = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, sc, nq, nb, n_tok), 1, 0, 2, 3));      // [nb, nq, n_tok]
+        }
         sc = ggml_soft_max_ext(c, sc, nullptr, 1.0f / std::sqrt((float)E), 0.0f);
         return ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, S, 1, 0, 2, 3)), sc);                     // [E, nq, n_tok]
     };
     auto pick = [&](ggml_tensor* m, int j) {                                  // query j's output of mix: [E, n_tok]
         if (lean && m->ne[1] == 1) return ggml_reshape_2d(c, m, E, n_tok);    // (the only one: as it is)
-        return ggml_cont(c, ggml_view_2d(c, m, E, n_tok, m->nb[2], (size_t)j * m->nb[1]));
+        ggml_tensor* v = ggml_view_2d(c, m, E, n_tok, m->nb[2], (size_t)j * m->nb[1]);
+        return lean && n_tok == 1 ? v : ggml_cont(c, v);                      // (one token: one vector, contiguous already)
     };
-    // Each vector (over ne0) times scale, then scaled down to a length of at most thr
-    auto clip = [&](ggml_tensor* t, ggml_tensor* scale, float thr) {
+    // Each vector (over ne0) times scale, then scaled down to a length of at most thr. lean: ggml's l2 norm divides by
+    // the length or its eps, whichever is larger (every engine), so with eps thr, times thr, it is that clip in one
+    // step: t thr / max(|t|, thr). unscaled: without the last "times thr", for the caller to fold into a later scale.
+    auto clip = [&](ggml_tensor* t, ggml_tensor* scale, float thr, bool unscaled = false) {
         if (scale) t = ggml_mul(c, t, scale);
-        if (lean) {                                                           // its direction, times its length or thr
-            ggml_tensor* len = ggml_sqrt(c, ggml_sum_rows(c, ggml_sqr(c, t)));
-            return ggml_mul(c, ggml_l2_norm(c, t, 1e-12f), ggml_clamp(c, len, 0.0f, thr));
+        if (lean) {
+            ggml_tensor* d = ggml_l2_norm(c, t, thr);
+            return unscaled ? d : ggml_scale(c, d, thr);
         }
         ggml_tensor* d = ggml_scale_bias(c, ggml_sqrt(c, ggml_sum_rows(c, ggml_sqr(c, t))), 1.0f, 1e-6f);
         ggml_tensor* f = ggml_clamp(c, ggml_div(c, ggml_fill(c, d, thr), d), -INFINITY, 1.0f);
@@ -4311,7 +4344,10 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
     };
     // A loop layer's message gate: (1 - forget) cur + gain msg, both from the normed pair through a low-rank projection
     auto gate = [&](const Layer& L, int k, ggml_tensor* cur, ggml_tensor* msg) {
-        ggml_tensor* in = ggml_concat(c, ggml_rms_norm(c, cur, hp.rms_eps), ggml_rms_norm(c, msg, hp.rms_eps), 0);   // [2E, n_tok]
+        // [2E, n_tok]. (lean: the pair side by side [E, 2, n_tok], normed vector by vector, is that already)
+        ggml_tensor* in = lean ? ggml_reshape_2d(c, ggml_rms_norm(c, ggml_concat(c, ggml_reshape_3d(c, cur, E, 1, n_tok),
+                                                                                  ggml_reshape_3d(c, msg, E, 1, n_tok), 1), hp.rms_eps), 2 * E, n_tok)
+                               : ggml_concat(c, ggml_rms_norm(c, cur, hp.rms_eps), ggml_rms_norm(c, msg, hp.rms_eps), 0);
         ggml_tensor* lo = ggml_mul_mat(c, L.ink_down[k], in);
         ggml_tensor* gain = ggml_tanh(c, ggml_mul_mat(c, L.ink_gain[k], lo));
         ggml_tensor* forget = ggml_tanh(c, ggml_mul_mat(c, L.ink_forget[k], lo));
@@ -4361,8 +4397,8 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
                         co = ggml_add(c, co, ggml_reshape_2d(c, ggml_mul(c, win, tap), C, n));
                     }
                 }
-                ggml_tensor* r = ggml_add(c, xs, co);
-                if (!raw) r = ggml_scale(c, r, 1.0f / std::sqrt((float)((dyn ? 2 : 1) * K + 1)));
+                ggml_tensor* r = ink_fold_id_.count(w) ? co : ggml_add(c, xs, co);   // (folded in at load: see there)
+                if (!raw && !ink_fold_sc_.count(w)) r = ggml_scale(c, r, 1.0f / std::sqrt((float)((dyn ? 2 : 1) * K + 1)));
                 out = out ? ggml_concat(c, out, r, 1) : r;
             }
             return out;
@@ -4382,7 +4418,9 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
             in[1] = ggml_mul(c, ggml_rms_norm(c, in[1], hp.rms_eps), L.ink_kn);
             in[2] = ggml_mul(c, ggml_rms_norm(c, in[2], hp.rms_eps), L.ink_vn);
         }
-        ggml_tensor* q = clip(ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, in[0]), hd, nh, n_tok), L.ink_qclip, hp.ink_qk_clip);
+        // (lean: the query's clip without its last scale, folded into the scores' scale below)
+        ggml_tensor* q = clip(ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, in[0]), hd, nh, n_tok), L.ink_qclip, hp.ink_qk_clip, true);
+        const float q_fold = lean ? hp.ink_qk_clip : 1.0f;
         ggml_tensor* k = conv(ggml_mul_mat(c, L.wk, in[1]), L.ink_kconv, swa ? nullptr : ggml_mul_mat(c, L.ink_kconvp, in[1]), 0);
         // (lean: the values are normed next, and y / s normed with eps is y normed with eps s^2: no division)
         ggml_tensor* v = conv(ggml_mul_mat(c, L.wv, in[2]), L.ink_vconv, swa ? nullptr : ggml_mul_mat(c, L.ink_vconvp, in[2]), kvd, lean);
@@ -4411,7 +4449,7 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
         ggml_tensor* vall = ggml_view_3d(c, S.v_cache, hd, kvh, n_at, S.v_cache->nb[1], S.v_cache->nb[2], 0);
         ggml_tensor* kq = ggml_mul_mat(c, ggml_permute(c, kall, 0, 2, 1, 3), ggml_permute(c, q, 0, 2, 1, 3));   // [n_at, n_tok, nh]
         ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-        kq = ggml_add(c, ggml_scale(c, kq, 1.0f / std::sqrt((float)hd)), bias);
+        kq = ggml_add(c, ggml_scale(c, kq, q_fold / std::sqrt((float)hd)), bias);
         kq = ggml_soft_max_ext(c, kq, swa ? g.mask_swa : g.mask, 1.0f, 0.0f);
         ggml_soft_max_add_sinks(kq, sinks0(nh));
         ggml_tensor* o = ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3)), kq);      // [hd, n_tok, nh]

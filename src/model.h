@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <array>
 #include <memory>
 #include <string>
@@ -671,6 +672,9 @@ private:
     ggml_tensor *g4_ple_tok_ = nullptr, *g4_ple_proj_ = nullptr, *g4_ple_norm_ = nullptr;   // Gemma 4 E2B/E4B: per-layer inputs
     ggml_tensor *tok_norm_ = nullptr, *ink_out_res_ = nullptr;   // Inkling 2: the embedding's norm, the last depth mixer's query
     ggml_tensor *ink_res_q_ = nullptr, *ink_kv_q_ = nullptr;     // (the earlier layout: all loop layers' message queries, see ink_layers)
+    // Inkling 2: short convolutions whose weights were changed at load to give (x + conv(x)) themselves (ink_fold_id_)
+    // and the division after it too (ink_fold_sc_), so the graph leaves out those steps (see the reading of weights)
+    std::set<const ggml_tensor*> ink_fold_id_, ink_fold_sc_;
     // Inkling 2's loop: the caches of the loop layers' later passes, pass p >= 1 of layer i at
     // (p - 1) * (loop_hi - loop_lo) + i - loop_lo. Each holds only its own cache (index: the layer it repeats).
     std::vector<Layer> ink_slots_;
