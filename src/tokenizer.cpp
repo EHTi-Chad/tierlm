@@ -364,7 +364,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
     if (model == "gpt2") {
         t.kind_ = Kind::Bpe;
         const std::string pre = sval("tokenizer.ggml.pre");
-        if (pre == "llama-bpe" || pre == "llama3" || pre == "smaug-bpe" || pre == "dbrx") t.pre_ = Pre::Llama3;
+        if (pre == "llama-bpe" || pre == "llama3" || pre == "smaug-bpe" || pre == "dbrx" || pre == "glm4") t.pre_ = Pre::Llama3;   // (GLM-4: the same pattern)
         else if (pre == "qwen2" || pre == "deepseek-r1-qwen" || pre == "megrez") t.pre_ = Pre::Qwen2;
         else if (pre == "qwen35") t.pre_ = Pre::Qwen35;
         else if (pre == "gpt-4o" || pre == "o200k" || pre == "inkling2") t.pre_ = Pre::O200k;   // (Inkling 2: the same split)
