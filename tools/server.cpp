@@ -3041,8 +3041,12 @@ int main(int argc, char** argv) {
         std::vector<int32_t> out;
         size_t shown = 0;
         auto g0 = Clock::now();
+        int quiet = 0;                                            // tokens in a row that showed nothing
         auto emit = [&](const std::string& visible, size_t upto) {
-            if (upto <= shown) return true;
+            // Nothing new to show: every 8th such token the listener is still asked (with no text), so Stop and a
+            // closed connection end a reply that writes only what isn't shown (it went on for minutes otherwise)
+            if (upto <= shown) return !on_token || ++quiet % 8 != 0 || on_token(std::string(), out.size() / std::max(since(g0), 1e-9), routing);
+            quiet = 0;
             const std::string delta = visible.substr(shown, upto - shown);
             shown = upto;
             r.text += delta;

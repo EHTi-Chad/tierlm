@@ -54,6 +54,11 @@ REPLIES = [
      "<think>Need weather.</think>\n\n", [("get_weather", {"city": "Toronto", "days": 2})]),
     ("<|message_model|><|content_text|>Partly writ", "Partly writ", []),
     ("<|message_model|><|content_think", "", []),
+    # text with no content tag after the block's start (still being written, and finished): shown as text
+    ("<|message_model|>Sure, here is a class", "Sure, here is a class", []),
+    ("<|message_model|>Sure.\nclass Human {};<|end_message|><|content_model_end_sampling|>", "Sure.\nclass Human {};", []),
+    ("<|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{}}<|end_message|>", "", [("get_time", {})]),
+    ("<|message_model|>get_ti", "", []),   # (a tool's name still being written: not shown)
 ]
 
 exe = sys.argv[1]

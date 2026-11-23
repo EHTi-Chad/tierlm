@@ -1633,7 +1633,7 @@ async function streamReply(useWs) {
         }
         else if (ev.type === "prompt") { if (!reply) bubble.textContent = ""; onPrompt(ev); }
         else if (ev.type === "token") {
-          if (!firstAt) firstAt = performance.now();
+          if (!firstAt && ev.text) firstAt = performance.now();   // (a token event with no text: the reply is still going)
           reply += ev.text; onToken(ev);
           if (!drawPending) { drawPending = true; requestAnimationFrame(() => { drawPending = false; setReply(bubble, reply); $("messages").scrollTop = $("messages").scrollHeight; }); }
         }

@@ -133,8 +133,22 @@ inline std::vector<Block> blocks_of(const std::string& raw) {
         size_t b = h + kModel.size();
         Block blk;
         const size_t lt = raw.find("<|", b);
-        if (lt == std::string::npos) break;                                  // (the header isn't finished)
+        // Text straight after <|message_model|>, with no content tag (Mini did that with its thinking tag not allowed:
+        // 4,771 tokens that showed nothing): a tool's name is one short word, so anything longer, or with a space or
+        // a line break in it, is the reply's text.
+        auto prose = [](const std::string& h) { return h.size() > 64 || h.find_first_of(" \n\t") != std::string::npos; };
+        if (lt == std::string::npos) {                                      // (the header isn't finished, or is text)
+            if (prose(raw.substr(b))) out.push_back({"text", "", raw.substr(b), false});
+            break;
+        }
         const std::string head = raw.substr(b, lt - b), tag = raw.substr(lt);
+        if (!head.empty() && (prose(head) || tag.compare(0, kEnd.size(), kEnd) == 0) && tag.compare(0, kTool.size(), kTool) != 0) {
+            const size_t e = raw.find(kEnd, b);                              // (text up to its end, whatever tags it holds)
+            out.push_back({"text", "", raw.substr(b, e == std::string::npos ? std::string::npos : e - b), e != std::string::npos});
+            if (e == std::string::npos) break;
+            p = e + kEnd.size();
+            continue;
+        }
         auto starts = [&](const std::string& t) { return tag.compare(0, t.size(), t) == 0; };
         if (starts(kText)) { blk.kind = "text"; b = lt + kText.size(); }
         else if (starts(kThink)) { blk.kind = "thinking"; b = lt + kThink.size(); }
