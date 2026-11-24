@@ -104,7 +104,21 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
         for (std::string line; std::getline(f, line); )
             if (line.compare(0, key.size(), key) == 0) o.vram_reserve_mb = std::atoi(line.c_str() + key.size());
     }
-    auto m = load_once(path, o);
+    // A first load of a kind (the busiest experts in VRAM, say) has nothing noted yet and keeps 512 MB free; on a small
+    // card the GPU's working memory may not fit in that, and the load stopped with "failed to reserve compute memory"
+    // (an RTX 2070 Super, 8 GB, with Qwen3.6-35B-A3B: 664 MB wanted, and Find the fastest settings ended there). It
+    // loads again keeping twice as much free, up to twice; what it really needs is then measured and noted below.
+    std::unique_ptr<Model> m;
+    for (int attempt = 0;; ++attempt) {
+        try { m = load_once(path, o); break; }
+        catch (const std::runtime_error& e) {
+            if (attempt >= 2 || std::strcmp(e.what(), "failed to reserve compute memory") != 0 || opt.vram_budget_mb > 0) throw;
+            const int was = o.vram_reserve_mb > 0 ? o.vram_reserve_mb : 512;
+            o.vram_reserve_mb = was * 2;
+            std::fprintf(stderr, "VRAM: the GPU's working memory didn't fit with %d MB kept free; loading again with %d MB kept\n",
+                         was, o.vram_reserve_mb);
+        }
+    }
     const int used = m->place_.vram_reserve_mb;
     // Scratch beyond the measured compute buffers (the GPU engine's own scratch memory, the driver): a share of the
     // card, 192 to 640 MB. Measured on an RTX 3070 Laptop (8 GB) with Qwen3.6-35B-A3B: 400 MB kept free in all (100
