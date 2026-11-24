@@ -9,6 +9,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <mutex>
 #include <vector>
 
 struct ggml_context;
@@ -538,6 +539,17 @@ private:
     mutable LiveStats live_stats_;
     bool live_frozen_ = false;
     void adapt_hot(const std::vector<int32_t>& routing, int n_tok);
+    // A layer visited more than once a token (Inkling 2's loop layers: three passes): the routing handed back has one
+    // place per layer, the first pass's picks; the later passes' picks are kept here, as layer * n_expert + expert,
+    // for the VRAM experts that follow the conversation (this step's) and for learning the busiest (summed until taken).
+    std::vector<int32_t> extra_picks_;
+    std::vector<float> extra_counts_;
+    std::mutex extra_mu_;                        // (extra_counts_: added to by a step, taken by the server's threads)
+public:
+    // The later passes' picks counted since the last call, [layer * n_expert + expert] (empty: none), for the
+    // learned busiest experts.
+    std::vector<float> take_extra_counts() { std::lock_guard<std::mutex> lk(extra_mu_); std::vector<float> c; c.swap(extra_counts_); return c; }
+private:
     std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way)
     double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
     std::chrono::steady_clock::time_point live_last_{};

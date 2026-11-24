@@ -967,10 +967,6 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             std::fprintf(stderr, "note: this model's head size (%d) can't use a %s cache; using f16\n", hp.head_dim, want.c_str());
             m->kv_t_ = GGML_TYPE_F16;
         }
-        if (ggml_is_quantized((ggml_type)m->kv_t_) && hp.ink) {     // (only flash attention reads a quantized cache)
-            std::fprintf(stderr, "note: Inkling 2's attention doesn't read a %s cache yet; using f16\n", want.c_str());
-            m->kv_t_ = GGML_TYPE_F16;
-        }
         m->kv_f32_ = m->kv_t_ == GGML_TYPE_F32;
     }
     // Sliding-window layers: rings instead of the whole context (see swa_R_), when that's smaller
@@ -4614,6 +4610,11 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
         kq = ggml_add(c, ggml_scale(c, kq, q_fold / std::sqrt((float)hd)), bias);
         kq = ggml_soft_max_ext(c, kq, swa ? g.mask_swa : g.mask, 1.0f, 0.0f);
         ggml_soft_max_add_sinks(kq, sinks0(nh));
+        // A quantized cache (8-bit and below, since 0.9.5): the keys are read as they are (a product takes them), the
+        // values turned back into numbers first, as the transposed copy below can't be made of blocks. Until 0.9.5
+        // Inkling 2 took a 16-bit cache whatever was asked: 1.1 GB at 32K, which on an 8 GB card was four layers'
+        // attention left in RAM.
+        if (ggml_is_quantized(vall->type)) vall = ggml_cast(c, vall, GGML_TYPE_F32);
         ggml_tensor* o = ggml_mul_mat(c, ggml_cont(c, ggml_permute(c, vall, 1, 2, 0, 3)), kq);      // [hd, n_tok, nh]
         o = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3)), (int64_t)hd * nh, n_tok);
         o = ggml_mul(c, o, ggml_sigmoid(c, gp ? gp : ggml_mul_mat(c, L.ink_gate, in[0])));
@@ -6199,16 +6200,32 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
         // [token][layer][pick] for every layer; layers without experts (Flint's dense first layers) get -1
         const int L = hp.is_moe() ? hp.n_layer : 0, K = hp.n_expert_used, R = (int)g.orders.size();
         routing->assign((size_t)n_tok * L * K, -1);
+        extra_picks_.clear();
         if (g.routing) {                                                  // laid out [moe layer][token][pick]
             std::vector<int32_t> buf((size_t)ggml_nelements(g.routing));
             ggml_backend_tensor_get(g.routing, buf.data(), 0, sizeof(int32_t) * buf.size());
             size_t at = 0;
+            std::vector<uint8_t> seen((size_t)std::max(L, 1), 0);
             for (int r = 0; r < R; ++r) {
                 const int l = g.order_layers[r];
                 const int kl = std::min(K, hp.n_used_at(l));              // (a block that picks fewer leaves the rest -1)
-                for (int t = 0; t < n_tok; ++t)
-                    for (int k = 0; k < kl; ++k)
-                        (*routing)[((size_t)t * L + l) * K + k] = buf[at + (size_t)t * kl + k];
+                if (l < L && seen[l]++) {
+                    // A later pass of a loop layer (Inkling 2): kept aside (see extra_picks_). Until 0.9.5 it took the
+                    // first pass's place, so only the last pass counted toward the VRAM experts and the busiest.
+                    const int E = hp.n_expert;
+                    std::lock_guard<std::mutex> lk(extra_mu_);
+                    if (extra_counts_.size() != (size_t)L * E) extra_counts_.assign((size_t)L * E, 0.0f);
+                    for (int t = 0; t < n_tok; ++t)
+                        for (int k = 0; k < kl; ++k) {
+                            const int32_t e = buf[at + (size_t)t * kl + k];
+                            if (e < 0 || e >= E) continue;
+                            extra_picks_.push_back(l * E + e);
+                            extra_counts_[(size_t)l * E + e] += 1.0f;
+                        }
+                } else
+                    for (int t = 0; t < n_tok; ++t)
+                        for (int k = 0; k < kl; ++k)
+                            (*routing)[((size_t)t * L + l) * K + k] = buf[at + (size_t)t * kl + k];
                 at += (size_t)kl * n_tok;
             }
         }
@@ -6341,6 +6358,18 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
                 live_stats_.picks++;
                 if (ll.slot_of[e] >= 0) live_stats_.hits++;
             }
+    }
+    if (!extra_picks_.empty()) {                                     // the loop layers' later passes (Inkling 2)
+        std::vector<int> at((size_t)NL, -1);
+        for (size_t i = 0; i < live_.size(); ++i) at[live_[i].layer] = (int)i;
+        for (int32_t le : extra_picks_) {
+            const int l = le / E, e = le % E;
+            if (l < 0 || l >= NL || at[l] < 0) continue;
+            LiveLayer& ll = live_[at[l]];
+            ll.score[e] += 1.0f;
+            live_stats_.picks++;
+            if (ll.slot_of[e] >= 0) live_stats_.hits++;
+        }
     }
     // After a prompt batch whose picks the VRAM experts served poorly (a new subject): as many moves as pay, so the
     // reply starts with the prompt's experts in VRAM instead of catching up 8% of a step at a time. How long it may

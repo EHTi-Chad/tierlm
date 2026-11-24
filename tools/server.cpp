@@ -971,6 +971,16 @@ struct Engine {
                 if (!in_vram.empty()) { ++picks; picks_vram += in_vram[l * hot_E + routing[i]]; }
             }
         }
+        // the loop layers' later passes (Inkling 2), which the routing above doesn't hold (see Model::extra_picks_)
+        if (model) {
+            const std::vector<float> extra = model->take_extra_counts();
+            if (extra.size() == usage.size())
+                for (size_t i = 0; i < extra.size(); ++i) {
+                    if (extra[i] <= 0) continue;
+                    if (learn) usage[i] += extra[i];
+                    if (!in_vram.empty()) { picks += (long long)extra[i]; picks_vram += in_vram[i] ? (long long)extra[i] : 0; }
+                }
+        }
         if (learn) usage_dirty = true;
     }
     void save_usage(bool force = false) {

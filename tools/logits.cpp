@@ -104,6 +104,16 @@ int main(int argc, char** argv) {
         }
         const int nt = std::getenv("TIERLM_THREADS") ? std::atoi(std::getenv("TIERLM_THREADS")) : std::max(1, (int)std::thread::hardware_concurrency() / 2);
 
+        // TIERLM_ROUTING_CHECK=1 (tests): the routing of the tokens given, and the later passes' picks of layers run
+        // more than once a token (Inkling 2's loop), then stop: "routing <places set> extra <picks>"
+        if (std::getenv("TIERLM_ROUTING_CHECK")) {
+            std::vector<int32_t> rt;
+            m->eval(ids, nt, &rt);
+            size_t set = 0; for (int32_t e : rt) set += e >= 0;
+            double extra = 0; for (float v : m->take_extra_counts()) extra += v;
+            std::printf("routing %zu extra %.0f\n", set, extra);
+            return 0;
+        }
         std::vector<float> lg;
         // TIERLM_SAMPLE_RUNS=R (with --gen or --gen-spec): R separate replies of n tokens, drawn with temperature
         // TIERLM_SAMPLE_TEMP over the TIERLM_SAMPLE_TOPK best tokens, one per line (comma-separated): the tests

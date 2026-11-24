@@ -695,7 +695,6 @@ window.FIT = (() => {
           <label for="kvsel">Context memory precision</label>
           <select id="kvsel"><option value="f16">16-bit (normal)</option><option value="q8_0">8-bit: half the memory, practically the same quality</option><option value="q5_0">5-bit: a third of the memory, between 8-bit and 4-bit in quality</option><option value="q4_0">4-bit: a quarter of the memory, lower quality</option><option value="f32">32-bit: exact, twice the memory</option></select>
           <div class="help">How the context (KV cache) is stored. Smaller leaves room for a longer context, or for more of the model in VRAM: watch the purple part of the bars. 8-bit and below use flash attention.</div>
-          <div class="help" id="kvnote" hidden>Inkling 2 keeps its context at 16-bit: its attention adds a bias for each head and position, which 8-bit and below can't take yet.</div>
         </div>
         <div>
           <label class="chk"><input type="checkbox" id="specon"> Speculative decoding</label>
@@ -2425,7 +2424,6 @@ function renderWarnings() {
 }
 function tagger(el) { return (t, c) => { const s = document.createElement("span"); s.className = "tag " + (c || ""); s.textContent = t; el.appendChild(s); }; }
 function renderSetup() {
-  syncInk();
   const ctx = ctxValue() || defCtx;
   const p = plan();
   $("allgpusrow").hidden = !(p.gpu && gpuGroup(p.gpu).length > 1);
@@ -2600,13 +2598,6 @@ function syncFa() {                       // a quantized cache needs flash atten
   $("fa").disabled = q;
 }
 $("kvsel").onchange = () => { syncFa(); buildCtx(ctxValue()); renderSetup(); };
-// Inkling 2: its context is always 16-bit (the engine uses 16-bit whatever is asked), so the choice isn't offered
-function syncInk() {
-  const ink = !!(selModel && /^inkling/.test(selModel.arch || ""));
-  for (const o of $("kvsel").options) o.disabled = ink && o.value !== "f16";
-  if (ink && $("kvsel").value !== "f16") { $("kvsel").value = "f16"; syncFa(); buildCtx(ctxValue()); }
-  $("kvnote").hidden = !ink;
-}
 $("thr").oninput = () => $("thrv").textContent = $("thr").value;
 $("experts").oninput = () => $("expv").textContent = $("experts").value;
 $("topk").oninput = () => $("topkv").textContent = +$("topk").value || "off";

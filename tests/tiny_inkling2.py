@@ -260,7 +260,9 @@ if __name__ == "__main__":
         for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}, 6e-2 if real else 1e-3), ("normal", {}, 6e-2),
                                 ("ring48", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu", "TIERLM_SWA_RING_EXTRA": "48"}, 6e-2 if real else 1e-3),
                                 # (a prompt read in steps that shrink as the cache grows, as in a long context: 64 tokens, then 32)
-                                ("steps", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu", "TIERLM_BATCH_SPAN": "64"}, 6e-2 if real else 1e-3)):
+                                ("steps", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu", "TIERLM_BATCH_SPAN": "64"}, 6e-2 if real else 1e-3),
+                                # (an 8-bit cache, since 0.9.5: values rounded to 8 bits, so a looser limit)
+                                ("q8cache", {"TIERLM_KV_TYPE": "q8_0", "TIERLM_DEVICE": "cpu"}, 6e-2)):
             worst, top, diffs = 0.0, True, []
             for mode in ([], ["--step"], ["snapshot"]):
                 for ids in tests:
