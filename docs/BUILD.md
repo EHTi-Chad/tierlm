@@ -86,6 +86,71 @@ build\tierlm-devices.exe
 
 ## Linux and WSL (CPU, Vulkan or CUDA)
 
+### Step by step: Ubuntu 24.04 or Linux Mint 22 with an NVIDIA card
+
+Tried from scratch on Linux Mint 22.3 (Ubuntu 24.04 underneath) with an RTX 2070 Super (8 GB), an i9-9900K and
+32 GB of RAM, NVIDIA driver 580. Each step in a Terminal (Ctrl+Alt+T).
+
+1. **See what's there.** `nvidia-smi` must show your card and a driver (any recent one; it says which CUDA it
+   supports, 13.0 for driver 580). If it doesn't, install the driver first (Mint: Driver Manager).
+
+   ```bash
+   nvidia-smi; gcc --version | head -1; cmake --version | head -1; git --version; nvcc --version | tail -2
+   ```
+
+2. **The build tools.**
+
+   ```bash
+   sudo apt update && sudo apt install -y build-essential cmake git ninja-build
+   ```
+
+3. **The CUDA toolkit, from NVIDIA** (the toolkit only: the driver is left as it is). Ubuntu's own
+   `nvidia-cuda-toolkit` is CUDA 12.0, too old for the gcc 13 that Ubuntu 24.04 has. CUDA 13 builds for RTX 20
+   (Turing) cards and newer; for a Tesla V100 or older, install `cuda-toolkit-12-9` instead.
+
+   ```bash
+   cd ~ && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+   sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update && sudo apt install -y cuda-toolkit-13-0
+   ```
+
+4. **Get tierlm and build it** (10 to 20 minutes). `CMAKE_CUDA_ARCHITECTURES` is your card's generation, which
+   makes the build much shorter: 75 for RTX 20, 86 for RTX 30, 89 for RTX 40, 120 for RTX 50 (leave it out to
+   build for all of them). If Anaconda shows `(base)` in the prompt, `conda deactivate` first: its compilers can
+   get in the way.
+
+   ```bash
+   export PATH=/usr/local/cuda-13.0/bin:$PATH
+   git clone --recursive https://github.com/EHTi-Chad/tierlm.git ~/tierlm
+   cd ~/tierlm && cmake -S . -B build -G Ninja -DTIERLM_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release
+   cmake --build build
+   ```
+
+   Warnings about `ggml_mul_mat_set_prec` being deprecated are harmless; the last line should be
+   `Linking CXX executable tierlm-server`.
+
+5. **Free the graphics card.** Other AI apps keep models in VRAM. `nvidia-smi` lists what's using it; Ollama,
+   for one, holds its last model for minutes. To stop it and keep it from starting with the PC:
+
+   ```bash
+   sudo systemctl disable --now ollama
+   ```
+
+   (`sudo systemctl enable --now ollama` to have it back.)
+
+6. **Start tierlm** from its folder (it finds its page in `web/` and keeps models in `models/` there), then open
+   **http://127.0.0.1:8080** in your browser. Leave the Terminal open: Ctrl+C stops tierlm. `--port 8040` uses
+   the same address as the Windows download.
+
+   ```bash
+   mkdir -p ~/tierlm/models && cd ~/tierlm && ./build/tierlm-server
+   ```
+
+7. **Get a model** with **Get models** on the setup screen, then **Find the fastest settings**. On the PC above,
+   Qwen3.6-35B-A3B UD-IQ3_XXS (13.2 GB) at 32K context measured 61.3 tok/s with the VRAM experts following the
+   conversation and 8 CPU threads, and wrote a 3,388-token C++ class at 45.9 tok/s.
+
+**Updating:** `cd ~/tierlm && git pull && git submodule update && cmake --build build`, then start it again.
+
 ### Requirements
 
 ```bash
