@@ -14,6 +14,23 @@ gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), Inkling 2 (
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
 
+### Inkling 2 Mini, on the PC you already have
+
+Thinking Machines' Inkling 2 Mini is a looped mixture-of-experts model: 24 layers, 12 of them run three times for
+every word, 128 experts. tierlm runs it on Windows and Linux, from Unsloth's files and from llama.cpp's layout
+(`inkling2_loop`), with its tool calls, thinking on or off and its makers' recommended sampling, each part checked
+against Hugging Face's own code.
+
+| PC | File | Where it lives | Writing code |
+|---|---|---|---|
+| RTX 5090 32 GB, Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11 | UD-Q8_K_XL (21.8 GiB) | all in VRAM, 64K context | **66.7 tok/s** (500 tokens) |
+| RTX 3070 Laptop 8 GB, Ryzen 9 5900HX, 32 GB, Linux (KDE neon) | UD-IQ3_XXS (11.7 GB) | 3.7 GB VRAM + 8.1 GB RAM, VRAM experts following the conversation, 32K context | **13.4 tok/s** (377 tokens); 26.3 on Find the fastest settings' test questions |
+| the same laptop, Windows 11 | UD-Q4_K_M (16.6 GB) | 5.4 GB VRAM + 13.5 GB RAM, 32K context | **12.2 tok/s** |
+
+16-bit context memory, thinking off, measured on finished replies. Next for it: fewer, larger GPU steps (a
+token is thousands of small ones), its loop layers' experts following the conversation too, 8-bit context memory
+and reading images.
+
 ### New in 0.9.4: Qwen3.8 Flash-Next as a coding agent's model, Inkling 2 Mini, GLM's chat format
 
 Measured with the pi coding agent (1.6.0) working through a 15-task session against tierlm's OpenAI API (9 short
