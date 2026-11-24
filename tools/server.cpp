@@ -5469,11 +5469,16 @@ int main(int argc, char** argv) {
             out["arch"] = j["gguf"].value("architecture", std::string());
             out["ctx_train"] = j["gguf"].value("context_length", 0LL);
         }
-        // what it is, from the first model file's header (its first megabytes)
-        if (!quants.empty()) {
+        // what it is, from the first model file's header (its first megabytes). A repo can also hold another engine's
+        // draft models (DFlash's, unsloth/Inkling-2-Mini-GGUF's dspark-*.gguf, the smallest files there): one of
+        // those, read first, marked the whole repo "the dflash architecture is not supported yet". They are left out
+        // of the list (tierlm can't use them) and the next file is read instead, up to three.
+        static const std::set<std::string> draft_only = {"dflash", "eagle", "eagle3"};
+        for (int tries = 0; tries < 3 && !quants.empty(); ++tries) {
             const std::string first = quants[0]["files"][0]["path"];
             std::error_code ec;
             const fs::path tmp = fs::temp_directory_path(ec) / "tierlm-hf-header.gguf";
+            bool draft_file = false;
             for (const char* range : {"0-8388607", "0-67108863"}) {
                 int rc2 = 0;
                 const std::string head = hf_get(hf_base + "/" + id + "/resolve/main/" + path_enc(first), &rc2, range);
@@ -5486,11 +5491,15 @@ int main(int argc, char** argv) {
                 json d = describe_model(tmp.u8string(), true);
                 // a header with no architecture says nothing either way: the repo isn't marked as unsupported for it
                 if (d.value("arch", std::string()).empty()) break;
+                if (draft_only.count(d.value("arch", std::string()))) { draft_file = true; break; }
                 for (const char* k : {"arch", "supported", "reason", "kind", "kv_bytes_per_token", "kv_swa_bytes_per_token", "swa_ring", "layers", "experts", "experts_used", "ctx_train", "hybrid", "name"})
                     if (d.contains(k)) out[k] = d[k];
                 break;
             }
             fs::remove(tmp, ec);
+            if (!draft_file) break;
+            quants.erase(quants.begin());
+            out["quants"] = quants;
         }
         if (!out.contains("supported") && out.contains("arch")) out["supported"] = arch_supported(out["arch"].get<std::string>());
         res.set_content(dump(out), "application/json; charset=utf-8");
