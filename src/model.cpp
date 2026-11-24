@@ -495,12 +495,12 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         if (hp.ink_earlier) {
             v_lo = u32(arch + ".loop.core_start", true);
             v_hi = u32(arch + ".loop.core_end", true);
-            hp.ink_loop_passes = u32(arch + ".num_loops", true);
+            hp.loop_passes = u32(arch + ".num_loops", true);
             hp.ink_loop_rank = u32(arch + ".loop.gate_rank", true);
-            if (v_lo < 1 || v_hi <= v_lo || hp.ink_loop_passes < 2 || hp.ink_loop_passes > 64 ||
-                (int64_t)v_hi + (int64_t)(hp.ink_loop_passes - 1) * (v_hi - v_lo) > n_visit) bad("loop");
-            v_extra = (hp.ink_loop_passes - 1) * (v_hi - v_lo);
-            hp.ink_loop_lo = v_lo; hp.ink_loop_hi = v_hi;
+            if (v_lo < 1 || v_hi <= v_lo || hp.loop_passes < 2 || hp.loop_passes > 64 ||
+                (int64_t)v_hi + (int64_t)(hp.loop_passes - 1) * (v_hi - v_lo) > n_visit) bad("loop");
+            v_extra = (hp.loop_passes - 1) * (v_hi - v_lo);
+            hp.loop_lo = v_lo; hp.loop_hi = v_hi;
             hp.n_layer = n_visit - v_extra;
         }
         auto layer_of = [&](int v) { return v < v_hi + v_extra ? (v < v_lo ? v : v_lo + (v - v_lo) % std::max(1, v_hi - v_lo)) : v - v_extra; };
@@ -556,9 +556,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.expert_renorm = true;                                  // the chosen weights sum to 1, then scaled
         hp.n_vocab_real = u32(arch + ".vocab_size_unpadded", false);
         if (arch == "inkling2_loop") {
-            hp.ink_loop_lo = u32(arch + ".loop.start", true);
-            hp.ink_loop_hi = u32(arch + ".loop.end", true);
-            hp.ink_loop_passes = u32(arch + ".loop.count", true);
+            hp.loop_lo = u32(arch + ".loop.start", true);
+            hp.loop_hi = u32(arch + ".loop.end", true);
+            hp.loop_passes = u32(arch + ".loop.count", true);
             hp.ink_loop_rank = u32(arch + ".loop.gate_rank", true);
             const int64_t vid = gguf_find_key(g, (arch + ".loop.varying").c_str());
             if (vid >= 0 && gguf_get_kv_type(g, vid) == GGUF_TYPE_BOOL && gguf_get_val_bool(g, vid))
@@ -570,10 +570,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         for (float v : {hp.ink_qk_clip, hp.ink_rel_clip, hp.situ_beta, hp.situ_lbeta, hp.rms_eps})
             if (!std::isfinite(v) || v <= 0) bad("clip, softcap or norm settings");
         if (!std::isfinite(hp.ink_log_alpha) || hp.ink_log_alpha < 0) bad("logarithmic scale");
-        if (hp.ink_loop_passes > 1 || arch == "inkling2_loop" || hp.ink_earlier) {
-            const int lo = hp.ink_loop_lo, hi = hp.ink_loop_hi, B = hp.ink_res_block;
+        if (hp.loop_passes > 1 || arch == "inkling2_loop" || hp.ink_earlier) {
+            const int lo = hp.loop_lo, hi = hp.loop_hi, B = hp.ink_res_block;
             if (lo < 1 || hi <= lo || hi > hp.n_layer || lo % B || hi % B ||
-                hp.ink_loop_passes < 1 || hp.ink_loop_passes > 64 || hp.ink_loop_rank < 1) bad("loop");
+                hp.loop_passes < 1 || hp.loop_passes > 64 || hp.ink_loop_rank < 1) bad("loop");
         }
     }
     if (arch == "flint") {
@@ -637,7 +637,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             pack(b + "attn_qx.tierlm", qx, 1);
             if (!hp.swa[i]) pack(b + "attn_qkv_norm.tierlm", {get(b + "attn_q_inp_norm.weight"), get(b + "attn_k_inp_norm.weight"),
                                                                get(b + "attn_v_inp_norm.weight")}, 1);
-            if (hp.ink_loop_passes > 1 && i >= hp.ink_loop_lo && i < hp.ink_loop_hi) {
+            if (hp.loop_passes > 1 && i >= hp.loop_lo && i < hp.loop_hi) {
                 const char* site[4] = {"q", "k", "v", "ffn"};
                 const char* site_e[4] = {"attn", "k", "v", "mlp"};
                 std::vector<ggml_tensor*> down, gf;
@@ -1008,10 +1008,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         const size_t rows = ring_il(il) ? (size_t)m->swa_R_ * std::max(1, opt.parallel) : (size_t)m->max_ctx_;
         size_t b = (size_t)(hp.mla ? 1 : 2) * ggml_row_size((ggml_type)m->kv_t_, width) * rows +
                    (qsa ? (size_t)hp.qsa_dim * 2 * (size_t)m->max_ctx_ : 0);
-        if (hp.ink && il < hp.n_layer) {                            // Inkling 2: the convolutions' inputs; loop layers once a pass
+        if (hp.ink && il < hp.n_layer)                              // Inkling 2: the convolutions' inputs
             b += (size_t)(hp.ink_conv - 1) * hp.ink_conv_ch(il) * 4 * (size_t)std::max(1, opt.parallel);
-            if (il >= hp.ink_loop_lo && il < hp.ink_loop_hi) b *= (size_t)hp.ink_loop_passes;
-        }
+        if (hp.looped() && il >= hp.loop_lo && il < hp.loop_hi) b *= (size_t)hp.loop_passes;   // loop layers: once a pass
         return b;
     };
     size_t kv_need = 0;
@@ -1910,7 +1909,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             m->ink_res_q_ = T("loop_res_query.weight");
             m->ink_kv_q_ = T("loop_kv_res_query.weight");
             for (ggml_tensor* t : {m->ink_res_q_, m->ink_kv_q_})
-                if (t->ne[0] != hp.n_embd || t->ne[1] != 2 * hp.ink_loop_n() || t->type != GGML_TYPE_F32)
+                if (t->ne[0] != hp.n_embd || t->ne[1] != 2 * hp.loop_n() || t->type != GGML_TYPE_F32)
                     throw std::runtime_error("unexpected shape of the loop's message queries");
         }
     }
@@ -2072,7 +2071,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             if (!L.gate_up_x) { L.gate_x = T(b + "ffn_gate_exps.weight"); L.up_x = T(b + "ffn_up_exps.weight"); }
             L.down_x = T(b + "ffn_down_exps.weight");
             expert_scales(L, b);
-            if (hp.ink_loop_passes > 1 && i >= hp.ink_loop_lo && i < hp.ink_loop_hi) {
+            if (hp.loop_passes > 1 && i >= hp.loop_lo && i < hp.loop_hi) {
                 // (the earlier layout: the gates named for where they act, and every layer's message queries in two
                 // tensors of the whole model: see ink_layers)
                 if (!hp.ink_earlier) L.ink_msgq = shaped(b + "loop_msg_query.weight", {H, 4});
@@ -2319,14 +2318,14 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         }
         m->mtp_ = std::make_unique<Layer>(L);
     }
-    if (hp.ink && hp.ink_loop_passes > 1) {
-        // Inkling 2's loop: the later passes' caches (see Model::ink_slots_). Each slot repeats a loop layer: the same
+    if (hp.looped()) {
+        // A looped model: the later passes' caches (see Model::loop_slots_). Each slot repeats a loop layer: the same
         // kind (sliding or full) and device; only its cache and convolution inputs are its own.
-        for (int p = 1; p < hp.ink_loop_passes; ++p)
-            for (int i = hp.ink_loop_lo; i < hp.ink_loop_hi; ++i) {
+        for (int p = 1; p < hp.loop_passes; ++p)
+            for (int i = hp.loop_lo; i < hp.loop_hi; ++i) {
                 Layer S;
                 S.index = i; S.swa = m->layers_[i].swa; S.rope = false;
-                m->ink_slots_.push_back(S);
+                m->loop_slots_.push_back(S);
             }
     }
 
@@ -2345,7 +2344,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     m->n_free_ = m->max_ctx_;
     // Several conversations in one step: a DeltaNet layer runs once per conversation, so the graph has more nodes.
     if (hp.hybrid && n_seq > 1) m->graph_size_ = 16384 + n_seq * hp.n_layer * 48;
-    if (hp.ink) m->graph_size_ = 32768 + (hp.n_layer + (int)m->ink_slots_.size()) * (256 + n_seq * 64);   // (Inkling 2: many small ops a layer)
+    if (hp.ink) m->graph_size_ = 32768 + (hp.n_layer + (int)m->loop_slots_.size()) * (256 + n_seq * 64);   // (Inkling 2: many small ops a layer)
 
     // Fused flash attention reads the cache once, with no copies. TIERLM_NO_FA=1 uses the plain version.
     m->flash_attn_ = opt.flash_attn >= 0 ? opt.flash_attn == 1 : std::getenv("TIERLM_NO_FA") == nullptr;
@@ -2627,7 +2626,7 @@ void Model::clear_state(int s) {
 std::vector<ggml_tensor*> Model::ink_states_of(int s) const {
     std::vector<ggml_tensor*> v;
     for (const Layer& L : layers_) if (s < (int)L.ink_states.size()) v.push_back(L.ink_states[s]);
-    for (const Layer& L : ink_slots_) if (s < (int)L.ink_states.size()) v.push_back(L.ink_states[s]);
+    for (const Layer& L : loop_slots_) if (s < (int)L.ink_states.size()) v.push_back(L.ink_states[s]);
     return v;
 }
 
@@ -2853,7 +2852,7 @@ Model::Snapshot Model::save() const {
     };
     for (const auto& L : layers_) layer(L, false);
     if (mtp_) layer(*mtp_, true);
-    for (const auto& L : ink_slots_) layer(L, false);
+    for (const auto& L : loop_slots_) layer(L, false);
     return s;
 }
 
@@ -2910,7 +2909,7 @@ void Model::restore(const Snapshot& s) {
     };
     for (const auto& L : layers_) layer(L, false);
     if (mtp_) layer(*mtp_, true);
-    for (const auto& L : ink_slots_) layer(L, false);
+    for (const auto& L : loop_slots_) layer(L, false);
     if (i != s.parts.size()) throw std::runtime_error("saved conversation doesn't match this model");
 }
 
@@ -2918,36 +2917,50 @@ const char* Model::kv_type() const { return ggml_type_name((ggml_type)kv_t_); }
 
 bool Model::draft_ok() const {
     if (!qsa_.empty() || hp_.mamba) return false;                  // (Flash-Next's indexer keys, Mamba: not yet)
-    for (const Layer& L : layers_) if (!L.ple_states.empty() || !L.ink_states.empty()) return false;
+    for (const Layer& L : layers_) if (!L.ple_states.empty()) return false;
     return true;
 }
 
 bool Model::draft_mark() {
     std::lock_guard<std::recursive_mutex> dev_lock(device_mutex());
     if (!draft_ok()) return false;
-    if (draft_keep_.empty() && hp_.hybrid) {                       // the copies, made once, beside the originals
+    if (draft_keep_.empty() && (hp_.hybrid || hp_.ink)) {          // the copies, made once, beside the originals
+        // (DeltaNet layers: their memory and convolution inputs; Inkling 2: the convolutions' inputs, every layer and
+        // loop pass, of every conversation; draft_pass_: the pass each belongs to, so a guess copies only the ones its
+        // passes write)
         std::map<ggml_backend_buffer_type_t, std::vector<std::pair<ggml_tensor*, ggml_tensor*>>> by;
+        std::map<ggml_backend_buffer_type_t, std::vector<int>> pass_of;
         std::map<ggml_backend_buffer_type_t, ggml_context*> ctxs;
-        for (const Layer& L : layers_)
-            for (ggml_tensor* t : {L.ssm_state_t, L.conv_state}) {
-                if (!t || !t->buffer) continue;
-                ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(t->buffer);
-                if (!ctxs.count(bt)) {
-                    ggml_init_params ip{ ggml_tensor_overhead() * 2 * layers_.size() + 1024, nullptr, true };
-                    ctxs[bt] = ggml_init(ip);
-                }
-                by[bt].push_back({t, ggml_dup_tensor(ctxs[bt], t)});
+        const size_t n_t = 2 * (layers_.size() + loop_slots_.size()) * (size_t)std::max<size_t>(1, n_seq_max());
+        auto keep = [&](ggml_tensor* t, int pass) {
+            if (!t || !t->buffer) return;
+            ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(t->buffer);
+            if (!ctxs.count(bt)) {
+                ggml_init_params ip{ ggml_tensor_overhead() * n_t + 1024, nullptr, true };
+                ctxs[bt] = ggml_init(ip);
             }
+            by[bt].push_back({t, ggml_dup_tensor(ctxs[bt], t)});
+            pass_of[bt].push_back(pass);
+        };
+        for (const Layer& L : layers_) {
+            keep(L.ssm_state_t, 0); keep(L.conv_state, 0);
+            for (ggml_tensor* t : L.ink_states) keep(t, 0);
+        }
+        for (size_t i = 0; i < loop_slots_.size(); ++i)
+            for (ggml_tensor* t : loop_slots_[i].ink_states) keep(t, 1 + (int)(i / (size_t)std::max(1, hp_.loop_n())));
         for (auto& [bt, ctx] : ctxs) {
             ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx, bt);
             if (!b) { for (auto& [b2, c2] : ctxs) ggml_free(c2); for (auto bb : draft_buf_) ggml_backend_buffer_free(bb); draft_buf_.clear(); return false; }
             draft_buf_.push_back(b); draft_ctx_.push_back(ctx);
             for (auto& pr : by[bt]) draft_keep_.push_back(pr);
+            for (int p : pass_of[bt]) draft_pass_.push_back(p);
         }
     }
     release_pending();
     draft_pos_ = n_past_;
-    for (auto& [orig, copy] : draft_keep_) ggml_backend_tensor_copy(orig, copy);
+    draft_passes_ = loop_draft_ > 0 ? loop_draft_ : hp_.loop_passes;
+    for (size_t i = 0; i < draft_keep_.size(); ++i)
+        if (draft_pass_[i] < draft_passes_) ggml_backend_tensor_copy(draft_keep_[i].first, draft_keep_[i].second);
     return true;
 }
 
@@ -2960,7 +2973,8 @@ void Model::draft_rewind() {
         free_cells_from(0, n_past_);
         rope_truncate(0, n_past_);
     }
-    for (auto& [orig, copy] : draft_keep_) ggml_backend_tensor_copy(copy, orig);
+    for (size_t i = 0; i < draft_keep_.size(); ++i)
+        if (draft_pass_[i] < draft_passes_) ggml_backend_tensor_copy(draft_keep_[i].second, draft_keep_[i].first);
     draft_pos_ = -1;
 }
 
@@ -3630,11 +3644,11 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             if (L.gate_inp_s) sh = ggml_mul(c, sh, ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h)));   // gate: [1, n_tok]
             return sh;
         };
-        // Inkling 2's loop layers: their RAM experts are never handed to the GPU. ggml keeps one GPU copy of a weight for
+        // A loop's layers (Inkling 2's): their RAM experts are never handed to the GPU. ggml keeps one GPU copy of a weight for
         // the whole step, and the loop reads a layer's experts again two and three passes later, so every loop layer's
         // RAM experts would be in VRAM at once: 7.9 GB of working memory on an 8 GB RTX 3070 Laptop with the busiest
         // experts in VRAM, 6.1 GB with all experts in RAM. Layers outside the loop are read once and handed over as usual.
-        const bool in_loop = hp.ink && hp.ink_loop_passes > 1 && L.index >= hp.ink_loop_lo && L.index < hp.ink_loop_hi;
+        const bool in_loop = hp.looped() && L.index >= hp.loop_lo && L.index < hp.loop_hi;
         if (L.map_hot) {
             // Hot-expert split: each pick is computed by the part that holds it (VRAM or RAM); in the other part it
             // goes to the all-zero expert with weight 0, so it adds nothing. The sum is the same as unsplit.
@@ -4648,8 +4662,9 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
         }
         tag(li);
     };
-    const bool loop = hp.ink_loop_passes > 1;
-    const int lo = loop ? hp.ink_loop_lo : hp.n_layer, hi = loop ? hp.ink_loop_hi : hp.n_layer;
+    const bool loop = hp.loop_passes > 1;
+    const int lo = loop ? hp.loop_lo : hp.n_layer, hi = loop ? hp.loop_hi : hp.n_layer;
+    const int passes = loop_draft_ > 0 ? loop_draft_ : hp.loop_passes;   // (guessing ahead: fewer, see set_loop_draft)
     // A loop layer's four message queries [H, 4]: for its q, k, v and experts' input. The earlier layout keeps all the
     // layers' in two tensors of the whole model, [H, 2 per loop layer] each: the first holds layer i's q and experts'
     // queries (columns 2i and 2i + 1), the second its k and v queries.
@@ -4668,7 +4683,7 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
     if (loop) {
         ggml_tensor* pre = x;
         const std::vector<ggml_tensor*> pre_blocks = blocks;
-        for (int p = 0; p < hp.ink_loop_passes; ++p) {
+        for (int p = 0; p < passes; ++p) {
             std::vector<ggml_tensor*> bank;                                   // the previous pass: its later blocks...
             ggml_tensor* bank_out = nullptr;                                  // ...and its output
             if (p > 0) {
@@ -4678,7 +4693,7 @@ ggml_tensor* Model::ink_layers(ggml_context* c, Graph& g, ggml_tensor* x, int n_
                 blocks = pre_blocks;
             }
             for (int li = lo; li < hi; ++li)
-                layer(li, ink_slot(li, p), p > 0 ? mix(bank, bank_out, msgq(li), 4) : nullptr);
+                layer(li, loop_slot(li, p), p > 0 ? mix(bank, bank_out, msgq(li), 4) : nullptr);
         }
     }
     for (int li = hi; li < hp.n_layer; ++li) layer(li, layers_[li], nullptr);
@@ -5405,9 +5420,13 @@ std::vector<float> Model::eval_batch(const int32_t* ids, int n_tok, int n_thread
 // each layer's part on the device that computes the layer (layer_dev_), one buffer per device. Cleared to zero.
 void Model::make_kv(int ctx, int n_seq) {
     const Hparams& hp = hp_;
+    // (guessing ahead's copies of the running memories: made again for the new ones, see draft_mark)
+    for (auto* b : draft_buf_) ggml_backend_buffer_free(b);
+    for (ggml_context* dc : draft_ctx_) ggml_free(dc);
+    draft_buf_.clear(); draft_ctx_.clear(); draft_keep_.clear(); draft_pass_.clear();
     const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), G = (int)gpus_.size(), hd = hp.head_dim;
     const ggml_type kv_type = (ggml_type)kv_t_;
-    ggml_init_params kp{ (size_t)(hp.dsv4 ? 8 : 3) * (nl_all + ink_slots_.size()) * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
+    ggml_init_params kp{ (size_t)(hp.dsv4 ? 8 : 3) * (nl_all + loop_slots_.size()) * n_seq * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     kvctx_ = ggml_init(kp);
     std::vector<std::vector<ggml_tensor*>> kv_t(G + 1);              // per GPU, then RAM
     for (int i = 0; i < nl_all; ++i) {
@@ -5474,7 +5493,7 @@ void Model::make_kv(int ctx, int n_seq) {
             dst.push_back(L.qsa_kc);
         }
     }
-    for (Layer& S : ink_slots_) {                                     // Inkling 2: the loop layers' later passes
+    for (Layer& S : loop_slots_) {                                     // Inkling 2: the loop layers' later passes
         const int i = S.index;
         auto& dst = kv_t[layer_dev_[i] >= 0 ? layer_dev_[i] : G];
         S.ink_states.clear();
@@ -5522,7 +5541,7 @@ size_t Model::kv_bytes_per_token(size_t* in_vram) const {
         all += b;
         if (layer_dev_[i] >= 0) vram += b;
     }
-    for (const Layer& S : ink_slots_) {                            // Inkling 2: the loop's later passes
+    for (const Layer& S : loop_slots_) {                            // Inkling 2: the loop's later passes
         if (!S.k_cache || ringed(S)) continue;
         const size_t b = S.k_cache->nb[2] + S.v_cache->nb[2];
         all += b;
@@ -5556,11 +5575,11 @@ void Model::resize_ctx(int new_ctx) {
     const int nl_all = hp.n_layer + (mtp_ ? 1 : 0), n_seq = n_seq_max();
     // 1. what to keep, in RAM
     struct Kept { std::vector<uint8_t> k, v; std::vector<std::vector<uint8_t>> conv, ssm, ple, ink; };
-    const int n_all = nl_all + (int)ink_slots_.size();          // (Inkling 2: the loop's later passes after the rest)
+    const int n_all = nl_all + (int)loop_slots_.size();          // (Inkling 2: the loop's later passes after the rest)
     std::vector<Kept> kept(n_all);
     auto get = [](ggml_tensor* t, size_t bytes) { std::vector<uint8_t> d(bytes); if (bytes) ggml_backend_tensor_get(t, d.data(), 0, bytes); return d; };
     for (int i = 0; i < n_all; ++i) {
-        auto& L = i < hp.n_layer ? layers_[i] : i < nl_all ? *mtp_ : ink_slots_[i - nl_all];
+        auto& L = i < hp.n_layer ? layers_[i] : i < nl_all ? *mtp_ : loop_slots_[i - nl_all];
         for (ggml_tensor* t : L.ple_states) kept[i].ple.push_back(get(t, ggml_nbytes(t)));
         for (ggml_tensor* t : L.ink_states) kept[i].ink.push_back(get(t, ggml_nbytes(t)));
         if (L.d4_win) {                                           // DeepSeek V4: rings whole, entries up to hi_
@@ -5593,7 +5612,7 @@ void Model::resize_ctx(int new_ctx) {
     }
     // 3. back in
     for (int i = 0; i < n_all; ++i) {
-        auto& L = i < hp.n_layer ? layers_[i] : i < nl_all ? *mtp_ : ink_slots_[i - nl_all];
+        auto& L = i < hp.n_layer ? layers_[i] : i < nl_all ? *mtp_ : loop_slots_[i - nl_all];
         for (size_t s = 0; s < L.ple_states.size() && s < kept[i].ple.size(); ++s)
             ggml_backend_tensor_set(L.ple_states[s], kept[i].ple[s].data(), 0, kept[i].ple[s].size());
         for (size_t s = 0; s < L.ink_states.size() && s < kept[i].ink.size(); ++s)
@@ -5899,7 +5918,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     // (a prompt batch; see Plan and check_main_), so check after check runs the same graph again.
     const bool plan = reuse_on && check_main_ && snapshots > 1 && !groups && !any_image && !hp.dsv4;
     stream_on_ = !plan && !groups && stream_ready(n_tok);
-    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_, qsa_gpu_, n_kv_swa};
+    const ReuseKey key{n_kv, routing != nullptr, n_logits, qsa_long_, want_hidden, n_tok, snapshots, hot_only_, qsa_gpu_, n_kv_swa, loop_draft_};
     const bool reuse = plan ? check_.g.ctx && key == check_.key : cacheable && reuse_.ctx && key == reuse_key_;
     ggml_backend_sched* const sc = sched_;
     Graph built;

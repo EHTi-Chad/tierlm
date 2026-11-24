@@ -220,6 +220,21 @@ def ref_logits(m, ids):
     with torch.no_grad():
         return m(torch.tensor([ids])).logits[0, -1].double().numpy()
 
+def self_draft(exe, name, path, ids, env):
+    """Guessing ahead with the model itself, one or two passes of the loop (since 0.9.5): the greedy reply must be the
+    same as without guesses, with scripted guesses wrong every 3rd token as well (undo at every depth)."""
+    def gen(mode, extra):
+        r = subprocess.run([exe, path, mode, "60", *map(str, ids)], capture_output=True, text=True, env={**os.environ, **env, **extra})
+        if r.returncode != 0: sys.exit(f"{name}: tierlm-logits {mode} failed: {r.stderr.strip()[-3000:]}")
+        return r.stdout.split(), r.stderr.strip().splitlines()[-1] if r.stderr.strip() else ""
+    plain, _ = gen("--gen", {})
+    checks = [gen("--gen-spec", {"TIERLM_SELF_DRAFT": "1", "TIERLM_LOOP_DRAFT": p}) for p in ("1", "2")]
+    checks += [gen("--gen-spec", {"TIERLM_DRAFT_SCRIPT": ",".join(plain), "TIERLM_DRAFT_CORRUPT": "3"})]
+    same = all(c[0] == plain for c in checks)
+    print(f"{name:9s} selfdraft: greedy output with its own guesses {'identical' if same else 'DIFFERENT'} "
+          f"({'; '.join(c[1] for c in checks)})  ->  {'ok' if same else 'FAIL'}", flush=True)
+    return same
+
 if __name__ == "__main__":
     exe = sys.argv[1]
     only = sys.argv[2:]
@@ -255,6 +270,9 @@ if __name__ == "__main__":
                 ok &= passed
                 print(f"{name:9s} {split:7s} {frac:4.2f} {'busiest' if hot == '1' else hot or '':7s}: typical relative diff {mid:.1e}, worst {worst:.1e}"
                       f"  ->  {'ok' if passed else 'FAIL'}  [{place.split(': ', 1)[-1]}]", flush=True)
+            if not real:                                                # (guesses with one pass and the VRAM experts only)
+                ok &= self_draft(exe, name, path, tests[2], {"TIERLM_KV_F32": "1", "TIERLM_SPLIT": "experts", "TIERLM_HOT": "1",
+                                                             "TIERLM_VRAM_BYTES": str(int(size * 0.4))})
             os.remove(path)
             continue
         for label, env, tol in (("exact", {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"}, 6e-2 if real else 1e-3), ("normal", {}, 6e-2),
@@ -292,5 +310,6 @@ if __name__ == "__main__":
                 passed = worst < tol and top
                 print(f"{name:9s} {label:7s}: worst relative diff {worst:.1e} (limit {tol:.0e}), top token matches: {top}  ->  {'ok' if passed else 'FAIL'}")
             ok &= passed
+        if name != "earlier-q": ok &= self_draft(exe, name, path, tests[2], {"TIERLM_KV_F32": "1", "TIERLM_DEVICE": "cpu"})
         os.remove(path)
     sys.exit(0 if ok else 1)

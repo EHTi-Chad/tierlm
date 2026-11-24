@@ -101,7 +101,18 @@ float Speculator::prob_of(const std::vector<std::pair<int32_t, float>>& w, int32
 }
 
 bool Speculator::self_draft_ok() const {
-    return m_.has_split_experts() && m_.draft_ok();
+    return (m_.has_split_experts() || m_.hparams().looped()) && m_.draft_ok();
+}
+
+// Guessing with the model itself: what's cut. Experts split between VRAM and RAM: only the VRAM ones (set_hot_only).
+// A looped model: one pass of its loop instead of all (set_loop_draft). Both when both apply.
+// TIERLM_LOOP_DRAFT=n (tests): n passes; TIERLM_LOOP_DRAFT_HOT=0: a looped model's guesses with all its experts.
+static void self_cut(Model& m, bool on) {
+    static const int passes = [] { const char* e = std::getenv("TIERLM_LOOP_DRAFT"); return e ? std::max(1, std::atoi(e)) : 1; }();
+    static const bool loop_hot = [] { const char* e = std::getenv("TIERLM_LOOP_DRAFT_HOT"); return !e || std::atoi(e) != 0; }();
+    const bool looped = m.hparams().looped();
+    m.set_hot_only(on && m.has_split_experts() && (!looped || loop_hot));
+    m.set_loop_draft(on && looped ? passes : 0);
 }
 
 std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& sample, const std::function<bool(int32_t)>& stop,
@@ -159,9 +170,10 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
     } else if (((m_.has_mtp() && h_pos_ == P - 1) || self_used) && n_max > 0) {
         int32_t tok = x;
         std::vector<float> h = h_last_, hn;
+        if (self_used) self_cut(m_, true);                // (first: the mark copies only what the cut model writes)
         const bool marked = self_used && m_.draft_mark();
+        if (self_used && !marked) self_cut(m_, false);
         const int lim = self_used && !marked ? 0 : n_max;
-        if (marked) m_.set_hot_only(true);
         for (int i = 0; i < lim; ++i) {
             std::vector<float> lg = self_used ? m_.eval_ex(&tok, 1, n_threads, 1, false, 1).logits
                                               : m_.mtp_eval(&tok, h.data(), 1, P + i, n_threads, &hn);
@@ -198,7 +210,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
             tok = d;
             h.swap(hn);
         }
-        if (marked) { m_.set_hot_only(false); m_.draft_rewind(); }   // back to x's place (the check writes it all again)
+        if (marked) { m_.draft_rewind(); self_cut(m_, false); }      // back to x's place (the check writes it all again)
         // (adaptive, timed: the many when every one of them pays, else the few)
         if (adapt && ad_n_ >= 8 && n_max == n_many && (int)drafts.size() < n_many && (int)drafts.size() > n_few &&
             !(std::find_if(drafts.begin(), drafts.end(), stop) != drafts.end())) {

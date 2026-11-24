@@ -1075,6 +1075,8 @@ json describe_model(const std::string& path, bool header_only = false) {
     // put in VRAM. The context estimates below go by visits, as each pass keeps its own cache.)
     if (const int64_t passes = u32(arch + ".num_loops"); arch == "inkling2" && passes > 1)
         j["layers"] = layers - (passes - 1) * (u32(arch + ".loop.core_end") - u32(arch + ".loop.core_start"));
+    // A looped model (some layers run several times a token): it can guess ahead with one pass of its loop
+    if (std::max(u32(arch + ".num_loops"), u32(arch + ".loop.count")) > 1) j["looped"] = true;
     j["experts"] = u32(arch + ".expert_count");
     j["experts_used"] = u32(arch + ".expert_used_count");
     j["ctx_train"] = u32(arch + ".context_length");
@@ -1213,6 +1215,7 @@ json describe_model(const std::string& path, bool header_only = false) {
     // Guessing ahead with the model itself, cut down to its experts in VRAM, for MoE models without a draft layer
     // (whether it can be used depends on the load: experts split between VRAM and RAM; see Speculator::self_draft).
     if (j.value("experts", 0) > 0 && !j.value("mtp", false) && arch != "nemotron_h_moe" && arch != "qwen4exp") j["self_draft"] = true;
+    if (j.value("looped", false) && !j.value("mtp", false)) j["self_draft"] = true;   // (or with one pass of its loop)
     gguf_free(g);
     return j;
 }
@@ -2159,7 +2162,7 @@ int main(int argc, char** argv) {
             {"think_switch", eng.think_switch}, {"thinking", eng.thinking}, {"reasoning_effort", eng.chat == ChatFmt::Harmony ? eng.effort : std::string()},
             {"vision_device", eng.vision ? eng.vision->device_name() : std::string()}, {"image_tokens", eng.image_tokens_for(0)},
             {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}, {"lookup_setting", eng.lookup}, {"has_draft_block", hp.n_nextn > 0},
-            {"mtp_loaded", eng.model->has_mtp()}, {"self_draft", !eng.model->has_mtp() && eng.can_guess()}, {"ffn_vram", eng.model->placement().ffn_vram},
+            {"mtp_loaded", eng.model->has_mtp()}, {"self_draft", !eng.model->has_mtp() && eng.can_guess()}, {"looped", eng.model->hparams().looped()}, {"ffn_vram", eng.model->placement().ffn_vram},
             {"hot_experts", eng.model->placement().hot_experts}, {"hot_share", eng.hot_share}, {"hot", eng.model->placement().hot},
             {"live_experts", eng.model->live_hot()},
             {"ssd_weights", eng.model->placement().ssd_weights}, {"ssd_layers", eng.model->placement().ssd_layers}, {"ssd_ngram", eng.model->placement().ssd_ngram},
@@ -4279,7 +4282,7 @@ int main(int argc, char** argv) {
             res.status = 409;
             res.set_content(dump({{"error", eng.model->hparams().n_nextn > 0
                 ? "this model was loaded without its draft layer: turn on Speculative decoding on the setup screen and load it again"
-                : "this model has no draft layer, and guessing with its experts in VRAM needs them split between VRAM and RAM"}}), "application/json; charset=utf-8");
+                : "this model has no draft layer, and guessing with its experts in VRAM needs them split between VRAM and RAM (or a looped model)"}}), "application/json; charset=utf-8");
             return;
         }
         eng.draft_max = d;

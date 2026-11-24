@@ -84,14 +84,19 @@ struct Hparams {
     // the padded vocabulary (output rows past n_vocab_real) dropped. The loop: layers [loop_lo, loop_hi) run
     // loop_passes times, each later pass from the same input, with messages from the previous pass (its last blocks
     // and output, mixed by 4 learned queries per layer) mixed into the queries', keys', values' and experts' inputs
-    // through low-rank gates; each pass keeps its own cache (see Model::ink_slots_).
+    // through low-rank gates; each pass keeps its own cache (see Model::loop_slots_).
     bool ink = false;
     int ink_conv = 0, ink_rel_dim = 0, ink_rel_extent = 0, ink_res_block = 0, ink_log_floor = 0;
     float ink_qk_clip = 0, ink_rel_clip = 0, ink_log_alpha = 0, situ_beta = 0, situ_lbeta = 0;
-    int ink_loop_lo = 0, ink_loop_hi = 0, ink_loop_passes = 1, ink_loop_rank = 0;
+    int ink_loop_rank = 0;
     bool ink_earlier = false;                 // the earlier layout of a looped file (arch "inkling2" with num_loops)
     int n_vocab_real = 0;             // logits kept (0: all the output rows); Inkling 2 pads its tables past it
-    int ink_loop_n() const { return ink_loop_hi - ink_loop_lo; }
+    // A looped model (Inkling 2, and the looped layouts coming after it): layers [loop_lo, loop_hi) run loop_passes
+    // times a token, each pass with its own cache (Model::loop_slots_); the layers after them read the last pass.
+    // Guessing ahead with the model itself can run fewer passes (Model::set_loop_draft).
+    int loop_lo = 0, loop_hi = 0, loop_passes = 1;
+    int loop_n() const { return loop_hi - loop_lo; }
+    bool looped() const { return loop_passes > 1 && loop_hi > loop_lo; }
     // The convolutions' saved inputs per layer: keys, values (head width x key/value heads each), both outputs
     int ink_conv_ch(int il) const { return 2 * hd_at(il) * kvh_at(il) + 2 * n_embd; }
     int hd_at(int il) const { return il >= 0 && il < (int)hd_l.size() && hd_l[il] ? hd_l[il] : head_dim; }
@@ -381,6 +386,12 @@ public:
     // the router's picks that are in VRAM (their weights scaled up to the picks' whole weight) and skips the RAM part,
     // so a step runs on the GPU alone. An approximation of the model, for guesses that the whole model then checks.
     void set_hot_only(bool on) { hot_only_ = on; }
+    // A looped model guessing ahead with itself: while on (n > 0), its loop layers run n passes instead of all of them
+    // (the layers after the loop read the last pass that ran). The first pass of each loop layer is the same as the
+    // whole model's, so the guesses come from the model's own first thoughts, at a fraction of a step's work; the
+    // later passes' caches aren't touched, and the check writes every place the guesses wrote. 0: all passes.
+    void set_loop_draft(int n) { loop_draft_ = hp_.looped() ? std::max(0, std::min(n, hp_.loop_passes - 1)) : 0; }
+    int loop_draft() const { return loop_draft_; }
     // Guessing with the model itself writes its own memory: draft_mark() remembers where the conversation is (and
     // copies the running memories of DeltaNet layers, which can't be rewound otherwise, next to them in the same
     // memory), draft_rewind() puts it back there. False if this model has memory that can't be put back this way.
@@ -695,8 +706,8 @@ private:
     std::set<const ggml_tensor*> ink_fold_id_, ink_fold_sc_;
     // Inkling 2's loop: the caches of the loop layers' later passes, pass p >= 1 of layer i at
     // (p - 1) * (loop_hi - loop_lo) + i - loop_lo. Each holds only its own cache (index: the layer it repeats).
-    std::vector<Layer> ink_slots_;
-    Layer& ink_slot(int li, int pass) { return pass == 0 ? layers_[li] : ink_slots_[(size_t)(pass - 1) * hp_.ink_loop_n() + li - hp_.ink_loop_lo]; }
+    std::vector<Layer> loop_slots_;
+    Layer& loop_slot(int li, int pass) { return pass == 0 ? layers_[li] : loop_slots_[(size_t)(pass - 1) * hp_.loop_n() + li - hp_.loop_lo]; }
     ggml_tensor *ple_embd_ = nullptr;            // Flash-Next: the PLE n-gram table [ple_dim, rows]
     ggml_tensor *out_hc_norm_ = nullptr, *out_hc_down_ = nullptr, *out_hc_up_ = nullptr;   // the last stream mixer
     ggml_tensor *d4_out_fn_ = nullptr, *d4_out_base_ = nullptr, *d4_out_scale_ = nullptr;  // DeepSeek V4: the last stream mixer
@@ -756,9 +767,9 @@ private:
     // a reply's one-token graph, kept to run again (see step)
     struct ReuseKey {
         int n_kv = 0; bool routing = false; int n_logits = 0; bool qsa_long = false; bool hidden = false;
-        int n_tok = 1, snapshots = 1; bool hot_only = false, qsa_gpu = false; int n_kv_swa = 0;
+        int n_tok = 1, snapshots = 1; bool hot_only = false, qsa_gpu = false; int n_kv_swa = 0, loop_draft = 0;
         bool operator==(const ReuseKey& o) const {
-            return n_kv == o.n_kv && n_kv_swa == o.n_kv_swa && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden &&
+            return loop_draft == o.loop_draft && n_kv == o.n_kv && n_kv_swa == o.n_kv_swa && routing == o.routing && n_logits == o.n_logits && qsa_long == o.qsa_long && hidden == o.hidden &&
                    n_tok == o.n_tok && snapshots == o.snapshots && hot_only == o.hot_only && qsa_gpu == o.qsa_gpu;
         }
     };
@@ -793,9 +804,12 @@ private:
     void drop_plan(Plan& p);
     void drop_plans();                                             // reuse_ and both plans (the cache changes size)
     bool overlap_ = true;                                          // CPU and GPU at once on split expert layers
+    int loop_draft_ = 0;                                           // set_loop_draft: passes a guess runs (0: all)
     bool hot_only_ = false;                                        // set_hot_only: only the experts in VRAM
     int draft_pos_ = -1;                                           // draft_mark: where the conversation was
     std::vector<std::pair<ggml_tensor*, ggml_tensor*>> draft_keep_; // (a running memory, its copy)
+    std::vector<int> draft_pass_;                                  // (the loop pass each belongs to: 0 outside a loop)
+    int draft_passes_ = 1;                                         // draft_mark: the passes the guesses run
     std::vector<ggml_context*> draft_ctx_;
     std::vector<struct ggml_backend_buffer*> draft_buf_;
     float cold_skip_ = 0.0f;                                       // TIERLM_COLD_SKIP (see the split expert layers)
