@@ -234,6 +234,73 @@ index ab82e3d6..a804be3f 100644
      }
  
  #ifdef GGML_USE_OPENMP
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 7a73e138..f29bd9bd 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -11413,8 +11413,8 @@ void ggml_compute_forward_gated_delta_net(
+ 
+ // ggml_compute_forward_dsv4_hc_comb
+ 
++template <int64_t hc>
+ static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {
+-    constexpr int64_t hc = 4;
+ 
+     for (int64_t idst = 0; idst < hc; ++idst) {
+         float sum = eps;
+@@ -11429,8 +11429,8 @@ static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {
+     }
+ }
+ 
++template <int64_t hc>
+ static void ggml_dsv4_hc_comb_norm_rows(float * comb, float eps) {
+-    constexpr int64_t hc = 4;
+ 
+     for (int64_t isrc = 0; isrc < hc; ++isrc) {
+         float sum = eps;
+@@ -11445,6 +11445,7 @@ static void ggml_dsv4_hc_comb_norm_rows(float * comb, float eps) {
+     }
+ }
+ 
++template <int64_t hc>
+ static void ggml_compute_forward_dsv4_hc_comb_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -11457,7 +11458,6 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
+     GGML_ASSERT(base->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+ 
+-    constexpr int64_t hc = 4;
+     constexpr int64_t comb_offset = 2*hc;
+     constexpr int64_t hc_mix_dim = (2 + hc)*hc;
+ 
+@@ -11517,10 +11517,10 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
+             }
+         }
+ 
+-        ggml_dsv4_hc_comb_norm_cols(comb, eps);
++        ggml_dsv4_hc_comb_norm_cols<hc>(comb, eps);
+         for (int32_t i = 1; i < n_iter; ++i) {
+-            ggml_dsv4_hc_comb_norm_rows(comb, eps);
+-            ggml_dsv4_hc_comb_norm_cols(comb, eps);
++            ggml_dsv4_hc_comb_norm_rows<hc>(comb, eps);
++            ggml_dsv4_hc_comb_norm_cols<hc>(comb, eps);
+         }
+ 
+         for (int64_t isrc = 0; isrc < hc; ++isrc) {
+@@ -11540,7 +11540,11 @@ void ggml_compute_forward_dsv4_hc_comb(
+     switch (src0->type) {
+         case GGML_TYPE_F32:
+             {
+-                ggml_compute_forward_dsv4_hc_comb_f32(params, dst);
++                if (src0->ne[0] == (2 + 2)*2) {
++                    ggml_compute_forward_dsv4_hc_comb_f32<2>(params, dst); // tierlm: 2 streams
++                } else {
++                    ggml_compute_forward_dsv4_hc_comb_f32<4>(params, dst);
++                }
+             } break;
+         default:
+             {
 diff --git a/src/ggml-cpu/repack.cpp b/src/ggml-cpu/repack.cpp
 index 2632ae3a..3f5f71a7 100644
 --- a/src/ggml-cpu/repack.cpp
@@ -252,6 +319,127 @@ index 2632ae3a..3f5f71a7 100644
  
                      MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
                      matrix_row_counts[i02] += 1;
+diff --git a/src/ggml-cuda/dsv4-hc.cu b/src/ggml-cuda/dsv4-hc.cu
+index ca1d2dc8..45927d41 100644
+--- a/src/ggml-cuda/dsv4-hc.cu
++++ b/src/ggml-cuda/dsv4-hc.cu
+@@ -2,9 +2,10 @@
+ #include "dsv4-hc.cuh"
+ 
+ 
+-static constexpr int DSV4_HC = 4;
++// (tierlm: the stream mixer for 2 streams too, as a template parameter; pre and post take any count)
+ 
+ 
++template <int DSV4_HC>
+ static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
+     for (int idst = 0; idst < DSV4_HC; ++idst) {
+         float sum = eps;
+@@ -19,6 +20,7 @@ static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
+     }
+ }
+ 
++template <int DSV4_HC>
+ static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
+     for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+         float sum = eps;
+@@ -33,6 +35,7 @@ static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
+     }
+ }
+ 
++template <int DSV4_HC>
+ static __global__ void dsv4_hc_comb_f32(
+         const float * mixes,
+         const float * scale,
+@@ -86,10 +89,10 @@ static __global__ void dsv4_hc_comb_f32(
+         }
+     }
+ 
+-    dsv4_hc_comb_norm_cols(comb, eps);
++    dsv4_hc_comb_norm_cols<DSV4_HC>(comb, eps);
+     for (int32_t i = 1; i < n_iter; ++i) {
+-        dsv4_hc_comb_norm_rows(comb, eps);
+-        dsv4_hc_comb_norm_cols(comb, eps);
++        dsv4_hc_comb_norm_rows<DSV4_HC>(comb, eps);
++        dsv4_hc_comb_norm_cols<DSV4_HC>(comb, eps);
+     }
+ 
+     for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+@@ -194,7 +197,8 @@ static __global__ void dsv4_hc_post_f32(
+     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+ }
+ 
+-void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++template <int DSV4_HC>
++static void dsv4_hc_comb_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * mixes = dst->src[0];
+     const ggml_tensor * scale = dst->src[1];
+     const ggml_tensor * base  = dst->src[2];
+@@ -227,7 +231,7 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+     const dim3 grid_dims((n_tokens + block_size - 1) / block_size, 1, 1);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+ 
+-    ggml_cuda_kernel_launch(dsv4_hc_comb_f32, launch_params,
++    ggml_cuda_kernel_launch(dsv4_hc_comb_f32<DSV4_HC>, launch_params,
+             (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
+             n_tokens,
+             nbm0 / sizeof(float), nbm1 / sizeof(float),
+@@ -237,6 +241,14 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+             eps, n_iter);
+ }
+ 
++void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->src[0]->ne[0] == (2 + 2)*2) {
++        dsv4_hc_comb_launch<2>(ctx, dst);
++    } else {
++        dsv4_hc_comb_launch<4>(ctx, dst);
++    }
++}
++
+ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * x       = dst->src[0];
+     const ggml_tensor * weights = dst->src[1];
+diff --git a/src/ggml-sycl/ggml-sycl.cpp b/src/ggml-sycl/ggml-sycl.cpp
+index 6759af0e..d3a46562 100644
+--- a/src/ggml-sycl/ggml-sycl.cpp
++++ b/src/ggml-sycl/ggml-sycl.cpp
+@@ -6920,7 +6920,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                 op->type == GGML_TYPE_F32;
+         case GGML_OP_DSV4_HC_COMB:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+-                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
++                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                op->src[0]->ne[0] == 24; // (tierlm: ggml takes 2 streams too; this backend's kernel is for 4)
+         case GGML_OP_DSV4_HC_POST:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 &&
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 436bfe3b..37b21256 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15889,7 +15889,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     return false;
+                 }
+                 if (op->op == GGML_OP_DSV4_HC_COMB) {
+-                    return device->pipeline_dsv4_hc_comb_f32 != nullptr;
++                    // (tierlm: ggml takes 2 streams too; the shader is for 4)
++                    return device->pipeline_dsv4_hc_comb_f32 != nullptr && op->src[0]->ne[0] == 24;
+                 }
+                 return true;
+             }
+diff --git a/src/ggml.c b/src/ggml.c
+index 01dc8d05..74d3a3bd 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -6502,7 +6502,7 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
+     }
+ 
+     GGML_ASSERT(hc > 0);
+-    GGML_ASSERT(hc == 4);
++    GGML_ASSERT(hc == 2 || hc == 4); // tierlm: 2 streams too (SenseNova-Loop's mHC)
+     GGML_ASSERT(mixes->ne[2] == 1);
+     GGML_ASSERT(mixes->ne[3] == 1);
+     GGML_ASSERT(scale->ne[0] >= 3);
 diff --git a/src/gguf.cpp b/src/gguf.cpp
 index 75ceade7..ff22569c 100644
 --- a/src/gguf.cpp

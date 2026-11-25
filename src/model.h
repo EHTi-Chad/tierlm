@@ -142,6 +142,17 @@ struct Hparams {
     // Qwen3.8 Flash-Next (qwen4exp): hyper-connections. The residual stream is hc copies of the width (4 x 2560),
     // mixed into one input for each block and added back to every copy with its own weight. hc = 0: one stream.
     int hc = 0;
+    // SenseNova-Loop (sensenova_loop): manifold-constrained hyper-connections (mHC) on layers [mhc_lo, mhc_hi): there
+    // the residual stream is mhc copies of the width (2), made at mhc_lo from the one stream and averaged back into one
+    // after mhc_hi - 1 (on every pass of a loop the range lies in). Before attention and before the MLP each layer reads
+    // all the copies, normed together, through a small router [2 mhc + mhc^2 outputs]: the block's input is the
+    // copies weighted by sigmoid(pre) (times mhc_pre_scale), and afterwards the copies are mixed by a matrix made
+    // doubly stochastic by mhc_iters Sinkhorn steps (or left as they are: mhc_fixed) and each gets the block's output
+    // times 2 sigmoid(post). mhc = 0: one stream.
+    int mhc = 0, mhc_lo = 0, mhc_hi = 0, mhc_iters = 20;
+    bool mhc_fixed = false;
+    float mhc_pre_scale = 1.0f;
+    bool sensenova = false;
     // The width of the hidden state the MTP draft block reads: the final-norm state (n_embd), or with
     // hyper-connections the hc copies before the last stream mixer (hc x n_embd).
     int hidden_width() const { return hc ? hc * n_embd : n_embd; }
@@ -582,6 +593,10 @@ private:
         // the width, low-rank mixing weights, and how much of the block's output each copy gets)...
         ggml_tensor *hc_a_norm = nullptr, *hc_a_down = nullptr, *hc_a_up = nullptr, *hc_a_inj = nullptr;
         ggml_tensor *hc_f_norm = nullptr, *hc_f_down = nullptr, *hc_f_up = nullptr, *hc_f_inj = nullptr;
+        // SenseNova-Loop: the mHC routers before attention and before the MLP (weight [mhc n_embd, 2 mhc + mhc^2], bias)
+        ggml_tensor *mhc_a_w = nullptr, *mhc_a_b = nullptr, *mhc_f_w = nullptr, *mhc_f_b = nullptr;
+        // DeltaNet's projections stored as one (newer conversions): [qkv rows | gate rows], [beta rows | alpha rows]
+        ggml_tensor *wqkv_z = nullptr, *ssm_beta_alpha = nullptr;
         // ...and the per-layer embedding (on the layers that have one), with its convolution's saved inputs per
         // conversation ([hc * n_embd, ple_state_len] each)
         ggml_tensor *ple_key = nullptr, *ple_value = nullptr, *ple_norm_key = nullptr, *ple_norm_query = nullptr;
@@ -839,7 +854,7 @@ private:
     void free_cells_from(int s, int n);          // conversation s keeps its first n positions
     int cells_end() const;                       // one past the highest cell in use
     void fill_masks(Graph& g, int n_kv, const std::vector<int>& tok_seq, const std::vector<int>& tok_pos);
-    std::vector<ggml_tensor*> ink_states_of(int s) const;   // Inkling 2: conversation s's convolution inputs, every layer and pass
+    std::vector<ggml_tensor*> loop_states_of(int s) const;   // conversation s: Inkling 2's convolution inputs (every layer and pass), a loop's later passes' running memories
     void clear_state(int s);
     void fill_ink_inputs(Graph& g, int n_kv, const std::vector<int>& tok_seq, const std::vector<int>& tok_pos);                     // DeltaNet memories of conversation s back to zero
     uint64_t weights_bytes_ = 0, kv_bytes_ = 0;

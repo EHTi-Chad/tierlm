@@ -1075,6 +1075,8 @@ json describe_model(const std::string& path, bool header_only = false) {
     // put in VRAM. The context estimates below go by visits, as each pass keeps its own cache.)
     if (const int64_t passes = u32(arch + ".num_loops"); arch == "inkling2" && passes > 1)
         j["layers"] = layers - (passes - 1) * (u32(arch + ".loop.core_end") - u32(arch + ".loop.core_start"));
+    if (const int64_t passes = u32(arch + ".loop.count"); arch == "sensenova_loop" && passes > 1)   // (the same layout)
+        j["layers"] = layers - (passes - 1) * (u32(arch + ".loop.end") - u32(arch + ".loop.start"));
     // A looped model (some layers run several times a token): it can guess ahead with one pass of its loop
     if (std::max(u32(arch + ".num_loops"), u32(arch + ".loop.count")) > 1) j["looped"] = true;
     j["experts"] = u32(arch + ".expert_count");
@@ -1106,7 +1108,7 @@ json describe_model(const std::string& path, bool header_only = false) {
     int64_t kv_layers = layers;
     // A multi-token-prediction (MTP) draft block, in the file or in a separate "mtp-" file next to it, makes
     // speculative decoding possible. A file that holds only a draft block is an add-on, not a model.
-    const bool mtp_arch = arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp";
+    const bool mtp_arch = arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp" || arch == "sensenova_loop";
     bool has_layer0 = false;                             // any layer-0 tensor (Flash-Next's layers have no attn_norm)
     for (int64_t k = 0; k < gguf_get_n_tensors(g) && !has_layer0; ++k) has_layer0 = std::strncmp(gguf_get_tensor_name(g, k), "blk.0.", 6) == 0;
     const bool draft_only = u32(arch + ".nextn_predict_layers") > 0 && !has_layer0;
@@ -1121,7 +1123,7 @@ json describe_model(const std::string& path, bool header_only = false) {
         const std::string comp = mtp_companion(path);
         if (!comp.empty()) { j["mtp"] = true; j["mtp_file"] = fs::u8path(comp).filename().u8string(); }
     }
-    if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp") {
+    if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp" || arch == "sensenova_loop") {
         const int64_t interval = u32(arch + ".full_attention_interval") ? u32(arch + ".full_attention_interval") : 4;
         kv_layers = layers / interval;
         j["hybrid"] = true;

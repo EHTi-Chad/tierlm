@@ -1,7 +1,7 @@
 # tierlm's changes to ggml, and what we learned about it
 
 tierlm runs on [ggml](https://github.com/ggml-org/ggml) (MIT license), the tensor library behind llama.cpp. We change
-very little of it: **about 145 lines in 5 files**, listed here in full so anyone can review them, reuse them, or offer them
+very little of it: **about 180 lines in 10 files**, listed here in full so anyone can review them, reuse them, or offer them
 upstream. This page also records three things about ggml that took us a while to find and that matter to anyone
 building on ggml directly rather than through llama.cpp.
 
@@ -17,6 +17,7 @@ building on ggml directly rather than through llama.cpp.
 | 3 | CPU and GPU at once, and fewer waits between them (opt-in) | `src/ggml-backend.cpp`, `include/ggml-backend.h` | +80 | A layer split between VRAM and RAM used to run its CPU half, then its GPU half; now both run together |
 | 4 | Optional time per op kind on the CPU | `src/ggml-cpu/ggml-cpu.c` | +27 | Shows which CPU ops a token's time goes to (`TIERLM_CPU_OP_TIMES=1`) |
 | 5 | The GGUF reader checks type numbers before treating them as types | `src/gguf.cpp` | +2 −2 | A damaged or hostile GGUF file no longer causes undefined behaviour while it is being refused |
+| 6 | The hyper-connection stream mixer takes 2 streams too | `src/ggml.c`, `src/ggml-cpu/ops.cpp`, `src/ggml-cuda/dsv4-hc.cu`, `src/ggml-vulkan/ggml-vulkan.cpp`, `src/ggml-sycl/ggml-sycl.cpp` | +34 −16 | SenseNova-Loop mixes 2 residual streams with the same Sinkhorn normalisation as DeepSeek V4's 4 |
 
 Nothing else in ggml is changed. tierlm also turns on one existing ggml build option (CUDA graphs, see Finding 1).
 
@@ -270,6 +271,36 @@ AddressSanitizer and UndefinedBehaviorSanitizer: 16 files tripped this, at the t
 caused a crash or a memory error with the GCC and Clang defaults (which don't rely on enum ranges), and every one was
 refused as invalid; with the change, the sanitizers report nothing for any of them. The one visible difference: the
 error for a bad tensor type now names the type as 43 (`GGML_TYPE_COUNT`) rather than the number in the file.
+
+---
+
+## Change 6: the hyper-connection stream mixer takes 2 streams too
+
+**What.** `ggml_dsv4_hc_comb` makes DeepSeek V4's stream-mixing matrix: a softmax, then alternating row and column
+normalisation (Sinkhorn), for each token. It asserted 4 streams, and its CPU and CUDA kernels had 4 built in. Now the
+stream count can be 2 or 4: both kernels take it as a template parameter, chosen from the input's width ((2 + hc) hc
+numbers a token: 8 or 24). The Vulkan and SYCL kernels are written for 4, so those backends now say they don't support
+2 streams, and the scheduler runs that op on the CPU there.
+
+```cpp
+// src/ggml.c, ggml_dsv4_hc_comb
+GGML_ASSERT(hc == 2 || hc == 4); // tierlm: 2 streams too (SenseNova-Loop's mHC)
+
+// src/ggml-cpu/ops.cpp (the CUDA launcher in dsv4-hc.cu does the same)
+if (src0->ne[0] == (2 + 2)*2) {
+    ggml_compute_forward_dsv4_hc_comb_f32<2>(params, dst);
+} else {
+    ggml_compute_forward_dsv4_hc_comb_f32<4>(params, dst);
+}
+```
+
+**Why.** SenseNova-Loop-9B keeps its residual stream as 2 copies in its looped layers (manifold-constrained
+hyper-connections) and mixes them, twice a layer and twice a pass, with a 2 x 2 matrix made by 20 Sinkhorn steps. Done
+with ordinary ggml operations that is about a hundred tiny steps for each matrix; done on the CPU, a trip from the GPU
+and back for each of the 96 per token. The existing op does exactly SenseNova's normalisation (with its eps at 0, its
+scales at 1 and SenseNova's bias as its base: its "destination" axis is the column SenseNova normalises first), so it
+only needed to take 2 streams. `ggml_dsv4_hc_pre` and `ggml_dsv4_hc_post`, which read and write the streams, already
+took any count on the CPU and CUDA.
 
 ---
 

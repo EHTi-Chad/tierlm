@@ -23,7 +23,7 @@
 
 namespace tierlm {
 
-static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint", "deepseek2", "qwen4exp", "nemotron_h_moe", "deepseek4", "gemma3", "gemma4", "inkling2", "inkling2_loop" };
+static const char* kArchs[] = { "llama", "qwen2", "qwen3", "qwen3moe", "olmoe", "qwen35", "qwen35moe", "qwen3next", "gpt-oss", "flint", "deepseek2", "qwen4exp", "nemotron_h_moe", "deepseek4", "gemma3", "gemma4", "inkling2", "inkling2_loop", "sensenova_loop" };
 bool arch_supported(const std::string& arch) {
     for (const char* a : kArchs) if (arch == a) return true;
     return false;
@@ -843,7 +843,7 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         const int64_t id = gguf_find_key(g, (arch + ".expert_weights_norm").c_str());
         hp.expert_renorm = id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_BOOL && gguf_get_val_bool(g, id);
     }
-    if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp") {
+    if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen4exp" || arch == "sensenova_loop") {
         hp.hybrid = true;
         hp.gated_attn = true;
         // Qwen3-Next (Qwen3-Coder-Next) files keep the linear-attention value heads grouped by key head, as
@@ -857,6 +857,45 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         // speculative decoding (LoadOptions::mtp), and then only the first one.
         hp.n_nextn   = u32(arch + ".nextn_predict_layers", false);
         hp.n_layer  -= hp.n_nextn;
+        // SenseNova-Loop: a Qwen3.5 whose layers [loop.start, loop.end) run loop.count times a token. Its file counts
+        // the visits (block_count = the layers before the loop, every pass over the loop, the layers after, then the
+        // MTP block) and stores each layer's tensors once, under its first visit's number. Here the visits are folded
+        // back onto the layers (the layers after the loop and the MTP block renamed to their own numbers), and each
+        // later pass gets its own caches (Model::loop_slots_). (The layout as OpenSenseNova's llama.cpp writes it.)
+        int v_extra = 0;
+        const int n_visit = hp.n_layer;
+        if (arch == "sensenova_loop") {
+            hp.sensenova = true;
+            auto bad = [&](const char* what) { throw std::runtime_error(std::string("this file's settings don't make sense: ") + what); };
+            hp.loop_lo = (int)u32(arch + ".loop.start", true);
+            hp.loop_hi = (int)u32(arch + ".loop.end", true);
+            hp.loop_passes = (int)u32(arch + ".loop.count", true);
+            if (hp.loop_lo < 0 || hp.loop_hi <= hp.loop_lo || hp.loop_passes < 1 || hp.loop_passes > 64) bad("loop");
+            v_extra = (hp.loop_passes - 1) * (hp.loop_hi - hp.loop_lo);
+            if ((int64_t)hp.loop_hi + v_extra > n_visit) bad("loop");
+            hp.n_layer = n_visit - v_extra;
+            hp.mhc = (int)u32(arch + ".mhc.streams", false);
+            if (hp.mhc) {
+                hp.mhc_lo = (int)u32(arch + ".mhc.start", true);
+                hp.mhc_hi = (int)u32(arch + ".mhc.end", true);
+                hp.mhc_iters = (int)u32(arch + ".mhc.iterations", true);
+                hp.mhc_pre_scale = f32(arch + ".mhc.pre_scale", 1.0f);
+                const int64_t fid = gguf_find_key(g, (arch + ".mhc.fixed_identity").c_str());
+                hp.mhc_fixed = fid >= 0 && gguf_get_kv_type(g, fid) == GGUF_TYPE_BOOL && gguf_get_val_bool(g, fid);
+                const bool phase = hp.mhc_hi <= hp.loop_lo || (hp.mhc_lo >= hp.loop_lo && hp.mhc_hi <= hp.loop_hi) || hp.mhc_lo >= hp.loop_hi;
+                if (hp.mhc < 2 || hp.mhc > 8 || hp.mhc_lo < 0 || hp.mhc_hi <= hp.mhc_lo || hp.mhc_hi > hp.n_layer || !phase ||
+                    hp.mhc_iters < 1 || hp.mhc_iters > 1000 || !std::isfinite(hp.mhc_pre_scale) || hp.mhc_pre_scale <= 0) bad("mHC");
+            }
+            // the layers after the loop, and the MTP block: from their first visit's number to their own
+            std::vector<std::pair<ggml_tensor*, std::string>> moved;
+            for (ggml_tensor* t = ggml_get_first_tensor(m->wctx_); t; t = ggml_get_next_tensor(m->wctx_, t)) {
+                int v = -1, off = 0;
+                if (std::sscanf(t->name, "blk.%d.%n", &v, &off) != 1 || off <= 0) continue;
+                if (v >= hp.loop_hi && v < hp.loop_hi + v_extra) bad("a later pass of the loop has tensors of its own");
+                if (v >= hp.loop_hi + v_extra) moved.push_back({t, "blk." + std::to_string(v - v_extra) + "." + std::string(t->name + off)});
+            }
+            for (auto& [t, name] : moved) ggml_set_name(t, name.c_str());
+        }
         hp.ssm_conv    = u32(arch + ".ssm.conv_kernel", true);
         hp.ssm_state   = u32(arch + ".ssm.state_size", true);
         hp.ssm_k_heads = u32(arch + ".ssm.group_count", true);
@@ -864,11 +903,14 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
         hp.recurrent.assign(hp.n_layer, false);
         const int64_t rid = gguf_find_key(g, (arch + ".attention.recurrent_layers").c_str());
         if (rid >= 0 && gg::is_array(g, rid)) {
-            for (int i = 0; i < hp.n_layer && i < (int)gguf_get_arr_n(g, rid); ++i) hp.recurrent[i] = gg::arr_num(g, rid, i) != 0;
+            for (int i = 0; i < hp.n_layer; ++i) {                  // (by visit: a layer after a loop at its first visit)
+                const int v = i < hp.loop_hi ? i : i + v_extra;
+                if (v < (int)gguf_get_arr_n(g, rid)) hp.recurrent[i] = gg::arr_num(g, rid, v) != 0;
+            }
         } else {
             int interval = u32(arch + ".full_attention_interval", false);
             if (interval <= 0) interval = 4;
-            for (int i = 0; i < hp.n_layer; ++i) hp.recurrent[i] = (i + 1) % interval != 0;
+            for (int i = 0; i < hp.n_layer; ++i) hp.recurrent[i] = ((i < hp.loop_hi ? i : i + v_extra) + 1) % interval != 0;
         }
         if (hp.ssm_k_heads <= 0 || hp.ssm_v_heads <= 0 || hp.ssm_v_heads % hp.ssm_k_heads != 0) throw std::runtime_error("unexpected linear attention head counts");
         // Qwen3.5 reads images too (with its vision file): 3-part positions, sections from the file.
@@ -986,9 +1028,9 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     };
     // Conversation memory per layer: a KV cache for attention layers, a small fixed-size state for DeltaNet layers.
     auto layer_mem = [&](int il) -> size_t {
-        if (hp.is_recurrent(il))
+        if (hp.is_recurrent(il))                                    // (a loop's layers: once a pass)
             return ((size_t)(hp.ssm_conv - 1) * hp.ssm_conv_dim() + (size_t)hp.ssm_mem_elems()) * 4 *
-                   (size_t)std::max(1, opt.parallel);
+                   (size_t)std::max(1, opt.parallel) * (hp.looped() && il >= hp.loop_lo && il < hp.loop_hi ? (size_t)hp.loop_passes : 1);
         if (hp.block_kind(il) == Hparams::kFfn) return 0;          // Nemotron's expert blocks keep nothing
         if (hp.dsv4 && il < hp.n_layer) {                           // DeepSeek V4: see make_kv
             const int r = hp.d4_ratio_at(il);
@@ -2109,6 +2151,16 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
             }
             return L;
         }
+        if (hp.mhc && i >= hp.mhc_lo && i < hp.mhc_hi) {              // SenseNova-Loop: the mHC routers (f32)
+            const int64_t n_route = 2 * hp.mhc + (hp.mhc_fixed ? 0 : hp.mhc * hp.mhc);
+            for (auto [w, bias, site] : {std::make_tuple(&L.mhc_a_w, &L.mhc_a_b, "attn"), std::make_tuple(&L.mhc_f_w, &L.mhc_f_b, "ffn")}) {
+                *w = T(b + "hc_" + site + "_fn.weight");
+                *bias = T(b + "hc_" + site + "_fn.bias");
+                if ((*w)->type != GGML_TYPE_F32 || (*bias)->type != GGML_TYPE_F32 || (*w)->ne[0] != (int64_t)hp.mhc * hp.n_embd ||
+                    (*w)->ne[1] != n_route || ggml_nelements(*bias) != n_route)
+                    throw std::runtime_error("SenseNova-Loop: layer " + std::to_string(i) + "'s mHC router isn't as expected");
+            }
+        }
         if (L.recurrent) {                                            // Gated DeltaNet layer
             if (hp.v_grouped) {                                       // Qwen3-Next
                 L.wqkv = T(b + "attn_qkv.weight", false);
@@ -2116,10 +2168,24 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
                 else L.ssm_in = T(b + "ssm_in.weight");               // older files: q, k, v, z interleaved per key head
                 L.ssm_ba = T(b + "ssm_ba.weight");                    // beta and alpha, interleaved per key head
             } else {
-                L.wqkv      = T(b + "attn_qkv.weight");
-                L.wgate     = T(b + "attn_gate.weight");
-                L.ssm_beta  = T(b + "ssm_beta.weight");
-                L.ssm_alpha = T(b + "ssm_alpha.weight");
+                // (newer conversions keep q, k, v and the gate in one tensor, beta and alpha in another: the graph
+                // multiplies by each part, row ranges of the one tensor)
+                L.wqkv_z = T(b + "attn_qkv_gate.weight", false);
+                if (L.wqkv_z) {
+                    if (L.wqkv_z->ne[1] != (int64_t)hp.ssm_conv_dim() + (int64_t)hp.ssm_state * hp.ssm_v_heads)
+                        throw std::runtime_error("layer " + std::to_string(i) + "'s attn_qkv_gate isn't as expected");
+                } else {
+                    L.wqkv  = T(b + "attn_qkv.weight");
+                    L.wgate = T(b + "attn_gate.weight");
+                }
+                L.ssm_beta_alpha = T(b + "ssm_beta_alpha.weight", false);
+                if (L.ssm_beta_alpha) {
+                    if (L.ssm_beta_alpha->ne[1] != 2 * (int64_t)hp.ssm_v_heads)
+                        throw std::runtime_error("layer " + std::to_string(i) + "'s ssm_beta_alpha isn't as expected");
+                } else {
+                    L.ssm_beta  = T(b + "ssm_beta.weight");
+                    L.ssm_alpha = T(b + "ssm_alpha.weight");
+                }
             }
             L.ssm_conv1d = T(b + "ssm_conv1d.weight");
             L.ssm_dt     = T(b + "ssm_dt.bias");
@@ -2320,11 +2386,16 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     }
     if (hp.looped()) {
         // A looped model: the later passes' caches (see Model::loop_slots_). Each slot repeats a loop layer: the same
-        // kind (sliding or full) and device; only its cache and convolution inputs are its own.
+        // kind (sliding or full, attention or DeltaNet) and device; only its cache and running memories are its own.
+        // (Inkling 2's graph reads the weights from the layer itself; other models' from the slot, a copy of the layer.)
         for (int p = 1; p < hp.loop_passes; ++p)
             for (int i = hp.loop_lo; i < hp.loop_hi; ++i) {
                 Layer S;
-                S.index = i; S.swa = m->layers_[i].swa; S.rope = false;
+                if (!hp.ink) S = m->layers_[i];
+                S.index = i; S.swa = m->layers_[i].swa;
+                if (hp.ink) S.rope = false;
+                S.k_cache = S.v_cache = S.conv_state = S.ssm_state_t = nullptr;
+                S.conv_states.clear(); S.ssm_states.clear(); S.ink_states.clear(); S.ple_states.clear();
                 m->loop_slots_.push_back(S);
             }
     }
@@ -2617,16 +2688,19 @@ void Model::clear_state(int s) {
                 zeros.assign(ggml_nbytes(t), 0);
                 ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
             }
-    for (ggml_tensor* t : ink_states_of(s)) {                     // Inkling 2: the convolutions' last inputs
+    for (ggml_tensor* t : loop_states_of(s)) {                     // Inkling 2's convolutions' inputs, a loop's later passes
         zeros.assign(ggml_nbytes(t), 0);
         ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
     }
 }
 
-std::vector<ggml_tensor*> Model::ink_states_of(int s) const {
+std::vector<ggml_tensor*> Model::loop_states_of(int s) const {
     std::vector<ggml_tensor*> v;
     for (const Layer& L : layers_) if (s < (int)L.ink_states.size()) v.push_back(L.ink_states[s]);
-    for (const Layer& L : loop_slots_) if (s < (int)L.ink_states.size()) v.push_back(L.ink_states[s]);
+    for (const Layer& L : loop_slots_) {
+        if (s < (int)L.ink_states.size()) v.push_back(L.ink_states[s]);
+        if (s < (int)L.conv_states.size()) { v.push_back(L.conv_states[s]); v.push_back(L.ssm_states[s]); }
+    }
     return v;
 }
 
@@ -2753,7 +2827,7 @@ void Model::checkpoint() {
         if (!L.ple_states.empty()) grab(L.ple_states[0]);
     }
     if (mtp_ && mtp_->conv_state) { grab(mtp_->conv_state); grab(mtp_->ssm_state_t); }
-    for (ggml_tensor* t : ink_states_of(0)) grab(t);
+    for (ggml_tensor* t : loop_states_of(0)) grab(t);
     ckpts_.push_back(std::move(ck));
     // Too many, or too much RAM: the one whose neighbours are closest together goes (never the first or the last),
     // so the ones kept stay spread over the conversation.
@@ -2792,7 +2866,7 @@ void Model::truncate(int n) {
             if (!L.ple_states.empty()) put(L.ple_states[0]);
         }
         if (mtp_ && mtp_->conv_state) { put(mtp_->conv_state); put(mtp_->ssm_state_t); }
-        for (ggml_tensor* t : ink_states_of(0)) put(t);
+        for (ggml_tensor* t : loop_states_of(0)) put(t);
         if ((int)seq_cells_[0].size() != n_past_) reset();          // (rings: further back than they hold, start again)
         return;
     }
@@ -2946,8 +3020,11 @@ bool Model::draft_mark() {
             keep(L.ssm_state_t, 0); keep(L.conv_state, 0);
             for (ggml_tensor* t : L.ink_states) keep(t, 0);
         }
-        for (size_t i = 0; i < loop_slots_.size(); ++i)
-            for (ggml_tensor* t : loop_slots_[i].ink_states) keep(t, 1 + (int)(i / (size_t)std::max(1, hp_.loop_n())));
+        for (size_t i = 0; i < loop_slots_.size(); ++i) {
+            const int pass = 1 + (int)(i / (size_t)std::max(1, hp_.loop_n()));
+            for (ggml_tensor* t : loop_slots_[i].ink_states) keep(t, pass);
+            keep(loop_slots_[i].ssm_state_t, pass); keep(loop_slots_[i].conv_state, pass);
+        }
         for (auto& [bt, ctx] : ctxs) {
             ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx, bt);
             if (!b) { for (auto& [b2, c2] : ctxs) ggml_free(c2); for (auto bb : draft_buf_) ggml_backend_buffer_free(bb); draft_buf_.clear(); return false; }
@@ -4054,17 +4131,68 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
         }
     };
     if (hp.ink) x = ink_layers(c, g, x, n_tok, n_kv, grp, snapshots, want_routing, tag);
-    for (int li = 0; li < (hp.ink ? 0 : (int)layers_.size()); ++li) {
-        tag(li - 1);
-        const Layer& L = layers_[li];
+    // The layers in the order they run: once each, or a loop's layers [loop_lo, loop_hi) once a pass (each later pass
+    // with its own caches: loop_slot; guessing ahead may run fewer passes, see set_loop_draft). (layer, pass)
+    std::vector<std::pair<int, int>> visits;
+    if (!hp.ink) {
+        const int NL = (int)layers_.size(), passes = hp.looped() ? (loop_draft_ > 0 ? loop_draft_ : hp.loop_passes) : 1;
+        const int lo = hp.looped() ? hp.loop_lo : NL, hi = hp.looped() ? hp.loop_hi : NL;
+        for (int li = 0; li < lo; ++li) visits.push_back({li, 0});
+        for (int p = 0; p < passes; ++p) for (int li = lo; li < hi; ++li) visits.push_back({li, p});
+        for (int li = hi; li < NL; ++li) visits.push_back({li, 0});
+    }
+    // ---- SenseNova-Loop's mHC (see Hparams::mhc), as its Hugging Face code computes it ----
+    // The streams are [E, MS, n] (stream s's numbers at s E). A router reads them all, normed together (eps 1e-6, no
+    // weight): pre (MS), post (MS), and the mixing matrix's logits (MS x MS, row r = the stream written, column c =
+    // the stream read), plus the bias. The block's input is the streams weighted by sigmoid(pre); after the block the
+    // streams become mix x streams + 2 sigmoid(post) x the block's output. The mixing matrix: softmax over c, then
+    // normalised over r, then (c, r) again, mhc_iters times in all: ggml's dsv4_hc_comb does exactly that with its
+    // "dst" as c and "src" as r (its logits are laid out as ours, dst + hc src), so its result is turned for hc_post.
+    const int MS = hp.mhc;
+    ggml_tensor* mhc_one = nullptr;
+    if (MS && !hp.mhc_fixed) {
+        mhc_one = ggml_new_tensor_1d(c, GGML_TYPE_F32, 3); ggml_set_input(mhc_one);
+        g.in_f32.push_back({mhc_one, std::vector<float>(3, 1.0f)});
+    }
+    auto mhc_in = [&](ggml_tensor* X, ggml_tensor* w, ggml_tensor* bias, ggml_tensor** post, ggml_tensor** comb) {
+        ggml_tensor* raw = ggml_mul_mat(c, w, ggml_rms_norm(c, X, 1e-6f));               // [2 MS (+ MS^2), n]
+        ggml_tensor* lg = ggml_add(c, raw, bias);
+        auto rows = [&](int from) { return ggml_view_2d(c, lg, MS, n_tok, lg->nb[1], (size_t)from * ggml_element_size(lg)); };
+        ggml_tensor* pre = ggml_sigmoid(c, rows(0));
+        *post = ggml_scale(c, ggml_sigmoid(c, rows(MS)), 2.0f);
+        *comb = nullptr;
+        if (!hp.mhc_fixed) {
+            ggml_tensor* m = ggml_dsv4_hc_comb(c, raw, mhc_one, bias, 0.0f, hp.mhc_iters);   // [c, r, n]
+            *comb = ggml_cont(c, ggml_permute(c, m, 1, 0, 2, 3));                            // [r, c, n]: hc_post's [dst, src]
+        }
+        ggml_tensor* in = ggml_dsv4_hc_pre(c, ggml_reshape_3d(c, X, E, MS, n_tok), pre);    // [E, n]
+        return hp.mhc_pre_scale != 1.0f ? ggml_scale(c, in, hp.mhc_pre_scale) : in;
+    };
+    auto mhc_out = [&](ggml_tensor* X, ggml_tensor* y, ggml_tensor* post, ggml_tensor* comb) {
+        return ggml_reshape_2d(c, ggml_dsv4_hc_post(c, whole(c, y), ggml_reshape_3d(c, X, E, MS, n_tok), post, comb),
+                               (int64_t)E * MS, n_tok);
+    };
+    int prev_li = -1;
+    for (size_t vi = 0; vi < visits.size(); ++vi) {
+        const int li = visits[vi].first, pass = visits[vi].second;
+        tag(prev_li);
+        prev_li = li;
+        const Layer& L = pass ? loop_slot(li, pass) : layers_[li];
+        // (a later pass's DeltaNet undo points: after the layers', see accept)
+        const int rk = pass ? hp.n_layer + (pass - 1) * hp.loop_n() + li - hp.loop_lo : li;
+        const bool mhc = MS && li >= hp.mhc_lo && li < hp.mhc_hi;
+        ggml_tensor *m_post = nullptr, *m_comb = nullptr;
+        if (mhc && li == hp.mhc_lo)                                          // into the streams: MS copies
+            x = ggml_reshape_2d(c, ggml_repeat_4d(c, ggml_reshape_3d(c, x, E, 1, n_tok), E, MS, n_tok, 1), (int64_t)E * MS, n_tok);
         // ---- attention ----
         ggml_tensor* inj = nullptr;                                          // (Flash-Next: each copy's share)
         if (li == 0) tr(x, "in", -1);
         if (HC && L.ple_key) x = ggml_add(c, x, tr(ple(L, x), "ple", li));
         ggml_tensor* h = HC ? hc_mix(x, L.hc_a_norm, L.hc_a_down, L.hc_a_up, L.hc_a_inj, &inj)
+                       : mhc ? ggml_mul(c, ggml_rms_norm(c, mhc_in(x, L.mhc_a_w, L.mhc_a_b, &m_post, &m_comb), hp.rms_eps), L.attn_norm)
                             : ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.attn_norm);
         tr(h, "mix_attn", li); tr(inj, "inj_attn", li);
-        auto add_back = [&](ggml_tensor* d) { x = HC ? hc_add(x, d, inj) : ggml_add(c, x, d); };
+        auto add_back = [&](ggml_tensor* d) { x = HC ? hc_add(x, d, inj) : mhc ? mhc_out(x, d, m_post, m_comb) : ggml_add(c, x, d); };
         if (hp.mamba && L.kind == Hparams::kMamba) {
             // ---- Mamba-2 (Nemotron's running memory) ----
             // One projection gives, per token: z (the output gate), x with B and C (through a short causal
@@ -4198,6 +4326,10 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
                 };
                 qkv = ggml_concat(c, ggml_concat(c, part(S, 0), part(S, S), 0), part((int64_t)R * S, 2 * S), 0);   // [CD, n_tok]
                 z   = part((int64_t)R * S, 2 * S + (int64_t)R * S);                                                 // [S*Hv, n_tok]
+            } else if (L.wqkv_z) {                                               // (one tensor: its two row ranges)
+                ggml_tensor* w = L.wqkv_z;
+                qkv = ggml_mul_mat(c, ggml_view_2d(c, w, w->ne[0], CD, w->nb[1], 0), h);
+                z   = ggml_mul_mat(c, ggml_view_2d(c, w, w->ne[0], (int64_t)S * Hv, w->nb[1], (size_t)CD * w->nb[1]), h);
             } else {
                 qkv = ggml_mul_mat(c, L.wqkv, h);                                // [CD, n_tok]
                 z   = ggml_mul_mat(c, L.wgate, h);                               // [S*Hv, n_tok]
@@ -4208,6 +4340,10 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
                 const size_t e = ggml_element_size(ba);
                 b_in = ggml_cont_2d(c, ggml_view_3d(c, ba, R, Hk, n_tok, ba->nb[1], ba->nb[2], 0), Hv, n_tok);
                 a_in = ggml_cont_2d(c, ggml_view_3d(c, ba, R, Hk, n_tok, ba->nb[1], ba->nb[2], (size_t)R * e), Hv, n_tok);
+            } else if (L.ssm_beta_alpha) {
+                ggml_tensor* w = L.ssm_beta_alpha;
+                b_in = ggml_mul_mat(c, ggml_view_2d(c, w, w->ne[0], Hv, w->nb[1], 0), h);
+                a_in = ggml_mul_mat(c, ggml_view_2d(c, w, w->ne[0], Hv, w->nb[1], (size_t)Hv * w->nb[1]), h);
             } else {
                 b_in = ggml_mul_mat(c, L.ssm_beta, h);
                 a_in = ggml_mul_mat(c, L.ssm_alpha, h);
@@ -4263,7 +4399,7 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
                     // For dropping the last d tokens: the memory d tokens back, and the convolution's last inputs before
                     // them. Kept as outputs until Model::accept() has used them. (One conversation only.)
                     ggml_set_output(res);
-                    auto& rb = g.rollback[li];
+                    auto& rb = g.rollback[rk];
                     rb.resize(std::min(snapshots, n));
                     for (int d = 1; d < (int)rb.size(); ++d) {
                         rb[d].first = ggml_view_3d(c, res, S, S, Hv, (size_t)S * 4, (size_t)S * S * 4,
@@ -4296,7 +4432,9 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
         }
         tr(x, "res_attn", li);
 
-        h = HC ? hc_mix(x, L.hc_f_norm, L.hc_f_down, L.hc_f_up, L.hc_f_inj, &inj) : ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.ffn_norm);
+        h = HC ? hc_mix(x, L.hc_f_norm, L.hc_f_down, L.hc_f_up, L.hc_f_inj, &inj)
+               : mhc ? ggml_mul(c, ggml_rms_norm(c, mhc_in(x, L.mhc_f_w, L.mhc_f_b, &m_post, &m_comb), hp.rms_eps), L.ffn_norm)
+               : ggml_mul(c, ggml_rms_norm(c, x, hp.rms_eps), L.ffn_norm);
         tr(h, "mix_ffn", li); tr(inj, "inj_ffn", li);
         ggml_tensor* fo;
         if (hp.gemma4 && L.router) {
@@ -4320,9 +4458,17 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
             x = ggml_add(c, x, p);
         }
         if (L.out_scale) x = ggml_mul(c, x, L.out_scale);                  // Gemma 4: the layer's output scale
+        if (mhc && li == hp.mhc_hi - 1) {                                   // out of the streams: their mean
+            ggml_tensor* sum = nullptr;
+            for (int k = 0; k < MS; ++k) {
+                ggml_tensor* v = ggml_view_2d(c, x, E, n_tok, x->nb[1], (size_t)k * E * ggml_element_size(x));
+                sum = sum ? ggml_add(c, sum, v) : v;
+            }
+            x = ggml_scale(c, sum, 1.0f / MS);
+        }
         tr(x, "res", li);
     }
-    tag((int)layers_.size() - 1);
+    tag(hp.ink ? (int)layers_.size() - 1 : prev_li);
 
     if (!g.orders.empty()) {                                               // every layer's picks in one tensor
         // (Nemotron: blocks pick different numbers of experts, so the lists are joined end to end instead)
@@ -5493,11 +5639,23 @@ void Model::make_kv(int ctx, int n_seq) {
             dst.push_back(L.qsa_kc);
         }
     }
-    for (Layer& S : loop_slots_) {                                     // Inkling 2: the loop layers' later passes
+    for (Layer& S : loop_slots_) {                                     // a loop's layers' later passes
         const int i = S.index;
         auto& dst = kv_t[layer_dev_[i] >= 0 ? layer_dev_[i] : G];
+        if (S.recurrent) {                                             // (SenseNova-Loop: DeltaNet's running memory)
+            S.conv_states.clear(); S.ssm_states.clear();
+            for (int s = 0; s < n_seq; ++s) {
+                S.conv_states.push_back(ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, hp.ssm_conv - 1, hp.ssm_conv_dim()));
+                S.ssm_states.push_back(ggml_new_tensor_3d(kvctx_, GGML_TYPE_F32, hp.ssm_state, hp.ssm_state, hp.ssm_v_heads));
+                dst.push_back(S.conv_states.back());
+                dst.push_back(S.ssm_states.back());
+            }
+            S.conv_state = S.conv_states[0];
+            S.ssm_state_t = S.ssm_states[0];
+            continue;
+        }
         S.ink_states.clear();
-        for (int s = 0; s < n_seq; ++s) {
+        for (int s = 0; hp.ink && s < n_seq; ++s) {
             S.ink_states.push_back(ggml_new_tensor_2d(kvctx_, GGML_TYPE_F32, hp.ink_conv - 1, hp.ink_conv_ch(i)));
             dst.push_back(S.ink_states.back());
         }
@@ -5717,7 +5875,7 @@ void Model::accept(int n_keep) {
         free_cells_from(0, n_past_);
         for (auto& [li, rb] : g.rollback) {                       // DeltaNet layers: restore the memory d tokens back
             if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
-            Layer& L = layers_[li];
+            Layer& L = li < hp_.n_layer ? layers_[li] : loop_slots_[li - hp_.n_layer];   // (a loop's later passes after the layers)
             ggml_backend_tensor_copy(rb[d].first, L.ssm_state_t);
             ggml_backend_tensor_copy(rb[d].second, L.conv_state);
         }

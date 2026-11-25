@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
         if (const char* v = std::getenv("TIERLM_SPLIT")) o.split_mode = v;
         if (const char* v = std::getenv("TIERLM_DEVICE")) o.device = v;      // e.g. cpu, CUDA0, Vulkan0
         if (const char* v = std::getenv("TIERLM_BATCH")) o.batch = std::atoi(v);   // prompt tokens per step (tests: with TIERLM_BATCH_SPAN)
-        o.mtp = mtp || mtp_step || (gen_spec && !std::getenv("TIERLM_DRAFT_SCRIPT"));
+        o.mtp = mtp || mtp_step || (gen_spec && !std::getenv("TIERLM_DRAFT_SCRIPT") && !std::getenv("TIERLM_NO_MTP"));   // (TIERLM_NO_MTP: guessing with the model itself)
         o.max_ctx = std::max<int>(o.max_ctx, (int)ids.size() + n_gen + 16);
         if (par) { o.parallel = par + 1; o.max_ctx = std::max<int>(o.max_ctx, (int)ids.size() * par + 64); }
         // TIERLM_HOT=1 (tests): the busiest experts in VRAM, as the app's "Keep the busiest experts in VRAM", from a
