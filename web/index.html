@@ -746,9 +746,9 @@ window.FIT = (() => {
             <div class="help">-1 is random. Any other number makes replies repeatable at the same settings.</div>
           </div>
           <div>
-            <label for="splitsel">When the model doesn't fit in VRAM</label>
-            <select id="splitsel"><option value="auto">Automatic (recommended)</option><option value="layers">Split by whole layers</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
-            <div class="help">Automatic uses experts in RAM for mixture-of-experts models and whole layers for the rest. Experts in RAM: the GPU does all the attention and the CPU only the few experts each word picks, much faster for MoE models (Qwen3.6-35B-A3B on an RTX 3070 laptop: 33 against 13 tok/s). Whole layers: the GPU and CPU hand over once per word; best for dense models.</div>
+            <label for="mintps">Slowest speed per reply (tok/s)</label>
+            <input id="mintps" type="number" min="1" max="100" step="1" value="5">
+            <div class="help">What Find the fastest settings keeps every reply above when it recommends a number of connections.</div>
           </div>
           <div>
             <label for="ssdsel">SSD tier: where the part that doesn't fit in RAM goes</label>
@@ -762,9 +762,9 @@ window.FIT = (() => {
             <div id="connrec" class="help" hidden></div>
           </div>
           <div>
-            <label for="mintps">Slowest speed per reply (tok/s)</label>
-            <input id="mintps" type="number" min="1" max="100" step="1" value="5">
-            <div class="help">What Find the fastest settings keeps every reply above when it recommends a number of connections.</div>
+            <label for="splitsel">When the model doesn't fit in VRAM</label>
+            <select id="splitsel"><option value="auto">Automatic (recommended)</option><option value="layers">Split by whole layers</option><option value="experts">Attention in VRAM, experts in RAM</option></select>
+            <div class="help">Automatic uses experts in RAM for mixture-of-experts models and whole layers for the rest. Experts in RAM: the GPU does all the attention and the CPU only the few experts each word picks, much faster for MoE models (Qwen3.6-35B-A3B on an RTX 3070 laptop: 33 against 13 tok/s). Whole layers: the GPU and CPU hand over once per word; best for dense models.</div>
           </div>
           <div id="allgpusrow" hidden>
             <label class="chk"><input type="checkbox" id="allgpus" checked> Use every graphics card</label>
