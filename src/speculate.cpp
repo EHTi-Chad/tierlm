@@ -138,8 +138,9 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
         static const double fixed = [] { const char* e = std::getenv("TIERLM_DRAFT_THETA"); return e ? std::atof(e) : -1.0; }();   // (tests)
         if (fixed >= 0) theta = fixed;
     }
-    // (how much of its sureness the draft block earns: of the guesses tested lately, kept over expected)
-    const double trust = ad_pred_ > 4.0 ? std::min(1.0, std::max(0.5, ad_kept_ / ad_pred_)) : 0.95;
+    // (how much of its sureness the draft block earns: of the guesses tested lately, kept over expected. Above 1 too:
+    // Flash-Next's draft block on code is surer of less than it gets right)
+    const double trust = ad_pred_ > 4.0 ? std::min(1.3, std::max(0.5, ad_kept_ / ad_pred_)) : 0.95;
     // (the last check had many guesses: this one keeps that size unless its guesses are far from paying)
     const double bar = adapt && last_many_ ? theta * 0.6 : theta;
     std::vector<float> conf;                          // how sure the draft block was of each guess made
@@ -188,7 +189,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                 for (const auto& e : q) qmax = std::max(qmax, e.second);
                 if (p_min_ > 0.0f && qmax < p_min_) break;
                 sure = qmax;
-                if (adapt && i >= n_few && chance * trust * sure < bar) break;
+                if (adapt && i >= n_few && chance * trust * sure < bar * 0.5) break;   // (hopeless: see below)
                 d = draw(q);
                 qs.push_back(std::move(q));
             } else {
@@ -199,7 +200,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                     for (float v : lg) if (v > top - 20.0f) sum += std::exp((double)(v - top));
                     sure = (float)(1.0 / sum);
                     if (sure < p_min_) break;
-                    if (adapt && i >= n_few && chance * trust * sure < bar) break;   // this guess doesn't pay: stop before it
+                    if (adapt && i >= n_few && chance * trust * sure < bar * 0.5) break;   // (hopeless: see below)
                 }
             }
             if (trace_) trace_q_.push_back(dist_ ? prob_of(qs.back(), d) : sure);
@@ -211,11 +212,18 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
             h.swap(hn);
         }
         if (marked) { m_.draft_rewind(); self_cut(m_, false); }      // back to x's place (the check writes it all again)
-        // (adaptive, timed: the many when every one of them pays, else the few)
-        if (adapt && ad_n_ >= 8 && n_max == n_many && (int)drafts.size() < n_many && (int)drafts.size() > n_few &&
+        // (adaptive, timed: the many when, together, the guesses past the few are expected to bring in more than
+        // their place in the check costs, else the few. Each one on its own having to pay was too strict: a stretch
+        // of sure guesses ending in a less sure one was cut to the few, and on Qwen3.8 Flash-Next a load could stay
+        // with the few all along, 99.5 tok/s where the many made 126.)
+        if (adapt && ad_n_ >= 8 && n_max == n_many && (int)drafts.size() > n_few &&
             !(std::find_if(drafts.begin(), drafts.end(), stop) != drafts.end())) {
-            drafts.resize(n_few); conf.resize(n_few);
-            if (dist_) qs.resize(n_few);
+            double c = 1.0, extra = 0.0;
+            for (size_t i = 0; i < conf.size(); ++i) { c *= trust * conf[i]; if ((int)i >= n_few) extra += std::min(1.0, c); }
+            if ((int)drafts.size() < n_many || extra < bar * (n_many - n_few)) {
+                drafts.resize(n_few); conf.resize(n_few);
+                if (dist_) qs.resize(n_few);
+            }
         }
     }
     // With the draft block's guesses, lookup only extends them: when lookup's guess starts with all of the draft
