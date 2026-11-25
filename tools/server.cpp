@@ -906,15 +906,14 @@ struct Engine {
     std::unique_ptr<Speculator> make_spec(int d) {
         if (!model || d <= 0) return nullptr;
         auto sp = std::make_unique<Speculator>(*model, d, draft_p_min);
-        // With a draft block: d guesses a check. TIERLM_DRAFT_ADAPT=N (an experiment, off by default): d, or N when
-        // the block is sure of that many and they pay for what they add to the check (Speculator::set_adaptive; 1: 8).
-        // Measured on an RTX 5090 over the same six 400-token replies, it gains nothing: Qwen3.8 Flash-Next at 256K
-        // 77.6 tok/s with 3 guesses, 77.1 with 3 or 6, 76.0 with 3 or 8; Qwen3.8-27B Q6_K 80.3, 80.7 and 80.8. A
-        // token more in a check costs about what a token costs anyway (RAM experts, or just the model's size), and
-        // a check of another size is laid out anew.
+        // With a draft block: d guesses a check, or up to 8 when the block is sure of that many and they pay for what
+        // they add to the check (Speculator::set_adaptive). TIERLM_DRAFT_ADAPT=N: up to N (0: always d). Measured on
+        // an RTX 5090 (0.9.5), Qwen3.8 Flash-Next UD-IQ3_XXS at 256K, 500-token code replies, 4 a load: 3 guesses
+        // 103.6 tok/s (two loads), 5: 109.4, 7: 114.9, 3 or up to 8: 116.6. (Before 0.9.4 it gained nothing: a check
+        // of a few more tokens cost about what those tokens cost anyway.)
         if (model->has_mtp()) {
             const char* e = std::getenv("TIERLM_DRAFT_ADAPT");
-            const int most = e ? std::atoi(e) : 0;
+            const int most = e ? std::atoi(e) : 8;
             sp->set_adaptive(most >= 1, most >= 2 ? most : 8);
             return sp;
         }
