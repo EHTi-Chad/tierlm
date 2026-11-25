@@ -478,13 +478,18 @@ of another size takes the scheduler from the check, which is then built and plac
 Flash-Next's 9,126 nodes; each size's graph is built in memory of its own, so its tensors come back where they were
 and the GPU's recording of it still fits).
 
-How many guesses per check: the set number. Deciding it at each check from how sure the draft block is
-(`Speculator::set_adaptive`, `TIERLM_DRAFT_ADAPT=N`: the set number, or N when the block is sure of them all) was
-built and measured in 0.9.4 and is off: on an RTX 5090 over the same six 400-token replies, Flash-Next at 256K wrote
-77.6 tok/s with 3 guesses, 77.1 with 3 or 6 and 76.0 with 3 or 8; Qwen3.8-27B Q6_K, all in VRAM, 80.3, 80.7 and 80.8.
-The draft block's sureness does tell which guesses are kept (90% or more: kept 93 to 96% of the time), but a token
-more in a check costs about what a token costs anyway (6 ms of RAM experts for Flash-Next against 9 to 10 ms a token
-overall), so the best depth is flat from 3 to 6 guesses and there is little for a cleverer choice to win.
+How many guesses per check: the set number, or up to 8 when the draft block is sure of them (since 0.9.5;
+`Speculator::set_adaptive`, `TIERLM_DRAFT_ADAPT=N`). Checks come in two sizes, the set number and the many, so their
+graphs are seldom laid out anew. A check goes to the many when the guesses past the set number are expected, together,
+to bring in more than their places in the check cost: their chances (the draft block's sureness, times how much of it
+the block has lately earned) against the reply's speed times the measured cost of a token more in a check. Built in
+0.9.4, it gained nothing then (Flash-Next at 256K: 77.6 tok/s with 3 guesses, 76.0 with 3 or 8), as a token more in a
+check cost about what a token costs anyway. With 0.9.4's faster Flash-Next that changed: on an RTX 5090 over 12
+500-token code replies, 105.6 tok/s with 3 guesses, 109.4 with 5, 114.9 with 7, and 116.2 with 3 or up to 8 (120 to
+130 once settled, 7 tokens a check). At first each guess past the set number had to pay on its own, and one load stayed
+with 3 guesses all along (99.5 tok/s); judged together they go to 8 on every load. Where a token more costs a lot
+(an 8 GB laptop with experts or layers in RAM: Qwen3.6-35B-A3B, Qwen3.6-27B) it stays at 4 to 5 tokens a check and
+the speed is unchanged; so is Qwen3.8-27B's on the RTX 5090.
 
 The draft block's experts also go into VRAM before the model's own (since 0.8.7; `TIERLM_MTP_VRAM=0` for the old
 placement by use): the draft block runs once per guess, so its experts in RAM cost a GPU-to-CPU round trip each time.
@@ -874,6 +879,29 @@ another size than the last is built and placed again (3.2 ms), and the first few
 computes about 6 ms slower. `TIERLM_PLAN_DIFF=1` shows the graph is the same to the GPU when it comes back (the same
 tensors at the same places), except when the cache's span has grown by its step of 256 positions meanwhile: the mask
 is then 512 bytes a token longer and the tensors after it have moved.
+
+## Looped models (0.9.5)
+
+A looped model runs layers [loop_lo, loop_hi) loop_passes times for every token (Inkling 2: 12 of 24 layers, 3
+passes; SenseNova-Loop-9B: 24 of 32, 2 passes). The weights are read again on each pass, but every pass keeps its own
+context memory: the first pass the layer's own, the later ones a slot each (`Model::loop_slots_`, a copy of the layer
+with caches of its own: attention's keys and values, DeltaNet's running memory and convolution inputs, Inkling's
+convolution inputs). The main graph runs the layers in the order they run, the later passes from their slots; the
+slots' running memories are cleared, checkpointed, kept for guessing ahead and undone after a check like the layers'
+own (undo points numbered after the layers). Files of both looped layouts count the visits rather than the layers and
+store each layer once, under its first visit's number; loading folds the visits back onto the layers.
+
+Guessing ahead: with a draft block (SenseNova-Loop has one) as for any model. Without one, a looped model can guess
+with itself running one pass of its loop (`Model::set_loop_draft`): the first pass is the same as the whole model's,
+so its caches are shared; the layers after the loop write theirs again when the guesses are checked. On Inkling 2 Mini
+the guesses were about half right, but a guess costs half a step and a check of 4 tokens about 2.5 steps (8 GB laptop)
+or 3 to 4 (RTX 5090, all in VRAM): 12 and 68 tok/s against 17 and 80 without. Find the fastest settings measures it.
+
+SenseNova-Loop's mHC: in its looped layers the residual stream is 2 copies. Before attention and before the MLP, a
+router reads both copies (normed together, f32 weights): the block's input is the copies weighted by sigmoid(pre),
+and after the block the copies are mixed by a 2 x 2 matrix made doubly stochastic by 20 Sinkhorn steps and each gets
+2 sigmoid(post) times the block's output. ggml's DeepSeek V4 hyper-connection ops do exactly this (its stream mixer
+taking 2 streams since tierlm's change 6 to ggml), so the whole step stays on the GPU: 96 mixing matrices a token.
 
 ## Several conversations at once
 

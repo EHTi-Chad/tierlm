@@ -10,26 +10,57 @@ in [docs/GGML_CHANGES.md](docs/GGML_CHANGES.md); the tokenizers, model graphs, K
 encoder, server and web page are all tierlm's own. It does not use llama.cpp.
 
 It runs **Llama 2/3, Mistral, Mixtral, Qwen2/2.5, Qwen3, Qwen3 MoE, Qwen3.5/3.6/3.8 dense and MoE, Qwen3-Next,
-gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), Inkling 2 (early), NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
+gpt-oss, Gemma 3 and Gemma 4, DeepSeek V2/V3/V4 and Kimi K2 (early), Inkling 2 (early), SenseNova-Loop, NVIDIA Nemotron 3.5 and OLMoE** on the CPU, on any GPU with Vulkan (Intel, AMD, NVIDIA), or on NVIDIA with CUDA, on **Windows**
 (unzip and run) and **Linux** (build from source). A web page lets you pick a model and chat; an OpenAI-compatible API
 serves your other apps, also with no page or browser at all: start it from the console.
 
-### Inkling 2 Mini, on the PC you already have
+### Looped models, on the PC you already have
 
-Thinking Machines' Inkling 2 Mini is a looped mixture-of-experts model: 24 layers, 12 of them run three times for
-every word, 128 experts. tierlm runs it on Windows and Linux, from Unsloth's files and from llama.cpp's layout
-(`inkling2_loop`), with its tool calls, thinking on or off and its makers' recommended sampling, each part checked
-against Hugging Face's own code.
+A looped model runs some of its layers more than once for every word: more thinking from the same weights. tierlm
+runs the loop as a setting of the model, each pass with its own context memory, checked against each model's own
+Hugging Face code.
+
+**SenseNova-Loop-9B** (SenseTime, Apache 2.0): a Qwen3.5 whose 24 middle layers run twice (56 layers of work from 32),
+with two residual streams mixed between them. Its files run on few apps yet; in tierlm they load as they come.
+
+| PC | File | Where it lives | Writing code: plain | with its own guesser |
+|---|---|---|---|---|
+| RTX 5090 32 GB, Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11 | Q8_0 (9.8 GB) | all in VRAM, 64K context | 82.3 to 86.9 tok/s | **118.9 to 131.3 tok/s** |
+| the same PC | BF16 (18.4 GB) | all in VRAM, 64K context | 53.9 to 62.8 tok/s | **77.2 to 82.9 tok/s** |
+| RTX 3070 Laptop 8 GB, Ryzen 9 5900HX, 32 GB, Windows 11 | Q4_K_M (5.8 GB) | all in VRAM, 32K context | 38.4 to 38.8 tok/s | **40.7 to 43.9 tok/s** |
+
+**Inkling 2 Mini** (Thinking Machines): a looped mixture-of-experts model, 24 layers, 12 of them run three times, 128
+experts. tierlm runs Unsloth's files and llama.cpp's layout (`inkling2_loop`), with its tool calls and thinking on or off.
 
 | PC | File | Where it lives | Writing code |
 |---|---|---|---|
-| RTX 5090 32 GB, Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11 | UD-Q8_K_XL (21.8 GiB) | all in VRAM, 64K context | **66.7 tok/s** (500 tokens) |
-| RTX 3070 Laptop 8 GB, Ryzen 9 5900HX, 32 GB, Linux (KDE neon) | UD-IQ3_XXS (11.7 GB) | 3.7 GB VRAM + 8.1 GB RAM, VRAM experts following the conversation, 32K context | **13.4 tok/s** (377 tokens); 26.3 on Find the fastest settings' test questions |
-| the same laptop, Windows 11 | UD-Q4_K_M (16.6 GB) | 5.4 GB VRAM + 13.5 GB RAM, 32K context | **12.2 tok/s** |
+| RTX 5090 32 GB, Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11 | UD-Q8_K_XL (21.8 GiB) | all in VRAM, 64K context, 16-bit context memory | **79.6 to 81.8 tok/s** (0.9.4: 66.0) |
+| RTX 3070 Laptop 8 GB, Ryzen 9 5900HX, 32 GB, Windows 11 | UD-Q4_K_M (16.6 GB) | 12.4 GB in RAM, the busiest experts in VRAM, 32K context, 8-bit context memory | **15.7 to 16.9 tok/s** (0.9.4: 14.5) |
+| the same laptop, Linux (KDE neon) | UD-IQ3_XXS (11.7 GB) | 3.7 GB VRAM + 8.1 GB RAM, VRAM experts following the conversation, 32K context | 13.4 tok/s (0.9.4) |
 
-16-bit context memory, thinking off, measured on finished replies. Next for it: fewer, larger GPU steps (a
-token is thousands of small ones), its loop layers' experts following the conversation too, 8-bit context memory
-and reading images.
+Thinking off, measured on finished replies of up to 500 tokens of C++. Next for both: reading images.
+
+### New in 0.9.5: looped models (SenseNova-Loop, Inkling 2 faster), longer guesses for Qwen3.8 Flash-Next
+
+- **SenseNova-Loop-9B** (`sensenova_loop`), new: SenseTime's looped Qwen3.5 with manifold-constrained
+  hyper-connections, from its official GGUF files (Q4_K_M to BF16) with their built-in MTP guesser; numbers above.
+  Checked against a NumPy version of SenseNova's own Hugging Face code (`tests/tiny_sensenova.py`). To mix its two
+  streams on the GPU, ggml's stream mixer now takes 2 streams as well as DeepSeek V4's 4
+  ([docs/GGML_CHANGES.md](docs/GGML_CHANGES.md), change 6).
+- **Inkling 2 Mini faster**: 22% on an RTX 5090 (66.0 to 80.4 tok/s, all in VRAM) and 13% on an 8 GB RTX 3070
+  Laptop (14.5 to 16.4 tok/s), the same files and settings, from fewer, larger GPU steps (about 6,700 down to 4,600
+  a word), its loop layers' experts counted on every pass when learning which are busiest (the busiest in VRAM did
+  43-47% of the expert work on the laptop, now 59-65%), and its context memory at 8 bits, which left room for about
+  200 more experts in VRAM.
+- **Longer guesses for models with a draft block**: up to 8 guesses a check where the draft block is sure of them and
+  they pay for themselves (they used to stay at the number set). Qwen3.8 Flash-Next UD-IQ3_XXS at 256K context on an
+  RTX 5090: **105.6 to 116.2 tok/s** over 12 code replies, 120 to 130 once it has settled; Qwen3.8-27B (RTX 5090) and
+  Qwen3.6-35B-A3B and Qwen3.6-27B (8 GB laptop) unchanged, as the extra guesses don't pay there and aren't made.
+- **Looped models in general**: the loop is now a setting of any model rather than Inkling's alone, so the next
+  looped layouts need only their own layers. A looped model with no draft block can guess ahead with one pass of its
+  loop; Find the fastest settings measures it and keeps it only where it is faster (on Inkling 2 Mini it wasn't).
+- **Newer Qwen3.5 conversions load**: files that keep the linear attention's projections in one tensor
+  (`attn_qkv_gate`, `ssm_beta_alpha`).
 
 ### New in 0.9.4: Qwen3.8 Flash-Next as a coding agent's model, Inkling 2 Mini, GLM's chat format
 
@@ -745,7 +776,8 @@ to send one in, start tierlm with `start-tierlm-with-log.bat` and attach the new
 | DeepSeek V4 Flash (`deepseek4`) | **early**: model math checked against Hugging Face's own code (hyper-connections, sliding-window and compressed attention with its indexer, hash-routed first layers) on the CPU and CUDA; tested on the real DeepSeek-V4-Flash UD-IQ3_XXS (about 96 GB) on an RTX 5090 with 64 GB RAM and the SSD tier: 9.6 to 10.8 tok/s in chats (since 0.9.0). Tool calls not yet |
 | Gemma 3 (`gemma3`: gemma-3-1b ... 27b-it), text | **new in 0.9.1**: model math checked against Hugging Face's own code; gemma-3-12b-it Q4_K_M on an RTX 5090 |
 | Gemma 4 (`gemma4`: E2B, E4B, 26B-A4B, 31B), text | **new in 0.9.1**: model math checked against Hugging Face's own code (all four layouts: shared caches, per-layer inputs, the 26B's experts), chat format with thinking on or off and its own tool calls; E4B Q4_K_M (210-250 tok/s) and 26B-A4B UD-Q4_K_M (180-190 tok/s) on an RTX 5090 (Ryzen 9 9950X3D, 64 GB DDR5), all in VRAM; the 31B not yet |
-| Inkling 2 (`inkling2_loop`, and Unsloth's `inkling2` files), text | **early, new in 0.9.4**: model math checked against Hugging Face's own code (the loop, attention over the depth, relative-position attention, both GGUF layouts, BF16 and NVFP4 experts with their scales); Unsloth's Inkling-2-Mini-UD-Q8_K_XL all in VRAM on an RTX 5090 (66.7 tok/s at 64K context); its chat format with thinking on and off and its own tool calls; images not yet |
+| Inkling 2 (`inkling2_loop`, and Unsloth's `inkling2` files), text | **early, since 0.9.4**: model math checked against Hugging Face's own code (the loop, attention over the depth, relative-position attention, both GGUF layouts, BF16 and NVFP4 experts with their scales); Unsloth's Inkling-2-Mini-UD-Q8_K_XL all in VRAM on an RTX 5090 (80.4 tok/s at 64K context, 0.9.5); its chat format with thinking on and off and its own tool calls; images not yet |
+| SenseNova-Loop (`sensenova_loop`), text | **new in 0.9.5**: model math checked against SenseNova's own Hugging Face code (the loop, mHC's two streams, the MTP block); the official SenseNova-Loop-9B GGUF files: Q8_0 and BF16 on an RTX 5090, Q4_K_M on an RTX 3070 laptop, all in VRAM; images not yet |
 | Qwen3.8 Flash-Next (`qwen4exp`) | model math checked against Hugging Face's own code (hyper-connections, the n-gram embedding, sparse attention past 2,048 tokens, the MTP draft block), text only for now; the real 120 GB Q4_K_M with Unsloth's MTP file at 80.3 tok/s in a chat (88.8 in Find the fastest settings) on an RTX 5090 with 64 GB RAM, with its n-gram table on the SSD tier; UD-IQ3_XXS (77.9 GiB) at 94.8 tok/s on the same PC (Ryzen 9 9950X3D, 64 GB DDR5-6000, VRAM experts following the conversation, 4 guesses, temperature 0.7; 0.8.7) |
 
 Embedding models (loaded next to a chat model): BERT-style (`bert`: bge, all-MiniLM, e5) and Nomic
