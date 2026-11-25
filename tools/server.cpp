@@ -908,9 +908,10 @@ struct Engine {
         auto sp = std::make_unique<Speculator>(*model, d, draft_p_min);
         // With a draft block: d guesses a check, or up to 8 when the block is sure of that many and they pay for what
         // they add to the check (Speculator::set_adaptive). TIERLM_DRAFT_ADAPT=N: up to N (0: always d). Measured on
-        // an RTX 5090 (0.9.5), Qwen3.8 Flash-Next UD-IQ3_XXS at 256K, 500-token code replies, 4 a load: 3 guesses
-        // 103.6 tok/s (two loads), 5: 109.4, 7: 114.9, 3 or up to 8: 116.6. (Before 0.9.4 it gained nothing: a check
-        // of a few more tokens cost about what those tokens cost anyway.)
+        // an RTX 5090 (0.9.5), Qwen3.8 Flash-Next UD-IQ3_XXS at 256K, 500-token code replies, 4 a load: always 3
+        // guesses 105.6 tok/s, up to 8 116.2 (three loads: 120.6, 107.9 as it took a few replies to go to 8, 120.2);
+        // Qwen3.8-27B Q6_K 78.6 and 79.6. (Before 0.9.4 it gained nothing: a check of a few more tokens cost about
+        // what those tokens cost anyway.)
         if (model->has_mtp()) {
             const char* e = std::getenv("TIERLM_DRAFT_ADAPT");
             const int most = e ? std::atoi(e) : 8;
