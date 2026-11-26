@@ -272,7 +272,8 @@ Example (values depend on the model and machine):
 
 It also reports where the model lives: `vram_weights` and `ram_weights` (bytes), `split_mode`, `gpus` (one entry per
 GPU in use: `name`, `weights`, `kv`, `layers`), `ffn_vram` (per layer: are its experts in VRAM), and
-`speculative`, `draft_max`, `has_draft_block` and `mtp_loaded` (the draft layer is in memory, so `/api/spec` can
+`speculative`, `draft_max`, `draft_adapt` (with a draft block: the most guesses a check when they pay, 0 when the
+count stays at `draft_max`), `has_draft_block` and `mtp_loaded` (the draft layer is in memory, so `/api/spec` can
 switch speculation on), `lookup` (most tokens prompt lookup guesses now, 0 when off) and `lookup_setting` (as set: -1 automatic), `hot_experts` (experts placed in VRAM by usage), `hot` (per layer: those experts' numbers, which change as you chat with
 live hot experts), `live_experts` (on or off) and `live` (`picks`, `hits`: picks served from VRAM, `swaps`, `swap_ms`),
 `hot_share` (the share of the learned expert use those VRAM experts cover, 0 to 1) and `learned_tokens` (about how
