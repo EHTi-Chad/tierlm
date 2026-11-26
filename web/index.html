@@ -403,6 +403,31 @@ window.FIT = (() => {
   .bar.stack > .add.less { background: transparent; box-shadow: inset 0 0 0 1px var(--kv); }
   canvas { display: block; width: 100%; }
   #spark { height: 58px; margin-top: 6px; }
+  /* Activity: a note in the Speed card while another app or page is getting a reply, and the full view */
+  #actopen { border: 0; background: transparent; color: var(--faint); font-size: 12px; padding: 0 3px; margin-left: 4px; cursor: pointer;
+             line-height: 1; vertical-align: 1px; border-radius: 4px; }
+  #actopen:hover, #actopen:focus-visible { color: var(--accent); background: var(--accent-soft); }
+  #actnote { display: block; width: 100%; text-align: left; margin-top: 4px; padding: 3px 7px; border: 0; border-radius: 6px; cursor: pointer;
+             font: inherit; font-size: 12px; color: var(--accent); background: var(--accent-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #actnote.done { color: var(--muted); background: var(--panel-2); }
+  #actwin { position: fixed; inset: 0; z-index: 900; display: flex; align-items: center; justify-content: center; padding: 20px;
+            background: color-mix(in srgb, #000 40%, transparent); }
+  #actwin[hidden] { display: none; }
+  #actwin .actbox { width: min(1100px, 100%); max-height: 100%; display: flex; flex-direction: column; background: var(--panel); color: var(--ink);
+                    border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,.35); padding: 16px 18px 14px; }
+  #actwin h2 { margin: 0; font-size: 17px; }
+  #actwin .sub { color: var(--muted); font-size: 12.5px; margin: 3px 0 10px; }
+  #acttot { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 12.5px; color: var(--muted); margin-bottom: 10px; }
+  #acttot b { color: var(--ink); font-variant-numeric: tabular-nums; }
+  #actwin .scroll { overflow: auto; border: 1px solid var(--line); border-radius: 10px; }
+  #acttab { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  #acttab th { position: sticky; top: 0; background: var(--panel-2); text-align: left; font-weight: 600; color: var(--muted); padding: 6px 9px; white-space: nowrap; }
+  #acttab td { padding: 6px 9px; border-top: 1px solid var(--line); white-space: nowrap; }
+  #acttab td.r, #acttab th.r { text-align: right; }
+  #acttab tr.live td { background: var(--accent-soft); }
+  #acttab tr.live td.st { color: var(--accent); font-weight: 600; }
+  #acttab .from { color: var(--muted); }
+  #actwin .foot { display: flex; justify-content: flex-end; margin-top: 10px; }
   .chead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
   .big.sm { font-size: 19px; line-height: 1.1; }
   .big.sm small { font-size: 11.5px; }
@@ -897,7 +922,8 @@ window.FIT = (() => {
     <div id="live" aria-label="Live view">
     <div class="card">
       <div class="body">
-        <div class="chead"><div class="ctitle">Speed</div><div class="big sm" id="tps">–<small>tok/s</small></div></div>
+        <div class="chead"><div class="ctitle">Speed<button id="actopen" class="hostonly" aria-label="Activity" title="Activity: replies for every app and page">⤢</button></div><div class="big sm" id="tps">–<small>tok/s</small></div></div>
+        <button id="actnote" hidden title="Another app or page is using tierlm: open Activity"></button>
         <canvas id="spark"></canvas>
         <dl class="kv">
           <dt>Prompt reading</dt><dd id="ptps">–</dd>
@@ -1157,6 +1183,17 @@ window.FIT = (() => {
 </main>
 <div id="tip"></div>
 
+<div id="actwin" hidden role="dialog" aria-modal="true" aria-labelledby="acttitle">
+  <div class="actbox">
+    <h2 id="acttitle">Activity</h2>
+    <div class="sub">Every reply tierlm writes, for this page, other browsers and apps such as opencode, newest first: the last 60 since tierlm started.</div>
+    <div id="acttot"></div>
+    <div class="scroll"><table id="acttab"><thead><tr>
+      <th>When</th><th>Who</th><th>From</th><th class="r">Prompt</th><th class="r">From the cache</th><th class="r">Reading</th>
+      <th class="r">Reply</th><th class="r">Writing</th><th class="r">Words a check</th><th>State</th></tr></thead><tbody></tbody></table></div>
+    <div class="foot"><button class="primary" id="actclose">Close</button></div>
+  </div>
+</div>
 <div id="hfwin" hidden role="dialog" aria-modal="true" aria-label="Get models">
   <div class="hfbox">
     <div class="hfhead">
@@ -1179,8 +1216,11 @@ window.FIT = (() => {
 let apiKeyMem = null;
 function storedKey() { if (apiKeyMem !== null) return apiKeyMem; try { return localStorage.getItem("tierlm.apikey") || ""; } catch (e) { return ""; } }
 const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+// This page's own name for the Activity view, so it can tell its replies from another browser's
+const TAB = Math.random().toString(36).slice(2, 10);
 async function api(url, opts = {}) {
-  const withKey = () => { const k = storedKey(); const o = { ...opts, headers: { ...(opts.headers || {}) } }; if (k) o.headers["Authorization"] = "Bearer " + k; return o; };
+  const withKey = () => { const k = storedKey(); const o = { ...opts, headers: { ...(opts.headers || {}) } }; if (k) o.headers["Authorization"] = "Bearer " + k;
+                          o.headers["X-Tierlm-Tab"] = TAB; return o; };
   const sent = storedKey();
   let r = await fetch(url, withKey());
   if (r.status === 401) {
@@ -1611,6 +1651,94 @@ setInterval(async () => {
   if (!info || (info.connections || 1) < 2 || document.hidden) return;
   try { const j = await (await api("/api/info")).json(); connActive = j.busy ? (j.active ?? 0) : 0; showStatus(); } catch (e) {}
 }, 3000);
+// ---- Activity: replies tierlm writes for other apps (opencode, pi, ...) and other browsers ----
+// While one is being written, the Speed card follows it, with a note saying who it's for; the ⤢ next to Speed opens
+// the full list. On the computer running tierlm only (the server keeps it to itself too).
+let actFollow = 0, actPrev = null, actLastSeen = 0, actData = null;
+const actWho = r => r.app === "tierlm's page" ? (r.tab === TAB ? "this page" : "tierlm in another browser") : r.app;
+const actMine = r => r.app === "tierlm's page" && r.tab === TAB;
+async function pollActivity() {
+  if (!info?.loaded || document.body.classList.contains("guest") || (document.hidden && $("actwin").hidden)) return;
+  let j;
+  try { const res = await api("/api/activity"); if (!res.ok) return; j = await res.json(); } catch (e) { return; }
+  if (!Array.isArray(j?.recs)) return;                       // (an older tierlm: no Activity)
+  actData = j;
+  if (!$("actwin").hidden) renderActivity();
+  const others = j.recs.filter(r => !actMine(r));
+  const live = others.filter(r => r.state < 2);
+  const note = $("actnote");
+  if (live.length) {
+    const r = live[live.length - 1];
+    actLastSeen = j.now;
+    if (actFollow !== r.id) { actFollow = r.id; actPrev = null; if (!busy) { speedPts = []; tokCount = 0; } }
+    note.hidden = false; note.classList.remove("done");
+    note.textContent = "⇄ " + actWho(r) + " · " + r.from + " · " + (r.state === 0 ? "reading the prompt" : "writing") +
+                       (live.length > 1 ? ` · +${live.length - 1} more` : "");
+    if (!busy) {                                             // (this page's own reply has the card while it writes)
+      if (r.state >= 1) {
+        const fresh = r.n_prompt - r.reused;
+        $("ptps").textContent = Math.round(fresh / Math.max(r.prompt_s, 1e-6)).toLocaleString() + " tok/s (" + fresh.toLocaleString() + " new)";
+        $("reused").textContent = r.reused.toLocaleString() + " of " + r.n_prompt.toLocaleString();
+        if (r.gen_s > 0.25) { const t = (r.n_gen / r.gen_s).toFixed(1); $("tps").firstChild.nodeValue = t; $("rtps").textContent = t; }
+        if (actPrev && r.n_gen > actPrev.n_gen && r.gen_s > actPrev.gen_s) {
+          speedPts.push([r.n_past, (r.n_gen - actPrev.n_gen) / (r.gen_s - actPrev.gen_s)]);
+          if (speedPts.length > 6000) speedPts.shift();
+        }
+        actPrev = r;
+      }
+      setContext(r.n_past);
+    }
+  } else if (actFollow) {
+    const r = others.find(x => x.id === actFollow);
+    if (r && !busy && r.state === 2) {
+      const t = (r.n_gen / Math.max(r.gen_s, 1e-6)).toFixed(1);
+      $("tps").firstChild.nodeValue = t; $("rtps").textContent = t;
+      $("lastreply").textContent = r.n_gen + " tokens in " + r.gen_s.toFixed(1) + " s";
+      setContext(r.n_past);
+    }
+    note.textContent = "⇄ " + (r ? actWho(r) : "another app") + " · finished";
+    note.classList.add("done");
+    actFollow = 0;
+  } else if (!note.hidden && j.now - actLastSeen > 60000) note.hidden = true;    // (a minute after the last one)
+}
+setInterval(pollActivity, 1000);
+function renderActivity() {
+  const j = actData;
+  if (!j) return;
+  const t = j.totals, num = n => n.toLocaleString();
+  $("acttot").innerHTML = "";
+  const add = (label, val) => { const sp = document.createElement("span"); sp.textContent = label + " "; const b = document.createElement("b"); b.textContent = val; sp.append(b); $("acttot").append(sp); };
+  add("Replies", num(t.replies));
+  add("Written", num(t.tokens) + " tokens" + (t.gen_s > 0 ? " at " + (t.tokens / t.gen_s).toFixed(1) + " tok/s" : ""));
+  add("Read", num(t.read) + " new prompt tokens" + (t.read_s > 0 ? " at " + num(Math.round(t.read / t.read_s)) + " tok/s" : ""));
+  add("Time", "writing " + fmtSecs(t.gen_s) + " · reading " + fmtSecs(t.read_s));
+  const tb = $("acttab").tBodies[0];
+  tb.innerHTML = "";
+  const states = ["reading", "writing", "done", "stopped"];
+  for (const r of j.recs.slice().reverse()) {
+    const tr = document.createElement("tr");
+    if (r.state < 2) tr.className = "live";
+    const fresh = r.n_prompt - r.reused;
+    const cells = [
+      [new Date(r.t0).toLocaleTimeString(), ""], [actWho(r), ""], [r.from, "from"],
+      [r.state === 0 ? "…" : num(r.n_prompt), "r"], [r.state === 0 ? "…" : num(r.reused), "r"],
+      [r.state === 0 || r.prompt_s <= 0 ? "…" : num(Math.round(fresh / r.prompt_s)) + " tok/s · " + r.prompt_s.toFixed(1) + " s", "r"],
+      [r.state === 0 ? "" : num(r.n_gen), "r"],
+      [r.gen_s > 0.05 ? (r.n_gen / r.gen_s).toFixed(1) + " tok/s · " + r.gen_s.toFixed(1) + " s" : "", "r"],
+      [r.state >= 2 && r.checks > 0 && r.accepted > 0 ? (r.n_gen / r.checks).toFixed(1) : "", "r"],
+      [r.state >= 2 && r.stop && r.stop !== "end" && r.stop !== "stop" ? states[r.state] + " (" + r.stop + ")" : states[r.state], "st"]];
+    for (const [v, c] of cells) { const td = document.createElement("td"); td.textContent = v; if (c) td.className = c; tr.append(td); }
+    tb.append(tr);
+  }
+  if (!j.recs.length) { const tr = document.createElement("tr"), td = document.createElement("td"); td.colSpan = 10; td.textContent = "No replies yet since tierlm started."; tr.append(td); tb.append(tr); }
+}
+function fmtSecs(s) { return s >= 90 ? Math.floor(s / 60) + " min " + Math.round(s % 60) + " s" : s.toFixed(1) + " s"; }
+function openActivity() { $("actwin").hidden = false; renderActivity(); pollActivity(); $("actclose").focus(); }
+$("actopen").onclick = openActivity;
+$("actnote").onclick = openActivity;
+$("actclose").onclick = () => { $("actwin").hidden = true; };
+$("actwin").addEventListener("click", e => { if (e.target === $("actwin")) $("actwin").hidden = true; });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("actwin").hidden) $("actwin").hidden = true; });
 // One reply from the model, streamed into a new bubble. Returns { reply, meta, done } (done: the "done" event).
 async function streamReply(useWs) {
   const bubble = addMsg("assistant", "");

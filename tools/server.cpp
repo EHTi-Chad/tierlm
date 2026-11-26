@@ -22,6 +22,7 @@
 //                     streams Server-Sent Events: one "prompt" event, a "token" event per token
 //                     (with the experts picked in every layer), then "done"
 //   POST /api/reset   clears the KV cache
+//   GET  /api/activity the replies being written and just written, from every app and page (this computer only)
 //   GET  /api/network  API and network settings, and the addresses other apps should use
 //   POST /api/network  {"allow_network": true, "api_key": "..."}  (this computer only; saved)
 //
@@ -1350,12 +1351,12 @@ void oai_error(httplib::Response& res, int status, const std::string& msg, const
 // ngrok and friends connect from localhost but add one of these headers), so it can't be someone outside.
 // What another device may not do (see the pre-routing handler): anything but reading under /api/, except
 // writing a reply (/api/chat) and starting a new chat (/api/reset); and a few reads that are about the computer
-// rather than the model (the console, the hardware, the models folder's files).
+// rather than the model (the console, the replies of every app, the hardware, the models folder's files).
 bool remote_refused(const httplib::Request& req) {
     const std::string& p = req.path;
     if (p.compare(0, 5, "/api/") != 0 || p.compare(0, 8, "/api/v0/") == 0) return false;   // the page, /v1, LM Studio's API
     if (req.method == "GET" || req.method == "HEAD")
-        return p == "/api/log" || p == "/api/devices" || p == "/api/models";
+        return p == "/api/log" || p == "/api/activity" || p == "/api/devices" || p == "/api/models";
     return !(p == "/api/chat" || p == "/api/reset" || p == "/api/reload");   // (/api/reload: only the model that was loaded)
 }
 
@@ -1364,6 +1365,100 @@ bool is_local(const httplib::Request& req) {
     const bool loop = a == "127.0.0.1" || a == "::1" || a == "::ffff:127.0.0.1";
     return loop && !req.has_header("X-Forwarded-For") && !req.has_header("Forwarded") &&
            !req.has_header("Cf-Connecting-Ip") && !req.has_header("X-Real-Ip");
+}
+
+// ---- Activity: the replies being written and just written, whichever app asked for them ----
+// The page's Speed card follows a reply another app (or another browser) is getting, and its Activity view lists
+// them. A route names the request's source (source()); generate() takes it up when it starts the reply (start()),
+// and updates the record as it reads the prompt and writes. Kept in memory: the last 60 replies and running totals.
+struct Activity {
+    struct Rec {
+        long long id = 0; std::string app, from, tab, route;
+        int state = 0;                                            // 0 reading the prompt, 1 writing, 2 done, 3 stopped (an error)
+        long long t0 = 0, t_end = 0;                               // (ms since 1970)
+        size_t n_prompt = 0, reused = 0, n_gen = 0, checks = 0, accepted = 0; double prompt_s = 0, gen_s = 0; int n_past = 0;
+        std::string stop;
+    };
+    std::mutex mu;
+    std::deque<Rec> recs, pending;                                 // pending: named by a route, not started yet
+    long long next = 1, n_done = 0, tok_gen = 0, tok_read = 0; double s_gen = 0, s_read = 0;
+    static long long now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    long long source(std::string app, std::string from, std::string tab, std::string route) {
+        std::lock_guard<std::mutex> lk(mu);
+        Rec r; r.id = next++; r.app = std::move(app); r.from = std::move(from); r.tab = std::move(tab); r.route = std::move(route);
+        pending.push_back(std::move(r));
+        while (pending.size() > 64) pending.pop_front();          // (named, but the request ended before a reply)
+        return pending.back().id;
+    }
+    long long start(long long src) {
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto it = pending.begin(); it != pending.end(); ++it)
+            if (it->id == src) {
+                Rec r = std::move(*it); pending.erase(it);
+                r.id = next++; r.t0 = now_ms();                    // (a new id: one request can write more than one reply)
+                recs.push_back(std::move(r));
+                while (recs.size() > 60) recs.pop_front();
+                return recs.back().id;
+            }
+        return 0;
+    }
+    // A record by id (the caller holds mu)
+    Rec* find(long long id) { for (auto it = recs.rbegin(); it != recs.rend(); ++it) if (it->id == id) return &*it; return nullptr; }
+    void read(long long id, size_t n_prompt, size_t reused, double s, int past) {
+        if (!id) return;
+        std::lock_guard<std::mutex> lk(mu);
+        if (Rec* r = find(id)) { r->n_prompt = n_prompt; r->reused = reused; r->prompt_s = s; r->n_past = past; r->state = 1; }
+    }
+    void wrote(long long id, size_t n, double s, int past) {
+        if (!id) return;
+        std::lock_guard<std::mutex> lk(mu);
+        if (Rec* r = find(id)) { r->n_gen = n; r->gen_s = s; r->n_past = past; }
+    }
+    void finish(long long id, bool ok, const std::string& stop, size_t n, double s, size_t checks, size_t accepted, int past) {
+        if (!id) return;
+        std::lock_guard<std::mutex> lk(mu);
+        Rec* r = find(id);
+        if (!r || r->state >= 2) return;
+        if (ok) { r->n_gen = n; r->gen_s = s; r->checks = checks; r->accepted = accepted; if (past > 0) r->n_past = past; }
+        r->state = ok ? 2 : 3; r->stop = ok ? stop : "error"; r->t_end = now_ms();
+        ++n_done; tok_gen += (long long)r->n_gen; s_gen += r->gen_s; tok_read += (long long)(r->n_prompt - std::min(r->n_prompt, r->reused)); s_read += r->prompt_s;
+    }
+    json snapshot() {
+        std::lock_guard<std::mutex> lk(mu);
+        json list = json::array();
+        for (const Rec& r : recs)
+            list.push_back({{"id", r.id}, {"app", r.app}, {"from", r.from}, {"tab", r.tab}, {"route", r.route}, {"state", r.state},
+                            {"t0", r.t0}, {"t_end", r.t_end}, {"n_prompt", r.n_prompt}, {"reused", r.reused}, {"prompt_s", r.prompt_s},
+                            {"n_gen", r.n_gen}, {"gen_s", r.gen_s}, {"n_past", r.n_past}, {"checks", r.checks}, {"accepted", r.accepted},
+                            {"stop", r.stop}});
+        return {{"now", now_ms()}, {"recs", list},
+                {"totals", {{"replies", n_done}, {"tokens", tok_gen}, {"gen_s", s_gen}, {"read", tok_read}, {"read_s", s_read}}}};
+    }
+};
+
+// Which app sent a request, as well as its headers tell: the name an app gives itself (X-Title, as OpenRouter asks
+// apps to send), a coding tool's name in its User-Agent, or the library it uses.
+std::string app_of(const httplib::Request& req) {
+    std::string t = req.get_header_value("X-Title");
+    if (!t.empty() && t.size() <= 48) return t;
+    const std::string ua = req.get_header_value("User-Agent");
+    std::string low = ua;
+    for (char& c : low) c = (char)std::tolower((unsigned char)c);
+    static const std::pair<const char*, const char*> known[] = {
+        {"opencode", "opencode"}, {"kilo", "Kilo Code"}, {"roo", "Roo Code"}, {"cline", "Cline"}, {"continue", "Continue"},
+        {"aider", "aider"}, {"cursor", "Cursor"}, {"zed", "Zed"}, {"hermes", "Hermes"}, {"goose", "Goose"}, {"crush", "Crush"},
+        {"openwebui", "Open WebUI"}, {"open-webui", "Open WebUI"}, {"anythingllm", "AnythingLLM"}, {"librechat", "LibreChat"},
+        {"claude-code", "Claude Code"}, {"claude-cli", "Claude Code"}, {"codex", "Codex"}, {"pi-coding-agent", "pi"}, {"n8n", "n8n"},
+        {"openai/js", "an app (OpenAI's JS library)"}, {"openai/python", "an app (OpenAI's Python library)"},
+        {"anthropic", "an app (Anthropic's library)"}, {"ai-sdk", "an app (AI SDK)"}, {"langchain", "LangChain"},
+        {"python-requests", "a Python script"}, {"python-httpx", "a Python script"}, {"aiohttp", "a Python script"},
+        {"curl", "curl"}, {"powershell", "PowerShell"}, {"node", "a Node.js app"}, {"mozilla", "a browser"}};
+    for (const auto& [k, name] : known) if (low.find(k) != std::string::npos) return name;
+    if (ua.empty()) return "an app";
+    std::string first = ua.substr(0, ua.find_first_of(" /("));
+    return first.empty() || first.size() > 32 ? "an app" : first;
 }
 
 // Same length and content, without returning early (so timing doesn't reveal how much of a key matched).
@@ -2029,9 +2124,10 @@ int main(int argc, char** argv) {
         return o;
     };
     httplib::Server svr;
+    Activity activity;                                              // (the Activity view: replies from every app)
     if (a.detailed)                                                 // each request (not the page's own polling)
         svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
-            if (req.method == "GET" && (req.path.rfind("/api/", 0) != 0 || req.path == "/api/progress" || req.path == "/api/log" || req.path == "/api/info")) return;
+            if (req.method == "GET" && (req.path.rfind("/api/", 0) != 0 || req.path == "/api/progress" || req.path == "/api/log" || req.path == "/api/activity" || req.path == "/api/info")) return;
             std::fprintf(stderr, "request: %s %s -> %d\n", req.method.c_str(), req.path.c_str(), res.status);
         });
     // (files are never taken for scripts or styles by a browser, and another site's page can't embed tierlm's replies)
@@ -2721,6 +2817,14 @@ int main(int argc, char** argv) {
     static thread_local int tl_image_tokens = 0;      // this request's image detail (0: automatic)
     static thread_local int tl_think = -1;            // this request's thinking: 1 on, 0 off, -1 the model's setting
     static thread_local bool tl_ignore_eos = false;   // this request writes max_tokens whatever (the benchmark page)
+    // The request's source for the Activity view (activity.source): set by the routes that answer apps and the page,
+    // taken by generate(). Every request starts with none (the pre-routing handler), so a benchmark isn't listed.
+    static thread_local long long tl_src = 0;
+    auto name_source = [&](const httplib::Request& req, bool page) {
+        // (a browser on the tierlm page: which page sent it, so each page can tell its own replies from others')
+        tl_src = activity.source(page ? std::string("tierlm's page") : app_of(req), is_local(req) ? std::string("this PC") : req.remote_addr,
+                                 req.get_header_value("X-Tierlm-Tab").substr(0, 32), req.path);
+    };
     // gpt-oss: this request's reasoning effort, 1 low, 2 medium, 3 high, 0 the model's setting (a number: a thread-local
     // std::string used from the route lambdas isn't set up on their threads with GCC)
     static thread_local int tl_effort = 0;
@@ -2753,6 +2857,10 @@ int main(int argc, char** argv) {
                         const std::function<bool(const std::string&, double, const std::vector<int32_t>&)>& on_token,
                         const agent::ojson& tools = agent::ojson()) {
         Gen r;
+        // (the Activity view: this reply's record, stopped if the reply ends with an error)
+        const long long act = tl_src ? activity.start(tl_src) : 0;
+        tl_src = 0;
+        struct ActEnd { Activity& a; long long id; ~ActEnd() { a.finish(id, false, "", 0, 0, 0, 0, 0); } } act_end{activity, act};
         // Sampling values as an app sent them, kept within what makes sense (a huge repeat_last_n walked the whole
         // cache for every token; a negative top_k or temperature isn't a setting).
         Sampling sp = sp_in;
@@ -3094,6 +3202,7 @@ int main(int argc, char** argv) {
         r.n_prompt = toks.size();
         r.reused = common;
         cached = toks;
+        activity.read(act, toks.size(), common, r.prompt_s, npast());
 
         std::vector<int> counts((size_t)L * E, 0);                // experts used while reading the prompt
         if (K > 0) for (size_t i = 0; i < routing.size(); ++i) if (routing[i] >= 0) counts[((i / K) % L) * E + routing[i]]++;   // (-1: a layer without experts)
@@ -3113,6 +3222,7 @@ int main(int argc, char** argv) {
             quiet = 0;
             const std::string delta = visible.substr(shown, upto - shown);
             shown = upto;
+            activity.wrote(act, out.size(), since(g0), npast());
             r.text += delta;
             tl_past = npast();
             return on_token ? on_token(delta, out.size() / std::max(since(g0), 1e-9), routing) : true;
@@ -3323,6 +3433,7 @@ int main(int argc, char** argv) {
         else
             std::fprintf(stderr, "reply: %zu tokens at %.1f tok/s (%s)\n", r.n_gen, r.n_gen / std::max(r.gen_s, 1e-9), r.stop.c_str());
         if (!vram_note.empty()) std::fprintf(stderr, "reply: %s\n", vram_note.c_str() + 2);
+        activity.finish(act, true, r.stop, r.n_gen, r.gen_s, r.checks, r.accepted, npast());
         return r;
     };
 
@@ -3479,6 +3590,7 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"expected {\\\"messages\\\": [...]}\"}", "application/json; charset=utf-8");
             return;
         }
+        name_source(req, true);
         auto lock = std::make_shared<Hold>();                              // held until the stream ends
         res.set_header("Cache-Control", "no-cache");
         const bool local = is_local(req);                                   // saved chats are read only for this computer
@@ -4313,6 +4425,10 @@ int main(int argc, char** argv) {
     svr.Get("/api/progress", [&](const httplib::Request&, httplib::Response& res) {
         res.set_content(dump({{"loading", loading.load()}, {"progress", load_progress.load()}}), "application/json; charset=utf-8");
     });
+    // The replies being written and just written, from every app and page (the page's Speed card and Activity view)
+    svr.Get("/api/activity", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_content(dump(activity.snapshot()), "application/json; charset=utf-8");
+    });
     svr.Get("/api/log", [&](const httplib::Request& req, httplib::Response& res) {
         long long after = -1;
         if (req.has_param("after")) after = std::atoll(req.get_param_value("after").c_str());
@@ -4490,6 +4606,7 @@ int main(int argc, char** argv) {
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array())
             return oai_error(res, 400, "expected a JSON body with a \"messages\" array");
         if (body.value("n", 1) != 1) return oai_error(res, 400, "only n = 1 is supported");
+        name_source(req, false);
         // Wait in line for replies already asked for (from the web page or other apps): one at a time, or as many
         // at once as there are connections. Loading a different model needs the engine to itself.
         const std::string want = body.value("model", std::string());
@@ -4697,6 +4814,7 @@ int main(int argc, char** argv) {
         };
         compat::Request rq = anthropic ? compat::from_anthropic(req.body) : compat::from_responses(req.body);
         if (!rq.error.empty()) return fail(400, rq.error, "invalid_request_error");
+        name_source(req, false);
         auto lock = std::make_shared<Hold>();
         if (!line.enter_reply(mu, *lock, std::function<std::atomic<int>*()>(reply_slots), req.is_connection_closed))
             return fail(503, "busy: waited too long for earlier replies to finish", anthropic ? "overloaded_error" : "server_error");
@@ -4936,6 +5054,7 @@ int main(int argc, char** argv) {
     });
 
     svr.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
+        tl_src = 0;                                                   // (no reply source until a route names one)
         const bool local = is_local(req);
         if (!local && !allow_network && !a.host_given) {
             oai_error(res, 403, "tierlm only accepts connections from this computer: turn on \"Allow other devices\" in tierlm's settings",

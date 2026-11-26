@@ -459,6 +459,26 @@ The engine's recent log lines (what the black window shows), after line number `
 `{"lines": [{"n": 12, "text": "reply: 212 tokens at 22.3 tok/s (end)", "v": false}], "next": 13}`. `v` marks lines
 from ggml and the graphics drivers (the console's Verbose view).
 
+### GET /api/activity
+
+The replies being written and the last 60 written, whichever app or page asked for them (the page's Speed card
+follows a reply another app is getting, and its Activity view lists them all). On this computer only.
+
+`{"now": <ms>, "recs": [...], "totals": {"replies", "tokens", "gen_s", "read", "read_s"}}`, each record
+`{"id", "app", "from", "tab", "route", "state", "t0", "t_end", "n_prompt", "reused", "prompt_s", "n_gen", "gen_s",
+"n_past", "checks", "accepted", "stop"}`:
+
+- `app`: who asked, as the request's headers tell: the name an app gives itself in `X-Title`, a coding tool's name
+  in its User-Agent (opencode, Cline, Continue, aider…), or the library it uses ("an app (OpenAI's JS library)").
+  Requests from tierlm's own page are "tierlm's page", with the page's `tab` (the `X-Tierlm-Tab` header it sends).
+- `from`: "this PC" or the other device's address. `route`: the API it came in on (`/v1/chat/completions`, ...).
+- `state`: 0 reading the prompt, 1 writing, 2 done, 3 stopped by an error. Times in ms since 1970; `t_end` 0 until done.
+- `n_prompt`, `reused` (of it, from the cache), `prompt_s`: the prompt. `n_gen`, `gen_s`: the reply so far (live
+  while writing). `n_past`: the conversation's length in the cache. `checks`, `accepted`: speculative decoding, once
+  done (`n_gen / checks` words a check). `stop`: why it ended (`end`, `length`, `stop`, `abort`, `context`, `error`).
+- `totals`: since tierlm started: replies, tokens written and the seconds spent writing them, tokens read (not from
+  the cache) and the seconds spent reading.
+
 ### GET /api/context, POST /api/context
 
 Changes the context length while the model stays loaded: the cache is made again at the new size on the same devices
