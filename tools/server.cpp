@@ -2260,6 +2260,7 @@ int main(int argc, char** argv) {
             {"think_switch", eng.think_switch}, {"thinking", eng.thinking}, {"reasoning_effort", eng.chat == ChatFmt::Harmony ? eng.effort : std::string()},
             {"vision_device", eng.vision ? eng.vision->device_name() : std::string()}, {"image_tokens", eng.image_tokens_for(0)},
             {"speculative", eng.spec != nullptr}, {"draft_max", eng.draft_max}, {"lookup", eng.lookup_len()}, {"lookup_setting", eng.lookup}, {"has_draft_block", hp.n_nextn > 0},
+            {"draft_adapt", eng.spec && eng.spec->adaptive() ? eng.spec->adaptive_most() : 0},   // (guesses a check go up to this when they pay)
             {"mtp_loaded", eng.model->has_mtp()}, {"self_draft", !eng.model->has_mtp() && eng.can_guess()}, {"looped", eng.model->hparams().looped()}, {"ffn_vram", eng.model->placement().ffn_vram},
             {"hot_experts", eng.model->placement().hot_experts}, {"hot_share", eng.hot_share}, {"hot", eng.model->placement().hot},
             {"live_experts", eng.model->live_hot()},

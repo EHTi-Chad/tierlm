@@ -1370,7 +1370,7 @@ async function loadInfo() {
     else setSampling({ temperature: 0.7, top_k: 40, top_p: 0.9, min_p: 0.05, repeat_penalty: 1.1, presence_penalty: 0, ...sv });
   }
   showRec();
-  if (info.path !== specsPath) { specsPath = info.path; lastBench = lastReply = null; }   // speeds from another model don't carry over
+  if (info.path !== specsPath) { specsPath = info.path; lastBench = lastReply = lastPrefill = null; }   // speeds from another model don't carry over
   L = info.layers; E = info.experts || 0; K = info.experts_used || 0;
   counts = new Float64Array(L * E); flash = new Float64Array(L * E);
   $("slots").max = Math.max(1, E); $("slots").value = Math.max(1, Math.round(E / 4));
@@ -2006,6 +2006,7 @@ async function summariseArchive(btn) {
 }
 function onPrompt(ev) {
   lastReply = { n_prompt: ev.n_prompt, n_new: ev.n_new, prompt_tps: ev.prompt_tps, prompt_s: ev.prompt_s };
+  if (ev.n_new >= 1024) lastPrefill = { tps: ev.prompt_tps, n_new: ev.n_new, n_prompt: ev.n_prompt };
   for (let i = 0; i < ev.counts.length; i++) counts[i] += ev.counts[i];
   totalPicks += ev.n_new * L * K;
   $("ptps").textContent = Math.round(ev.prompt_tps).toLocaleString() + " tok/s (" + ev.n_new.toLocaleString() + " new)";
@@ -2030,7 +2031,7 @@ function onToken(ev) {
   if (tokCount % 4 === 0) updateHits();
 }
 function onDone(ev) {
-  if (lastReply) Object.assign(lastReply, { n_gen: ev.n_gen, gen_s: ev.gen_s, gen_tps: ev.gen_tps });
+  if (lastReply) Object.assign(lastReply, { n_gen: ev.n_gen, gen_s: ev.gen_s, gen_tps: ev.gen_tps, spec: ev.spec || null });
   $("tps").firstChild.nodeValue = ev.gen_tps.toFixed(1); $("rtps").textContent = ev.gen_tps.toFixed(1);
   $("lastreply").textContent = ev.n_gen + " tokens in " + ev.gen_s.toFixed(1) + " s";
   setContext(ev.n_past);
@@ -4054,7 +4055,8 @@ $("chatsfolder").onclick = () => chatApi("/api/chats-folder", { method: "POST", 
 // Everything people ask for next to a speed result, in three forms: one line, a Markdown table (Reddit, GitHub)
 // and JSON. Built from /api/info (the model and where it went), /api/specs (this PC, the model file) and the
 // latest benchmark and reply. Plain separators only ("|", "->"): fancy ones turn into "?" in some places pasted to.
-var lastBench = null, lastReply = null, specsPath = "";   // (var: loadInfo may run before this line)
+// lastPrefill: the last prompt long enough to time reading (prefill) well: 1,024 new tokens or more
+var lastBench = null, lastReply = null, lastPrefill = null, specsPath = "";   // (var: loadInfo may run before this line)
 const gbs = b => (b / 1e9).toFixed(1) + " GB";
 async function getSpecs() {
   let inf = info, pc = {};
@@ -4115,7 +4117,8 @@ function specsData({ pc, inf }) {
     batch: inf.batch,
     threads: inf.on_gpu && inf.all_on_gpu ? "" : String(inf.threads),
     connections: inf.connections || 1,
-    speculative: inf.speculative ? `on, ${inf.draft_max} ${inf.draft_max === 1 ? "guess" : "guesses"} per check (${inf.mtp_loaded ? "MTP draft layer" : "self-draft"})` : "off",
+    speculative: inf.speculative ? `on, ${inf.draft_max} ${inf.draft_max === 1 ? "guess" : "guesses"} per check` +
+      (inf.draft_adapt > inf.draft_max ? `, up to ${inf.draft_adapt} when they pay (adaptive)` : "") + ` (${inf.mtp_loaded ? "MTP draft layer" : "self-draft"})` : "off",
     lookup: inf.lookup > 0 ? `up to ${inf.lookup} tokens` : "off",
     thinking: inf.reasoning_effort ? "reasoning " + inf.reasoning_effort : inf.think_switch ? (inf.thinking ? "on" : "off") : "",
     sampling: `temp ${s.temperature}, top_k ${s.top_k}, top_p ${s.top_p}, min_p ${s.min_p}`,
@@ -4123,14 +4126,15 @@ function specsData({ pc, inf }) {
   };
   if (lastBench) {
     const ttft = 512 / lastBench.prompt_tps + 1 / Math.max(lastBench.gen_tps, 1e-9);
-    d.benchmark = `prompt ${lastBench.prompt_tps.toFixed(1)} tok/s (${lastBench.prompt_tokens || 512}-token prompt), ` +
-      `generation ${lastBench.gen_tps.toFixed(1)} tok/s (${lastBench.questions || 3} answers of up to ${lastBench.gen_tokens || 160} tokens), ` +
+    d.benchmark = `prefill ${lastBench.prompt_tps.toFixed(1)} tok/s (${lastBench.prompt_tokens || 512}-token prompt), ` +
+      `decode ${lastBench.gen_tps.toFixed(1)} tok/s (${lastBench.questions || 3} answers of up to ${lastBench.gen_tokens || 160} tokens), ` +
       `first token after ~${ttft.toFixed(2)} s`;
   }
   if (lastReply && lastReply.gen_tps) {
-    d.last_reply = `${lastReply.n_prompt.toLocaleString()}-token prompt (${lastReply.n_new.toLocaleString()} new, read at ${Math.round(lastReply.prompt_tps)} tok/s in ${lastReply.prompt_s.toFixed(2)} s), ` +
-      `${lastReply.n_gen.toLocaleString()} tokens generated at ${lastReply.gen_tps.toFixed(1)} tok/s`;
+    d.last_reply = `${lastReply.n_prompt.toLocaleString()}-token prompt (${lastReply.n_new.toLocaleString()} new, prefill ${Math.round(lastReply.prompt_tps)} tok/s in ${lastReply.prompt_s.toFixed(2)} s), ` +
+      `decode ${lastReply.gen_tps.toFixed(1)} tok/s for ${lastReply.n_gen.toLocaleString()} tokens` + (perCheck() ? `, ${perCheck()} tokens a check` : "");
   }
+  if (lastPrefill) d.prefill = `${Math.round(lastPrefill.tps).toLocaleString()} tok/s (${lastPrefill.n_new.toLocaleString()} new tokens of a ${lastPrefill.n_prompt.toLocaleString()}-token prompt)`;
   return d;
 }
 function specsLine(sp) {
@@ -4139,13 +4143,23 @@ function specsLine(sp) {
   const parts = [`tierlm ${d.tierlm}`, `${d.model}${d.quant ? " " + d.quant : ""}`, d.gpus.join(" + "),
     [d.cpu.split(",")[0], d.ram && d.ram + " RAM"].filter(Boolean).join(", "),
     p.short + (tiers.length > 1 ? " (" + tiers.join(" / ") + ")" : ""),
-    `${d.context}`, d.threads && d.threads + " threads", d.speculative === "off" ? "no speculation" : "speculative " + (sp.inf.draft_max || "")].filter(Boolean);
+    `${d.context}`, d.threads && d.threads + (d.threads === "1" ? " thread" : " threads"),
+    d.speculative === "off" ? "no speculation" : "speculative " + (sp.inf.draft_max || "") + (sp.inf.draft_adapt > sp.inf.draft_max ? ` (adaptive up to ${sp.inf.draft_adapt})` : "")].filter(Boolean);
   let out = parts.join(" | ");
-  if (lastBench) out += ` -> prompt ${lastBench.prompt_tps.toFixed(1)} tok/s, generation ${lastBench.gen_tps.toFixed(1)} tok/s (benchmark)`;
-  else if (lastReply && lastReply.gen_tps) out += ` -> generation ${lastReply.gen_tps.toFixed(1)} tok/s (${lastReply.n_prompt.toLocaleString()}-token prompt` +
-    (lastReply.n_gen ? `, ${lastReply.n_gen.toLocaleString()}-token reply)` : `)`);
+  // Prefill (reading the prompt) and decode (writing the reply), the two speeds people compare. A chat's prefill is
+  // timed only from a prompt of 1,024 new tokens or more (a short one is mostly overhead); else the line says so.
+  const num = n => Math.round(n).toLocaleString();
+  if (lastBench) out += ` -> prefill ${num(lastBench.prompt_tps)} tok/s (${lastBench.prompt_tokens || 512}-token prompt), decode ${lastBench.gen_tps.toFixed(1)} tok/s (benchmark)`;
+  else if (lastReply && lastReply.gen_tps) {
+    const pre = lastPrefill ? `prefill ${num(lastPrefill.tps)} tok/s (${lastPrefill.n_new.toLocaleString()} new tokens)`
+                            : `prefill not timed (${lastReply.n_new.toLocaleString()} new prompt tokens)`;
+    out += ` -> ${pre}, decode ${lastReply.gen_tps.toFixed(1)} tok/s (${lastReply.n_gen.toLocaleString()}-token reply` +
+           (perCheck() ? `, ${perCheck()} tokens a check` : "") + `, after a ${lastReply.n_prompt.toLocaleString()}-token prompt)`;
+  }
   return out;
 }
+// The last reply's tokens a check with speculative decoding ("" without)
+function perCheck() { const s = lastReply?.spec; return s && s.checks > 0 && s.accepted > 0 ? (lastReply.n_gen / s.checks).toFixed(1) : ""; }
 function specsMarkdown(sp) {
   const d = specsData(sp), p = d.placement;
   const rows = [
@@ -4156,7 +4170,7 @@ function specsMarkdown(sp) {
     ["Context", d.context], ["Flash attention", d.flash_attn], ["Batch", d.batch], ["CPU threads", d.threads],
     ["Connections", d.connections > 1 ? d.connections : ""], ["Speculative decoding", d.speculative], ["Prompt lookup", d.lookup],
     ["Thinking", d.thinking], ["Sampling", d.sampling], ["Load time", d.load_time],
-    ["Benchmark", d.benchmark || ""], ["Last chat reply", d.last_reply || ""],
+    ["Benchmark", d.benchmark || ""], ["Last chat reply", d.last_reply || ""], ["Prefill (last long prompt)", d.prefill || ""],
   ].filter(r => r[1] !== "" && r[1] != null);
   const cell = v => String(v).replace(/\|/g, "\\|");
   return "| tierlm specs | |\n|---|---|\n" + rows.map(r => `| **${r[0]}** | ${cell(r[1])} |`).join("\n") + "\n";

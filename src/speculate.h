@@ -78,6 +78,7 @@ public:
     // for draft blocks (up to 8; TIERLM_DRAFT_ADAPT=0 turns it off).
     void set_adaptive(bool on, int most = 8) { adapt_ = on; adapt_most_ = std::max(1, most); }
     bool adaptive() const { return adapt_; }
+    int adaptive_most() const { return adapt_most_; }
 
     // Guessing with the model itself, cut down to the experts in VRAM (Model::set_hot_only), for models with experts
     // split between VRAM and RAM and no draft block: each guess is a step on the GPU alone, and the whole model then
