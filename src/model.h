@@ -541,6 +541,8 @@ private:
     void pin_cpu_layers(const Graph& g, ggml_backend_sched* sc = nullptr);        // keep every op of a RAM layer on the CPU
     std::vector<float> eval_batch(const int32_t* ids, int n_tok, int n_threads, std::vector<int32_t>* routing);
     void release_pending();
+    // Copies between tensors (src, dst), all done when it returns; on a CUDA card waited for together (see model.cpp)
+    void copy_many(const std::vector<std::pair<const ggml_tensor*, ggml_tensor*>>& cp);
     // One graph: n_tok tokens of conversation 0 (groups null), or of the conversations in groups.
     EvalOut step(const int32_t* ids, int n_tok, int n_threads, int n_logits, bool want_hidden, int snapshots,
                  std::vector<int32_t>* routing, const std::vector<SeqGroup>* groups);
@@ -573,6 +575,7 @@ public:
     std::vector<float> take_extra_counts() { std::lock_guard<std::mutex> lk(extra_mu_); std::vector<float> c; c.swap(extra_counts_); return c; }
 private:
     std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way)
+    std::vector<uint32_t> map_stage_;            // (adapt_hot: the VRAM maps' new entries on their way)
     double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
     std::chrono::steady_clock::time_point live_last_{};
     size_t live_credit_ = 0;                     // (adapt_hot: moving budget left unused by earlier steps)

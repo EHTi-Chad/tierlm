@@ -1,4 +1,5 @@
 #include "speculate.h"
+#include "vec_scan.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -30,34 +31,39 @@ std::vector<float> Speculator::prompt(const std::vector<int32_t>& toks, int n_th
     int s = m_.n_past();
     if (s >= end) { m_.truncate(end - 1); s = m_.n_past(); }   // always evaluate at least one token
 
-    std::vector<float> H, lg;                         // hidden states of positions [s, end)
+    // Each batch of the prompt, then the draft block's entries it makes possible: position p needs the model's
+    // hidden state at p - 1, so after the batch [off, off + k) the draft block can do every position up to off + k
+    // (its token is known). Positions [c, end) need (re)doing; the hidden state for c - 1 is in the first batch
+    // (s <= c - 1) or kept (h_pos_). One batch's hidden states at a time: holding the whole prompt's until it was
+    // read (as before 0.9.6) was the model's hidden width a token (Flash-Next's: all its streams), gigabytes for a
+    // long prompt, copied again each time the vector grew.
+    std::vector<float> lg, hrows;
+    int pm = c;                                       // the draft block's next position
     for (int off = s; off < end; ) {
         const int k = std::min(m_.batch_at(off), end - off);       // (fewer at a time far into a long context)
         std::vector<int32_t> part;
         Model::EvalOut r = m_.eval_ex(toks.data() + off, k, n_threads, 1, true, 1, routing ? &part : nullptr);
         if (routing) routing->insert(routing->end(), part.begin(), part.end());
-        H.insert(H.end(), r.hidden.begin(), r.hidden.end());
         lg = std::move(r.logits);
-        off += k;
-    }
-    if (m_.has_mtp()) {
-        const int c0 = c;                             // positions [c, end) need (re)doing in the draft block; the
-                                                      // hidden state for c - 1 is in H (s <= c - 1) or kept (h_pos_)
-        std::vector<float> hrows;
-        for (int p0 = c0, k = 0; p0 < end; p0 += k) {
-            k = std::min(m_.batch_at(p0), end - p0);
-            hrows.assign((size_t)k * E, 0.0f);
-            for (int i = 0; i < k; ++i) {
-                const int q = p0 + i - 1;             // the hidden state paired with token p0 + i
-                const float* src = q < 0 ? nullptr : q >= s ? H.data() + (size_t)(q - s) * E
-                                                     : q == h_pos_ ? h_last_.data() : nullptr;
-                if (q >= 0 && !src) throw std::runtime_error("speculative decoding: missing hidden state");
-                if (src) std::copy(src, src + E, hrows.begin() + (size_t)i * E);
+        if (m_.has_mtp()) {
+            const int upto = std::min(end, off + k + 1);
+            for (int p0 = std::max(pm, c), kk = 0; p0 < upto; p0 += kk) {
+                kk = std::min(m_.batch_at(p0), upto - p0);
+                hrows.assign((size_t)kk * E, 0.0f);
+                for (int i = 0; i < kk; ++i) {
+                    const int q = p0 + i - 1;         // the hidden state paired with token p0 + i
+                    const float* src = q < 0 ? nullptr : q >= off ? r.hidden.data() + (size_t)(q - off) * E
+                                                         : q < s && q == h_pos_ ? h_last_.data() : nullptr;
+                    if (q >= 0 && !src) throw std::runtime_error("speculative decoding: missing hidden state");
+                    if (src) std::copy(src, src + E, hrows.begin() + (size_t)i * E);
+                }
+                m_.mtp_eval(toks.data() + p0, hrows.data(), kk, p0, n_threads);
             }
-            m_.mtp_eval(toks.data() + p0, hrows.data(), k, p0, n_threads);
+            pm = std::max(pm, upto);
         }
+        off += k;
+        if (off >= end) h_last_.assign(r.hidden.end() - E, r.hidden.end());
     }
-    h_last_.assign(H.end() - E, H.end());
     h_pos_ = end - 1;
     mtp_valid_ = end;
     hist_ = toks;
@@ -193,7 +199,7 @@ std::vector<int32_t> Speculator::step(int32_t x, int n_threads, const Sampler& s
                 d = draw(q);
                 qs.push_back(std::move(q));
             } else {
-                d = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+                d = (int32_t)vec_argmax(lg.data(), lg.size());   // (as std::max_element, several times faster)
                 if (p_min_ > 0.0f || trace_ || adapt) {   // how sure is the draft block? (softmax probability of d)
                     const float top = lg[d];
                     double sum = 0.0;                 // (tokens e^-20 below the best add nothing that matters)

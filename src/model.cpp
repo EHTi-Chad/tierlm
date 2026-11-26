@@ -2711,12 +2711,24 @@ void Model::fill_masks(Graph& g, int n_kv, const std::vector<int>& tok_seq, cons
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
     std::vector<ggml_fp16_t> mask((size_t)n_kv * n_tok, ninf);
     const int end = std::min(n_kv, hi_);
+    // Usually a conversation's cells are its positions (cell q holds position q: one conversation, never cut in the
+    // middle): how far that holds, per conversation, so those rows' seen part is one fill. Past it, its own list is
+    // walked (positions up to p), not the whole cache. (Each row walked was 1.1 ms for a 9-token check at 128K.)
+    std::map<int, int> plain;                                     // conversation: positions [0, n) are cells [0, n)
     for (int t = 0; t < n_tok; ++t) {
         ggml_fp16_t* row = mask.data() + (size_t)t * n_kv;
         const int s = tok_seq[t], p = tok_pos[t];
-        // Usually a conversation's cells: walk its own list (positions 0..p), not the whole cache.
         const auto& mine = seq_cells_[s];
-        for (int q = 0; q <= p && q < (int)mine.size(); ++q) if (mine[q] < end) row[mine[q]] = zero;
+        auto it = plain.find(s);
+        if (it == plain.end()) {
+            int n = 0;
+            const int most = (int)mine.size();
+            while (n < most && mine[n] == n) ++n;
+            it = plain.emplace(s, n).first;
+        }
+        const int run = std::min(it->second, p + 1);                // positions [0, run) in cells [0, run)
+        std::fill(row, row + std::min(run, end), zero);
+        for (int q = run; q <= p && q < (int)mine.size(); ++q) if (mine[q] < end) row[mine[q]] = zero;
     }
     // (a mask no layer uses, as with a model whose layers are all sliding-window or none are, gets no memory: skipped)
     if (g.mask && g.mask->buffer) ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
@@ -3036,8 +3048,10 @@ bool Model::draft_mark() {
     release_pending();
     draft_pos_ = n_past_;
     draft_passes_ = loop_draft_ > 0 ? loop_draft_ : hp_.loop_passes;
+    std::vector<std::pair<const ggml_tensor*, ggml_tensor*>> cp;
     for (size_t i = 0; i < draft_keep_.size(); ++i)
-        if (draft_pass_[i] < draft_passes_) ggml_backend_tensor_copy(draft_keep_[i].first, draft_keep_[i].second);
+        if (draft_pass_[i] < draft_passes_) cp.push_back({draft_keep_[i].first, draft_keep_[i].second});
+    copy_many(cp);
     return true;
 }
 
@@ -3050,8 +3064,10 @@ void Model::draft_rewind() {
         free_cells_from(0, n_past_);
         rope_truncate(0, n_past_);
     }
+    std::vector<std::pair<const ggml_tensor*, ggml_tensor*>> cp;
     for (size_t i = 0; i < draft_keep_.size(); ++i)
-        if (draft_pass_[i] < draft_passes_) ggml_backend_tensor_copy(draft_keep_[i].second, draft_keep_[i].first);
+        if (draft_pass_[i] < draft_passes_) cp.push_back({draft_keep_[i].second, draft_keep_[i].first});
+    copy_many(cp);
     draft_pos_ = -1;
 }
 
@@ -5315,8 +5331,12 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
         const int n_kv = kv_span(pos0 + n_tok);                    // padded columns are future: -inf
         const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
         std::vector<ggml_fp16_t> mask((size_t)n_kv * n_tok);
-        for (int t = 0; t < n_tok; ++t)
-            for (int j = 0; j < n_kv; ++j) mask[(size_t)t * n_kv + j] = j <= pos0 + t ? zero : ninf;
+        for (int t = 0; t < n_tok; ++t) {                         // (row t: columns up to pos0 + t seen, the rest not)
+            ggml_fp16_t* row = mask.data() + (size_t)t * n_kv;
+            const int seen = std::min(n_kv, std::max(0, pos0 + t + 1));
+            std::fill(row, row + seen, zero);
+            std::fill(row + seen, row + n_kv, ninf);
+        }
         ggml_backend_tensor_set(g.mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
     }
     set_n_threads(cpu_, n_threads);
@@ -5861,6 +5881,33 @@ void Model::release_pending() {
     if (pending_) { if (!((Graph*)pending_)->kept) ggml_free(((Graph*)pending_)->ctx); delete (Graph*)pending_; pending_ = nullptr; }
 }
 
+// Copies between tensors, all done when this returns. ggml_backend_tensor_copy waits for each copy on its own (CUDA:
+// a cudaStreamSynchronize per copy), and a check whose guesses weren't all kept rolls back every DeltaNet layer's
+// memory and convolution inputs (Flash-Next: about a hundred tensors), as does guessing with the model itself
+// before and after its guesses: each one a round trip to the card. Copies on one CUDA card, both tensors in its
+// memory, are queued on the card's stream instead (behind the step that wrote them, ahead of the next) and waited
+// for once. Anything else (Vulkan, the CPU, two cards) is copied as before. TIERLM_COPY_SYNC=1: as before.
+void Model::copy_many(const std::vector<std::pair<const ggml_tensor*, ggml_tensor*>>& cp) {
+    static const bool each = std::getenv("TIERLM_COPY_SYNC") && std::strcmp(std::getenv("TIERLM_COPY_SYNC"), "0") != 0;
+    auto cuda_of = [&](const ggml_tensor* t) -> ggml_backend_t {   // the CUDA backend whose memory holds t, if any
+        ggml_backend_buffer_t b = t->view_src ? t->view_src->buffer : t->buffer;
+        if (!b || ggml_backend_buffer_is_host(b)) return nullptr;
+        ggml_backend_dev_t d = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b));
+        for (ggml_backend_t g : gpus_)
+            if (ggml_backend_get_device(g) == d) return std::strncmp(ggml_backend_name(g), "CUDA", 4) == 0 ? g : nullptr;
+        return nullptr;
+    };
+    std::vector<ggml_backend_t> used;
+    for (const auto& [src, dst] : cp) {
+        ggml_backend_t b = each ? nullptr : cuda_of(src);
+        if (b && cuda_of(dst) == b) {
+            ggml_backend_tensor_copy_async(b, b, src, dst);
+            if (std::find(used.begin(), used.end(), b) == used.end()) used.push_back(b);
+        } else ggml_backend_tensor_copy(src, dst);
+    }
+    for (ggml_backend_t b : used) ggml_backend_synchronize(b);
+}
+
 void Model::accept(int n_keep) {
     if (!pending_) return;
     Graph& g = *(Graph*)pending_;
@@ -5873,17 +5920,15 @@ void Model::accept(int n_keep) {
         for (auto& [st, rb] : g.ink_rollback) if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
         n_past_ -= d;                                             // attention layers: just forget their keys/values
         free_cells_from(0, n_past_);
+        std::vector<std::pair<const ggml_tensor*, ggml_tensor*>> cp;
         for (auto& [li, rb] : g.rollback) {                       // DeltaNet layers: restore the memory d tokens back
-            if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
             Layer& L = li < hp_.n_layer ? layers_[li] : loop_slots_[li - hp_.n_layer];   // (a loop's later passes after the layers)
-            ggml_backend_tensor_copy(rb[d].first, L.ssm_state_t);
-            ggml_backend_tensor_copy(rb[d].second, L.conv_state);
+            cp.push_back({rb[d].first, L.ssm_state_t});
+            cp.push_back({rb[d].second, L.conv_state});
         }
-        for (auto& [li, rb] : g.ple_rollback) {                   // Flash-Next's PLE convolutions: their kept inputs too
-            if (d >= (int)rb.size()) throw std::runtime_error("speculative rollback deeper than its snapshots");
-            ggml_backend_tensor_copy(rb[d], layers_[li].ple_states[0]);
-        }
-        for (auto& [st, rb] : g.ink_rollback) ggml_backend_tensor_copy(rb[d], st);   // Inkling 2's convolutions: likewise
+        for (auto& [li, rb] : g.ple_rollback) cp.push_back({rb[d], layers_[li].ple_states[0]});   // Flash-Next's PLE convolutions: their kept inputs too
+        for (auto& [st, rb] : g.ink_rollback) cp.push_back({rb[d], st});   // Inkling 2's convolutions: likewise
+        copy_many(cp);
     }
     release_pending();
 }
@@ -6240,17 +6285,27 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     }
     if (g.zero_id && g.zero_id->buffer) { const int32_t z = 0; ggml_backend_tensor_set(g.zero_id, &z, 0, sizeof z); }
     if (g.ngram) {                                                 // Flash-Next: each token's n-gram rows
-        const int NH = hp.ngram.heads();
+        const int NH = hp.ngram.heads(), back = std::max(1, hp.ngram.ngram) - 1;
         std::vector<int32_t> rows((size_t)NH * n_tok);
-        std::map<int, std::vector<int32_t>> hist;                 // each conversation's tokens, this step's included
+        // Each conversation's last tokens, this step's included: an n-gram reads only the `back` tokens before its
+        // own (copying the whole conversation each step was half a megabyte at 128K). `first`: the position of h[0].
+        struct Tail { int first = 0; std::vector<int32_t> h; };
+        std::map<int, Tail> hist;
         for (int t = 0; t < n_tok; ++t) {
             const int s = tok_seq[t];
             auto it = hist.find(s);
-            if (it == hist.end()) it = hist.emplace(s, std::vector<int32_t>(seq_tok_[s].begin(), seq_tok_[s].begin() + std::min((size_t)tok_pos[t], seq_tok_[s].size()))).first;
-            auto& h = it->second;
-            if ((int)h.size() != tok_pos[t]) throw std::runtime_error("the n-gram history is out of step with the conversation");
-            h.push_back(is_image_id(ids[t]) ? (hp.ple_image_tok >= 0 ? hp.ple_image_tok : hp.ngram.eos) : ids[t]);
-            hp.ngram.rows(h.data(), (int64_t)h.size() - 1, rows.data() + (size_t)t * NH);
+            if (it == hist.end()) {
+                const auto& all = seq_tok_[s];
+                const int have = (int)std::min((size_t)tok_pos[t], all.size()), from = std::max(0, have - back);
+                it = hist.emplace(s, Tail{from, std::vector<int32_t>(all.begin() + from, all.begin() + have)}).first;
+            }
+            Tail& tl = it->second;
+            if (tl.first + (int)tl.h.size() != tok_pos[t]) throw std::runtime_error("the n-gram history is out of step with the conversation");
+            tl.h.push_back(is_image_id(ids[t]) ? (hp.ple_image_tok >= 0 ? hp.ple_image_tok : hp.ngram.eos) : ids[t]);
+            // the n-gram of position p reads p - back .. p; rows() takes the start of the conversation for positions
+            // before 0, so the window is given from its first real position on (the conversation's start, or `back` back)
+            const int p = tok_pos[t], lo = std::max(0, p - back);
+            hp.ngram.rows(tl.h.data() + (lo - tl.first), (int64_t)(p - lo), rows.data() + (size_t)t * NH);
         }
         ggml_backend_tensor_set(g.ngram, rows.data(), 0, sizeof(int32_t) * rows.size());
         // The table on the SSD tier: ask the drive for every row this step reads, all at once, before the graph
@@ -6569,6 +6624,8 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     static const bool sync_each = std::getenv("TIERLM_LIVE_SYNC") != nullptr;
     ggml_backend* gpu = sync_each || gpus_.empty() ? nullptr : gpus_[0];
     swap_buf_.clear();
+    map_stage_.clear();
+    if (gpu && map_stage_.capacity() < 4096) map_stage_.reserve(4096);
     // (a burst is staged 64 MB at a time: the copies queued so far are waited for when the staging memory is full)
     const size_t stage = std::min(budget_bytes, (size_t)64 << 20) + ((size_t)64 << 20);
     if (gpu && swap_buf_.capacity() < stage) swap_buf_.reserve(stage);
@@ -6615,10 +6672,28 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
             ggml_backend_tensor_set(ll.mask, &m_out, sizeof(float) * out, sizeof(float));
             if (ll.map_hot_g) {
                 const float b_in = 0.0f, b_out = -1e9f;
-                ggml_backend_tensor_set(ll.map_hot_g, &h_in, sizeof(int32_t) * in, sizeof(int32_t));
-                ggml_backend_tensor_set(ll.map_hot_g, &h_out, sizeof(int32_t) * out, sizeof(int32_t));
-                ggml_backend_tensor_set(ll.hot_bias_g, &b_in, sizeof(float) * in, sizeof(float));
-                ggml_backend_tensor_set(ll.hot_bias_g, &b_out, sizeof(float) * out, sizeof(float));
+                // The VRAM copies of the maps: on the GPU's queue with the experts' bytes (each write waited for
+                // on its own was four round trips to the card a move; a reply moves one or two a token). Their new
+                // entries are staged where they stay put until the wait at the end.
+                const bool queue = gpu && ll.map_hot_g->buffer && ll.hot_bias_g->buffer &&
+                                   ggml_backend_buffer_get_type(ll.map_hot_g->buffer) == ggml_backend_get_default_buffer_type(gpu) &&
+                                   ggml_backend_buffer_get_type(ll.hot_bias_g->buffer) == ggml_backend_get_default_buffer_type(gpu);
+                if (queue) {
+                    if (map_stage_.size() + 4 > map_stage_.capacity()) { ggml_backend_synchronize(gpu); map_stage_.clear(); }
+                    uint32_t v[4];
+                    std::memcpy(&v[0], &h_in, 4); std::memcpy(&v[1], &h_out, 4); std::memcpy(&v[2], &b_in, 4); std::memcpy(&v[3], &b_out, 4);
+                    const size_t at = map_stage_.size();
+                    map_stage_.insert(map_stage_.end(), v, v + 4);                // (capacity reserved: never moves)
+                    ggml_backend_tensor_set_async(gpu, ll.map_hot_g, &map_stage_[at], sizeof(int32_t) * in, sizeof(int32_t));
+                    ggml_backend_tensor_set_async(gpu, ll.map_hot_g, &map_stage_[at + 1], sizeof(int32_t) * out, sizeof(int32_t));
+                    ggml_backend_tensor_set_async(gpu, ll.hot_bias_g, &map_stage_[at + 2], sizeof(float) * in, sizeof(float));
+                    ggml_backend_tensor_set_async(gpu, ll.hot_bias_g, &map_stage_[at + 3], sizeof(float) * out, sizeof(float));
+                } else {
+                    ggml_backend_tensor_set(ll.map_hot_g, &h_in, sizeof(int32_t) * in, sizeof(int32_t));
+                    ggml_backend_tensor_set(ll.map_hot_g, &h_out, sizeof(int32_t) * out, sizeof(int32_t));
+                    ggml_backend_tensor_set(ll.hot_bias_g, &b_in, sizeof(float) * in, sizeof(float));
+                    ggml_backend_tensor_set(ll.hot_bias_g, &b_out, sizeof(float) * out, sizeof(float));
+                }
             }
             ll.slot_of[in] = slot; ll.slot_of[out] = -1; ll.in_slot[slot] = in;
             ll.cold_of[out] = cs; ll.cold_of[in] = -1;
