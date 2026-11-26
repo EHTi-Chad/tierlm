@@ -77,6 +77,9 @@ window.FIT = (() => {
     if (f.radius != null) { st.setProperty("--fit-r", f.radius + "px"); r.dataset.fitR = ""; } else { st.removeProperty("--fit-r"); delete r.dataset.fitR; }
     st.setProperty("--fit-back", BACK[f.backdrop] || "none");
     st.setProperty("--fit-back-size", BACK_SIZE[f.backdrop] || "auto");
+    const cols = Math.round(+f.cols);                        // the setup page's cards a row (4 when not set)
+    if (cols >= 3 && cols <= 6 && cols !== 4) st.setProperty("--setup-cols", String(cols)); else st.removeProperty("--setup-cols");
+    if (cols > 4 && cols <= 6) st.setProperty("--setup-min", "220px"); else st.removeProperty("--setup-min");   // (narrower cards fit more a row)
   }
   apply(load());
   return { P, FONTS, BACK, BACK_SIZE, colours, fromPreset, load, save, apply };
@@ -423,7 +426,10 @@ window.FIT = (() => {
   [hidden] { display: none !important; }
 
   /* setup screen */
-  #setup { display: block; max-width: 1240px; margin: 0 auto; padding: 24px 16px 40px; height: auto; }   /* (4 model cards a row on a wide window) */
+  /* (4 model cards a row on a wide window; the Fit can make it 3 to 6: --setup-cols, and --setup-min the narrowest card) */
+  #setup { display: block; max-width: calc(var(--setup-cols, 4) * 300px + 40px); margin: 0 auto; padding: 24px 16px 40px; height: auto; }
+  #setup .choices, #setup .hw { grid-template-columns: repeat(auto-fill, minmax(max(var(--setup-min, 280px), calc((100% - (var(--setup-cols, 4) - 1) * 10px) / var(--setup-cols, 4) - 2px)), 1fr)); }
+  #setup .settings { grid-template-columns: repeat(auto-fit, minmax(max(var(--setup-min, 260px), calc((100% - (var(--setup-cols, 4) - 1) * 24px) / var(--setup-cols, 4) - 2px)), 1fr)); }
   #setup h1 { font-size: 24px; margin: 4px 0 2px; letter-spacing: -.3px; }
   #setup .lead { color: var(--muted); margin: 0 0 18px; }
   #setup .card { margin-bottom: 14px; }
@@ -4236,6 +4242,7 @@ loadWorkspace();
     <h3>Size and shape</h3>
     <div class="fitrange"><span>Text size</span><input type="range" id="fitsize" min="85" max="130" step="5"><output id="fitsizev"></output></div>
     <div class="fitrange"><span>Corners</span><input type="range" id="fitrad" min="0" max="22" step="1"><output id="fitradv"></output></div>
+    <div class="fitrange"><span>Setup cards</span><input type="range" id="fitwide" min="3" max="6" step="1"><output id="fitwidev"></output></div>
     <h3>Backdrop behind the chat</h3>
     <div class="fitchips" id="fitbacks"></div>
     <div class="fitfoot">
@@ -4305,6 +4312,7 @@ loadWorkspace();
     }
     el("fitsize").value = fit.size || 100; el("fitsizev").textContent = (fit.size || 100) + "%";
     el("fitrad").value = fit.radius ?? 10; el("fitradv").textContent = fit.radius == null ? "usual" : fit.radius + " px";
+    el("fitwide").value = fit.cols || 4; el("fitwidev").textContent = (fit.cols || 4) + " a row";
     const backs = el("fitbacks"); backs.innerHTML = "";
     for (const name of Object.keys(F.BACK)) {
       const b = document.createElement("button"); b.type = "button"; b.className = "bk"; b.textContent = name;
@@ -4317,6 +4325,7 @@ loadWorkspace();
   }
   el("fitsize").oninput = e => set({ size: +e.target.value });
   el("fitrad").oninput = e => set({ radius: +e.target.value });
+  el("fitwide").oninput = e => set({ cols: +e.target.value === 4 ? undefined : +e.target.value });
   el("fitreset").onclick = () => { fit = {}; F.save(fit); F.apply(fit); render(); };
   const note = t => { el("fitnote").textContent = t; setTimeout(render, 1600); };
   el("fitcopy").onclick = () => {
@@ -4334,7 +4343,8 @@ loadWorkspace();
       const c = f.colors && COLS.every(([k]) => hex(f.colors[k])) ? { scheme: f.colors.scheme === "light" ? "light" : "dark", ...Object.fromEntries(COLS.map(([k]) => [k, f.colors[k]])) } : null;
       fit = { look: c ? (F.P[f.look] ? f.look : "Custom") : "Default", colors: c, font: F.FONTS[f.font] !== undefined ? f.font : "Default",
               size: Math.min(130, Math.max(85, +f.size || 100)), radius: f.radius == null ? undefined : Math.min(22, Math.max(0, +f.radius || 0)),
-              backdrop: F.BACK[f.backdrop] !== undefined ? f.backdrop : "None" };
+              backdrop: F.BACK[f.backdrop] !== undefined ? f.backdrop : "None",
+              cols: [3, 5, 6].includes(+f.cols) ? +f.cols : undefined };
       F.save(fit); F.apply(fit); render(); note("Fit applied");
     } catch (e) { if (t) note("That isn't a Fit code"); }
   };
