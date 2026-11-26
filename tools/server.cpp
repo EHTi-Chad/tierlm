@@ -429,11 +429,23 @@ static std::vector<std::pair<float, int32_t>> candidates(const float* lg, size_t
     const size_t want = std::min(nv, keep + pen.size());
     std::vector<C> h;
     h.reserve(want + pen.size());
-    for (size_t i = 0; i < nv; ++i) {                 // h is a heap with its worst candidate first
+    auto one = [&](size_t i) {                         // h is a heap with its worst candidate first
         const float v = lg[i];
         if (h.size() < want) { h.push_back({v, (int32_t)i}); std::push_heap(h.begin(), h.end(), better); }
         else if (v > h.front().first) { std::pop_heap(h.begin(), h.end(), better); h.back() = {v, (int32_t)i}; std::push_heap(h.begin(), h.end(), better); }
+    };
+    // Once h is full, eight tokens at a time: their best is compared with h's worst, and only a group that beats it
+    // is looked at token by token (the same tokens in the same order as one at a time; Flash-Next's 248,320 tokens:
+    // 0.12 to 0.18 ms a row against 0.23 to 0.26 on a 2.1 GHz Xeon, for every row a check samples)
+    size_t i = 0;
+    for (; i < nv && h.size() < want; ++i) one(i);
+    for (; i + 8 <= nv; i += 8) {
+        float m = lg[i];
+        for (int k = 1; k < 8; ++k) m = lg[i + k] > m ? lg[i + k] : m;
+        if (!(m > h.front().first)) continue;
+        for (int k = 0; k < 8; ++k) one(i + k);
     }
+    for (; i < nv; ++i) one(i);
     for (const auto& [t, v] : pen) {
         auto it = std::find_if(h.begin(), h.end(), [t = t](const C& c) { return c.second == t; });
         if (it != h.end()) it->first = v; else h.push_back({v, t});
@@ -797,6 +809,31 @@ struct Engine {
     // for the model and how it's placed, 0 turns it off. `look` does it alone when the draft block is off.
     int lookup = -1;
     std::unique_ptr<Speculator> look;
+    // The last prompt encoded, its tokens and where its added tokens end (Tokenizer::encode_from). An app sends the
+    // whole conversation each turn and it grows at the end, so the next prompt's tokens are these up to the last
+    // added token well before the first change, and only the rest is encoded (a 100K-token conversation took about
+    // 0.1 s a turn to encode on a 2.1 GHz Xeon). Cleared when a model loads.
+    struct PromptToks { std::mutex mu; std::string text; std::vector<int32_t> ids; std::vector<std::pair<size_t, size_t>> marks; } prompt_toks;
+    std::vector<int32_t> encode_prompt(const Tokenizer& tk, const std::string& text) {
+        std::lock_guard<std::mutex> lk(prompt_toks.mu);
+        PromptToks& c = prompt_toks;
+        size_t same = 0;                                          // bytes the two prompts start with alike
+        const size_t most = std::min(c.text.size(), text.size());
+        while (same < most && c.text[same] == text[same]) ++same;
+        // the last mark whose added token can't reach a changed byte: a match starting before it reads at most
+        // added_max_len() bytes, so those are the same; after it, encoding starts afresh just as encode() would
+        size_t m = c.marks.size();
+        while (m > 0 && c.marks[m - 1].first + tk.added_max_len() > same) --m;
+        const size_t from = m ? c.marks[m - 1].first : 0, keep = m ? c.marks[m - 1].second : 0;
+        std::vector<std::pair<size_t, size_t>> more;
+        std::vector<int32_t> rest = tk.encode_from(text, true, from, &more);
+        c.ids.resize(keep);
+        c.ids.insert(c.ids.end(), rest.begin(), rest.end());
+        c.marks.resize(m);
+        for (const auto& [at, n] : more) c.marks.push_back({at, keep + n});
+        c.text = text;
+        return c.ids;
+    }
     std::unique_ptr<Model> model;
     // The loaded model's recommended sampling (describe_model's "sampling": only what its file gives), for apps that
     // don't send their own values.
@@ -1954,6 +1991,7 @@ int main(int argc, char** argv) {
         eng.saved.clear();
         auto t0 = Clock::now();
         eng.tok = Tokenizer::from_gguf(path);
+        { std::lock_guard<std::mutex> lk(eng.prompt_toks.mu); eng.prompt_toks.text.clear(); eng.prompt_toks.ids.clear(); eng.prompt_toks.marks.clear(); }
         eng.rec_sampling = info.value("sampling", json::object());
         LoadOptions o = opt;
         const int uL = info.value("layers", 0), uE = info.value("experts", 0);
@@ -2913,7 +2951,7 @@ int main(int argc, char** argv) {
             static std::atomic<int> n{0};
             std::ofstream(fs::u8path(prompt_dir) / (std::to_string(++n) + ".txt"), std::ios::binary) << prompt_text;
         }
-        std::vector<int32_t> toks = tok.encode(prompt_text, true);
+        std::vector<int32_t> toks = eng.encode_prompt(tok, prompt_text);   // (= tok.encode(prompt_text, true))
         if (!pics.empty()) {                                      // each image's <|image_pad|> becomes its words
             const int32_t pad = tok.find("<|image_pad|>");
             std::vector<int32_t> with;
@@ -2973,6 +3011,15 @@ int main(int argc, char** argv) {
         auto npast = [&] { return par ? model->seq_past(seq) : model->n_past(); };
         auto evalm = [&](const std::vector<int32_t>& ids, std::vector<int32_t>* rt) {
             return par ? eng.batch.eval(seq, ids, rt) : model->eval(ids, eng.threads, rt);
+        };
+        // Reading the prompt with another number of CPU threads than writing: TIERLM_PROMPT_THREADS=n (unset or 0:
+        // the same). With experts in RAM, a prompt batch has the CPU read most of them once, which memory bandwidth
+        // limits, while writing reads a few per token and was tuned on its own (8 of 16 cores on a Ryzen 9 9950X3D):
+        // for measuring whether reading gains from more (one connection).
+        static const int prompt_threads_env = [] { const char* e = std::getenv("TIERLM_PROMPT_THREADS"); return e ? std::atoi(e) : 0; }();
+        const int pth = prompt_threads_env > 0 ? prompt_threads_env : eng.threads;
+        auto evalp = [&](const std::vector<int32_t>& ids, std::vector<int32_t>* rt) {
+            return par ? eng.batch.eval(seq, ids, rt) : model->eval(ids, pth, rt);
         };
         if ((int)toks.size() + 1 >= ctx_lim) throw std::runtime_error("the prompt is " + std::to_string(toks.size()) + " tokens and the context length is " + std::to_string(ctx_lim) +
                                      ": load the model with a longer context, or send less (the app's system prompt and the tools it "
@@ -3117,8 +3164,8 @@ int main(int argc, char** argv) {
         size_t opened = 0;
         if (save_opening && opening > common && !eng.pc_writing->load()) {
             const std::vector<int32_t> head(toks.begin(), toks.begin() + opening);
-            if (spx) { run_lock(); spx->prompt(head, eng.threads, &routing); run_unlock(); }
-            else evalm(std::vector<int32_t>(head.begin() + common, head.end()), &routing);
+            if (spx) { run_lock(); spx->prompt(head, pth, &routing); run_unlock(); }
+            else evalp(std::vector<int32_t>(head.begin() + common, head.end()), &routing);
             opened = opening - common;
             common = opening;
             cached = head;
@@ -3179,20 +3226,20 @@ int main(int argc, char** argv) {
             size_t at = common;
             for (size_t stop : stops_at) {
                 const std::vector<int32_t> head(toks.begin(), toks.begin() + stop);
-                if (spx) spx->prompt(head, eng.threads, &part);
-                else evalm(std::vector<int32_t>(head.begin() + at, head.end()), &part);
+                if (spx) spx->prompt(head, pth, &part);
+                else evalp(std::vector<int32_t>(head.begin() + at, head.end()), &part);
                 routing.insert(routing.end(), part.begin(), part.end());
                 model->checkpoint();
                 if (spx) spx->mark();
                 at = stop;
             }
-            if (spx) { lg = spx->prompt(toks, eng.threads, &part); spx->reset_stats(); }
-            else lg = evalm(std::vector<int32_t>(toks.begin() + split, toks.end()), &part);   // (split: one connection only)
+            if (spx) { lg = spx->prompt(toks, pth, &part); spx->reset_stats(); }
+            else lg = evalp(std::vector<int32_t>(toks.begin() + split, toks.end()), &part);   // (split: one connection only)
             routing.insert(routing.end(), part.begin(), part.end());
         } else {
             std::vector<int32_t> part;
-            if (spx) { run_lock(); lg = spx->prompt(toks, eng.threads, &part); run_unlock(); spx->reset_stats(); }   // also feeds the draft block
-            else lg = evalm(suffix, &part);
+            if (spx) { run_lock(); lg = spx->prompt(toks, pth, &part); run_unlock(); spx->reset_stats(); }   // also feeds the draft block
+            else lg = evalp(suffix, &part);
             routing.insert(routing.end(), part.begin(), part.end());
             if (!par && hp.hybrid && common == 0) { model->checkpoint(); if (spx) spx->mark(); }
         }
@@ -3281,10 +3328,15 @@ int main(int argc, char** argv) {
             return rc;
         };
         // Adds a chosen token to the reply and streams its text. False when the reply must end here.
+        // (decoded: the reply's tokens decoded so far, each added once; decoding all of them again for every token
+        // was 5 s of a 9,572-token reply on a 2.1 GHz Xeon, growing with the square of the length)
+        std::string decoded;
         auto add = [&](int32_t id) {
             out.push_back(id);
-            const std::string text = tok.decode(out);
-            raw = pre + text.substr(0, utf8_complete(text));
+            tok.decode_append(decoded, id);
+            const size_t from = tok.strip_len(decoded), upto = utf8_complete(decoded);   // (as tok.decode(out), then whole characters)
+            raw = pre;
+            if (upto > from) raw.append(decoded, from, upto - from);
             visible = harm ? harmony::display(raw) : ink ? inkling::display(raw) : g4 ? gemma4::display(raw) : raw;
             // A stop string: end the reply just before it.
             size_t cut = std::string::npos;
