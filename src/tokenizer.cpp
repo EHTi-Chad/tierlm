@@ -414,6 +414,7 @@ Tokenizer Tokenizer::from_gguf(const std::string& path) {
             t.added_.push_back({t.id_to_token_[i], (int32_t)i});
     std::stable_sort(t.added_.begin(), t.added_.end(),
                      [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+    for (const auto& [s, id] : t.added_) { t.added_first_[(unsigned char)s[0]] = true; t.added_max_ = std::max(t.added_max_, s.size()); }
 
     int64_t sk = gguf_find_key(g, "tokenizer.ggml.scores");
     if (sk >= 0 && gg::is_array(g, sk) && gguf_get_arr_type(g, sk) == GGUF_TYPE_FLOAT32 && gguf_get_arr_n(g, sk) == nt) {
@@ -517,31 +518,55 @@ void Tokenizer::spm(const std::string& raw, std::vector<int32_t>& out, bool pref
     for (char ch : text) { if (ch == ' ') s += "\xE2\x96\x81"; else s += ch; }
     std::vector<std::string> sym;
     for (const auto& c : utf8_decode(s)) sym.push_back(s.substr(c.off, c.len));
-    // score[i]: score of merging sym[i] and sym[i + 1] (-inf if that piece isn't in the vocabulary).
-    // After a merge only the two neighbouring pairs change, so only they are looked up again.
     // Merge priority: if the file has a merges list (Hugging Face conversions), its order decides, like
     // Hugging Face's tokenizer; otherwise the score of the merged piece does, like SentencePiece. Some files
     // store all scores as 0 and rely on the merges list.
-    auto pair_score = [&](size_t i) -> float {
+    // The pieces as a list (next/prev), the pairs that can merge in a queue, best first: the highest score, and on
+    // equal scores the leftmost (pieces keep their first place in the text, so the lower place is further left).
+    // A pair is in the queue once for each time its two pieces were put side by side; when either piece has merged
+    // since, it's left out as it comes up (ver). Picking the best pair by looking at every pair after every merge,
+    // as before 0.9.6, is the same order of merges but took the square of a message's length: 108 s for a 290 KB
+    // agent conversation with Gemma 4's vocabulary.
+    const int n = (int)sym.size();
+    std::vector<int> next(n), prev(n), ver(n, 0);
+    for (int i = 0; i < n; ++i) { next[i] = i + 1 < n ? i + 1 : -1; prev[i] = i - 1; }
+    struct Pair { float score; int left, right, vl, vr; };
+    auto worse = [](const Pair& a, const Pair& b) { return a.score < b.score || (a.score == b.score && a.left > b.left); };
+    std::vector<Pair> q;
+    auto score_of = [&](int l, int r) -> float {
         if (!merge_rank_.empty()) {
-            auto m = merge_rank_.find(sym[i] + " " + sym[i + 1]);
+            auto m = merge_rank_.find(sym[l] + " " + sym[r]);
             return m == merge_rank_.end() ? -INFINITY : -(float)m->second;
         }
-        auto it = token_to_id_.find(sym[i] + sym[i + 1]);
+        auto it = token_to_id_.find(sym[l] + sym[r]);
         return it == token_to_id_.end() ? -INFINITY : score_[it->second];
     };
-    std::vector<float> score(sym.size() > 1 ? sym.size() - 1 : 0);
-    for (size_t i = 0; i < score.size(); ++i) score[i] = pair_score(i);
-    while (!score.empty()) {
-        size_t at = 0;
-        for (size_t i = 1; i < score.size(); ++i) if (score[i] > score[at]) at = i;   // highest, leftmost on ties
-        if (score[at] == -INFINITY) break;
-        sym[at] += sym[at + 1];
-        sym.erase(sym.begin() + (long)at + 1);
-        score.erase(score.begin() + (long)at);
-        if (at < score.size()) score[at] = pair_score(at);
-        if (at > 0) score[at - 1] = pair_score(at - 1);
+    auto offer = [&](int l) {                                   // the pair starting at piece l, if it can merge
+        const int r = next[l];
+        if (l < 0 || r < 0) return;
+        const float sc = score_of(l, r);
+        if (sc == -INFINITY) return;
+        q.push_back({sc, l, r, ver[l], ver[r]});
+        std::push_heap(q.begin(), q.end(), worse);
+    };
+    for (int i = 0; i + 1 < n; ++i) offer(i);
+    while (!q.empty()) {
+        std::pop_heap(q.begin(), q.end(), worse);
+        const Pair p = q.back();
+        q.pop_back();
+        if (next[p.left] != p.right || ver[p.left] != p.vl || ver[p.right] != p.vr) continue;   // (out of date)
+        sym[p.left] += sym[p.right];
+        sym[p.right].clear();
+        ++ver[p.left]; ++ver[p.right];
+        next[p.left] = next[p.right];
+        if (next[p.right] >= 0) prev[next[p.right]] = p.left;
+        next[p.right] = -2;                                     // (merged away)
+        offer(p.left);
+        if (prev[p.left] >= 0) offer(prev[p.left]);
     }
+    std::vector<std::string> kept;
+    for (int i = n > 0 ? 0 : -1; i >= 0; i = next[i]) kept.push_back(std::move(sym[i]));
+    sym.swap(kept);
     for (const auto& p : sym) {
         auto it = token_to_id_.find(p);
         if (it != token_to_id_.end()) { out.push_back(it->second); continue; }
@@ -623,10 +648,18 @@ void Tokenizer::wpm(const std::string& text, std::vector<int32_t>& out) const {
 }
 
 std::vector<int32_t> Tokenizer::encode(const std::string& text, bool parse_special) const {
+    return encode_from(text, parse_special, 0, nullptr);
+}
+
+std::vector<int32_t> Tokenizer::encode_from(const std::string& text, bool parse_special, size_t from,
+                                            std::vector<std::pair<size_t, size_t>>* marks) const {
     std::vector<int32_t> ids;
-    size_t start = 0, i = 0;
-    bool prev_special = false;
+    size_t start = std::min(from, text.size()), i = start;
+    bool prev_special = start > 0;                                // (from: just after an added token)
     while (i < text.size()) {
+        // (only where an added token could start: comparing every added token at every byte was most of the time
+        // a long conversation took to encode)
+        if (!added_first_[(unsigned char)text[i]]) { ++i; continue; }
         int32_t hit = -1; size_t hit_len = 0;
         for (const auto& [s, id] : added_) {
             if (!parse_special && token_type_[id] == 3) continue;
@@ -638,40 +671,43 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool parse_speci
         prev_special = true;
         i += hit_len;
         start = i;
+        if (marks) marks->push_back({i, ids.size()});
     }
     if (start < text.size()) encode_plain(text.substr(start), ids, start == 0 || prev_special);
     return ids;
 }
 
+void Tokenizer::decode_append(std::string& out, int32_t id) const {
+    if (id < 0 || (size_t)id >= id_to_token_.size()) return;
+    const std::string& tok = id_to_token_[id];
+    if (token_type_[id] == 3 || token_type_[id] == 4) { out += tok; return; }   // added tokens are raw text
+    if (kind_ == Kind::Wpm) {                                   // "▁word" starts a word, "ing" continues one
+        if (tok.compare(0, 3, "\xE2\x96\x81") == 0) { if (!out.empty()) out += ' '; out += tok.substr(3); }
+        else out += tok;
+        return;
+    }
+    if (kind_ == Kind::Spm) {
+        if (token_type_[id] == 6 && tok.size() == 6 && tok.compare(0, 3, "<0x") == 0) {   // byte token <0xAB>
+            out += (char)std::strtol(tok.substr(3, 2).c_str(), nullptr, 16);
+            return;
+        }
+        for (size_t k = 0; k < tok.size();) {
+            if (tok.compare(k, 3, "\xE2\x96\x81") == 0) { out += ' '; k += 3; } else out += tok[k++];
+        }
+        return;
+    }
+    for (const auto& c : utf8_decode(tok)) {
+        std::string ch = tok.substr(c.off, c.len);
+        auto it = uni_to_byte_.find(ch);
+        out += it != uni_to_byte_.end() ? std::string(1, (char)it->second) : ch;
+    }
+}
+
 std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool strip_prefix) const {
     std::string out;
-    for (int32_t id : ids) {
-        if (id < 0 || (size_t)id >= id_to_token_.size()) continue;
-        const std::string& tok = id_to_token_[id];
-        if (token_type_[id] == 3 || token_type_[id] == 4) { out += tok; continue; }   // added tokens are raw text
-        if (kind_ == Kind::Wpm) {                                   // "▁word" starts a word, "ing" continues one
-            if (tok.compare(0, 3, "\xE2\x96\x81") == 0) { if (!out.empty()) out += ' '; out += tok.substr(3); }
-            else out += tok;
-            continue;
-        }
-        if (kind_ == Kind::Spm) {
-            if (token_type_[id] == 6 && tok.size() == 6 && tok.compare(0, 3, "<0x") == 0) {   // byte token <0xAB>
-                out += (char)std::strtol(tok.substr(3, 2).c_str(), nullptr, 16);
-                continue;
-            }
-            for (size_t k = 0; k < tok.size();) {
-                if (tok.compare(k, 3, "\xE2\x96\x81") == 0) { out += ' '; k += 3; } else out += tok[k++];
-            }
-            continue;
-        }
-        for (const auto& c : utf8_decode(tok)) {
-            std::string ch = tok.substr(c.off, c.len);
-            auto it = uni_to_byte_.find(ch);
-            out += it != uni_to_byte_.end() ? std::string(1, (char)it->second) : ch;
-        }
-    }
+    for (int32_t id : ids) decode_append(out, id);
     // SentencePiece adds a space before the text; take it back off, like Hugging Face's decoder does.
-    if (strip_prefix && kind_ == Kind::Spm && add_space_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
+    if (strip_prefix) out.erase(0, strip_len(out));
     return out;
 }
 
