@@ -99,10 +99,16 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // "v3": 0.9.4 needs less at long contexts (batch_at); "v4": and nothing beside it for checking guesses)
     const std::string key = "v4 " + std::to_string(opt.max_ctx) + " " + std::to_string(opt.batch) + " " + std::to_string(opt.parallel) + " " +
                             opt.split_mode + (opt.expert_usage.empty() ? "" : "+hot") + (opt.live_hot ? "+live" : "") + " ";
-    if (o.vram_reserve_mb <= 0 && !o.vram_note.empty()) {
+    // "min <key>": the least a long prompt was seen to need on this card (see check_room): never kept below
+    int floor_mb = 0;
+    if (!o.vram_note.empty()) {
         std::ifstream f(std::filesystem::u8path(o.vram_note));
-        for (std::string line; std::getline(f, line); )
-            if (line.compare(0, key.size(), key) == 0) o.vram_reserve_mb = std::atoi(line.c_str() + key.size());
+        for (std::string line; std::getline(f, line); ) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (opt.vram_reserve_mb <= 0 && line.compare(0, key.size(), key) == 0) o.vram_reserve_mb = std::atoi(line.c_str() + key.size());
+            if (line.compare(0, 4, "min ") == 0 && line.compare(4, key.size(), key) == 0) floor_mb = std::atoi(line.c_str() + 4 + key.size());
+        }
+        if (opt.vram_reserve_mb <= 0 && floor_mb > o.vram_reserve_mb) o.vram_reserve_mb = floor_mb;
     }
     // A first load of a kind (the busiest experts in VRAM, say) has nothing noted yet and keeps 512 MB free; on a small
     // card the GPU's working memory may not fit in that, and the load stopped with "failed to reserve compute memory"
@@ -129,14 +135,14 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     const int runtime = [&]{ const char* e = std::getenv("TIERLM_VRAM_SCRATCH_MB");
                              return e ? std::atoi(e) : std::clamp((int)(vram_total >> 20) / 32, 192, 640); }();
     auto need_of = [&](const Model& mm) { return (int)(mm.place_.compute_gpu >> 20) + runtime; };
-    int need = need_of(*m);
+    int need = std::max(need_of(*m), opt.vram_reserve_mb <= 0 ? floor_mb : 0);
     const bool tight = m->place_.compute_gpu > 0 && need > used + 64 && opt.vram_budget_mb <= 0 && !std::getenv("TIERLM_VRAM_BYTES");
     // Keeping more free leaves fewer experts in VRAM, so each layer has more in RAM, and the two slots long prompts
     // stream them through (setup_stream) grow with the biggest layer's: about a 24th of what's given up (48 layers).
     if (tight && m->stream_.buf) need += (need - used) / 20;
     auto note = [&](int mb) {
         std::vector<std::string> keep;
-        { std::ifstream f(std::filesystem::u8path(o.vram_note)); for (std::string line; std::getline(f, line); ) if (line.compare(0, key.size(), key) != 0 && !line.empty()) keep.push_back(line); }
+        { std::ifstream f(std::filesystem::u8path(o.vram_note)); for (std::string line; std::getline(f, line); ) { if (!line.empty() && line.back() == '\r') line.pop_back(); if (line.compare(0, key.size(), key) != 0 && !line.empty()) keep.push_back(line); } }
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::u8path(o.vram_note).parent_path(), ec);
         std::ofstream f(std::filesystem::u8path(o.vram_note), std::ios::trunc);
@@ -147,6 +153,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // tierlm that needs less: the next load keeps less free)
     if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && (need > o.vram_reserve_mb || (opt.vram_reserve_mb <= 0 && need + 256 < o.vram_reserve_mb)))
         note(need);
+    m->note_path_ = o.vram_note; m->note_key_ = key;
     if (!tight) return m;
     std::fprintf(stderr, "VRAM: this model needs %d MB free for the GPU's working memory and %d MB was kept; loading again "
                          "with %d MB kept, so replies don't slow down when VRAM runs out (once: it's remembered)\n", need, used, need);
@@ -155,7 +162,47 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     m = load_once(path, o);
     // (what it needs with that much kept, if still more: for next time)
     if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && need_of(*m) > need + 64) note(need_of(*m));
+    m->note_path_ = o.vram_note; m->note_key_ = key;
     return m;
+}
+
+// After a long prompt's step (the card waited for): how much of the card is still free. The GPU engine takes its own
+// working memory as it goes (CUDA's memory pool, cuBLAS, graphs), beyond the compute buffers load measures, and for
+// long prompts that grows with the batch: Flash-Next at 256K with 4,096-token batches on an RTX 5090 needed 5.5 to 6
+// GB kept free where load had noted 5.0 to 5.3. Short of it, Windows doesn't fail the allocation: it lends the card
+// RAM over PCIe ("shared GPU memory"), and prompts read at 60 to 220 tok/s instead of 2,000 (replies a little slower
+// too). So when a long step leaves under 128 MB free, the least this kind of load needs is noted ("min <key>" in the
+// note file, which load never keeps less than) and the server loads the model again when it's idle. Once per load.
+void Model::check_room(int n_tok) {
+    if (gpus_.empty() || vram_short_mb_ > 0) return;
+    static const bool off = std::getenv("TIERLM_ROOM_CHECK") && !std::strcmp(std::getenv("TIERLM_ROOM_CHECK"), "0");
+    if (off) return;
+    size_t fr = 0, tot = 0;
+    ggml_backend_dev_memory(ggml_backend_get_device(gpus_[0]), &fr, &tot);
+    if (tot == 0) return;
+    const int free_mb = (int)(fr >> 20);
+    static bool told = false;
+    if (!told || std::getenv("TIERLM_ROOM_LOG")) {
+        told = true;
+        std::fprintf(stderr, "VRAM: %d MB of the card free after a %d-token prompt step (%d MB kept free at load)\n",
+                     free_mb, n_tok, place_.vram_reserve_mb);
+    }
+    const int floor = 128;
+    if (free_mb >= floor) return;
+    const int want = place_.vram_reserve_mb + 768 + (floor - free_mb);
+    vram_short_mb_ = want;
+    std::fprintf(stderr, "VRAM: a %d-token prompt step left %d MB of the card free: the GPU's working memory outgrew the %d MB "
+                         "kept for it, and long prompts slow down several times while Windows lends the card RAM; from now "
+                         "on loads keep %d MB free\n", n_tok, free_mb, place_.vram_reserve_mb, want);
+    if (note_path_.empty()) return;
+    std::vector<std::string> keep;
+    const std::string mk = "min " + note_key_;
+    { std::ifstream f(std::filesystem::u8path(note_path_));
+      for (std::string line; std::getline(f, line); ) { if (!line.empty() && line.back() == '\r') line.pop_back();
+                                                        if (!line.empty() && line.compare(0, mk.size(), mk) != 0) keep.push_back(line); } }
+    std::ofstream f(std::filesystem::u8path(note_path_), std::ios::trunc);
+    for (const auto& l : keep) f << l << "\n";
+    f << mk << want << "\n";
 }
 
 std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptions& opt) {
@@ -6424,6 +6471,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     EvalOut res;
     res.logits.resize((size_t)hp.n_vocab * g.logits->ne[1]);
     ggml_backend_tensor_get(g.logits, res.logits.data(), 0, sizeof(float) * res.logits.size());
+    if (n_tok >= 256) check_room(n_tok);
     if (g.hidden) {
         res.hidden.resize((size_t)hp.hidden_width() * n_tok);
         ggml_backend_tensor_get(g.hidden, res.hidden.data(), 0, sizeof(float) * res.hidden.size());

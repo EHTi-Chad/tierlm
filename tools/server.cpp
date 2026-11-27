@@ -2786,11 +2786,11 @@ int main(int argc, char** argv) {
     });
     // A model put away for being idle, loaded again with the settings it had (the caller holds mu alone). False, with
     // why in err, when that fails.
-    auto bring_back = [&](std::string& err) -> bool {
+    auto bring_back = [&](std::string& err, bool quiet = false) -> bool {
         if (eng.model || !idle_out) return true;
         const LastLoad l = last_load;
         const int im = idle_minutes();
-        std::fprintf(stderr, "loading %s again (it was put away after %d minute%s with nothing to do)\n", idle_name().c_str(), im, im == 1 ? "" : "s");
+        if (!quiet) std::fprintf(stderr, "loading %s again (it was put away after %d minute%s with nothing to do)\n", idle_name().c_str(), im, im == 1 ? "" : "s");
         try {
             eng.draft_max = l.draft_max; eng.lookup = l.lookup;
             load(l.path, l.o, l.threads, l.seed, l.hot);
@@ -5902,8 +5902,29 @@ int main(int argc, char** argv) {
     // the fastest settings or a request waiting in line keeps it (and replies and loads reset the clock).
     std::atomic<bool> quit_idle{false};
     std::thread idle_watch([&] {
+        // A long prompt found the card nearly full (Model::vram_short_mb: Windows lending it RAM, long prompts several
+        // times slower): loaded again with more kept free once nothing has used it for 2 s (between an agent's turns).
+        auto room_reload = [&]() -> bool {
+            if (loading || line.waiting() > 0) return false;
+            const long long now = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
+            if (now - g_last_use < 2 || !mu.try_lock()) return false;
+            std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
+            if (!eng.model || eng.model->vram_short_mb() <= 0 || last_load.path.empty()) return false;
+            last_load.o.max_ctx = eng.model->max_ctx();
+            last_load.o.vram_reserve_mb = 0;                                   // (what the note now says)
+            last_load.draft_max = eng.draft_max; last_load.lookup = eng.lookup; last_load.spec_on = eng.spec != nullptr;
+            last_load.thinking = eng.thinking; last_load.effort = eng.effort;
+            std::fprintf(stderr, "VRAM: loading %s again with %d MB kept free, so long prompts stay on the card\n",
+                         idle_name().c_str(), eng.model->vram_short_mb());
+            bool emb_freed = false;
+            eject(false, emb_freed);
+            idle_out = true;
+            std::string err;
+            bring_back(err, true);
+            return true;
+        };
         while (!quit_idle) {
-            for (int i = 0; i < 20 && !quit_idle; ++i) std::this_thread::sleep_for(std::chrono::seconds(1));
+            for (int i = 0; i < 20 && !quit_idle; ++i) { std::this_thread::sleep_for(std::chrono::seconds(1)); room_reload(); }
             const int mins = idle_minutes();
             if (quit_idle || mins <= 0 || loading || line.waiting() > 0) continue;
             const long long now = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();

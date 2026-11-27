@@ -433,6 +433,10 @@ public:
     bool on_gpu() const { return main_ != cpu_; }
     bool integrated_gpu() const;                  // shares system memory (e.g. Intel Arc in a laptop)
     void device_memory(size_t& free, size_t& total) const;   // of the device holding the weights
+    // A long prompt's step found the card nearly full (see check_room): the GPU engine's own working memory outgrew
+    // what was kept free, so Windows lends it RAM over PCIe and long prompts run several times slower. The next load
+    // keeps this many MB free (noted); 0: not seen. The server loads the model again when it is idle.
+    int vram_short_mb() const { return vram_short_mb_; }
     bool flash_attn() const { return flash_attn_ && !hp_.ink; }   // (Inkling 2's attention has a bias per head and pair: worked out in the open)
     const char* kv_type() const;      // "f16", "f32", "q8_0", "q5_0" or "q4_0"
     int batch() const { return batch_; }
@@ -574,6 +578,9 @@ public:
     // learned busiest experts.
     std::vector<float> take_extra_counts() { std::lock_guard<std::mutex> lk(extra_mu_); std::vector<float> c; c.swap(extra_counts_); return c; }
 private:
+    void check_room(int n_tok);                  // after a long prompt's step: is the card nearly full? (see vram_short_mb)
+    std::string note_path_, note_key_;           // where load noted the VRAM kept free, and this kind's line
+    int vram_short_mb_ = 0;
     std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way)
     std::vector<uint32_t> map_stage_;            // (adapt_hot: the VRAM maps' new entries on their way)
     double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
