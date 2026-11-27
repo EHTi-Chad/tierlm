@@ -40,9 +40,6 @@ Model::~Model() {
     if (stream_.buf) ggml_backend_buffer_free(stream_.buf);
     if (stream_.zeros) ggml_backend_buffer_free(stream_.zeros);
     if (swap_pin_) ggml_backend_buffer_free(swap_pin_);
-    if (swap_vram_) ggml_backend_buffer_free(swap_vram_);
-    if (swap_ctx_) ggml_free(swap_ctx_);
-    if (swap_park_ctx_) ggml_free(swap_park_ctx_);
     if (stream_.ctx) ggml_free(stream_.ctx);
     if (stream_.copy) ggml_backend_free(stream_.copy);
     for (auto* b : draft_buf_) ggml_backend_buffer_free(b);
@@ -6772,30 +6769,37 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     }
     char* const pin = gpu && swap_pin_ ? (char*)ggml_backend_buffer_get_base(swap_pin_) : nullptr;
     size_t pin_used = 0;
-    // Straight across, with no copy by the CPU (0.9.7), on CUDA with the RAM experts pinned: the outgoing expert is
-    // parked in 32 MB on the card, the incoming one goes from its RAM slot into the VRAM slot, then the parked one
-    // into that RAM slot, all queued in that order on the card's one queue. Staged by the CPU, a move was a copy
-    // through memory and two over PCIe: 16-17 GB/s both ways on an RTX 5090 whose link takes 57.9 one way.
-    // TIERLM_LIVE_DIRECT=0: staged, as before.
-    static const bool direct_off = std::getenv("TIERLM_LIVE_DIRECT") && !std::strcmp(std::getenv("TIERLM_LIVE_DIRECT"), "0");
-    const bool direct = gpu && !direct_off && place_.pinned_weights > 0 && std::strncmp(ggml_backend_name(gpu), "CUDA", 4) == 0;
-    // (Everything goes through byte views: a tensor of a quantized type allocated on a CUDA buffer has its padding
-    // cleared and the card waited for, every time; that made a move 0.4 ms instead of 0.25.)
-    if (direct && !swap_vram_) {
-        swap_vram_ = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(gpu), (size_t)32 << 20);
-        swap_vram_cap_ = swap_vram_ ? ggml_backend_buffer_get_size(swap_vram_) : 0;
-        if (swap_vram_) {
-            ggml_init_params pp{ggml_tensor_overhead(), nullptr, true};
-            swap_park_ctx_ = ggml_init(pp);
-            swap_park_t_ = ggml_new_tensor_1d(swap_park_ctx_, GGML_TYPE_I8, (int64_t)swap_vram_cap_);
-            ggml_backend_tensor_alloc(swap_vram_, swap_park_t_, ggml_backend_buffer_get_base(swap_vram_));
-            ggml_init_params ip{ggml_tensor_overhead() * 4, nullptr, true};
-            if (!swap_ctx_) swap_ctx_ = ggml_init(ip);
+    // With pinned staging the copies go in batches (0.9.7): the moves are decided first, then the incoming experts'
+    // bytes are copied into the staging memory by several threads at once, then all the transfers are queued. One
+    // thread copying each piece as it was decided was most of a move's time: about 0.25 ms an expert on an RTX 5090
+    // (16-17 GB/s both ways, on a link that takes 57.9 one way). A batch goes out when the staging memory is full, or
+    // when a move would read a RAM slot an earlier move of the batch writes (its expert isn't there yet).
+    struct Job { const ggml_tensor* hot; char* ram; size_t at, per, off; };
+    std::vector<Job> jobs;
+    std::set<const char*> pending;                       // RAM slots the queued batch writes
+    bool queued = false;                                 // a batch is on the card's queue, reading the staging memory
+    auto flush = [&]() {
+        if (jobs.empty()) return;
+        if (queued) ggml_backend_synchronize(gpu);       // (the staging memory is read by the batch before)
+        size_t total = 0;
+        for (const Job& j : jobs) total += j.per;
+        const int nt = (int)std::clamp<size_t>(total >> 22, 1, (size_t)std::clamp((int)std::thread::hardware_concurrency() / 2, 1, 8));
+        auto copy = [&](int t) {                         // (thread t: every nt-th job)
+            for (size_t i = (size_t)t; i < jobs.size(); i += (size_t)nt) std::memcpy(pin + jobs[i].off, jobs[i].ram, jobs[i].per);
+        };
+        if (nt == 1) copy(0);
+        else {
+            std::vector<std::thread> th;
+            for (int t = 1; t < nt; ++t) th.emplace_back(copy, t);
+            copy(0);
+            for (auto& x : th) x.join();
         }
-    }
-    const bool park = direct && swap_park_t_ && swap_ctx_;
-    const size_t park_align = park ? ggml_backend_buffer_get_alignment(swap_vram_) : 1;
-    size_t park_used = 0;
+        for (const Job& j : jobs) {
+            ggml_backend_tensor_get_async(gpu, (ggml_tensor*)j.hot, j.ram, j.at, j.per);   // out: VRAM slot -> its RAM slot
+            ggml_backend_tensor_set_async(gpu, (ggml_tensor*)j.hot, pin + j.off, j.at, j.per);   // in: staged -> VRAM slot
+        }
+        jobs.clear(); pending.clear(); pin_used = 0; queued = true;
+    };
     if (gpu && !pin && swap_buf_.capacity() < stage) swap_buf_.reserve(stage);
     static int start = 0;
     start = n ? (start + 1) % n : 0;
@@ -6820,32 +6824,19 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
                 const size_t per = p.hot->nb[2];
                 char* ram = (char*)p.cold->data + (size_t)cs * per;
                 const bool on_card = gpu && p.hot->buffer && ggml_backend_buffer_get_type(p.hot->buffer) == ggml_backend_get_default_buffer_type(gpu);
-                if (on_card && park && per <= swap_vram_cap_ && ggml_is_contiguous(p.hot)) {
-                    if (park_used + per > swap_vram_cap_) park_used = 0;  // (the queue keeps the order: no wait)
-                    ggml_reset(swap_ctx_);
-                    ggml_tensor* bytes = ggml_new_tensor_1d(swap_ctx_, GGML_TYPE_I8, (int64_t)ggml_nbytes(p.hot));
-                    bytes->data = p.hot->data; bytes->buffer = p.hot->buffer;   // (p.hot's memory, as bytes: no allocation)
-                    ggml_tensor* from = ggml_view_1d(swap_ctx_, bytes, (int64_t)per, (size_t)slot * per);
-                    ggml_tensor* parked = ggml_view_1d(swap_ctx_, swap_park_t_, (int64_t)per, park_used);
-                    ggml_backend_tensor_copy_async(gpu, gpu, from, parked);              // out: VRAM slot -> parked
-                    ggml_backend_tensor_set_async(gpu, p.hot, ram, (size_t)slot * per, per);  // in: RAM slot -> VRAM slot
-                    ggml_backend_tensor_get_async(gpu, parked, ram, 0, per);            // out: parked -> that RAM slot
-                    park_used += (per + park_align - 1) / park_align * park_align;
+                if (on_card && pin && per <= swap_pin_cap_) {
+                    if (pin_used + per > swap_pin_cap_ || pending.count(ram)) flush();
+                    jobs.push_back({p.hot, ram, (size_t)slot * per, per, pin_used});
+                    pending.insert(ram);
+                    pin_used += per;
                 } else if (on_card) {
-                    const char* src;
-                    if (pin) {
-                        if (pin_used + per > swap_pin_cap_) { ggml_backend_synchronize(gpu); pin_used = 0; }
-                        std::memcpy(pin + pin_used, ram, per);
-                        src = pin + pin_used;
-                        pin_used += per;
-                    } else {
-                        if (swap_buf_.size() + per > swap_buf_.capacity()) { ggml_backend_synchronize(gpu); swap_buf_.clear(); }
-                        const size_t off = swap_buf_.size();
-                        swap_buf_.insert(swap_buf_.end(), ram, ram + per);      // (capacity reserved: never moves)
-                        src = swap_buf_.data() + off;
-                    }
+                    flush();
+                    if (queued) { ggml_backend_synchronize(gpu); queued = false; }   // (it may write this RAM slot)
+                    if (swap_buf_.size() + per > swap_buf_.capacity()) { ggml_backend_synchronize(gpu); swap_buf_.clear(); }
+                    const size_t off = swap_buf_.size();
+                    swap_buf_.insert(swap_buf_.end(), ram, ram + per);          // (capacity reserved: never moves)
                     ggml_backend_tensor_get_async(gpu, p.hot, ram, (size_t)slot * per, per);
-                    ggml_backend_tensor_set_async(gpu, p.hot, src, (size_t)slot * per, per);
+                    ggml_backend_tensor_set_async(gpu, p.hot, swap_buf_.data() + off, (size_t)slot * per, per);
                 } else {
                     swap_buf_.assign(ram, ram + per);
                     ggml_backend_tensor_get(p.hot, ram, (size_t)slot * per, per);
@@ -6899,6 +6890,7 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
         }
     }
     }
+    if (gpu) flush();
     if (any && gpu) ggml_backend_synchronize(gpu);                // the outgoing experts are in RAM before the CPU's next step
     const auto t1 = std::chrono::steady_clock::now();
     if (any) {
