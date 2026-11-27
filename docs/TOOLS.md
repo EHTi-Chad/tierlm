@@ -274,6 +274,7 @@ See [BUILD.md](BUILD.md#running-the-tests).
 | `TIERLM_COLD_OFFLOAD_MIN=n` | Experts split between VRAM and RAM: the prompt batch size from which the GPU does the RAM experts' work too, copying them over for the batch (default 512 on a 24 GB card or more, 128 otherwise; 256 for layers whose RAM experts are streamed, since 0.9.4; ggml's rule, and tierlm's before 0.8.7, is 32) |
 | `TIERLM_LIVE_MARGIN=1.3` | Live hot experts: how much more an expert in RAM must be wanted than one in VRAM to replace it (times its score, + 0.5) |
 | `TIERLM_LIVE_SYNC=1` | Live hot experts: wait for each copy instead of queuing them all on the GPU (for comparison) |
+| `TIERLM_LIVE_PIN=0` | Live hot experts: stage the incoming experts in ordinary memory, one at a time, as before 0.9.7, instead of in pinned memory in batches copied by several threads (RTX 5090, Flash-Next: about 15 GB/s both ways before, 18 now) |
 | `TIERLM_NO_TIMES=1` | `tierlm-server`: no time (HH:MM:SS) in front of each line in its window (the page's console still shows it) |
 | `TIERLM_SPEC_SAMPLING=0` | `tierlm-server`: at temperature > 0, guess the draft block's best word and keep it only when the model's own draw matches, instead of speculative sampling (for comparison; the replies' odds are the model's either way) |
 | `TIERLM_MTP_VRAM=0` | Don't put the draft block's experts in VRAM before the model's own (the default since 0.8.7, so guessing runs wholly on the GPU): they compete with the model's experts by use, as before |

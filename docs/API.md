@@ -288,6 +288,28 @@ Since 0.8.7 also `prompt_cache` (`files`, `bytes`, `limit_bytes`, `min_tokens`: 
 ARCHITECTURE.md) and `ram_short` (true when the model was loaded with less RAM free than it keeps there, so the system
 will page and replies will be slow), with `ram_need_at_load` and `ram_free_at_load` in bytes.
 
+Since 0.9.7 also `movement`, what the model sends between RAM and the GPU: `ram_weights` and `ram_pinned` (bytes of
+weights in RAM, and how many of them are pinned), `moves`, `move_bytes` and `move_ms` (live hot experts moved into
+VRAM since loading; the bytes count both ways, the outgoing expert goes back to RAM), `stream_steps`, `stream_bytes`
+and `stream_ms` (long prompts: RAM experts sent to the GPU while it computes) and `last` (`moves`, `bytes`, `ms` and
+`vram_pct`, the share of the last reply's expert work done in VRAM). The page shows them under **Model info → Data
+movement**.
+
+### GET /api/linktest, POST /api/linktest
+
+`POST` measures the link between RAM and the GPU in use (or the first GPU when no model is loaded), through ggml, in a
+few seconds; replies wait while it runs. `GET` returns the last result as below (`last` is `null` before the first); `POST` returns the new result itself, without `last`.
+
+```json
+{"last": {"ok": true, "device": "CUDA0 (NVIDIA GeForce RTX 5090)", "bytes": 536870912, "pinned": true,
+  "to_card": 57.7, "to_ram": 56.9, "to_card_plain": 21.4, "pieces_queued": 56.0, "pieces_each": 38.0,
+  "seconds": 0.5, "when": 1795799038}}
+```
+
+GB/s: `to_card` and `to_ram` from pinned memory, `to_card_plain` from ordinary memory, and `pieces_*` in 2 MB pieces
+queued together or waited for one at a time (`bytes`: the size of the large copies). With `"ok": false`, `error` says
+why.
+
 ### GET /api/devices
 
 ```json
