@@ -45,7 +45,9 @@ bool is_vision_file(const std::string& path, std::string* why = nullptr);
 class Vision {
 public:
     // device: "auto" (a GPU with room to spare, else the CPU), "cpu" or a ggml device name. Throws on failure.
-    static std::unique_ptr<Vision> load(const std::string& path, const std::string& device = "auto");
+    // keep: VRAM on that GPU that isn't its to take (the chat model's room for working memory beyond its compute
+    // buffers, which only shows as free until long prompts need it).
+    static std::unique_ptr<Vision> load(const std::string& path, const std::string& device = "auto", size_t keep = 0);
     ~Vision();
 
     // An image made ready for encode(): resized and cut into patches. max_tokens limits the image words it

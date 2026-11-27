@@ -152,7 +152,7 @@ Vision::~Vision() {
     if (gguf_) gguf_free(gguf_);
 }
 
-std::unique_ptr<Vision> Vision::load(const std::string& path, const std::string& device) {
+std::unique_ptr<Vision> Vision::load(const std::string& path, const std::string& device, size_t keep) {
     std::unique_ptr<Vision> v(new Vision());
     gguf_init_params gp{ /*no_alloc=*/true, &v->wctx_ };
     v->gguf_ = gguf_init_from_file(path.c_str(), gp);
@@ -253,7 +253,7 @@ std::unique_ptr<Vision> Vision::load(const std::string& path, const std::string&
         return best;
     };
     if (mode == "auto" || mode == "gpu") {
-        if (!force_ram) dev = pref ? (room(pref) >= need ? pref : nullptr) : best_gpu(true);
+        if (!force_ram) dev = pref ? (room(pref) >= need + keep ? pref : nullptr) : best_gpu(true);
     } else if (mode != "cpu") {
         dev = ggml_backend_dev_by_name(mode.c_str());
         if (!dev) throw std::runtime_error("unknown device '" + mode + "'");

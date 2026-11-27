@@ -2039,7 +2039,12 @@ int main(int argc, char** argv) {
                     const auto& gp = eng.model->placement().gpus;
                     const std::string where = opt.device == "cpu" || !eng.model->on_gpu() ? "cpu"
                                             : gp.empty() ? std::string("auto") : "auto:" + gp[0].name;
-                    eng.vision = Vision::load(vf.u8string(), where);
+                    // (not in the room the chat model keeps free for working memory beyond its compute buffers: its
+                    // long prompts need it, and with the image reader in it Windows lent the card RAM, or a kernel
+                    // couldn't load at all: "shared object initialization failed", Flash-Next on an RTX 5090)
+                    const auto& pl = eng.model->placement();
+                    const size_t kept = (size_t)std::max(0, pl.vram_reserve_mb) << 20;
+                    eng.vision = Vision::load(vf.u8string(), where, kept > pl.compute_gpu ? kept - pl.compute_gpu : 0);
                     eng.vision_file = vf.filename().u8string();
                     std::fprintf(stderr, "vision: %s on %s (%.0f MB)\n", eng.vision_file.c_str(), eng.vision->device_name().c_str(),
                                  eng.vision->weight_bytes() / 1048576.0);
