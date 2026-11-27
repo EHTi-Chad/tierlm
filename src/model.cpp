@@ -2693,6 +2693,25 @@ void Model::pin_cpu_layers(const Graph& g, ggml_backend_sched* sc) {
     }
     for (ggml_tensor* t : g.cpu_ops) ggml_backend_sched_set_tensor_backend(sc, t, cpu_);
     if (!pin_layers_) return;
+    // A big prompt batch with the RAM layers' weights pinned (0.9.7): only what reads or writes a RAM layer's own
+    // memory (its cache, running memories) stays on the CPU; its products with weights are left to the scheduler,
+    // which hands them to the GPU (copying the weights over, from cold_offload_min_ tokens, as for RAM experts).
+    // Until 0.9.7 a RAM layer ran wholly on the CPU, prompts too: Qwen3.8-27B Q8_0 on a 16 GB RTX 5080 (35 of 64
+    // layers in RAM) read a 2,212-token prompt at 19 tok/s. TIERLM_LEND=0: as before.
+    static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
+    static const bool lend_off = std::getenv("TIERLM_LEND") && !std::strcmp(std::getenv("TIERLM_LEND"), "0");
+    const bool lend = !lend_off && gpus_.size() == 1 && place_.pinned_weights > 0 &&
+                      g.n_tok >= std::max(offload_batch, cold_offload_min_);
+    auto state = [](const ggml_tensor* t) {                          // a layer's memory in RAM (not a weight, not made by the step)
+        while (t && t->view_src) t = t->view_src;
+        return t && t->op == GGML_OP_NONE && t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
+               ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    };
+    auto touches_state = [&](const ggml_tensor* t) {
+        if (state(t)) return true;
+        for (const ggml_tensor* s : t->src) if (s && state(s)) return true;
+        return false;
+    };
     // A view computes nothing: it is its source's memory, so it can only be where its source is. A layer that takes a
     // view of what another device holds or made must not pin it (Inkling 2's depth mixers reshape every earlier
     // block's output and the embedding's, and take columns of query tables that are weights of the whole model):
@@ -2710,7 +2729,7 @@ void Model::pin_cpu_layers(const Graph& g, ggml_backend_sched* sc) {
                                                  : src->op == GGML_OP_NONE && !src->buffer;   // or an input of the graph
             if (!here) continue;
         }
-        if (d < 0) ggml_backend_sched_set_tensor_backend(sc, t, cpu_);
+        if (d < 0) { if (!lend || touches_state(t)) ggml_backend_sched_set_tensor_backend(sc, t, cpu_); }
         else if (gpus_.size() > 1) ggml_backend_sched_set_tensor_backend(sc, t, gpus_[d]);
     }
 }
@@ -4132,6 +4151,7 @@ Model::Graph Model::build(int n_tok, int n_kv_end, bool want_routing, int n_logi
     std::vector<uint8_t>& gm = mem ? *mem : graph_mem(n_tok == 1 ? 0 : 1, n_tok);
     ggml_init_params ip{ gm.size(), gm.data(), /*no_alloc=*/true };
     ggml_context* c = g.ctx = ggml_init(ip);
+    g.n_tok = n_tok;
     g.gf = ggml_new_graph_custom(c, graph_size_, false);
 
     g.inp = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tok);
