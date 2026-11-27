@@ -58,6 +58,7 @@
 #include "prompt_cache.h"
 #include "api_compat.h"
 #include "download.h"
+#include "linktest.h"
 
 #include <climits>
 #include <algorithm>
@@ -996,6 +997,9 @@ struct Engine {
     int hot_E = 0, hot_L = 0;
     std::vector<uint8_t> in_vram;        // [layer * E + expert]: in VRAM (hot experts or a whole layer), for the share below
     long long picks = 0, picks_vram = 0; // the router's picks since the last reply line, and how many VRAM served
+    // The last reply's data movement, for Model info (0.9.7): experts moved into VRAM, bytes both ways, time, and the
+    // share of the expert work VRAM did (-1: not known)
+    long long last_moves = 0; double last_move_bytes = 0, last_move_ms = 0; int last_vram_pct = -1;
     // Off while Find the fastest settings measures: its test questions must not teach the busiest-experts set, or
     // that set fits the test unusually well and wins against settings that serve real chats better.
     bool learn = true;
@@ -2312,6 +2316,13 @@ int main(int argc, char** argv) {
             {"ssd_file", eng.model->placement().ssd_file},
             {"live", [&] { const auto& s = eng.model->live_stats();
                            return json{{"picks", s.picks}, {"hits", s.hits}, {"swaps", s.swaps}, {"swap_ms", std::round(s.swap_ms)}}; }()},
+            // Data movement between RAM and the GPU (0.9.7): see Model::Movement
+            {"movement", [&] { const auto& m = eng.model->movement(); const auto& pl = eng.model->placement();
+                               return json{{"moves", m.moves}, {"move_bytes", m.move_bytes}, {"move_ms", std::round(m.move_ms)},
+                                           {"stream_steps", m.stream_steps}, {"stream_bytes", m.stream_bytes}, {"stream_ms", std::round(m.stream_ms)},
+                                           {"ram_weights", pl.cpu_weights}, {"ram_pinned", pl.pinned_weights},
+                                           {"last", {{"moves", eng.last_moves}, {"bytes", eng.last_move_bytes}, {"ms", std::round(eng.last_move_ms)},
+                                                     {"vram_pct", eng.last_vram_pct}}}}; }()},
             {"learned_tokens", [&] { double t = 0; for (float v : eng.usage) t += v; return hp.n_layer * hp.n_expert_used > 0 ? (long long)(t / (hp.n_layer * hp.n_expert_used)) : 0LL; }()},
             {"version", TIERLM_VERSION},
             // For "slower than expected" hints: system RAM now, and what Find the fastest settings measured here.
@@ -2778,6 +2789,32 @@ int main(int argc, char** argv) {
         if (with_embed) { std::lock_guard<std::mutex> le(emb.mu); emb_freed = emb.enc != nullptr; emb.enc.reset(); emb.id.clear(); emb.path.clear(); emb.name.clear(); }
         return had;
     };
+    // Test the link (0.9.7): how fast data goes between RAM and the model's GPU, measured the way tierlm moves it, to
+    // set beside the speeds in Data movement. Waits for replies in progress; nothing runs on the card meanwhile.
+    json link_last = nullptr;
+    std::mutex link_mu;
+    svr.Get("/api/linktest", [&](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lk(link_mu);
+        res.set_content(json{{"last", link_last}}.dump(), "application/json; charset=utf-8");
+    });
+    svr.Post("/api/linktest", [&](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::shared_timed_mutex> lk(mu);
+        const std::string dev = eng.model ? eng.model->device_name() : std::string();
+        const LinkTest r = link_test(dev);
+        json j = r.ok ? json{{"ok", true}, {"device", r.device}, {"bytes", r.big}, {"pinned", r.pinned},
+                              {"to_card", r.to_card}, {"to_ram", r.to_ram}, {"to_card_plain", r.to_card_plain},
+                              {"pieces_each", r.pieces_each}, {"pieces_queued", r.pieces_queued}, {"seconds", r.seconds},
+                              {"when", (long long)std::time(nullptr)}}
+                      : json{{"ok", false}, {"error", r.error}};
+        if (r.ok)
+            std::fprintf(stderr, "link test, %s: RAM to card %.1f GB/s (pinned), %.1f GB/s (ordinary memory); card to RAM %.1f GB/s; "
+                                 "2 MB pieces %.1f GB/s queued, %.1f each waited for\n", r.device.c_str(), r.to_card, r.to_card_plain,
+                         r.to_ram, r.pieces_queued, r.pieces_each);
+        else
+            std::fprintf(stderr, "link test: %s\n", r.error.c_str());
+        { std::lock_guard<std::mutex> l2(link_mu); if (r.ok) link_last = j; }
+        res.set_content(j.dump(), "application/json; charset=utf-8");
+    });
     svr.Post("/api/unload", [&](const httplib::Request& req, httplib::Response& res) {
         const json body = json::parse(req.body.empty() ? "{}" : req.body, nullptr, false);
         const bool with_embed = body.is_object() && body.value("embedding", false);
@@ -3470,16 +3507,25 @@ int main(int argc, char** argv) {
                 r.vram_pct = (int)std::lround(100.0 * eng.picks_vram / eng.picks);
                 vram_note = "; VRAM experts did " + std::to_string(r.vram_pct) + "% of this reply's expert work";
             }
+            eng.last_vram_pct = r.vram_pct;
+            eng.last_moves = 0; eng.last_move_bytes = eng.last_move_ms = 0;
             eng.picks = eng.picks_vram = 0;
         }
         if (model->live_hot()) {                                 // the VRAM set moves: count where each pick really was
             const Model::LiveStats ls = model->live_stats();
             if (ls.picks > 0) {
-                char b[160];
-                std::snprintf(b, sizeof b, "; VRAM experts did %d%% of this reply's expert work (%lld moved into VRAM, %.0f ms)",
-                              (int)std::lround(100.0 * ls.hits / ls.picks), ls.swaps, ls.swap_ms);
+                char b[240];
+                if (ls.swaps > 0 && ls.swap_ms > 0)
+                    std::snprintf(b, sizeof b, "; VRAM experts did %d%% of this reply's expert work (%lld moved into VRAM, %.0f ms: %.0f MB both ways, %.1f GB/s)",
+                                  (int)std::lround(100.0 * ls.hits / ls.picks), ls.swaps, ls.swap_ms, ls.swap_bytes / 1048576.0,
+                                  ls.swap_bytes / 1e9 / (ls.swap_ms / 1000.0));
+                else
+                    std::snprintf(b, sizeof b, "; VRAM experts did %d%% of this reply's expert work (none moved into VRAM)",
+                                  (int)std::lround(100.0 * ls.hits / ls.picks));
                 vram_note = b;
                 r.vram_pct = (int)std::lround(100.0 * ls.hits / ls.picks); r.moved = ls.swaps;
+                eng.last_vram_pct = r.vram_pct;
+                eng.last_moves = ls.swaps; eng.last_move_bytes = ls.swap_bytes; eng.last_move_ms = ls.swap_ms;
             }
             model->reset_live_stats();
         }

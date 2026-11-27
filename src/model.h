@@ -385,8 +385,14 @@ public:
                       std::vector<std::vector<float>> qsa; };   // (Flash-Next) each indexed layer's indexer keys
     Snapshot save() const;
     // Live hot experts (LoadOptions::live_hot): how well VRAM is serving the router's picks.
-    struct LiveStats { long long picks = 0, hits = 0, swaps = 0; double swap_ms = 0; };
+    struct LiveStats { long long picks = 0, hits = 0, swaps = 0; double swap_ms = 0, swap_bytes = 0; };
     const LiveStats& live_stats() const { return live_stats_; }
+    // Data moved between RAM and the GPU since the load (0.9.7, Model info's "Data movement"): experts traded into
+    // VRAM as the conversation goes (bytes both ways, and the time from the first copy to the last one done, choosing
+    // included), and the RAM experts sent to the card for long prompts (bytes, and the time of the steps they were sent
+    // in: the copies run beside the GPU's work, so bytes over that time is what the step got, not the link's speed).
+    struct Movement { long long moves = 0, stream_steps = 0; double move_bytes = 0, move_ms = 0, stream_bytes = 0, stream_ms = 0; };
+    const Movement& movement() const { return movement_; }
     void reset_live_stats() { live_stats_ = LiveStats(); }
     bool live_hot() const { return !live_.empty(); }
     // Find the fastest settings: the VRAM experts held where they are (frozen, a live load serves as the fixed set the
@@ -565,6 +571,8 @@ private:
     };
     std::vector<LiveLayer> live_;
     mutable LiveStats live_stats_;
+    Movement movement_;
+    double stream_sent_ = 0;                     // (stream_send: this step's bytes)
     bool live_frozen_ = false;
     void adapt_hot(const std::vector<int32_t>& routing, int n_tok);
     // A layer visited more than once a token (Inkling 2's loop layers: three passes): the routing handed back has one
@@ -583,7 +591,9 @@ private:
     int vram_short_mb_ = 0;
     bool room_done_ = false, room_told_ = false; // (check_room: acted on, and said, once a load)
     bool room_warm_ = false;                     // (check_room: this is load's made-up step)
-    std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way)
+    std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way, without a pinned one)
+    ggml_backend_buffer* swap_pin_ = nullptr;    // (adapt_hot: the same in pinned memory, see there)
+    size_t swap_pin_cap_ = 0;
     std::vector<uint32_t> map_stage_;            // (adapt_hot: the VRAM maps' new entries on their way)
     double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
     std::chrono::steady_clock::time_point live_last_{};

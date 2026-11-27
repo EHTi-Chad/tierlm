@@ -61,7 +61,7 @@ if(MSVC AND TIERLM_CUDA AND NOT GGML_BACKEND_DL)
   link_libraries(delayimp)
 endif()
 
-add_library(tierlm_core STATIC src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/model.cpp src/mapped_file.cpp src/gguf_split.cpp src/speculate.cpp src/backends.cpp src/encoder.cpp src/vision.cpp src/image.cpp)
+add_library(tierlm_core STATIC src/model_map.cpp src/planner.cpp src/tokenizer.cpp src/model.cpp src/mapped_file.cpp src/gguf_split.cpp src/speculate.cpp src/backends.cpp src/encoder.cpp src/vision.cpp src/image.cpp src/linktest.cpp)
 target_include_directories(tierlm_core PUBLIC src)
 target_link_libraries(tierlm_core PUBLIC ggml)
 # Which NVIDIA generations this build's CUDA engine has code for, so tierlm can send a card it can't run to Vulkan

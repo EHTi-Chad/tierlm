@@ -977,6 +977,17 @@ window.FIT = (() => {
         <div class="note" id="hotnote" hidden></div>
         <button class="tiny ghost" id="hotforget" hidden>Forget what tierlm learned about this model</button>
         <div class="note" id="densenote" hidden></div>
+        <div id="mvsec" hidden>
+          <div class="subhead">Data movement</div>
+          <div class="help">What this model sends between RAM and the graphics card, and how fast. Test the link to see what this PC's
+            connection can do, to compare.</div>
+          <dl class="kv" id="mvkv"></dl>
+          <div class="apirow">
+            <button class="tiny" id="linkbtn" title="A few seconds; waits for a reply in progress">Test the link</button>
+            <span class="caption" id="linknote"></span>
+          </div>
+          <dl class="kv" id="linkkv" hidden></dl>
+        </div>
         <div class="subhead">Copy specs</div>
         <div class="help">Everything people ask for next to a speed result: this PC, the model and quantization, what ran in VRAM, RAM and on the SSD,
           the settings, and the latest speeds with how long the prompt and reply were. Paste it with your numbers.</div>
@@ -1338,10 +1349,61 @@ async function refreshLive() {
   try {
     const j = await (await api("/api/info")).json();
     if (!info || !j.loaded || j.path !== info.path) return;
-    info.hot = j.hot; info.live = j.live; info.hot_experts = j.hot_experts;
+    info.hot = j.hot; info.live = j.live; info.hot_experts = j.hot_experts; info.movement = j.movement;
     renderHot();
+    renderMove();
   } catch (e) {}
 }
+// Data movement (0.9.7): what crosses between RAM and the card for this model, and the link test to set beside it
+let linkLast = null;
+function renderMove() {
+  const sec = $("mvsec"), m = info && info.movement;
+  if (!info || !info.loaded || !info.on_gpu || info.device_type === "igpu" || !m) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const GB = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : Math.round(b / 1048576).toLocaleString() + " MB";
+  const rate = (b, ms) => ms > 0 ? (b / 1e9 / (ms / 1000)).toFixed(1) + " GB/s" : "–";
+  const rows = [];
+  if (m.ram_weights > 0)
+    rows.push(["Experts in RAM", GB(m.ram_weights) + (m.ram_pinned > 0 ? ", pinned" :
+      ", in ordinary memory: copies to the card go slower (not enough RAM to pin them)")]);
+  else rows.push(["Experts in RAM", "none: the whole model is on the card"]);
+  if (info.live_experts) {
+    const l = m.last || {};
+    if (l.vram_pct >= 0) rows.push(["Expert work in VRAM", l.vram_pct + "% last reply" + (m.ram_weights > 0 ? ", the rest by the CPU in RAM (no copies)" : "")]);
+    rows.push(["Moved into VRAM, last reply", l.moves > 0 ? `${l.moves.toLocaleString()} experts, ${GB(l.bytes)} both ways, ${rate(l.bytes, l.ms)}` : "none"]);
+    rows.push(["Moved into VRAM, since loading", m.moves > 0 ? `${m.moves.toLocaleString()} experts, ${GB(m.move_bytes)}, ${rate(m.move_bytes, m.move_ms)}` : "none yet"]);
+  }
+  if (m.stream_steps > 0)
+    rows.push(["Long prompts", `${GB(m.stream_bytes)} of RAM experts sent in ${m.stream_steps.toLocaleString()} prompt steps, ${rate(m.stream_bytes, m.stream_ms)} with the GPU's work alongside`]);
+  else if (m.ram_weights > 0 && m.ram_pinned > 0) rows.push(["Long prompts", "none read yet"]);
+  if (linkLast && linkLast.ok && m.moves > 0 && m.move_ms > 0 && linkLast.pieces_queued > 0) {
+    const pct = Math.round(100 * (m.move_bytes / 1e9 / (m.move_ms / 1000)) / linkLast.pieces_queued);
+    rows.push(["Moves against the link", pct + "% of what it takes in 2 MB pieces"]);
+  }
+  $("mvkv").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");
+  const lk = $("linkkv");
+  if (linkLast && linkLast.ok) {
+    lk.hidden = false;
+    const f = x => x > 0 ? x.toFixed(1) + " GB/s" : "–";
+    lk.innerHTML = [["RAM → card", f(linkLast.to_card) + (linkLast.pinned ? "" : " (no pinned memory)")],
+                    ["Card → RAM", f(linkLast.to_ram)],
+                    ["RAM → card, ordinary memory", f(linkLast.to_card_plain)],
+                    ["2 MB pieces, queued", f(linkLast.pieces_queued)],
+                    ["2 MB pieces, one at a time", f(linkLast.pieces_each)]]
+      .map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");
+    $("linknote").textContent = linkLast.device + ", " + new Date(linkLast.when * 1000).toLocaleTimeString();
+  } else lk.hidden = true;
+}
+$("linkbtn").onclick = async () => {
+  const b = $("linkbtn");
+  b.disabled = true; $("linknote").textContent = "Testing…";
+  try {
+    const j = await (await api("/api/linktest", { method: "POST" })).json();
+    if (j.ok) linkLast = j; else $("linknote").textContent = "Couldn't test: " + (j.error || "unknown error");
+  } catch (e) { $("linknote").textContent = "Couldn't test: the server didn't answer"; }
+  b.disabled = false;
+  if (linkLast) renderMove();
+};
 async function loadInfo() {
   try {
     info = await (await api("/api/info")).json();
@@ -1384,6 +1446,8 @@ async function loadInfo() {
   document.querySelectorAll(".hK").forEach(x => x.textContent = K);
   ffnVram = info.ffn_vram || [];
   renderHot();
+  renderMove();
+  api("/api/linktest").then(r => r.json()).then(j => { if (j.last && j.last.ok) { linkLast = j.last; renderMove(); } }).catch(() => {});
   const learned = info.learned_tokens || 0;
   $("hotforget").hidden = !(moe && learned > 0);
   renderMiniMem();
@@ -1887,7 +1951,7 @@ async function runTurn() {
   }
   setBusy(false);
   controller = null;
-  if (info && info.live_experts) refreshLive();
+  if (info && info.loaded) refreshLive();
   if (rerender) { rerender = false; renderHistory(); }
   autoPreview();
   if (lastFull) { const why = lastFull; lastFull = null; showContextFull(why); }
@@ -4171,12 +4235,21 @@ function specsMarkdown(sp) {
     ["Connections", d.connections > 1 ? d.connections : ""], ["Speculative decoding", d.speculative], ["Prompt lookup", d.lookup],
     ["Thinking", d.thinking], ["Sampling", d.sampling], ["Load time", d.load_time],
     ["Benchmark", d.benchmark || ""], ["Last chat reply", d.last_reply || ""], ["Prefill (last long prompt)", d.prefill || ""],
+    ...moveRows(sp.inf),
   ].filter(r => r[1] !== "" && r[1] != null);
   const cell = v => String(v).replace(/\|/g, "\\|");
   return "| tierlm specs | |\n|---|---|\n" + rows.map(r => `| **${r[0]}** | ${cell(r[1])} |`).join("\n") + "\n";
 }
+// Data movement and the link test, for the table (0.9.7): only what was measured
+function moveRows(inf) {
+  const m = inf && inf.movement, r = [], rate = (b, ms) => (b / 1e9 / (ms / 1000)).toFixed(1) + " GB/s";
+  if (m && m.moves > 0 && m.move_ms > 0) r.push(["Experts moved into VRAM", `${m.moves.toLocaleString()} since loading, ${(m.move_bytes / 1e9).toFixed(1)} GB both ways, ${rate(m.move_bytes, m.move_ms)}`]);
+  if (m && m.stream_steps > 0 && m.stream_ms > 0) r.push(["Long prompts' RAM experts", `${(m.stream_bytes / 1e9).toFixed(1)} GB sent in ${m.stream_steps} steps, ${rate(m.stream_bytes, m.stream_ms)} with the GPU working alongside`]);
+  if (linkLast && linkLast.ok) r.push(["Link test (RAM to card)", `${linkLast.to_card.toFixed(1)} GB/s pinned, ${linkLast.to_card_plain.toFixed(1)} GB/s ordinary memory, ${linkLast.pieces_queued.toFixed(1)} GB/s in 2 MB pieces`]);
+  return r;
+}
 function specsJson(sp) {
-  return JSON.stringify({ summary: specsData(sp), system: sp.pc, model: sp.inf, benchmark: lastBench, last_reply: lastReply }, null, 2);
+  return JSON.stringify({ summary: specsData(sp), system: sp.pc, model: sp.inf, benchmark: lastBench, last_reply: lastReply, link_test: linkLast }, null, 2);
 }
 async function copySpecs(kind, btn) {
   if (!info) return;

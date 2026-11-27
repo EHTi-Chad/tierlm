@@ -39,6 +39,7 @@ Model::~Model() {
     for (auto* e : stream_.ev) if (e) ggml_backend_event_free(e);
     if (stream_.buf) ggml_backend_buffer_free(stream_.buf);
     if (stream_.zeros) ggml_backend_buffer_free(stream_.zeros);
+    if (swap_pin_) ggml_backend_buffer_free(swap_pin_);
     if (stream_.ctx) ggml_free(stream_.ctx);
     if (stream_.copy) ggml_backend_free(stream_.copy);
     for (auto* b : draft_buf_) ggml_backend_buffer_free(b);
@@ -5575,7 +5576,7 @@ void Model::stream_send(int turn) {
     const std::pair<ggml_tensor*, ggml_tensor*> parts[4] = { {L.gate_up_xs, L.gate_up_xc}, {L.gate_xs, L.gate_xc},
                                                              {L.up_xs, L.up_xc}, {L.down_xs, L.down_xc} };
     for (auto [dst, src] : parts)
-        if (dst && src) ggml_backend_tensor_set_async(stream_.copy, dst, src->data, 0, ggml_nbytes(src));
+        if (dst && src) { ggml_backend_tensor_set_async(stream_.copy, dst, src->data, 0, ggml_nbytes(src)); stream_sent_ += (double)ggml_nbytes(src); }
     const void* z = stream_.zeros ? ggml_backend_buffer_get_base(stream_.zeros) : nullptr;
     for (ggml_tensor* p : stream_.pads[turn]) if (z) ggml_backend_tensor_set_async(stream_.copy, p, z, 0, ggml_nbytes(p));
     ggml_backend_event_record(stream_.ev[turn % 2], stream_.copy);
@@ -6501,7 +6502,9 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     struct StreamCb { Model* m; std::unordered_map<const ggml_tensor*, int> at; };
     StreamCb scb{this, {}};
     const bool streaming = stream_on_ && !g.stream_marks.empty() && !opprof && !trace;
+    const auto t_stream = clk::now();
     if (streaming) {
+        stream_sent_ = 0;
         for (auto [t, k] : g.stream_marks) scb.at[t] = k;
         stream_send(0);
         stream_send(1);
@@ -6522,6 +6525,9 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
     if (streaming) {
         ggml_backend_sched_set_eval_callback(sc, nullptr, nullptr);
         ggml_backend_synchronize(stream_.copy);
+        movement_.stream_steps++;
+        movement_.stream_bytes += stream_sent_;
+        movement_.stream_ms += std::chrono::duration<double, std::milli>(clk::now() - t_stream).count();
     }
     stream_on_ = false;
     if (!computed) {
@@ -6751,10 +6757,23 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     if (gpu && map_stage_.capacity() < 4096) map_stage_.reserve(4096);
     // (a burst is staged 64 MB at a time: the copies queued so far are waited for when the staging memory is full)
     const size_t stage = std::min(budget_bytes, (size_t)64 << 20) + ((size_t)64 << 20);
-    if (gpu && swap_buf_.capacity() < stage) swap_buf_.reserve(stage);
+    // The staging memory is pinned (0.9.7): copied to the card from ordinary memory, the incoming experts went at the
+    // speed of ordinary memory, 15.8 to 22.3 GB/s on PCIe 5.0 x16 cards that take 57.9 from pinned memory (RTX 5080 and
+    // 5090, tierlm-linktest). Held at its largest from then on: 128 MB at most. TIERLM_LIVE_PIN=0: ordinary memory.
+    static const bool pin_off = std::getenv("TIERLM_LIVE_PIN") && !std::strcmp(std::getenv("TIERLM_LIVE_PIN"), "0");
+    if (gpu && !pin_off && swap_pin_cap_ < stage) {
+        if (swap_pin_) { ggml_backend_synchronize(gpu); ggml_backend_buffer_free(swap_pin_); swap_pin_ = nullptr; swap_pin_cap_ = 0; }
+        ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(gpu));
+        if (host) swap_pin_ = ggml_backend_buft_alloc_buffer(host, stage);
+        if (swap_pin_) swap_pin_cap_ = stage;
+    }
+    char* const pin = gpu && swap_pin_ ? (char*)ggml_backend_buffer_get_base(swap_pin_) : nullptr;
+    size_t pin_used = 0;
+    if (gpu && !pin && swap_buf_.capacity() < stage) swap_buf_.reserve(stage);
     static int start = 0;
     start = n ? (start + 1) % n : 0;
     bool any = false;
+    long long moved_total = 0;
     for (int pass = 0, moved = 1; moved && pass < (burst ? 64 : 1); ++pass) {     // (a burst: round after round while any layer moves one)
     moved = 0;
     for (int j = 0; j < n && spent < budget_bytes; ++j) {
@@ -6774,11 +6793,20 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
                 const size_t per = p.hot->nb[2];
                 char* ram = (char*)p.cold->data + (size_t)cs * per;
                 if (gpu && p.hot->buffer && ggml_backend_buffer_get_type(p.hot->buffer) == ggml_backend_get_default_buffer_type(gpu)) {
-                    if (swap_buf_.size() + per > swap_buf_.capacity()) { ggml_backend_synchronize(gpu); swap_buf_.clear(); }
-                    const size_t off = swap_buf_.size();
-                    swap_buf_.insert(swap_buf_.end(), ram, ram + per);          // (capacity reserved: never moves)
+                    const char* src;
+                    if (pin) {
+                        if (pin_used + per > swap_pin_cap_) { ggml_backend_synchronize(gpu); pin_used = 0; }
+                        std::memcpy(pin + pin_used, ram, per);
+                        src = pin + pin_used;
+                        pin_used += per;
+                    } else {
+                        if (swap_buf_.size() + per > swap_buf_.capacity()) { ggml_backend_synchronize(gpu); swap_buf_.clear(); }
+                        const size_t off = swap_buf_.size();
+                        swap_buf_.insert(swap_buf_.end(), ram, ram + per);      // (capacity reserved: never moves)
+                        src = swap_buf_.data() + off;
+                    }
                     ggml_backend_tensor_get_async(gpu, p.hot, ram, (size_t)slot * per, per);
-                    ggml_backend_tensor_set_async(gpu, p.hot, swap_buf_.data() + off, (size_t)slot * per, per);
+                    ggml_backend_tensor_set_async(gpu, p.hot, src, (size_t)slot * per, per);
                 } else {
                     swap_buf_.assign(ram, ram + per);
                     ggml_backend_tensor_get(p.hot, ram, (size_t)slot * per, per);
@@ -6822,6 +6850,7 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
             ll.cold_of[out] = cs; ll.cold_of[in] = -1;
             spent += per_expert;
             live_stats_.swaps++;
+            ++moved_total;
             any = true; ++moved;
             if (ll.layer < (int)place_.hot.size()) {             // the dashboard's map of VRAM experts
                 auto& v = place_.hot[ll.layer];
@@ -6836,6 +6865,10 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     if (any) {
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         live_stats_.swap_ms += ms;
+        live_stats_.swap_bytes += (double)spent;
+        movement_.moves += moved_total;
+        movement_.move_bytes += (double)spent;
+        movement_.move_ms += ms;
         const double mb = spent / (1024.0 * 1024.0);
         if (mb > 0) live_ms_per_mb_ = live_ms_per_mb_ > 0 ? 0.8 * live_ms_per_mb_ + 0.2 * (ms / mb) : ms / mb;
     }
