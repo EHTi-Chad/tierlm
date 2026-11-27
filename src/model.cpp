@@ -42,6 +42,7 @@ Model::~Model() {
     if (swap_pin_) ggml_backend_buffer_free(swap_pin_);
     if (swap_vram_) ggml_backend_buffer_free(swap_vram_);
     if (swap_ctx_) ggml_free(swap_ctx_);
+    if (swap_park_ctx_) ggml_free(swap_park_ctx_);
     if (stream_.ctx) ggml_free(stream_.ctx);
     if (stream_.copy) ggml_backend_free(stream_.copy);
     for (auto* b : draft_buf_) ggml_backend_buffer_free(b);
@@ -6778,13 +6779,21 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
     // TIERLM_LIVE_DIRECT=0: staged, as before.
     static const bool direct_off = std::getenv("TIERLM_LIVE_DIRECT") && !std::strcmp(std::getenv("TIERLM_LIVE_DIRECT"), "0");
     const bool direct = gpu && !direct_off && place_.pinned_weights > 0 && std::strncmp(ggml_backend_name(gpu), "CUDA", 4) == 0;
+    // (Everything goes through byte views: a tensor of a quantized type allocated on a CUDA buffer has its padding
+    // cleared and the card waited for, every time; that made a move 0.4 ms instead of 0.25.)
     if (direct && !swap_vram_) {
         swap_vram_ = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(gpu), (size_t)32 << 20);
         swap_vram_cap_ = swap_vram_ ? ggml_backend_buffer_get_size(swap_vram_) : 0;
-        ggml_init_params ip{ggml_tensor_overhead() * 4, nullptr, true};
-        if (swap_vram_ && !swap_ctx_) swap_ctx_ = ggml_init(ip);
+        if (swap_vram_) {
+            ggml_init_params pp{ggml_tensor_overhead(), nullptr, true};
+            swap_park_ctx_ = ggml_init(pp);
+            swap_park_t_ = ggml_new_tensor_1d(swap_park_ctx_, GGML_TYPE_I8, (int64_t)swap_vram_cap_);
+            ggml_backend_tensor_alloc(swap_vram_, swap_park_t_, ggml_backend_buffer_get_base(swap_vram_));
+            ggml_init_params ip{ggml_tensor_overhead() * 4, nullptr, true};
+            if (!swap_ctx_) swap_ctx_ = ggml_init(ip);
+        }
     }
-    char* const park = direct && swap_vram_ && swap_ctx_ ? (char*)ggml_backend_buffer_get_base(swap_vram_) : nullptr;
+    const bool park = direct && swap_park_t_ && swap_ctx_;
     const size_t park_align = park ? ggml_backend_buffer_get_alignment(swap_vram_) : 1;
     size_t park_used = 0;
     if (gpu && !pin && swap_buf_.capacity() < stage) swap_buf_.reserve(stage);
@@ -6814,10 +6823,10 @@ void Model::adapt_hot(const std::vector<int32_t>& routing, int n_tok) {
                 if (on_card && park && per <= swap_vram_cap_ && ggml_is_contiguous(p.hot)) {
                     if (park_used + per > swap_vram_cap_) park_used = 0;  // (the queue keeps the order: no wait)
                     ggml_reset(swap_ctx_);
-                    const int64_t n_el = p.hot->ne[0] * p.hot->ne[1];
-                    ggml_tensor* from = ggml_view_1d(swap_ctx_, p.hot, n_el, (size_t)slot * per);
-                    ggml_tensor* parked = ggml_new_tensor_1d(swap_ctx_, p.hot->type, n_el);
-                    ggml_backend_tensor_alloc(swap_vram_, parked, park + park_used);
+                    ggml_tensor* bytes = ggml_new_tensor_1d(swap_ctx_, GGML_TYPE_I8, (int64_t)ggml_nbytes(p.hot));
+                    bytes->data = p.hot->data; bytes->buffer = p.hot->buffer;   // (p.hot's memory, as bytes: no allocation)
+                    ggml_tensor* from = ggml_view_1d(swap_ctx_, bytes, (int64_t)per, (size_t)slot * per);
+                    ggml_tensor* parked = ggml_view_1d(swap_ctx_, swap_park_t_, (int64_t)per, park_used);
                     ggml_backend_tensor_copy_async(gpu, gpu, from, parked);              // out: VRAM slot -> parked
                     ggml_backend_tensor_set_async(gpu, p.hot, ram, (size_t)slot * per, per);  // in: RAM slot -> VRAM slot
                     ggml_backend_tensor_get_async(gpu, parked, ram, 0, per);            // out: parked -> that RAM slot

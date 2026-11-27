@@ -597,6 +597,8 @@ private:
     ggml_backend_buffer* swap_vram_ = nullptr;   // (adapt_hot: outgoing experts parked on the card, see there)
     size_t swap_vram_cap_ = 0;
     ggml_context* swap_ctx_ = nullptr;           // (adapt_hot: the views its copies go through)
+    ggml_context* swap_park_ctx_ = nullptr;      // (adapt_hot: the parking space as one byte tensor, made once)
+    ggml_tensor* swap_park_t_ = nullptr;
     std::vector<uint32_t> map_stage_;            // (adapt_hot: the VRAM maps' new entries on their way)
     double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
     std::chrono::steady_clock::time_point live_last_{};
