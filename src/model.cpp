@@ -150,10 +150,12 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
             for (int i = 0; i < n; ++i) ids[(size_t)i] = 1 + (int32_t)(((int64_t)i * 7919) % (nv - 1));
             const bool frozen = M.live_frozen_;
             M.live_frozen_ = true;
+            M.room_warm_ = true;
             bool ran = true;
             try { M.eval(ids, std::clamp((int)std::thread::hardware_concurrency() / 2, 1, 8)); }
             catch (const std::exception&) { ran = false; }
             M.live_frozen_ = frozen;
+            M.room_warm_ = false;
             M.reset();
             M.reset_stats();
             M.reset_live_stats();
@@ -220,7 +222,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
 // long prompts that grows with the batch; other programs take VRAM after the load too. Flash-Next at 256K with
 // 4,096-token batches on an RTX 5090 needed about 5.75 GB kept free where load had noted 5.0 to 5.3. Short of it,
 // Windows doesn't fail the allocation: it lends the card RAM over PCIe ("shared GPU memory"), and prompts read at 60
-// to 220 tok/s instead of 2,000 (replies a little slower too). So when a long step leaves under 48 MB free, the
+// to 220 tok/s instead of 2,000 (replies a little slower too). So when a long step leaves the card out of room, the
 // least this kind of load needs is noted ("min <key>" in the note file, which load never keeps less than) and the
 // server loads the model again when it's idle. Once per load, on a card of its own (built-in graphics share the
 // system's memory: nothing to run out of), and never more than 2 GB above what load measured: beyond that it is
@@ -240,10 +242,29 @@ void Model::check_room(int n_tok) {
         std::fprintf(stderr, "VRAM: %d MB of the card free after a %d-token prompt step (%d MB kept free at load)\n",
                      free_mb, n_tok, place_.vram_reserve_mb);
     }
-    const int floor = 48;                                          // (out of room reads 0; 100 MB left read at full speed)
-    if (free_mb >= floor) return;
+    // Out of room reads 0 (seen three times); a card that is merely full read 41 to 500 MB and ran at full speed. So
+    // under 16 MB is short. The made-up step at load asks for more, 256 MB: a real session's image turns and wider
+    // checks took up to 400 MB more than it. Between the two it only notes a little more for the next fresh load.
+    const int spill = 16, tight = 256;
+    if (free_mb >= (room_warm_ ? tight : spill)) return;
     const int scratch = std::clamp((int)(tot >> 20) / 32, 192, 640);
     const int most = (int)(place_.compute_gpu >> 20) + scratch + 2048;
+    auto note_min = [&](int mb) {
+        if (note_path_.empty()) return;
+        std::vector<std::string> keep;
+        const std::string mk = "min " + note_key_;
+        { std::ifstream f(std::filesystem::u8path(note_path_));
+          for (std::string line; std::getline(f, line); ) { if (!line.empty() && line.back() == '\r') line.pop_back();
+                                                            if (!line.empty() && line.compare(0, mk.size(), mk) != 0) keep.push_back(line); } }
+        std::ofstream f(std::filesystem::u8path(note_path_), std::ios::trunc);
+        for (const auto& l : keep) f << l << "\n";
+        f << mk << mb << "\n";
+    };
+    if (free_mb >= spill) {                                        // (the step at load, tight: for the next fresh load)
+        const int more = std::min(place_.vram_reserve_mb + (tight - free_mb) + 64, most);
+        if (more > place_.vram_reserve_mb + 32) note_min(more);
+        return;
+    }
     const int want = std::min(place_.vram_reserve_mb + 896, most);  // (how far short isn't known: 0.9 GB did it at 256K)
     room_done_ = true;                                             // (either way: said once, acted on once)
     if (want < place_.vram_reserve_mb + 128) {
@@ -256,15 +277,7 @@ void Model::check_room(int n_tok) {
     std::fprintf(stderr, "VRAM: a %d-token prompt step left %d MB of the card free: the GPU's working memory outgrew the %d MB "
                          "kept for it, and long prompts slow down several times while Windows lends the card RAM; from now "
                          "on loads keep %d MB free\n", n_tok, free_mb, place_.vram_reserve_mb, want);
-    if (note_path_.empty()) return;
-    std::vector<std::string> keep;
-    const std::string mk = "min " + note_key_;
-    { std::ifstream f(std::filesystem::u8path(note_path_));
-      for (std::string line; std::getline(f, line); ) { if (!line.empty() && line.back() == '\r') line.pop_back();
-                                                        if (!line.empty() && line.compare(0, mk.size(), mk) != 0) keep.push_back(line); } }
-    std::ofstream f(std::filesystem::u8path(note_path_), std::ios::trunc);
-    for (const auto& l : keep) f << l << "\n";
-    f << mk << want << "\n";
+    note_min(want);
 }
 
 std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptions& opt) {

@@ -611,6 +611,27 @@ limited by RAM speed either way. The embedding table, looked up by row rather th
   compute buffers) never used shared memory over a 1,500-token reply (the process's shared GPU memory stayed at
   98 MB, the card still had 1 GB free) and fit 2,865 VRAM experts instead of 2,459 with 936 MB kept: 40.0 against
   38.7 tok/s.
+  The compute buffers aren't all a GPU engine takes, though: CUDA's own memory pool, cuBLAS and the graphs it keeps
+  grow as steps run, most of all in long prompts read in big steps (0.9.6). Qwen3.8 Flash-Next at a 256K context,
+  read 4,096 tokens a step on an RTX 5090, measured 5.1 to 5.3 GB and needed about 6.0: with 5.1 kept, the first
+  long prompt left 0 MB of the card free and read at 62 to 250 tok/s instead of 2,100 to 2,250, and a session of
+  231 agent turns took 21.6 minutes instead of about 13. So on a CUDA card the first load of a kind (model,
+  context, batch, split) runs one full prompt step of made-up tokens after the measured room is kept, and reads the
+  card's free memory (`Model::check_room`). Out of room (it reads 0; a card that was merely full read 41 to 500
+  MB and ran at full speed): it loads again with 0.9 GB more kept, tries once more, and notes the least this kind
+  needs (`min <key>` in `<usage>.vram`, which later loads never keep less than, so a remembered amount can't shrink
+  back under it). Under 256 MB left after that step, a little more is noted for the next fresh start (a real
+  session's image turns and wider checks took up to 400 MB more than the made-up step). Enough room is noted too
+  (`ok <key>`), and later loads skip the step. The same check runs after every
+  real prompt step of 256 tokens or more, for memory other programs take from the card later: the server then loads
+  the model again once it has had nothing to do for 2 seconds (between an agent's turns), at most twice a run. It
+  never asks for more than 2 GB above what load measured: past that it is other programs filling the card, and it
+  says so instead. Not on built-in graphics (they share the system's memory). `TIERLM_WARM=0`,
+  `TIERLM_ROOM_CHECK=0`, `TIERLM_ROOM_LOG=1`.
+  The image reader counts all of that kept room as taken (0.9.6): it goes on the card only when there is room for
+  it beyond the room the chat model keeps, else its weights stay in RAM with the GPU helping. Right after a load most
+  of the kept room still shows as free, and an image reader put there left a long prompt short of it (or a kernel
+  couldn't load at all: "shared object initialization failed").
 
 ## Hot experts (adaptive tiering)
 

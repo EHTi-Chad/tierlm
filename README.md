@@ -40,6 +40,46 @@ experts. tierlm runs Unsloth's files and llama.cpp's layout (`inkling2_loop`), w
 
 Thinking off, measured on finished replies of up to 500 tokens of C++. Next for both: reading images.
 
+### New in 0.9.6: long prompts stay on the card, long conversations cost less, see what other apps are getting
+
+- **Fixed: long prompts could run the card out of memory, and everything after them crawled.** tierlm keeps VRAM
+  free for the GPU's working memory and measures how much at load. The GPU engine takes more than that measure
+  showed once big prompt steps run, and on Windows a card that runs out doesn't fail: the driver lends it system
+  RAM, at a fraction of the speed. Qwen3.8 Flash-Next UD-IQ3_XXS at a 256K context on an RTX 5090, from a fresh
+  start: a 10,330-token prompt read at **131 to 250 tok/s**, and a coding agent's session of 231 turns took **21.6
+  minutes**. 0.9.6, the same PC and settings: **2,145 to 2,270 tok/s**, and **13.3 minutes**. The first load of a
+  model at a context size now runs one made-up prompt step and reads the card's free memory after it; short, it
+  loads again with more kept free and remembers it, so that first load takes two or three times as long, once. The
+  card is checked after real long prompts too (other programs take VRAM later), and the remembered amount can no
+  longer shrink back under what was needed. ([How](docs/ARCHITECTURE.md), under "VRAM kept free".)
+- **Fixed: the image reader could take the room kept for long prompts.** Right after a load most of that room still
+  shows as free, and the image reader went on the card when it found enough. A long prompt then ran short, or
+  tierlm stopped with "shared object initialization failed". It goes on the card only with room beyond what the
+  chat model keeps; otherwise its weights stay in RAM and the GPU still does the work (an image: about 0.5 s).
+- **Long conversations cost less outside the model.** A prompt is encoded from where it changed, not from its
+  start, at every turn. SentencePiece vocabularies (Gemma, Llama 2, Mistral) merge in n log n: a 290 KB
+  conversation with Gemma 4's vocabulary, 108 s to 0.17 s, the same tokens. A reply's text is added to a token at
+  a time: a 9,572-token reply spent 5.1 s putting its text together, now 1.4 ms.
+- **A little faster per word with a draft block.** Undoing guesses and moving experts into VRAM wait for the card
+  once a check, not once a tensor; masks and vocabulary scans are cheaper; the draft block reads a long prompt a
+  batch at a time. The same 231-turn session with enough VRAM kept for both: 0.9.5 13.6 minutes (79.1 tok/s
+  writing), 0.9.6 13.3 (82.0), no failed turn in either.
+- **Activity: see what tierlm is writing for other apps.** While opencode, pi, Claude Code or tierlm open in another
+  browser is getting a reply, the Speed card follows it, with a note saying who it's for. The ⤢ beside Speed opens
+  the last 60 replies for every app and page (prompt, cache, reading and writing speed, how each ended) and totals
+  since tierlm started (`GET /api/activity`, this computer only).
+- **Copy specs names prefill and decode**, as people compare them: "prefill 2,090 tok/s (10,327 new tokens), decode
+  95.2 tok/s (9,572-token reply, 6.4 tokens a check)". It also says when guesses go further than the number set
+  ("speculative 2 (adaptive up to 8)").
+- **Setup page**: only models that can be the chat model get a card (embedding models and files tierlm can't run
+  are counted in a line under the list, with Show them), cards and settings sit 4 a row on a wide window, and the
+  short settings share rows.
+
+Measured on an RTX 5090 32 GB, Ryzen 9 9950X3D, 64 GB DDR5-6000, Windows 11: Qwen3.8 Flash-Next UD-IQ3_XXS, 256K
+context, 8-bit context memory, VRAM experts following the conversation, 3 guesses a check (up to 8), 8 threads,
+thinking off, temperature 0.7; the session is a recorded airbench run by the pi agent (231 turns, up to 133K tokens
+of context, with images), replayed turn for turn with each reply as long as the original.
+
 ### New in 0.9.5: looped models (SenseNova-Loop, Inkling 2 faster), longer guesses for Qwen3.8 Flash-Next
 
 - **SenseNova-Loop-9B** (`sensenova_loop`), new: SenseTime's looped Qwen3.5 with manifold-constrained
