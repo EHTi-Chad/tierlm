@@ -633,6 +633,24 @@ limited by RAM speed either way. The embedding table, looked up by row rather th
   of the kept room still shows as free, and an image reader put there left a long prompt short of it (or a kernel
   couldn't load at all: "shared object initialization failed").
 
+### Prompts with whole layers in RAM (0.9.7)
+
+A dense model that doesn't fit is split by whole layers, and until 0.9.7 each RAM layer was pinned to the CPU, prompts
+too. Now a prompt batch of `cold_offload_min_` tokens or more (128, or 512 on a 24 GB card), with the RAM layers'
+weights pinned and one GPU, leaves a RAM layer's work to ggml's scheduler: the GPU does it, copying the weights over
+and the layer's own memory (its cache, DeltaNet's running memory) in; whatever writes into a RAM tensor (the cache's
+new rows, the updated memories) is placed with that tensor, so the updates land back in RAM, where the CPU reads them
+for the reply. Qwen3.8-27B Q6_K on an RTX 5090 held to 12 GB (34 of 64 layers in RAM, 8 threads), a 1,739-token prompt:
+
+| | prompt |
+|---|---|
+| RAM layers on the CPU (before 0.9.7, `TIERLM_LEND=0`) | 75 tok/s |
+| only their products with weights handed to the GPU | 229 tok/s |
+| all their work handed to the GPU | 1,421 tok/s |
+
+All three answered the same question about the prompt with the same facts. On a 16 GB RTX 5080 (Qwen3.8-27B Q8_0, 35
+layers in RAM) 0.9.6 read a 2,212-token prompt at 19 tok/s.
+
 ## Hot experts (adaptive tiering)
 
 A mixture-of-experts model picks a few experts per token, and some are picked far more than others: on real models a
