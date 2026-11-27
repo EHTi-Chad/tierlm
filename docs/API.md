@@ -295,6 +295,15 @@ and `stream_ms` (long prompts: RAM experts sent to the GPU while it computes) an
 `vram_pct`, the share of the last reply's expert work done in VRAM). The page shows them under **Model info → Data
 movement**.
 
+Also since 0.9.7, `kv_hint`: a model split by whole layers with a 16- or 32-bit cache, where an 8-bit cache would make
+room for layers left in RAM, gets `{"to": "q8_0", "layers_in_ram": 1, "would_fit": 1, "freed_bytes": 1132462080}`
+(estimated, with a tenth to spare); otherwise `null`. Model info says so, with a button that calls `/api/kvtype`.
+
+### POST /api/kvtype
+
+`{"kv_type": "q8_0"}` (or `f16`, `q5_0`, `q4_0`, `f32`): loads the loaded model again with that cache type and its
+other settings as saved, and saves the new type with them. From the computer running tierlm only.
+
 ### GET /api/linktest, POST /api/linktest
 
 `POST` measures the link between RAM and the GPU in use (or the first GPU when no model is loaded), through ggml, in a

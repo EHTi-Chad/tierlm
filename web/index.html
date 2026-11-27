@@ -980,6 +980,8 @@ window.FIT = (() => {
         <div class="note" id="hotnote" hidden></div>
         <button class="tiny ghost" id="hotforget" hidden>Forget what tierlm learned about this model</button>
         <div class="note" id="densenote" hidden></div>
+        <div class="note" id="kvhint" hidden><span id="kvhinttext"></span>
+          <div class="apirow"><button class="tiny" id="kvhintbtn">Switch to 8-bit and load again</button><span class="caption" id="kvhintnote"></span></div></div>
         <div id="mvsec" hidden>
           <div class="subhead">Data movement</div>
           <div class="help">What this model sends between RAM and the graphics card, and how fast. Experts left in RAM are run there by
@@ -1360,6 +1362,32 @@ async function refreshLive() {
 }
 // Data movement (0.9.7): what crosses between RAM and the card for this model, and the link test to set beside it
 let linkLast = null;
+// Layers left in RAM that an 8-bit context memory would make room for (0.9.7): said, with a button that loads the
+// model again with it (its other settings as saved). Only on this computer (another device can't load models).
+function renderKvHint() {
+  const h = info && info.kv_hint, box = $("kvhint");
+  if (!h || info.remote) { box.hidden = true; return; }
+  const n = h.would_fit, all = n >= h.layers_in_ram;
+  const gb = (h.freed_bytes / 1e9).toFixed(1);
+  $("kvhinttext").textContent = `${h.layers_in_ram} of ${info.layers} layers are in RAM, so the CPU works on every word. ` +
+    `An 8-bit context memory instead of ${info.kv_type === "f32" ? "32" : "16"}-bit would free about ${gb} GB of VRAM: room for ` +
+    (all ? (h.layers_in_ram === 1 ? "that layer" : `all ${h.layers_in_ram} of them`) : `about ${n} of them`) +
+    ", with practically the same quality. Replies get faster with every layer that moves to the card.";
+  $("kvhintnote").textContent = "";
+  box.hidden = false;
+}
+$("kvhintbtn").onclick = async () => {
+  const b = $("kvhintbtn");
+  b.disabled = true; $("kvhintnote").textContent = "Loading again…";
+  try {
+    const r = await api("/api/kvtype", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kv_type: "q8_0" }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    if ($("kvsel")) $("kvsel").value = "q8_0";                      // (the setup screen's choice too)
+    await loadInfo();
+  } catch (e) { $("kvhintnote").textContent = "Couldn't: " + await whyFailed(e); }
+  b.disabled = false;
+};
 function renderMove() {
   const sec = $("mvsec"), m = info && info.movement;
   if (!info || !info.loaded || !info.on_gpu || info.device_type === "igpu" || !m) { sec.hidden = true; return; }
@@ -1445,6 +1473,7 @@ async function loadInfo() {
   const dn = moe ? "" : `${info.name} is a dense model: every word uses all of its ${L} layers, so there are no experts to map. ` +
     "When it doesn't fit in VRAM, tierlm splits it by whole layers between VRAM and RAM.";
   $("densenote").textContent = dn;
+  renderKvHint();
   document.querySelectorAll(".hL").forEach(x => x.textContent = L);
   document.querySelectorAll(".hE").forEach(x => x.textContent = E);
   document.querySelectorAll(".hK").forEach(x => x.textContent = K);

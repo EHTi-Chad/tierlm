@@ -2299,6 +2299,22 @@ int main(int argc, char** argv) {
             {"kv_on_gpu", eng.model->placement().kv_on_gpu}, {"all_on_gpu", eng.model->placement().all_on_gpu()}, {"attn_gpu", eng.model->placement().attn_gpu},
             {"ffn_gpu", eng.model->placement().ffn_gpu}, {"kv_gpu_layers", eng.model->placement().kv_gpu_layers},
             {"split_mode", eng.model->placement().mode},
+            // A model split by whole layers with a 16- or 32-bit cache: would an 8-bit one make room for the layers
+            // in RAM? (0.9.7; an 8-bit cache is 8.5 bits a number, practically the same quality.) Estimated: a layer
+            // as the weights over the layers (the word table and head counted in: on the safe side), the cache freed
+            // on the GPU's layers against the RAM layers' weights and 8-bit caches, with a tenth to spare.
+            {"kv_hint", [&]() -> json {
+                 const auto& pl = eng.model->placement();
+                 const std::string kt = eng.model->kv_type();
+                 const int L = hp.n_layer, in_ram = L - pl.ffn_gpu;
+                 if (pl.mode != "layers" || (kt != "f16" && kt != "f32") || in_ram <= 0 || L <= 0 || pl.gpu_weights == 0) return nullptr;
+                 const double bits = kt == "f32" ? 32.0 : 16.0, keep = 8.5 / bits;
+                 const double kv_l = (double)eng.model->kv_bytes() / L, w_l = (double)eng.model->weights_bytes() / L;
+                 const double freed = pl.kv_gpu_layers * kv_l * (1.0 - keep), per = (w_l + kv_l * keep) * 1.1;
+                 const int fits = std::min(in_ram, (int)(freed / per));
+                 if (fits <= 0) return nullptr;
+                 return json{{"to", "q8_0"}, {"layers_in_ram", in_ram}, {"would_fit", fits}, {"freed_bytes", (uint64_t)freed}};
+             }()},
             {"gpus", [&] {
                  json g = json::array();
                  for (const auto& x : eng.model->placement().gpus) g.push_back({{"name", x.name}, {"weights", x.weights}, {"kv", x.kv}, {"layers", x.layers}});
@@ -2631,6 +2647,41 @@ int main(int argc, char** argv) {
             eng.vision.reset();
             eng.model.reset();
             eng.path.clear();
+            res.status = 500;
+            res.set_content(dump({{"error", e.what()}}), "application/json; charset=utf-8");
+        }
+    });
+
+    // The loaded model again with another cache type, its other settings as saved (0.9.7: Model info offers an 8-bit
+    // cache when that would make room for layers left in RAM, see kv_hint). {"kv_type": "q8_0"}. From this computer.
+    svr.Post("/api/kvtype", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        const std::string t = body.is_object() ? body.value("kv_type", std::string()) : std::string();
+        if (t != "f16" && t != "q8_0" && t != "q5_0" && t != "q4_0" && t != "f32") return oai_error(res, 400, "expected {\"kv_type\": \"q8_0\"} (f16, q8_0, q5_0, q4_0 or f32)");
+        if (!line.enter(mu, req.is_connection_closed)) return oai_error(res, 503, "busy: waited too long for earlier replies to finish");
+        std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
+        if (!eng.model) return oai_error(res, 400, "no model is loaded");
+        const std::string id = model_key(eng.path), path = eng.path;
+        json saved;
+        { std::lock_guard<std::recursive_mutex> sl(settings_mu);
+          if (settings.contains("models") && settings["models"].contains(id)) saved = settings["models"][id]; }
+        if (!saved.is_object()) return oai_error(res, 400, "this model's settings weren't saved: load it from the setup screen");
+        saved["kv_type"] = t;
+        const LastLoad before = last_load;
+        try {
+            std::fprintf(stderr, "loading %s again with a %s cache\n", fs::u8path(path).filename().u8string().c_str(), t.c_str());
+            const LoadOptions o = load_options(saved);
+            eng.draft_max = std::min(8, std::max(0, saved.value("draft_max", 0)));
+            eng.lookup = std::max(-1, std::min(16, saved.value("lookup", -1)));
+            load(path, o, saved.value("threads", a.threads), saved.value("seed", -1), saved.value("hot_experts", false));
+            if (saved.contains("thinking") && saved["thinking"].is_boolean()) eng.thinking = saved["thinking"].get<bool>();
+            if (saved.contains("effort") && saved["effort"].is_string()) eng.effort = saved["effort"].get<std::string>();
+            std::lock_guard<std::recursive_mutex> sl(settings_mu);
+            settings["models"][id] = saved;
+            write_settings(a.settings, settings);
+            res.set_content(dump({{"ok", true}, {"kv_type", t}, {"load_s", eng.load_s}}), "application/json; charset=utf-8");
+        } catch (const std::exception& e) {
+            eng.spec.reset(); eng.look.reset(); eng.vision.reset(); eng.model.reset(); eng.path.clear();
             res.status = 500;
             res.set_content(dump({{"error", e.what()}}), "application/json; charset=utf-8");
         }
