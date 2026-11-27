@@ -838,6 +838,23 @@ size's auto setting is 4,096 when streaming.
 (Replies vary by about ±15% from run to run with the live VRAM experts; the streamed setup keeps 8,478 experts in VRAM
 against 9,529.) Batches of 8,192 were slower (5.5-8 s each): their working memory (6.4 GB) pushed 2,600 experts out of VRAM.
 
+**Looped models (0.9.7).** The stream's turns are the visits of the streamed layers in the order they run, so a loop's
+layers have one a pass (Inkling 2: 48 turns for 24 layers), each with its own slot tensors and padding. Before, a loop's
+RAM experts were never handed to the GPU for a prompt (ggml keeps one GPU copy of a weight for the whole step, so all
+the loop's would be in VRAM at once) and the CPU worked them out on every pass. Inkling 2's prompt steps are small (its
+attention is worked out in the open: 256 tokens, 128 at 32K), so a looped model streams from 64 tokens, and on cards
+under 24 GB too when the two slots are at most an eighth of the card. Inkling 2 Mini UD-Q8_K_XL held to 16 GB of an
+RTX 5090 (8-12 GB of experts in RAM, 4 threads), a 2,082-token prompt:
+
+| | a 256-token step | the request (prompt and a 60-token answer) |
+|---|---|---|
+| the CPU on every pass (0.9.6) | 3.1 s | 28.6 s |
+| streamed, a pass at a time | 0.39 s | 4.7 s |
+| all in VRAM, for comparison | 0.19 s | |
+
+The same question about the prompt got the same facts back from all of them; replies ran 38-40 tok/s with the slots and
+without.
+
 **MXFP4 on Blackwell.** ggml's CUDA engine already multiplies MXFP4 weights by 4-bit activations with the RTX 50-series'
 FP4 tensor cores (built for `120a`, which ggml's build picks for `120`). It is worth little here: the same gpt-oss-120b
 32K prompt with 8-bit activations instead (`GGML_CUDA_MMQ_PREC=q8`) read at 2,057 tok/s against 2,125, because copying

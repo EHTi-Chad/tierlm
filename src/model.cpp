@@ -5517,11 +5517,12 @@ void Model::setup_stream() {
     }
     if (ls.size() < 2) return;
     {   // 24 GB cards and up: the two slots hold the biggest layer's RAM experts, about 1 GB each for Flash-Next. A
-        // looped model (Inkling 2) on smaller cards too, when the slots are small (a twelfth of the card at most):
+        // looped model (Inkling 2) on smaller cards too, when the slots are small (an eighth of the card at most):
         // without them its loop's RAM experts are worked out by the CPU on every pass of a prompt. Inkling 2 Mini
-        // UD-Q8_K_XL with 8 GB of experts in RAM, RTX 5090: 3.1 s a 256-token step that way, 0.19 s all in VRAM.
+        // UD-Q8_K_XL held to 16 GB of an RTX 5090 (8 to 12 GB of experts in RAM, 4 threads): 3.1 s a 256-token step
+        // that way, 0.39 s streamed (0.19 s all in VRAM), the same answers; replies 38-40 tok/s either way.
         const char* e = std::getenv("TIERLM_STREAM");
-        const bool ok = dev_total >= ((size_t)23 << 30) || (hp_.looped() && 2 * per <= dev_total / 12);
+        const bool ok = dev_total >= ((size_t)23 << 30) || (hp_.looped() && 2 * per <= dev_total / 8);
         if (!ok && !(e && !std::strcmp(e, "1"))) return;
     }
     // The turns: the streamed layers' visits in the order they run (a loop's layers once a pass)
