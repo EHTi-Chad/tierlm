@@ -4223,7 +4223,10 @@ function specsLine(sp) {
     [d.cpu.split(",")[0], d.ram && d.ram + " RAM"].filter(Boolean).join(", "),
     p.short + (tiers.length > 1 ? " (" + tiers.join(" / ") + ")" : ""),
     `${d.context}`, d.threads && d.threads + (d.threads === "1" ? " thread" : " threads"),
-    d.speculative === "off" ? "no speculation" : "speculative " + (sp.inf.draft_max || "") + (sp.inf.draft_adapt > sp.inf.draft_max ? ` (adaptive up to ${sp.inf.draft_adapt})` : "")].filter(Boolean);
+    // The two ways of guessing ahead (0.9.7): speculative decoding (a draft layer, or the model's own first loop pass)
+    // and prompt lookup (copying from the prompt). Either can be on alone; "no speculation" only when both are off.
+    [d.speculative !== "off" && "speculative " + (sp.inf.draft_max || "") + (sp.inf.draft_adapt > sp.inf.draft_max ? ` (adaptive up to ${sp.inf.draft_adapt})` : ""),
+     sp.inf.lookup > 0 && `prompt lookup ${sp.inf.lookup}`].filter(Boolean).join(" + ") || "no speculation"].filter(Boolean);
   let out = parts.join(" | ");
   // Prefill (reading the prompt) and decode (writing the reply), the two speeds people compare. A chat's prefill is
   // timed only from a prompt of 1,024 new tokens or more (a short one is mostly overhead); else the line says so.
