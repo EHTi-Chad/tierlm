@@ -980,8 +980,9 @@ window.FIT = (() => {
         <div class="note" id="densenote" hidden></div>
         <div id="mvsec" hidden>
           <div class="subhead">Data movement</div>
-          <div class="help">What this model sends between RAM and the graphics card, and how fast. Test the link to see what this PC's
-            connection can do, to compare.</div>
+          <div class="help">What this model sends between RAM and the graphics card, and how fast. Experts left in RAM are run there by
+            the CPU, with no copies; the busiest are moved into VRAM as you chat (speeds count both ways). Test the link
+            to see what this PC's connection can do.</div>
           <dl class="kv" id="mvkv"></dl>
           <div class="apirow">
             <button class="tiny" id="linkbtn" title="A few seconds; waits for a reply in progress">Test the link</button>
@@ -1366,20 +1367,20 @@ function renderMove() {
   const rows = [];
   if (m.ram_weights > 0)
     rows.push(["Experts in RAM", GB(m.ram_weights) + (m.ram_pinned > 0 ? ", pinned" :
-      ", in ordinary memory: copies to the card go slower (not enough RAM to pin them)")]);
+      ", not pinned (slower copies)")]);
   else rows.push(["Experts in RAM", "none: the whole model is on the card"]);
   if (info.live_experts) {
     const l = m.last || {};
-    if (l.vram_pct >= 0) rows.push(["Expert work in VRAM", l.vram_pct + "% last reply" + (m.ram_weights > 0 ? ", the rest by the CPU in RAM (no copies)" : "")]);
-    rows.push(["Moved into VRAM, last reply", l.moves > 0 ? `${l.moves.toLocaleString()} experts, ${GB(l.bytes)} both ways, ${rate(l.bytes, l.ms)}` : "none"]);
-    rows.push(["Moved into VRAM, since loading", m.moves > 0 ? `${m.moves.toLocaleString()} experts, ${GB(m.move_bytes)}, ${rate(m.move_bytes, m.move_ms)}` : "none yet"]);
+    if (l.vram_pct >= 0) rows.push(["Expert work in VRAM", l.vram_pct + "% last reply"]);
+    rows.push(["Moved into VRAM, last reply", l.moves > 0 ? `${l.moves.toLocaleString()} experts, ${rate(l.bytes, l.ms)}` : "none"]);
+    rows.push(["Moved into VRAM, since loading", m.moves > 0 ? `${m.moves.toLocaleString()} experts, ${rate(m.move_bytes, m.move_ms)}` : "none yet"]);
   }
   if (m.stream_steps > 0)
-    rows.push(["Long prompts", `${GB(m.stream_bytes)} of RAM experts sent in ${m.stream_steps.toLocaleString()} prompt steps, ${rate(m.stream_bytes, m.stream_ms)} with the GPU's work alongside`]);
+    rows.push(["Long prompts", `${GB(m.stream_bytes)} sent, ${rate(m.stream_bytes, m.stream_ms)}`]);
   else if (m.ram_weights > 0 && m.ram_pinned > 0) rows.push(["Long prompts", "none read yet"]);
   if (linkLast && linkLast.ok && m.moves > 0 && m.move_ms > 0 && linkLast.pieces_queued > 0) {
     const pct = Math.round(100 * (m.move_bytes / 1e9 / (m.move_ms / 1000)) / linkLast.pieces_queued);
-    rows.push(["Moves against the link", pct + "% of what it takes in 2 MB pieces"]);
+    rows.push(["Moves against the link", pct + "% of the link"]);
   }
   $("mvkv").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");
   const lk = $("linkkv");
