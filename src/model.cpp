@@ -2600,6 +2600,10 @@ std::unique_ptr<Model> Model::load_once(const std::string& path, const LoadOptio
     // 1.69 s). So streamed batches start at 256 tokens instead of 512 (TIERLM_COLD_OFFLOAD_MIN: at that size).
     // (only the layers that are streamed: a layer whose RAM experts are copied the old way keeps its own size)
     m->stream_min_ = std::getenv("TIERLM_COLD_OFFLOAD_MIN") ? m->cold_offload_min_ : std::min(m->cold_offload_min_, 256);
+    // A looped model's prompt steps are small (Inkling 2: 128 tokens at 32K, see batch_span_ below), and without the
+    // stream its loop's RAM experts are the CPU's on every pass: about 11 ms a token with 8 GB of them in RAM (RTX
+    // 5090, 4 threads), against about 0.3 s a step to stream them. So it streams from 64 tokens.
+    if (hp.looped() && !std::getenv("TIERLM_COLD_OFFLOAD_MIN")) m->stream_min_ = std::min(m->stream_min_, 64);
     // Auto prompt batch size: 4,096 when streamed (see setup_stream: the copies then hide behind the work; 2,048
     // was copy-bound, 8,192's working memory pushed experts out of VRAM)
     if (opt.batch <= 0 && !m->stream_.layers.empty()) m->batch_ = std::min(4096, std::max(256, m->max_ctx_));
@@ -3860,7 +3864,8 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             if (L.gate_inp_s) sh = ggml_mul(c, sh, ggml_sigmoid(c, ggml_mul_mat(c, L.gate_inp_s, h)));   // gate: [1, n_tok]
             return sh;
         };
-        // A loop's layers (Inkling 2's): their RAM experts are never handed to the GPU. ggml keeps one GPU copy of a weight for
+        // A loop's layers (Inkling 2's): their RAM experts are never copied over by the scheduler (they are streamed, a
+        // pass at a time, where the card has a stream: see setup_stream). ggml keeps one GPU copy of a weight for
         // the whole step, and the loop reads a layer's experts again two and three passes later, so every loop layer's
         // RAM experts would be in VRAM at once: 7.9 GB of working memory on an 8 GB RTX 3070 Laptop with the busiest
         // experts in VRAM, 6.1 GB with all experts in RAM. Layers outside the loop are read once and handed over as usual.
@@ -3914,12 +3919,16 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
             // Streamed (see setup_stream): the RAM experts are read from their VRAM slot, filled ahead on another queue
             // (stream_on_: this step is big enough for it, see stream_ready; that is a smaller size than the copy's)
-            const bool streamed = stream_on_ && L.stream_turn >= 0;
+            // (a turn is a visit of a streamed layer, in the order they run: a loop's layers have one a pass, 0.9.7)
+            const int turn = (int)g.stream_marks.size();
+            const bool streamed = stream_on_ && L.stream_turn >= 0 && turn < (int)stream_.visits.size() &&
+                                  stream_.visits[turn] == L.index;
             const bool cold_gpu = streamed || (!in_loop && n_tok >= std::max(offload_batch, cold_offload_min_));
-            ggml_tensor* gu_c = streamed ? L.gate_up_xs : L.gate_up_xc;
-            ggml_tensor* g_c  = streamed ? L.gate_xs : L.gate_xc;
-            ggml_tensor* u_c  = streamed ? L.up_xs : L.up_xc;
-            ggml_tensor* d_c  = streamed ? L.down_xs : L.down_xc;
+            const auto* sl = streamed ? &stream_.slots[turn] : nullptr;
+            ggml_tensor* gu_c = streamed ? (*sl)[0] : L.gate_up_xc;
+            ggml_tensor* g_c  = streamed ? (*sl)[1] : L.gate_xc;
+            ggml_tensor* u_c  = streamed ? (*sl)[2] : L.up_xc;
+            ggml_tensor* d_c  = streamed ? (*sl)[3] : L.down_xc;
             ggml_tensor* ids_c  = remap(L.map_cold, L.down_xc, cold_gpu);
             ggml_tensor* ids_h  = remap(L.map_hot, L.down_xh, true);
             if (cold_skip_ > 0.0f && !cold_gpu) {
@@ -3997,7 +4006,7 @@ ggml_tensor* Model::ffn_block(ggml_context* c, Graph& g, const Layer& L, ggml_te
             if (streamed) {                                                 // the slot is free once this is done
                 ggml_tensor* mk = cold;
                 while (mk->op == GGML_OP_VIEW || mk->op == GGML_OP_RESHAPE) mk = mk->src[0];
-                g.stream_marks.push_back({mk, L.stream_turn});
+                g.stream_marks.push_back({mk, turn});
             }
             moe = ggml_add(c, cold, hot);                                   // cold first: the graph runs the RAM part, then the VRAM part
             }
@@ -5486,15 +5495,12 @@ std::vector<float> Model::mtp_eval(const int32_t* ids, const float* h, int n_tok
 // TIERLM_STREAM=0: as before.
 void Model::setup_stream() {
     if (const char* e = std::getenv("TIERLM_STREAM"); e && !std::strcmp(e, "0")) return;
-    if (hp_.ink) return;                                            // (Inkling 2: its loop reads layers out of order; see ffn_block)
     if (gpus_.size() != 1 || main_ == cpu_) return;
     ggml_backend_dev_t dev = ggml_backend_get_device(gpus_[0]);
     if (std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) != 0) return;
-    {   // (24 GB cards and up for now: the two slots hold the biggest layer's RAM experts, about 1 GB each for Flash-Next)
-        size_t fr = 0, tot = 0;
-        ggml_backend_dev_memory(dev, &fr, &tot);
-        const char* e = std::getenv("TIERLM_STREAM");
-        if (tot < ((size_t)23 << 30) && !(e && !std::strcmp(e, "1"))) return;
+    size_t dev_total = 0;
+    {   size_t fr = 0;
+        ggml_backend_dev_memory(dev, &fr, &dev_total);
     }
     ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(dev);
     if (!host) return;
@@ -5510,6 +5516,26 @@ void Model::setup_stream() {
         per = std::max(per, bytes_of(L.gate_up_xc) + bytes_of(L.gate_xc) + bytes_of(L.up_xc) + bytes_of(L.down_xc));
     }
     if (ls.size() < 2) return;
+    {   // 24 GB cards and up: the two slots hold the biggest layer's RAM experts, about 1 GB each for Flash-Next. A
+        // looped model (Inkling 2) on smaller cards too, when the slots are small (a twelfth of the card at most):
+        // without them its loop's RAM experts are worked out by the CPU on every pass of a prompt. Inkling 2 Mini
+        // UD-Q8_K_XL with 8 GB of experts in RAM, RTX 5090: 3.1 s a 256-token step that way, 0.19 s all in VRAM.
+        const char* e = std::getenv("TIERLM_STREAM");
+        const bool ok = dev_total >= ((size_t)23 << 30) || (hp_.looped() && 2 * per <= dev_total / 12);
+        if (!ok && !(e && !std::strcmp(e, "1"))) return;
+    }
+    // The turns: the streamed layers' visits in the order they run (a loop's layers once a pass)
+    std::vector<int> visits;
+    {
+        const std::set<int> in(ls.begin(), ls.end());
+        auto add = [&](int i) { if (in.count(i)) visits.push_back(i); };
+        const Hparams& hp = hp_;
+        if (hp.looped()) {
+            for (int i = 0; i < hp.loop_lo; ++i) add(i);
+            for (int p = 0; p < hp.loop_passes; ++p) for (int i = hp.loop_lo; i < hp.loop_hi; ++i) add(i);
+            for (int i = hp.loop_hi; i < hp.n_layer; ++i) add(i);
+        } else visits = ls;
+    }
     static const bool dbg = std::getenv("TIERLM_STREAM_DEBUG") != nullptr;
     if (dbg) std::fprintf(stderr, "stream: %zu layers, %zu bytes a slot\n", ls.size(), per);
     Stream& S = stream_;
@@ -5525,13 +5551,13 @@ void Model::setup_stream() {
         return;
     }
     if (dbg) std::fprintf(stderr, "stream: queue, events and slots made\n");
-    ggml_init_params ip{ 8 * ls.size() * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
+    ggml_init_params ip{ 8 * visits.size() * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
     S.ctx = ggml_init(ip);
     char* base = (char*)ggml_backend_buffer_get_base(S.buf);
     size_t zero_need = 0;
-    for (size_t k = 0; k < ls.size(); ++k) {
-        Layer& L = layers_[ls[k]];
-        L.stream_turn = (int)k;
+    for (int i : ls) layers_[i].stream_turn = 0;                     // (streamed: see visits for when)
+    for (size_t k = 0; k < visits.size(); ++k) {
+        Layer& L = layers_[visits[k]];
         size_t off = (k % 2) * per;
         S.pads.emplace_back();
         auto slot = [&](const ggml_tensor* src) -> ggml_tensor* {
@@ -5551,8 +5577,8 @@ void Model::setup_stream() {
             off += bytes_of(src);
             return t;
         };
-        L.gate_up_xs = slot(L.gate_up_xc); L.gate_xs = slot(L.gate_xc); L.up_xs = slot(L.up_xc); L.down_xs = slot(L.down_xc);
-        if (dbg && (k == 0 || k + 1 == ls.size())) std::fprintf(stderr, "stream: layer %d's slot tensors made\n", ls[k]);
+        S.slots.push_back({slot(L.gate_up_xc), slot(L.gate_xc), slot(L.up_xc), slot(L.down_xc)});
+        if (dbg && (k == 0 || k + 1 == visits.size())) std::fprintf(stderr, "stream: turn %zu (layer %d)'s slot tensors made\n", k, visits[k]);
     }
     if (zero_need) {
         S.zeros = ggml_backend_buft_alloc_buffer(host, zero_need);
@@ -5560,8 +5586,13 @@ void Model::setup_stream() {
         ggml_backend_buffer_clear(S.zeros, 0);
     }
     S.layers = ls;
+    S.visits = visits;
     S.bytes = 2 * per;
-    std::fprintf(stderr, "long prompts: %zu split layers' RAM experts streamed through two %.0f MB VRAM slots\n", ls.size(), per / 1048576.0);
+    if (visits.size() > ls.size())
+        std::fprintf(stderr, "long prompts: %zu split layers' RAM experts streamed through two %.0f MB VRAM slots, %zu times a step (the loop's passes)\n",
+                     ls.size(), per / 1048576.0, visits.size());
+    else
+        std::fprintf(stderr, "long prompts: %zu split layers' RAM experts streamed through two %.0f MB VRAM slots\n", ls.size(), per / 1048576.0);
 }
 
 bool Model::stream_ready(int n_tok) const {
@@ -5571,10 +5602,11 @@ bool Model::stream_ready(int n_tok) const {
 }
 
 void Model::stream_send(int turn) {
-    if (turn < 0 || turn >= (int)stream_.layers.size()) return;
-    const Layer& L = layers_[stream_.layers[turn]];
-    const std::pair<ggml_tensor*, ggml_tensor*> parts[4] = { {L.gate_up_xs, L.gate_up_xc}, {L.gate_xs, L.gate_xc},
-                                                             {L.up_xs, L.up_xc}, {L.down_xs, L.down_xc} };
+    if (turn < 0 || turn >= (int)stream_.visits.size()) return;
+    const Layer& L = layers_[stream_.visits[turn]];
+    const auto& sl = stream_.slots[turn];
+    const std::pair<ggml_tensor*, ggml_tensor*> parts[4] = { {sl[0], L.gate_up_xc}, {sl[1], L.gate_xc},
+                                                             {sl[2], L.up_xc}, {sl[3], L.down_xc} };
     for (auto [dst, src] : parts)
         if (dst && src) { ggml_backend_tensor_set_async(stream_.copy, dst, src->data, 0, ggml_nbytes(src)); stream_sent_ += (double)ggml_nbytes(src); }
     const void* z = stream_.zeros ? ggml_backend_buffer_get_base(stream_.zeros) : nullptr;
@@ -6517,7 +6549,7 @@ Model::EvalOut Model::step(const int32_t* ids, int n_tok, int n_threads, int n_l
             const int k = it->second;
             Model* m = sb->m;
             m->stream_send(k + 2);
-            if (k + 1 < (int)m->stream_.layers.size()) ggml_backend_event_wait(m->gpus_[0], m->stream_.ev[(k + 1) % 2]);
+            if (k + 1 < (int)m->stream_.visits.size()) ggml_backend_event_wait(m->gpus_[0], m->stream_.ev[(k + 1) % 2]);
             return true;
         }, &scb);
     }

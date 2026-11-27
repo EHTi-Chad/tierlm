@@ -650,8 +650,7 @@ private:
         // a bias on the router's choice (0 in VRAM, -1e9 not), so the picks are the best of those in VRAM.
         ggml_tensor *map_hot_g = nullptr, *hot_bias_g = nullptr;
         bool cold_mapped = false;                // the RAM part is the file's whole expert tensor (see load: RAM short)
-        int stream_turn = -1;                    // streamed prompt batches: this layer's turn among those streamed (see Stream)
-        ggml_tensor *gate_xs = nullptr, *up_xs = nullptr, *down_xs = nullptr, *gate_up_xs = nullptr;   // its RAM part's VRAM slot
+        int stream_turn = -1;                    // streamed prompt batches: 0 when this layer is streamed (see Stream::visits)
         ggml_tensor *up_s = nullptr, *gate_s = nullptr, *down_s = nullptr, *gate_inp_s = nullptr;   // shared expert
         ggml_tensor *k_cache = nullptr, *v_cache = nullptr;   // [head_dim, n_head_kv, max_ctx]
         // Hybrid models: Gated DeltaNet layer
@@ -895,7 +894,9 @@ private:
         ggml_backend_buffer* buf = nullptr;      // the two slots
         ggml_context* ctx = nullptr;             // the slot tensors, one set per streamed layer (two layers share a slot)
         ggml_backend_event* ev[2] = {nullptr, nullptr};
-        std::vector<int> layers;                 // the streamed layers, in order (their turns)
+        std::vector<int> layers;                 // the streamed layers, in order
+        std::vector<int> visits;                 // the turns: the streamed layers' visits as they run (a loop's: once a pass)
+        std::vector<std::array<ggml_tensor*, 4>> slots;   // per turn: its slot tensors (gate_up, gate, up, down)
         size_t bytes = 0;                        // both slots
         std::vector<std::vector<ggml_tensor*>> pads;   // per turn: the CUDA row padding after each slot tensor (zeroed after each copy)
         ggml_backend_buffer* zeros = nullptr;    // as many zeros as the biggest padding, pinned (a copy from ordinary memory
