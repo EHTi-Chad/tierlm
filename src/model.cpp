@@ -168,28 +168,41 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
 
 // After a long prompt's step (the card waited for): how much of the card is still free. The GPU engine takes its own
 // working memory as it goes (CUDA's memory pool, cuBLAS, graphs), beyond the compute buffers load measures, and for
-// long prompts that grows with the batch: Flash-Next at 256K with 4,096-token batches on an RTX 5090 needed 5.5 to 6
-// GB kept free where load had noted 5.0 to 5.3. Short of it, Windows doesn't fail the allocation: it lends the card
-// RAM over PCIe ("shared GPU memory"), and prompts read at 60 to 220 tok/s instead of 2,000 (replies a little slower
-// too). So when a long step leaves under 128 MB free, the least this kind of load needs is noted ("min <key>" in the
-// note file, which load never keeps less than) and the server loads the model again when it's idle. Once per load.
+// long prompts that grows with the batch; other programs take VRAM after the load too. Flash-Next at 256K with
+// 4,096-token batches on an RTX 5090 needed about 5.75 GB kept free where load had noted 5.0 to 5.3. Short of it,
+// Windows doesn't fail the allocation: it lends the card RAM over PCIe ("shared GPU memory"), and prompts read at 60
+// to 220 tok/s instead of 2,000 (replies a little slower too). So when a long step leaves under 128 MB free, the
+// least this kind of load needs is noted ("min <key>" in the note file, which load never keeps less than) and the
+// server loads the model again when it's idle. Once per load, on a card of its own (built-in graphics share the
+// system's memory: nothing to run out of), and never more than 2 GB above what load measured: beyond that it is
+// other programs filling the card, and giving them the model's VRAM for good would cost more than it saves.
+// TIERLM_ROOM_CHECK=0: off. TIERLM_ROOM_LOG=1: a line after every long step.
 void Model::check_room(int n_tok) {
-    if (gpus_.empty() || vram_short_mb_ > 0) return;
+    if (gpus_.empty() || vram_short_mb_ > 0 || room_done_) return;
     static const bool off = std::getenv("TIERLM_ROOM_CHECK") && !std::strcmp(std::getenv("TIERLM_ROOM_CHECK"), "0");
-    if (off) return;
+    if (off || integrated_gpu()) { room_done_ = true; return; }
     size_t fr = 0, tot = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(gpus_[0]), &fr, &tot);
-    if (tot == 0) return;
+    if (tot == 0) { room_done_ = true; return; }
     const int free_mb = (int)(fr >> 20);
-    static bool told = false;
-    if (!told || std::getenv("TIERLM_ROOM_LOG")) {
-        told = true;
+    static const bool log_all = std::getenv("TIERLM_ROOM_LOG") != nullptr;
+    if (!room_told_ || log_all) {
+        room_told_ = true;
         std::fprintf(stderr, "VRAM: %d MB of the card free after a %d-token prompt step (%d MB kept free at load)\n",
                      free_mb, n_tok, place_.vram_reserve_mb);
     }
     const int floor = 128;
     if (free_mb >= floor) return;
-    const int want = place_.vram_reserve_mb + 768 + (floor - free_mb);
+    const int scratch = std::clamp((int)(tot >> 20) / 32, 192, 640);
+    const int most = (int)(place_.compute_gpu >> 20) + scratch + 2048;
+    const int want = std::min(place_.vram_reserve_mb + 768 + (floor - free_mb), most);
+    room_done_ = true;                                             // (either way: said once, acted on once)
+    if (want < place_.vram_reserve_mb + 128) {
+        std::fprintf(stderr, "VRAM: a %d-token prompt step left %d MB of the card free with %d MB kept for the GPU's working "
+                             "memory: other programs are using the card's memory, and long prompts may be slow until they "
+                             "are closed\n", n_tok, free_mb, place_.vram_reserve_mb);
+        return;
+    }
     vram_short_mb_ = want;
     std::fprintf(stderr, "VRAM: a %d-token prompt step left %d MB of the card free: the GPU's working memory outgrew the %d MB "
                          "kept for it, and long prompts slow down several times while Windows lends the card RAM; from now "

@@ -2039,12 +2039,13 @@ int main(int argc, char** argv) {
                     const auto& gp = eng.model->placement().gpus;
                     const std::string where = opt.device == "cpu" || !eng.model->on_gpu() ? "cpu"
                                             : gp.empty() ? std::string("auto") : "auto:" + gp[0].name;
-                    // (not in the room the chat model keeps free for working memory beyond its compute buffers: its
-                    // long prompts need it, and with the image reader in it Windows lent the card RAM, or a kernel
-                    // couldn't load at all: "shared object initialization failed", Flash-Next on an RTX 5090)
-                    const auto& pl = eng.model->placement();
-                    const size_t kept = (size_t)std::max(0, pl.vram_reserve_mb) << 20;
-                    eng.vision = Vision::load(vf.u8string(), where, kept > pl.compute_gpu ? kept - pl.compute_gpu : 0);
+                    // (never in the room the chat model keeps free for its working memory: right after a load most
+                    // of it still shows as free, as the GPU takes it when long prompts come. With the image reader in
+                    // it, Windows lent the card RAM for those, or a kernel couldn't load at all: "shared object
+                    // initialization failed", Flash-Next on an RTX 5090. So it goes on the card only when there is
+                    // room for it beyond all of that: a model wholly in VRAM with VRAM to spare.)
+                    const size_t kept = (size_t)std::max(0, eng.model->placement().vram_reserve_mb) << 20;
+                    eng.vision = Vision::load(vf.u8string(), where, kept);
                     eng.vision_file = vf.filename().u8string();
                     std::fprintf(stderr, "vision: %s on %s (%.0f MB)\n", eng.vision_file.c_str(), eng.vision->device_name().c_str(),
                                  eng.vision->weight_bytes() / 1048576.0);
@@ -5909,12 +5910,14 @@ int main(int argc, char** argv) {
     std::thread idle_watch([&] {
         // A long prompt found the card nearly full (Model::vram_short_mb: Windows lending it RAM, long prompts several
         // times slower): loaded again with more kept free once nothing has used it for 2 s (between an agent's turns).
+        std::map<std::string, int> room_reloads;
         auto room_reload = [&]() -> bool {
             if (loading || line.waiting() > 0) return false;
             const long long now = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
             if (now - g_last_use < 2 || !mu.try_lock()) return false;
             std::lock_guard<std::shared_timed_mutex> lk(mu, std::adopt_lock);
             if (!eng.model || eng.model->vram_short_mb() <= 0 || last_load.path.empty()) return false;
+            if (++room_reloads[last_load.path] > 2) return false;              // (never back and forth: twice a model, a run)
             last_load.o.max_ctx = eng.model->max_ctx();
             last_load.o.vram_reserve_mb = 0;                                   // (what the note now says)
             last_load.draft_max = eng.draft_max; last_load.lookup = eng.lookup; last_load.spec_on = eng.spec != nullptr;

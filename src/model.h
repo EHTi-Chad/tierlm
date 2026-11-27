@@ -581,6 +581,7 @@ private:
     void check_room(int n_tok);                  // after a long prompt's step: is the card nearly full? (see vram_short_mb)
     std::string note_path_, note_key_;           // where load noted the VRAM kept free, and this kind's line
     int vram_short_mb_ = 0;
+    bool room_done_ = false, room_told_ = false; // (check_room: acted on, and said, once a load)
     std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way)
     std::vector<uint32_t> map_stage_;            // (adapt_hot: the VRAM maps' new entries on their way)
     double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
