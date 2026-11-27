@@ -984,9 +984,10 @@ window.FIT = (() => {
           <div class="apirow"><button class="tiny" id="kvhintbtn">Switch to 8-bit and load again</button><span class="caption" id="kvhintnote"></span></div></div>
         <div id="mvsec" hidden>
           <div class="subhead">Data movement</div>
-          <div class="help">What this model sends between RAM and the graphics card, and how fast. Experts left in RAM are run there by
-            the CPU, with no copies; the busiest are moved into VRAM as you chat (speeds count both ways). Test the link
-            to see what this PC's connection can do.</div>
+          <div class="help">What this model sends between RAM and the graphics card, and how fast. Weights left in RAM are worked on
+            there by the CPU as it writes, with no copies; long prompts send them to the card. With live experts, the
+            busiest are moved into VRAM as you chat (speeds count both ways). Test the link to see what this PC's
+            connection can do.</div>
           <dl class="kv" id="mvkv"></dl>
           <div class="apirow">
             <button class="tiny" id="linkbtn" title="A few seconds; waits for a reply in progress">Test the link</button>
@@ -1395,10 +1396,11 @@ function renderMove() {
   const GB = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : Math.round(b / 1048576).toLocaleString() + " MB";
   const rate = (b, ms) => ms > 0 ? (b / 1e9 / (ms / 1000)).toFixed(1) + " GB/s" : "–";
   const rows = [];
+  const what = info.experts > 0 ? "Experts in RAM" : "Weights in RAM";   // (a dense model: whole layers)
   if (m.ram_weights > 0)
-    rows.push(["Experts in RAM", GB(m.ram_weights) + (m.ram_pinned > 0 ? ", pinned" :
+    rows.push([what, GB(m.ram_weights) + (m.ram_pinned > 0 ? ", pinned" :
       ", not pinned (slower copies)")]);
-  else rows.push(["Experts in RAM", "none: the whole model is on the card"]);
+  else rows.push([what, "none: the whole model is on the card"]);
   if (info.live_experts) {
     const l = m.last || {};
     if (l.vram_pct >= 0) rows.push(["Expert work in VRAM", l.vram_pct + "% last reply"]);
