@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <thread>
 
 namespace tierlm {
 
@@ -101,12 +102,14 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                             opt.split_mode + (opt.expert_usage.empty() ? "" : "+hot") + (opt.live_hot ? "+live" : "") + " ";
     // "min <key>": the least a long prompt was seen to need on this card (see check_room): never kept below
     int floor_mb = 0;
+    bool warmed = false;                                           // "ok <key>": a full prompt step fitted (see warm, below)
     if (!o.vram_note.empty()) {
         std::ifstream f(std::filesystem::u8path(o.vram_note));
         for (std::string line; std::getline(f, line); ) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (opt.vram_reserve_mb <= 0 && line.compare(0, key.size(), key) == 0) o.vram_reserve_mb = std::atoi(line.c_str() + key.size());
             if (line.compare(0, 4, "min ") == 0 && line.compare(4, key.size(), key) == 0) floor_mb = std::atoi(line.c_str() + 4 + key.size());
+            if (line.compare(0, 3, "ok ") == 0 && line.compare(3, key.size(), key) == 0) warmed = true;
         }
         if (opt.vram_reserve_mb <= 0 && floor_mb > o.vram_reserve_mb) o.vram_reserve_mb = floor_mb;
     }
@@ -125,6 +128,52 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
                          was, o.vram_reserve_mb);
         }
     }
+    // The first load of a kind on a CUDA card, once the measured room is kept: one full prompt step of made-up tokens,
+    // then the card's free memory is read (check_room), so room that turns out short is found now, while the user
+    // waits for the load anyway, not at the first long prompt (which read at a tenth of the speed, with a load after
+    // it). Short: loaded again with what check_room asks for, and tried once more. Noted either way ("ok <key>" or
+    // check_room's "min <key>"), so later loads skip it. The conversation is forgotten again; the VRAM experts
+    // don't follow it. TIERLM_WARM=0: not done.
+    auto warm = [&, warmed, floor_mb](std::unique_ptr<Model> mm) -> std::unique_ptr<Model> {
+        static const bool off = (std::getenv("TIERLM_WARM") && !std::strcmp(std::getenv("TIERLM_WARM"), "0")) ||
+                                (std::getenv("TIERLM_ROOM_CHECK") && !std::strcmp(std::getenv("TIERLM_ROOM_CHECK"), "0"));
+        if (off || warmed || floor_mb > 0 || o.vram_note.empty() || opt.vram_reserve_mb > 0 || opt.vram_budget_mb > 0 ||
+            std::getenv("TIERLM_VRAM_BYTES")) return mm;
+        for (int round = 0; round < 2; ++round) {
+            Model& M = *mm;
+            if (M.gpus_.empty() || M.integrated_gpu() || M.place_.compute_gpu == 0 || M.hp_.dsv4 ||
+                std::strncmp(ggml_backend_name(M.gpus_[0]), "CUDA", 4) != 0) return mm;
+            const int n = std::min(M.batch_, M.max_ctx_ / 2);
+            if (n < 256) return mm;
+            std::vector<int32_t> ids((size_t)n);
+            const int nv = std::max(2, std::min(M.hp_.n_vocab_real > 0 ? M.hp_.n_vocab_real : M.hp_.n_vocab, 30000));
+            for (int i = 0; i < n; ++i) ids[(size_t)i] = 1 + (int32_t)(((int64_t)i * 7919) % (nv - 1));
+            const bool frozen = M.live_frozen_;
+            M.live_frozen_ = true;
+            bool ran = true;
+            try { M.eval(ids, std::clamp((int)std::thread::hardware_concurrency() / 2, 1, 8)); }
+            catch (const std::exception&) { ran = false; }
+            M.live_frozen_ = frozen;
+            M.reset();
+            M.reset_stats();
+            M.reset_live_stats();
+            { std::lock_guard<std::mutex> lk(M.extra_mu_); M.extra_counts_.clear(); }
+            const int want = M.vram_short_mb_;
+            if (!ran || want <= 0) {
+                if (ran) {                                         // enough room: say so for the next loads
+                    std::ofstream f(std::filesystem::u8path(o.vram_note), std::ios::app);
+                    f << "ok " << key << "1\n";
+                }
+                return mm;
+            }
+            std::fprintf(stderr, "VRAM: loading again with %d MB kept free (once: it's remembered)\n", want);
+            mm.reset();
+            o.vram_reserve_mb = want;
+            mm = load_once(path, o);
+            mm->note_path_ = o.vram_note; mm->note_key_ = key;
+        }
+        return mm;
+    };
     const int used = m->place_.vram_reserve_mb;
     // Scratch beyond the measured compute buffers (the GPU engine's own scratch memory, the driver): a share of the
     // card, 192 to 640 MB. Measured on an RTX 3070 Laptop (8 GB) with Qwen3.6-35B-A3B: 400 MB kept free in all (100
@@ -154,7 +203,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && (need > o.vram_reserve_mb || (opt.vram_reserve_mb <= 0 && need + 256 < o.vram_reserve_mb)))
         note(need);
     m->note_path_ = o.vram_note; m->note_key_ = key;
-    if (!tight) return m;
+    if (!tight) return warm(std::move(m));
     std::fprintf(stderr, "VRAM: this model needs %d MB free for the GPU's working memory and %d MB was kept; loading again "
                          "with %d MB kept, so replies don't slow down when VRAM runs out (once: it's remembered)\n", need, used, need);
     m.reset();
@@ -163,7 +212,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
     // (what it needs with that much kept, if still more: for next time)
     if (!o.vram_note.empty() && m->place_.compute_gpu > 0 && need_of(*m) > need + 64) note(need_of(*m));
     m->note_path_ = o.vram_note; m->note_key_ = key;
-    return m;
+    return warm(std::move(m));
 }
 
 // After a long prompt's step (the card waited for): how much of the card is still free. The GPU engine takes its own
@@ -171,7 +220,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const LoadOptions& o
 // long prompts that grows with the batch; other programs take VRAM after the load too. Flash-Next at 256K with
 // 4,096-token batches on an RTX 5090 needed about 5.75 GB kept free where load had noted 5.0 to 5.3. Short of it,
 // Windows doesn't fail the allocation: it lends the card RAM over PCIe ("shared GPU memory"), and prompts read at 60
-// to 220 tok/s instead of 2,000 (replies a little slower too). So when a long step leaves under 128 MB free, the
+// to 220 tok/s instead of 2,000 (replies a little slower too). So when a long step leaves under 48 MB free, the
 // least this kind of load needs is noted ("min <key>" in the note file, which load never keeps less than) and the
 // server loads the model again when it's idle. Once per load, on a card of its own (built-in graphics share the
 // system's memory: nothing to run out of), and never more than 2 GB above what load measured: beyond that it is
@@ -191,11 +240,11 @@ void Model::check_room(int n_tok) {
         std::fprintf(stderr, "VRAM: %d MB of the card free after a %d-token prompt step (%d MB kept free at load)\n",
                      free_mb, n_tok, place_.vram_reserve_mb);
     }
-    const int floor = 128;
+    const int floor = 48;                                          // (out of room reads 0; 100 MB left read at full speed)
     if (free_mb >= floor) return;
     const int scratch = std::clamp((int)(tot >> 20) / 32, 192, 640);
     const int most = (int)(place_.compute_gpu >> 20) + scratch + 2048;
-    const int want = std::min(place_.vram_reserve_mb + 768 + (floor - free_mb), most);
+    const int want = std::min(place_.vram_reserve_mb + 896, most);  // (how far short isn't known: 0.9 GB did it at 256K)
     room_done_ = true;                                             // (either way: said once, acted on once)
     if (want < place_.vram_reserve_mb + 128) {
         std::fprintf(stderr, "VRAM: a %d-token prompt step left %d MB of the card free with %d MB kept for the GPU's working "
