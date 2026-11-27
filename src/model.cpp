@@ -2700,6 +2700,7 @@ void Model::pin_cpu_layers(const Graph& g, ggml_backend_sched* sc) {
     // layers in RAM) read a 2,212-token prompt at 19 tok/s. TIERLM_LEND=0: as before.
     static const int offload_batch = [] { const char* e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? atoi(e) : 32; }();
     static const bool lend_off = std::getenv("TIERLM_LEND") && !std::strcmp(std::getenv("TIERLM_LEND"), "0");
+    static const bool lend_all = std::getenv("TIERLM_LEND") && !std::strcmp(std::getenv("TIERLM_LEND"), "2");   // (testing)
     const bool lend = !lend_off && gpus_.size() == 1 && place_.pinned_weights > 0 &&
                       g.n_tok >= std::max(offload_batch, cold_offload_min_);
     auto state = [](const ggml_tensor* t) {                          // a layer's memory in RAM (not a weight, not made by the step)
@@ -2729,7 +2730,7 @@ void Model::pin_cpu_layers(const Graph& g, ggml_backend_sched* sc) {
                                                  : src->op == GGML_OP_NONE && !src->buffer;   // or an input of the graph
             if (!here) continue;
         }
-        if (d < 0) { if (!lend || touches_state(t)) ggml_backend_sched_set_tensor_backend(sc, t, cpu_); }
+        if (d < 0) { if (!lend || (!lend_all && touches_state(t))) ggml_backend_sched_set_tensor_backend(sc, t, cpu_); }
         else if (gpus_.size() > 1) ggml_backend_sched_set_tensor_backend(sc, t, gpus_[d]);
     }
 }
