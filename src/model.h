@@ -594,6 +594,9 @@ private:
     std::vector<char> swap_buf_;                 // (adapt_hot: the incoming experts on their way, without a pinned one)
     ggml_backend_buffer* swap_pin_ = nullptr;    // (adapt_hot: the same in pinned memory, see there)
     size_t swap_pin_cap_ = 0;
+    ggml_backend_buffer* swap_vram_ = nullptr;   // (adapt_hot: outgoing experts parked on the card, see there)
+    size_t swap_vram_cap_ = 0;
+    ggml_context* swap_ctx_ = nullptr;           // (adapt_hot: the views its copies go through)
     std::vector<uint32_t> map_stage_;            // (adapt_hot: the VRAM maps' new entries on their way)
     double live_step_ms_ = 0, live_ms_per_mb_ = 0;   // (adapt_hot: a step's time, and moving's cost per MB, both averaged)
     std::chrono::steady_clock::time_point live_last_{};
