@@ -432,6 +432,7 @@ window.FIT = (() => {
   .big.sm { font-size: 19px; line-height: 1.1; }
   .big.sm small { font-size: 11.5px; }
   .kv dd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  #mvkv dd { white-space: normal; overflow: visible; }   /* (long values wrap in the narrow menu) */
   .caption { font-size: 11.5px; color: var(--faint); margin-top: 2px; }
   .tiers { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
   .tier { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
