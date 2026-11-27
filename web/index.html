@@ -433,6 +433,8 @@ window.FIT = (() => {
   .big.sm small { font-size: 11.5px; }
   .kv dd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
   #mvkv dd { white-space: normal; overflow: visible; }   /* (long values wrap in the narrow menu) */
+  .metacopy { font: inherit; font-size: 11px; color: var(--muted); background: none; border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; margin-left: 8px; cursor: pointer; }
+  .metacopy:hover { color: var(--ink); }
   .caption { font-size: 11.5px; color: var(--faint); margin-top: 2px; }
   .tiers { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
   .tier { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
@@ -1882,7 +1884,18 @@ async function streamReply(useWs) {
   if (!reply.trim() && !calls.length && (lastFull === "full" || failed)) bubble.remove();
   else if (!reply.trim() && calls.length) bubble.remove();         // only a tool call: its card says it all
   else {
-    if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m); }
+    if (meta) {
+      const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; bubble.appendChild(m);
+      // Copy one line (0.9.7), beside the newest reply's speeds: Model info, where Copy specs is, isn't shown on other
+      // devices, and the line is about this reply. (The one before loses its button: the line would be this one's.)
+      if (doneEv && doneEv.gen_tps) {
+        document.querySelectorAll(".metacopy").forEach(b => b.remove());
+        const b = document.createElement("button"); b.className = "metacopy"; b.textContent = "Copy one line";
+        b.title = "This PC, the model, the settings and this reply's speeds, in one line to paste with your numbers";
+        b.onclick = () => copySpecs("line", b);
+        m.appendChild(b);
+      }
+    }
     if (recall?.length) bubble.appendChild(recallLine(recall));
   }
   return { reply, meta, done: doneEv, recall, failed };
